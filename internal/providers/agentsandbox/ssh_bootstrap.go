@@ -21,7 +21,20 @@ const (
 	sshUserMarker        = "CRABBOX_SSH_USER="
 	sshHostKeyMarker     = "CRABBOX_SSH_HOST_KEY="
 	sshPortMarker        = "CRABBOX_SSH_PORT="
+	sshSeedInitializer   = "/opt/crabbox-seed/initialize"
 )
+
+// Compatibility discovery reads the image executable without running it. A
+// missing seed or unsupported checksum utility is an explicit successful probe;
+// failures of Kubernetes exec itself must never look like seed absence.
+const sshSeedProbe = `if [ -f "$1" ] && [ -x "$1" ] && command -v sha256sum >/dev/null 2>&1; then
+  if digest=$(sha256sum "$1" 2>/dev/null); then
+    printf '%s\n' "$digest"
+    exit 0
+  fi
+fi
+printf 'CRABBOX_SEED_UNAVAILABLE\n'
+`
 
 type sshBootstrapInfo struct {
 	User    string
@@ -95,6 +108,23 @@ func (b *backend) initializeSSH(ctx context.Context, client kubernetesClient, re
 		return info, err
 	}
 	defer payload.Close()
+	digest, err := sshInitializerSHA256()
+	if err != nil {
+		return info, err
+	}
+	var probe bytes.Buffer
+	if err := b.execPod(ctx, client, ready, podExecRequest{
+		Command: []string{"sh", "-c", sshSeedProbe, "crabbox-seed-probe", sshSeedInitializer}, Stdout: &probe, Stderr: b.rt.Stderr,
+	}); err != nil {
+		return info, fmt.Errorf("agent-sandbox-ssh probe seeded initializer: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return info, err
+	}
+	fields := strings.Fields(probe.String())
+	if len(fields) == 2 && fields[0] == digest && fields[1] == sshSeedInitializer {
+		return b.executeSSHInitializer(ctx, client, ready, sshSeedInitializer, input)
+	}
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return info, fmt.Errorf("create initializer upload name: %w", err)
@@ -121,11 +151,15 @@ func (b *backend) initializeSSH(ctx context.Context, client kubernetesClient, re
 			resultErr = errors.Join(resultErr, fmt.Errorf("remove temporary SSH initializer: %w", err))
 		}
 	}()
+	return b.executeSSHInitializer(ctx, client, ready, path, input)
+}
+
+func (b *backend) executeSSHInitializer(ctx context.Context, client kubernetesClient, ready sandboxReadiness, path string, input []byte) (sshBootstrapInfo, error) {
 	var output bytes.Buffer
 	if err := b.execPod(ctx, client, ready, podExecRequest{
 		Command: []string{path}, Stdin: bytes.NewReader(input), Stdout: &output, Stderr: b.rt.Stderr,
 	}); err != nil {
-		return info, fmt.Errorf("agent-sandbox-ssh additive initialization failed: %w", err)
+		return sshBootstrapInfo{}, fmt.Errorf("agent-sandbox-ssh additive initialization failed: %w", err)
 	}
 	return parseSSHBootstrapOutput(output.String())
 }

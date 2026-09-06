@@ -112,12 +112,12 @@ func runSSHSyncScriptCombinedOutput(ctx context.Context, target SSHTarget, remot
 func remoteUploadSyncScript(dir, owner string) string {
 	script := "set -eu\numask 077\n" +
 		"dir=" + shellQuote(dir) + "\n" +
-		"/bin/mkdir \"$dir\"\n" +
-		"trap 'status=$?; trap - 0; /bin/rm -f \"$dir/script\" \"$dir/owner\" && /bin/rmdir \"$dir\"; exit \"$status\"' 0\n" +
+		"mkdir \"$dir\"\n" +
+		"trap 'status=$?; trap - 0; rm -f \"$dir/script\" \"$dir/owner\" && rmdir \"$dir\"; exit \"$status\"' 0\n" +
 		"trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n" +
 		"set -C\n" +
 		"printf '%s\\n' " + shellQuote(owner) + " > \"$dir/owner\"\n" +
-		"/bin/cat > \"$dir/script\"\n" +
+		"cat > \"$dir/script\"\n" +
 		"trap - 0\n"
 	return "/bin/sh -c " + shellQuote(script)
 }
@@ -129,9 +129,9 @@ func remoteCleanupSyncScript(dir, owner string) string {
 		"dir=" + shellQuote(dir) + "\n" +
 		"if [ ! -e \"$dir\" ] && [ ! -L \"$dir\" ]; then exit 0; fi\n" +
 		"[ ! -L \"$dir\" ] && [ -d \"$dir\" ] && [ ! -L \"$dir/owner\" ] && [ -f \"$dir/owner\" ] || exit 1\n" +
-		"[ \"$(/bin/cat \"$dir/owner\")\" = " + shellQuote(owner) + " ] || exit 1\n" +
-		"/bin/rm -f \"$dir/script\"\n" +
-		"/bin/rm \"$dir/owner\"\n" +
-		"/bin/rmdir \"$dir\"\n"
+		"[ \"$(cat \"$dir/owner\")\" = " + shellQuote(owner) + " ] || exit 1\n" +
+		"rm -f \"$dir/script\"\n" +
+		"rm \"$dir/owner\"\n" +
+		"rmdir \"$dir\"\n"
 	return "/bin/sh -c " + shellQuote(script)
 }

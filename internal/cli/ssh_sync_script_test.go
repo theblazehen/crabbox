@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -17,6 +18,68 @@ import (
 type syncScriptSSHFixture struct {
 	root   string
 	target SSHTarget
+}
+
+func TestRemoteUploadSyncScriptHonorsPATHFailureAndCleansStaging(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX SSH shell fixture")
+	}
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Leave a partial upload so the failure trap must remove both staged files.
+	if err := os.WriteFile(filepath.Join(bin, "cat"), []byte("#!/bin/sh\nprintf 'partial source'\nexit 41\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "staging")
+	cmd := exec.Command("/bin/sh", "-c", remoteUploadSyncScript(dir, "fixture-owner"))
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Stdin = strings.NewReader("printf 'complete source'\n")
+	out, err := cmd.CombinedOutput()
+	if exitCode(err) != 41 {
+		t.Fatalf("upload exit=%d err=%v output=%q", exitCode(err), err, out)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed upload left staging directory: %v", err)
+	}
+}
+
+func TestRemoteCleanupSyncScriptHonorsPATHFailureAndPreservesOwnership(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX SSH shell fixture")
+	}
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "rm"), []byte("#!/bin/sh\nexit 42\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "staging")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{"owner": "fixture-owner\n", "script": "printf 'staged source'\n"}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("/bin/sh", "-c", remoteCleanupSyncScript(dir, "fixture-owner"))
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if exitCode(err) != 42 {
+		t.Fatalf("cleanup exit=%d err=%v output=%q", exitCode(err), err, out)
+	}
+	for name, want := range files {
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || string(got) != want {
+			t.Fatalf("failed cleanup changed %s: got=%q want=%q err=%v", name, got, want, err)
+		}
+	}
 }
 
 func newSyncScriptSSHFixture(t *testing.T, mode string) syncScriptSSHFixture {

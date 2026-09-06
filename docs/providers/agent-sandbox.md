@@ -84,17 +84,28 @@ In addition to the Kubernetes prerequisites below, this variant requires:
 
 ### Additive initialization and SSH transport
 
-The existing authenticated Kubernetes exec channel uploads a Linux amd64
-static Go initializer to a new private directory under `/tmp`. The
-initializer contains a compressed static tool payload; no target package
-manager, package repository, shared-library installation, or Nix store is
-needed. A separate exec invokes it with JSON on stdin carrying the lease ID,
+The existing authenticated Kubernetes exec channel first checks the optional
+`/opt/crabbox-seed/initialize` without executing it. An executable seed is used
+only when its `sha256sum` matches the exact decompressed initializer bytes
+embedded in the CLI. An absent, incompatible, or unhashable seed falls back to
+uploading the Linux amd64 static Go initializer into a new private directory
+under `/tmp`; actual Kubernetes exec/transport failures remain hard errors,
+not evidence of seed absence. The initializer contains a compressed static
+tool payload; no target package manager, package repository, shared-library
+installation, or Nix store is needed. A separate exec invokes the selected
+initializer with JSON on stdin carrying the lease ID,
 client public key, and, on reuse, the expected host public key and port. The
 client private key stays local. The host private key is generated and retained
 only in the container; the returned host public key is pinned in the local
 private per-lease `known_hosts` file.
 
-The initializer stages a content-addressed runtime under
+The initializer can also reuse an optional sibling `payload` directory beside
+its resolved executable, verified against the embedded payload before use.
+An ordinary image can provide `/opt/crabbox-seed/{initialize,payload}`; a
+symlinked layout can point `/opt/crabbox-seed` at an immutable Nix store output
+containing both. Nix is optional. Unsafe, incomplete, or mismatched pre-extracted
+payloads fail closed and are never repaired in the image. With no sibling
+payload, the initializer stages a content-addressed runtime under
 `/opt/crabbox-runtime/<payload-sha256>`. It checks existing command paths and
 adds only missing `/bin` and `/usr/bin` symlinks, reusing a compatible image
 tool where available and otherwise pointing to the bundled static executable.
@@ -112,10 +123,11 @@ there is no fixed SSH port requirement. Initialization never takes over an
 unrelated daemon or its port. Changes to the pinned identity, port, or owned
 daemon state are rejected rather than silently adopted.
 
-Every preparation uploads the full initializer again, including on reuse;
-verified installed runtime content and the matching lease endpoint are reused,
-not reinstalled or assigned a new identity. The temporary upload is removed
-after invocation. The amd64 initializer upload is approximately 36.2 MB, and
+Every preparation checks seed compatibility, including on reuse. An exact
+seed skips the initializer upload; fallback uploads the full initializer and
+removes the temporary upload after invocation. Verified runtime content and
+the matching lease endpoint are reused, not reinstalled or assigned a new
+identity. The amd64 initializer upload is approximately 36.2 MB, and
 its compressed embedded asset is approximately 33.4 MB. These are approximate
 artifact sizes, not total CLI binary sizes or a promise of incremental uploads.
 
@@ -179,7 +191,20 @@ and generates `internal/providers/agentsandbox/assets/initializer-linux-amd64.gz
 for embedding in the CLI. Do not run concurrent producers: the build uses
 `runtimes/agent-sandbox/payload.tar.gz` as a fixed intermediate, and the script
 enforces an exclusive build lock. Only amd64 is accepted. Rebuild the CLI after
-regenerating assets.
+regenerating the canonical assets, not before: the CLI embeds their bytes at
+build time. An image seed's `initialize` must be decompressed from that same
+`internal/providers/agentsandbox/assets/initializer-linux-amd64.gz`; its optional
+`payload` directory must be extracted from the matching
+`runtimes/agent-sandbox/payload.tar.gz`. Do not mix independently generated
+assets or regenerate the initializer after building the CLI.
+
+Live CPU-worker proof with matching CLI/initializer artifacts covered absent
+seed upload, exact-seed reuse with zero initializer uploads, and incompatible
+seed fallback without executing the incompatible seed; real SSH preserved the
+pinned host key and port. A separately built immutable Nix seed package passed
+initialization and pinned SSH twice without private payload extraction or
+account-file changes. This does not establish a full pool-image rollout or
+compatibility with arbitrary images.
 
 The Dropbear build includes a root-only shell-policy patch. For the existing
 UID-0 `root` account, it accepts an absolute executable regular-file shell

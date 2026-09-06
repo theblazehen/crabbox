@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Add `agent-sandbox-ssh` for SSH/rsync sync, scripts, captures, and downloads on compatible Linux amd64 Agent Sandbox warm pools, with an additive static initializer, independent key-only Dropbear and private root-shell policy on a pinned dynamic loopback port, and Kubernetes port-forwarding; existing image tools and accounts are preserved, and the archive provider remains unchanged.
+- Reuse an optional image-seeded SSH initializer and verified immutable pre-extracted runtime, skipping initializer uploads only for an exact embedded-byte match and retaining safe upload fallback for absent or incompatible seeds.
 - Upload generated POSIX SSH sync scripts separately from their input data, keeping large sync and ownership-check source out of SSH exec requests with guarded private staging and cleanup; normal workload execution and Windows sync are unchanged.
+- Resolve POSIX SSH script staging, cleanup, and fingerprint-invalidation utilities through the remote PATH instead of assuming `/bin` coreutils, allowing NixOS Git-workspace `run --no-sync` execution without guest shims.
 - Preserve piped stdin only at POSIX SSH workload execution, isolating sync/upload/ownership controls and preventing input replay; `--script-stdin` remains source-only, and Windows/WSL/delegated paths are unchanged.
 - OpenComputer: share run finalization so cleanup failures are reported, timing errors preserve the original exit, and command preparation honors `--keep-on-failure`; preserve cancellation and timeout causes and distinguish transport errors from command exits. [PR 1845](https://github.com/openclaw/crabbox/pull/1845). Thanks @steipete.
 - Preserve literal E2B and CubeSandbox profile arguments through their shared envd command transport, and accept inferred single-string shell programs and explicit empty shell source. [PR 1837](https://github.com/openclaw/crabbox/pull/1837). Thanks @steipete.
