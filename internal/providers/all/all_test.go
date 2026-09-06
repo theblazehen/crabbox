@@ -1274,7 +1274,7 @@ func offlineConformanceConfig(provider string) (core.Config, bool) {
 	cfg := core.BaseConfig()
 	cfg.Provider = provider
 	switch provider {
-	case "agent-sandbox":
+	case "agent-sandbox", "agent-sandbox-ssh":
 		cfg.AgentSandbox.Context = "agent-context"
 		cfg.AgentSandbox.WarmPool = "linux-pool"
 		return cfg, true
@@ -1335,6 +1335,7 @@ func offlineConformanceConfig(provider string) (core.Config, bool) {
 func allBuiltInProviderNames() []string {
 	return []string{
 		"agent-sandbox",
+		"agent-sandbox-ssh",
 		"apple-container",
 		"apple-machine",
 		"apple-vm",

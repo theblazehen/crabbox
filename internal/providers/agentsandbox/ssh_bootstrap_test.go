@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,6 +121,9 @@ type sshBootstrapTestClient struct {
 	uploadHeader      [4]byte
 	uploadBytes       int64
 	initializerPath   string
+	probeOutput       string
+	probeErr          error
+	probe             func() error
 	during            func() error
 	upload            func(podExecRequest) error
 	initializeErr     error
@@ -138,6 +142,25 @@ func (c *sshBootstrapTestClient) Exec(ctx context.Context, req podExecRequest) e
 		}
 		_, err := io.WriteString(req.Stdout, architecture+"\n")
 		return err
+	case len(req.Command) == 5 && req.Command[0] == "sh" && req.Command[1] == "-c" && req.Command[3] == "crabbox-seed-probe" && req.Command[4] == sshSeedInitializer:
+		c.phases = append(c.phases, "probe")
+		if req.Stdin != nil {
+			return errors.New("seed probe received initializer or credentials")
+		}
+		if c.probe != nil {
+			if err := c.probe(); err != nil {
+				return err
+			}
+		}
+		if c.probeErr != nil {
+			return c.probeErr
+		}
+		output := c.probeOutput
+		if output == "" {
+			output = "CRABBOX_SEED_UNAVAILABLE\n"
+		}
+		_, err := io.WriteString(req.Stdout, output)
+		return err
 	case len(req.Command) == 3 && req.Command[0] == "sh" && req.Command[1] == "-c" && req.Stdin != nil:
 		c.phases = append(c.phases, "upload")
 		if c.upload != nil {
@@ -151,7 +174,7 @@ func (c *sshBootstrapTestClient) Exec(ctx context.Context, req podExecRequest) e
 		rest, err := io.Copy(io.Discard, req.Stdin)
 		c.uploadBytes += rest
 		return err
-	case len(req.Command) == 1 && strings.HasPrefix(req.Command[0], "/tmp/crabbox-init-") && strings.HasSuffix(req.Command[0], "/initialize"):
+	case len(req.Command) == 1 && (req.Command[0] == sshSeedInitializer || (strings.HasPrefix(req.Command[0], "/tmp/crabbox-init-") && strings.HasSuffix(req.Command[0], "/initialize"))):
 		c.phases = append(c.phases, "initialize")
 		c.initializerPath = req.Command[0]
 		data, err := io.ReadAll(req.Stdin)
@@ -218,7 +241,7 @@ func TestInitializeSSHArchitectureSelection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(client.phases, []string{"architecture", "upload", "initialize", "cleanup"}) {
+			if !reflect.DeepEqual(client.phases, []string{"architecture", "probe", "upload", "initialize", "cleanup"}) {
 				t.Fatalf("bootstrap phases=%v", client.phases)
 			}
 			if client.uploadHeader != [4]byte{0x7f, 'E', 'L', 'F'} || client.uploadBytes <= 4 {
@@ -235,9 +258,18 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 	if _, err := exec.LookPath("ssh-keygen"); err != nil {
 		t.Skip("ssh-keygen unavailable")
 	}
-	for _, scenario := range []string{"publish", "reuse", "host key changed", "port changed", "claim changed"} {
+	for _, scenario := range []string{"publish", "reuse", "host key changed", "port changed", "claim changed", "seed publish", "seed reuse", "seed host key changed", "seed port changed", "seed claim changed"} {
 		t.Run(scenario, func(t *testing.T) {
 			b, client, ready, claim := newSSHBootstrapTestSetup(t)
+			seeded := strings.HasPrefix(scenario, "seed ")
+			scenario = strings.TrimPrefix(scenario, "seed ")
+			if seeded {
+				digest, err := sshInitializerSHA256()
+				if err != nil {
+					t.Fatal(err)
+				}
+				client.probeOutput = digest + "  " + sshSeedInitializer + "\n"
+			}
 			key := bootstrapTestPublicKey(t, 1)
 			keyPath, publicKey, err := core.EnsureTestboxKey(claim.LeaseID)
 			if err != nil {
@@ -281,10 +313,17 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 				}
 			}
 			updated, prepareErr := b.prepareSSH(t.Context(), client, ready, claim)
-			if !reflect.DeepEqual(client.phases, []string{"architecture", "upload", "initialize", "cleanup"}) {
+			wantPhases := []string{"architecture", "probe", "upload", "initialize", "cleanup"}
+			if seeded {
+				wantPhases = []string{"architecture", "probe", "initialize"}
+			}
+			if !reflect.DeepEqual(client.phases, wantPhases) {
 				t.Fatalf("bootstrap phases=%v error=%v", client.phases, prepareErr)
 			}
-			if client.uploadHeader != [4]byte{0x7f, 'E', 'L', 'F'} || client.uploadBytes <= 4 {
+			if seeded && (client.uploadBytes != 0 || client.initializerPath != sshSeedInitializer) {
+				t.Fatalf("seed path uploaded or used wrong executable: bytes=%d path=%s", client.uploadBytes, client.initializerPath)
+			}
+			if !seeded && (client.uploadHeader != [4]byte{0x7f, 'E', 'L', 'F'} || client.uploadBytes <= 4) {
 				t.Fatalf("initializer upload is not a decoded ELF: header=%x size=%d", client.uploadHeader, client.uploadBytes)
 			}
 			wantRequest := sshInitializationRequest{LeaseID: claim.LeaseID, PublicKey: strings.TrimSpace(publicKey), ExpectedHostKey: claim.Labels[claimLabelSSHHostKey], ExpectedPort: claim.Labels[claimLabelSSHPort]}
@@ -334,6 +373,140 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 				if scenario == "claim changed" && stored.Labels["concurrent_change"] != "preserved" {
 					t.Fatal("bootstrap overwrote a concurrent claim update")
 				}
+			}
+		})
+	}
+}
+
+func TestInitializeSSHSeedSelection(t *testing.T) {
+	reader, err := openSSHInitializer("amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, reader); err != nil {
+		t.Fatal(err)
+	}
+	checksum := fmt.Sprintf("%x  %s\n", hash.Sum(nil), sshSeedInitializer)
+	for _, scenario := range []string{"match", "mismatch", "missing", "unsupported", "malformed", "runtime failure", "invalid output", "transport failure", "remote failure", "canceled probe"} {
+		t.Run(scenario, func(t *testing.T) {
+			b, client, ready, claim := newSSHBootstrapTestSetup(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			input, err := sshInitializationInput(claim.LeaseID, bootstrapTestPublicKey(t, 2), "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New("seed operation failed")
+			client.probeOutput = checksum
+			wantPhases := []string{"architecture", "probe", "initialize"}
+			var wantErr error
+			fallback := false
+			switch scenario {
+			case "mismatch", "missing", "unsupported", "malformed":
+				fallback = true
+				wantPhases = []string{"architecture", "probe", "upload", "initialize", "cleanup"}
+				client.probeOutput = "CRABBOX_SEED_UNAVAILABLE\n"
+				if scenario == "mismatch" {
+					client.probeOutput = strings.Repeat("0", 64) + "  " + sshSeedInitializer + "\n"
+				} else if scenario == "malformed" {
+					client.probeOutput = checksum + "unexpected extra output\n"
+				}
+			case "runtime failure":
+				client.initializeErr, wantErr = failure, failure
+			case "invalid output":
+				client.output = "not endpoint metadata\n"
+			case "transport failure", "remote failure", "canceled probe":
+				wantPhases = []string{"architecture", "probe"}
+				if scenario == "transport failure" {
+					client.probeErr, wantErr = failure, failure
+				} else if scenario == "remote failure" {
+					client.probeErr = testExitError{code: 1}
+					wantErr = client.probeErr
+				} else {
+					client.probe = func() error { cancel(); return nil }
+					wantErr = context.Canceled
+				}
+			}
+			info, err := b.initializeSSH(ctx, client, ready, input)
+			if wantErr != nil {
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("error=%v want=%v", err, wantErr)
+				}
+			} else if scenario == "invalid output" {
+				if err == nil || !strings.Contains(err.Error(), "unexpected or duplicate output") {
+					t.Fatalf("invalid seed output accepted: %v", err)
+				}
+			} else if err != nil || info.User != "root" || info.HostKey != bootstrapTestPublicKey(t, 1) || info.Port != "43210" {
+				t.Fatalf("identity=%#v error=%v", info, err)
+			}
+			if !reflect.DeepEqual(client.phases, wantPhases) {
+				t.Fatalf("phases=%v want=%v", client.phases, wantPhases)
+			}
+			if fallback {
+				if client.uploadBytes <= 4 || client.uploadHeader != [4]byte{0x7f, 'E', 'L', 'F'} || !strings.HasPrefix(client.initializerPath, "/tmp/crabbox-init-") {
+					t.Fatalf("fallback did not upload executable: bytes=%d path=%s", client.uploadBytes, client.initializerPath)
+				}
+			} else if client.uploadBytes != 0 || (len(wantPhases) == 3 && client.initializerPath != sshSeedInitializer) {
+				t.Fatalf("seed path uploaded or used wrong executable: bytes=%d path=%s", client.uploadBytes, client.initializerPath)
+			}
+			if client.initializerPath != "" && !bytes.Equal(client.requestData, input) {
+				t.Fatal("seed selection changed per-lease initialization request")
+			}
+		})
+	}
+}
+
+func TestSSHSeedProbeReadsExecutableWithoutRunningIt(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh unavailable")
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("sha256sum unavailable")
+	}
+	for _, scenario := range []string{"executable", "symlink", "missing", "not executable", "unsupported checksum", "failed checksum"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			seed := filepath.Join(dir, "initialize")
+			marker := filepath.Join(dir, "executed")
+			data := []byte("#!/bin/sh\nprintf executed > " + shellQuote(marker) + "\n")
+			if scenario != "missing" {
+				if err := os.WriteFile(seed, data, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "symlink" {
+				link := filepath.Join(dir, "seed-link")
+				if err := os.Symlink(seed, link); err != nil {
+					t.Fatal(err)
+				}
+				seed = link
+			} else if scenario == "not executable" {
+				if err := os.Chmod(seed, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(sh, "-c", sshSeedProbe, "crabbox-seed-probe", seed)
+			if scenario == "unsupported checksum" || scenario == "failed checksum" {
+				cmd.Env = append(os.Environ(), "PATH="+dir)
+				if scenario == "failed checksum" {
+					if err := os.WriteFile(filepath.Join(dir, "sha256sum"), []byte("#!"+sh+"\nexit 1\n"), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			output, err := cmd.CombinedOutput()
+			want := "CRABBOX_SEED_UNAVAILABLE\n"
+			if scenario == "executable" || scenario == "symlink" {
+				want = fmt.Sprintf("%x  %s\n", sha256.Sum256(data), seed)
+			}
+			if err != nil || string(output) != want {
+				t.Fatalf("probe=%q error=%v want=%q", output, err, want)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("probe executed image-provided initializer: %v", err)
 			}
 		})
 	}
@@ -392,7 +565,7 @@ func TestInitializeSSHUploadFailureDoesNotCleanUnownedPath(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "upload static initializer") {
 		t.Fatalf("upload failure error=%v", err)
 	}
-	if !reflect.DeepEqual(client.phases, []string{"architecture", "upload"}) {
+	if !reflect.DeepEqual(client.phases, []string{"architecture", "probe", "upload"}) {
 		t.Fatalf("failed upload initialized or cleaned an unowned path: %v", client.phases)
 	}
 	got, err := os.ReadFile(marker)
@@ -451,7 +624,7 @@ func TestInitializeSSHAlwaysCleansOwnedUploadAndReportsCleanupFailure(t *testing
 			if err == nil {
 				t.Fatal("initializer/cleanup failure was ignored")
 			}
-			if !reflect.DeepEqual(client.phases, []string{"architecture", "upload", "initialize", "cleanup"}) || client.cleanupContextErr != nil {
+			if !reflect.DeepEqual(client.phases, []string{"architecture", "probe", "upload", "initialize", "cleanup"}) || client.cleanupContextErr != nil {
 				t.Fatalf("owned upload was not cleaned with live context: phases=%v context=%v", client.phases, client.cleanupContextErr)
 			}
 			if client.initializeErr != nil && !errors.Is(err, initializeErr) {

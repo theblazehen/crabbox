@@ -372,6 +372,21 @@ func syncScriptAwareSSHFixture(t *testing.T, script string) string {
 	if err != nil {
 		t.Skip("base64 is required for the SSH ownership fixture")
 	}
+	// Command fakes may later isolate PATH to their own directory. Only the
+	// real staging envelope needs host utilities; keep that PATH separate from
+	// the fake's workload environment, including deliberately hostile PATHs.
+	var stagingDirs []string
+	catPath := ""
+	for _, name := range []string{"cat", "mkdir", "rm", "rmdir"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatalf("resolve SSH staging fixture utility %s: %v", name, err)
+		}
+		stagingDirs = append(stagingDirs, filepath.Dir(path))
+		if name == "cat" {
+			catPath = path
+		}
+	}
 	const transport = `
 sync_remote=""
 for sync_arg do sync_remote="$sync_arg"; done
@@ -394,7 +409,7 @@ done
 sync_decode_remote
 case "$sync_remote" in
   "/bin/sh -c "*"/tmp/crabbox-sync-script-"*)
-    exec /bin/sh -c "$sync_remote"
+    PATH=CRABBOX_FIXTURE_STAGING_PATH exec /bin/sh -c "$sync_remote"
     ;;
   "/bin/sh '/tmp/crabbox-sync-script-"*"/script'")
     sync_path=${sync_remote#"/bin/sh '"}
@@ -409,7 +424,11 @@ esac
 	if !ok {
 		panic("SSH fixture must include a shebang line")
 	}
-	return strings.ReplaceAll(first+"\n"+transport+rest, "/usr/bin/base64", shellQuote(base64Path))
+	fixtureTransport := strings.NewReplacer(
+		"/bin/cat", shellQuote(catPath),
+		"CRABBOX_FIXTURE_STAGING_PATH", shellQuote(strings.Join(stagingDirs, string(os.PathListSeparator))),
+	).Replace(transport)
+	return strings.ReplaceAll(first+"\n"+fixtureTransport+rest, "/usr/bin/base64", shellQuote(base64Path))
 }
 
 func installRecordingSSH(t *testing.T, dir string) string {

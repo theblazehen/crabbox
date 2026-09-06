@@ -1622,7 +1622,7 @@ case "$decoded" in
         ;;
     esac
     ;;
-  *"/bin/rm -f --"*sync-fingerprint*)
+  *'rm -f -- "$meta_dir/sync-fingerprint"'*)
     count=0
     if [ -f "$CRABBOX_INVALIDATION_COUNT" ]; then
       count=$(/bin/cat "$CRABBOX_INVALIDATION_COUNT")
@@ -1871,7 +1871,7 @@ esac
 	}
 	invalidations := 0
 	for _, command := range strings.Split(string(logData), "---\n") {
-		if strings.Contains(command, "/bin/rm -f --") && strings.Contains(command, "sync-fingerprint") {
+		if strings.Contains(command, `rm -f -- "$meta_dir/sync-fingerprint"`) {
 			invalidations++
 			for _, want := range []string{remoteJoin(cfg, "cbx_gh", "repo"), "/usr/bin/env -i", "/bin/bash --noprofile --norc"} {
 				if !strings.Contains(command, want) {

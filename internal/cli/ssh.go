@@ -2127,7 +2127,7 @@ func remoteInvalidateSyncFingerprintForTarget(target SSHTarget, workdir string, 
 	script := `set -e
 cd ` + shellQuote(workdir) + `
 ` + metadataScript + `
-/bin/rm -f -- "$meta_dir/sync-fingerprint"`
+rm -f -- "$meta_dir/sync-fingerprint"`
 	return shellCommand(script)
 }
 

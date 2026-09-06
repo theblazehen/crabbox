@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Add `agent-sandbox-ssh` for SSH/rsync sync, scripts, captures, and downloads on compatible Linux amd64 Agent Sandbox warm pools, with an additive static initializer, independent key-only Dropbear and private root-shell policy on a pinned dynamic loopback port, and Kubernetes port-forwarding; existing image tools and accounts are preserved, and the archive provider remains unchanged.
+- Reuse an optional image-seeded SSH initializer and verified immutable pre-extracted runtime, skipping initializer uploads only for an exact embedded-byte match and retaining safe upload fallback for absent or incompatible seeds.
 - Upload generated POSIX SSH sync scripts separately from their input data, keeping large sync and ownership-check source out of SSH exec requests with guarded private staging and cleanup; normal workload execution and Windows sync are unchanged.
+- Resolve POSIX SSH script staging, cleanup, and fingerprint-invalidation utilities through the remote PATH instead of assuming `/bin` coreutils, allowing NixOS Git-workspace `run --no-sync` execution without guest shims.
 - Preserve piped stdin only at POSIX SSH workload execution, isolating sync/upload/ownership controls and preventing input replay; `--script-stdin` remains source-only, and Windows/WSL/delegated paths are unchanged.
 - Local containers: optionally omit the explicit hostname for runtimes sharing a host UTS namespace, support YAML and environment configuration, and reject incompatible fixed-ID reuse without changing existing default fingerprints. [PR 1813](https://github.com/openclaw/crabbox/pull/1813), [PR 1924](https://github.com/openclaw/crabbox/pull/1924). Thanks @atrawog.
 - Define a strict provider-neutral Linux developer-image recipe whose digest binds the executable contract and exact installer/readiness source hashes.

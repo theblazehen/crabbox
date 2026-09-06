@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -118,14 +119,21 @@ func setupSSHScriptRun(t *testing.T) (*sshScriptTestProvider, *sshScriptTestBack
 			}
 		}
 	})
+	realSSH, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("ssh is required for the SSH script fixture")
+	}
 	ssh := `#!/bin/sh
 for arg do
-  if [ "$arg" = -G ]; then exec /usr/bin/ssh "$@"; fi
+  if [ "$arg" = -G ]; then exec ` + shellQuote(realSSH) + ` "$@"; fi
 done
 cmd=""
 for arg do cmd="$arg"; done
-printf '%s\n' "$cmd" >> "$CRABBOX_SCRIPT_SSH_LOG"
 decoded=$cmd
+# The staging helper exposes source for readiness inspection. Execute and log
+# the actual staged command so its interpreter and private argv stay intact.
+if [ -n "${sync_path:-}" ]; then cmd="/bin/sh '$sync_path'"; fi
+printf '%s\n' "$cmd" >> "$CRABBOX_SCRIPT_SSH_LOG"
 while :; do
   case "$decoded" in
     *'payload_b64="'*'"; decoded=; if command -v base64'*)
@@ -146,7 +154,7 @@ sh -c 'sh -c "$1"; code=$?; printf "%s\n" "$code" > "$2.done"; exit "$code"' sh 
 code=$?
 exit "$code"
 `
-	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(ssh), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(syncScriptAwareSSHFixture(t, ssh)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "rsync"), []byte("#!/bin/sh\nexit 91\n"), 0o755); err != nil {
