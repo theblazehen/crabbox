@@ -257,6 +257,13 @@ type SSHLoginBackend interface {
 	Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error)
 }
 
+// SSHProxyBackend owns the raw SSH transport for an already prepared lease.
+// ProxySSH must validate the lease without preparing it or acquiring operation
+// locks: the SSH caller can already hold those locks for the connection's life.
+type SSHProxyBackend interface {
+	ProxySSH(context.Context, string, io.Reader, io.Writer, io.Writer) error
+}
+
 type LeaseTouchBackend interface {
 	Backend
 	Touch(ctx context.Context, req TouchRequest) (Server, error)

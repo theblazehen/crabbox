@@ -363,6 +363,55 @@ func TestStopDefersUnsafeLocalConnectionCleanupUntilRelease(t *testing.T) {
 	}
 }
 
+// syncScriptAwareSSHFixture executes the real upload/cleanup envelope locally.
+// On the short execution request, existing command fakes inspect the staged
+// source while stdin remains the original manifest or workload data.
+func syncScriptAwareSSHFixture(t *testing.T, script string) string {
+	t.Helper()
+	base64Path, err := exec.LookPath("base64")
+	if err != nil {
+		t.Skip("base64 is required for the SSH ownership fixture")
+	}
+	const transport = `
+sync_remote=""
+for sync_arg do sync_remote="$sync_arg"; done
+sync_decode_remote() {
+sync_depth=0
+while [ "$sync_depth" -lt 8 ]; do
+  case "$sync_remote" in
+    *'payload_b64="'*'"; decoded=; if command -v base64'*)
+      sync_payload=${sync_remote#*'payload_b64="'}
+      sync_payload=${sync_payload%%'"; decoded=; if command -v base64'*}
+      sync_remote=$(printf %s "$sync_payload" | /usr/bin/base64 --decode 2>/dev/null) ||
+        sync_remote=$(printf %s "$sync_payload" | /usr/bin/base64 -d 2>/dev/null) ||
+        sync_remote=$(printf %s "$sync_payload" | /usr/bin/base64 -D 2>/dev/null) || break
+      sync_depth=$((sync_depth + 1))
+      ;;
+    *) break ;;
+  esac
+done
+}
+sync_decode_remote
+case "$sync_remote" in
+  "/bin/sh -c "*"/tmp/crabbox-sync-script-"*)
+    exec /bin/sh -c "$sync_remote"
+    ;;
+  "/bin/sh '/tmp/crabbox-sync-script-"*"/script'")
+    sync_path=${sync_remote#"/bin/sh '"}
+    sync_path=${sync_path%"'"}
+    sync_remote=$(/bin/cat "$sync_path") || exit $?
+    sync_decode_remote
+    set -- "$sync_remote"
+    ;;
+esac
+`
+	first, rest, ok := strings.Cut(script, "\n")
+	if !ok {
+		panic("SSH fixture must include a shebang line")
+	}
+	return strings.ReplaceAll(first+"\n"+transport+rest, "/usr/bin/base64", shellQuote(base64Path))
+}
+
 func installRecordingSSH(t *testing.T, dir string) string {
 	t.Helper()
 	logPath := filepath.Join(dir, "ssh.log")
@@ -396,7 +445,7 @@ else
 fi
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
@@ -407,7 +456,7 @@ exit 0
 func installWorkspaceOwnerAwareSSH(t *testing.T, sshPath, commandScript string) {
 	t.Helper()
 	commandPath := filepath.Join(filepath.Dir(sshPath), "ssh-command")
-	if err := os.WriteFile(commandPath, []byte(commandScript), 0o755); err != nil {
+	if err := os.WriteFile(commandPath, []byte(syncScriptAwareSSHFixture(t, commandScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	wrapper := `#!/bin/sh
@@ -449,7 +498,7 @@ case "$current" in
 esac
 exec "$(dirname "$0")/ssh-command" "$current"
 `
-	if err := os.WriteFile(sshPath, []byte(wrapper), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, wrapper)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -587,7 +636,7 @@ esac
 /bin/cat >/dev/null || true
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
@@ -1277,7 +1326,7 @@ func TestRunBuildsSyncManifestAfterAcquire(t *testing.T) {
 		t.Fatal(err)
 	}
 	sshPath := filepath.Join(binDir, "ssh")
-	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\n/bin/cat >/dev/null || true\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, "#!/bin/sh\n/bin/cat >/dev/null || true\nexit 0\n")), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	rsyncLog := filepath.Join(dir, "rsync-manifest.log")
@@ -4685,7 +4734,7 @@ case "$cmd" in
 esac
 exit 0
 `
-			if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+			if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -4802,7 +4851,7 @@ fi
 printf 'argv:%s\n' "$cmd" >> "$CRABBOX_FAKE_SSH_LOG"
 exec sh -c "$cmd"
 `
-	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -4953,7 +5002,7 @@ case "$cmd" in
 esac
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -5124,7 +5173,7 @@ case "$cmd" in
 esac
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -5222,7 +5271,7 @@ case "$cmd" in
 esac
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -5274,7 +5323,7 @@ func TestRunCommandRejectsWindowsEnvHelperBeforeRemoteCommands(t *testing.T) {
 printf 'ssh called\n' >> "$CRABBOX_FAKE_SSH_LOG"
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -5467,7 +5516,9 @@ case "$marker_mutation:$remote" in
     rm -f "$CRABBOX_FAKE_OWNER_CHILD"
     exit 0
     ;;
-  *"nohup"*"cbx_env_profile_test.local.sh"*)
+  # Uploaded owner launchers are decoded to the hydration payload, without
+  # the outer nohup text. Match its actual bash invocation, not installation.
+  *"nohup"*"cbx_env_profile_test.local.sh"*|*'bash "$1" >"$2" 2>&1'*"cbx_env_profile_test.local.sh"*)
     printf 'hydrate\n' >> "$CRABBOX_FAKE_EVENTS"
     : > "$CRABBOX_FAKE_HYDRATED"
     printf '123\n'
@@ -5525,7 +5576,7 @@ for arg do last="$arg"; done
 printf '%s\n' "$last" > "$CRABBOX_FAKE_SYNC_TARGET"
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(rsyncPath, []byte(rsyncScript), 0o755); err != nil {

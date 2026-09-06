@@ -42,9 +42,10 @@ type LocalCommandRequest = core.LocalCommandRequest
 type LocalCommandResult = core.LocalCommandResult
 
 const (
-	providerName = "agent-sandbox"
-	leasePrefix  = "asbx_"
-	namePrefix   = "crabbox-"
+	providerName    = "agent-sandbox"
+	sshProviderName = "agent-sandbox-ssh"
+	leasePrefix     = "asbx_"
+	namePrefix      = "crabbox-"
 
 	agentSandboxCoreGroupVersion       = "agents.x-k8s.io/v1beta1"
 	agentSandboxExtensionsGroupVersion = "extensions.agents.x-k8s.io/v1beta1"
@@ -123,7 +124,7 @@ func handleDelegatedRunFailure(w io.Writer, cfg Config, req RunRequest, leaseID,
 func agentSandboxRecoveryCommand(cfg Config, command string) string {
 	args := []string{
 		"crabbox", command,
-		"--provider", providerName,
+		"--provider", selectedProvider(cfg),
 		"--agent-sandbox-kubectl", cfg.AgentSandbox.Kubectl,
 	}
 	if cfg.AgentSandbox.Kubeconfig != "" {

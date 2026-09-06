@@ -168,7 +168,7 @@ func TestWorkspaceOwnerWSLStagedInputAndSharedOutput(t *testing.T) {
 	remote := `(i=0; while [ "$i" -lt 2000 ]; do printf 'stdout\n'; i=$((i+1)); done) &
 i=0; while [ "$i" -lt 2000 ]; do printf 'stderr\n' >&2; i=$((i+1)); done
 wait`
-	code, err := runSSHStreamResult(ctx, target, remote, &combined, &combined)
+	code, err := runSSHStreamResult(ctx, target, remote, nil, &combined, &combined)
 	if code != 0 || err != nil || strings.Count(combined.String(), "stdout\n") != 2000 || strings.Count(combined.String(), "stderr\n") != 2000 {
 		t.Fatal("staged shared stdout/stderr lost serialization or output")
 	}
@@ -239,7 +239,7 @@ func TestWorkspaceOwnerWSLStageFailureIsNotWitnessSetup(t *testing.T) {
 	ctx := contextWithWorkspaceOwner(t.Context(), &workspaceOwner{key: workspaceOwnerKey("stage-failure"), token: strings.Repeat("a", 64)})
 	target := SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
 	var stdout, stderr bytes.Buffer
-	code, err := runSSHStreamResult(ctx, target, "true", &stdout, &stderr)
+	code, err := runSSHStreamResult(ctx, target, "true", nil, &stdout, &stderr)
 	var setupErr *workspaceOwnerSetupError
 	if code != 1 || errors.As(err, &setupErr) || stdout.Len() != 0 || stderr.String() != unrelated {
 		t.Fatal("lower-level staging was misclassified as witness setup")

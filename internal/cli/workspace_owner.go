@@ -241,7 +241,10 @@ func runWorkspaceOwnerBackgroundOutput(ctx context.Context, target SSHTarget, ow
 		return runSSHOutput(ctx, target, remote)
 	}
 	if !isWindowsNativeTarget(target) {
-		return runSSHOutput(ctx, target, owner.wrapPOSIXBackgroundCommand(remote))
+		// The launcher passes the complete witness source to the detached
+		// child before returning its PID, so its uploaded copy can be removed
+		// after that handshake without changing the child's lifetime.
+		return runSSHSyncScriptOutput(ctx, target, owner.wrapPOSIXBackgroundCommand(remote))
 	}
 	prepared, err := stageWorkspaceOwnerWindowsWitness(ctx, target, owner, remote, nil, true)
 	if err != nil {

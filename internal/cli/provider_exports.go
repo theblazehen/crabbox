@@ -18,6 +18,12 @@ func LoadConfig() (Config, error) {
 	return loadConfig()
 }
 
+// PrepareLeaseSSHTrust installs a provider-authoritative host key in the
+// isolated per-lease known_hosts file and binds the target to that identity.
+func PrepareLeaseSSHTrust(target *SSHTarget, leaseID string) error {
+	return prepareLeaseSSHTrust(target, leaseID)
+}
+
 // RuntimeForProviderOperation supplies the standard local command runner for
 // provider lifecycle capabilities that are invoked on Provider rather than an
 // already-configured Backend.

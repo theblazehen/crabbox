@@ -1470,7 +1470,7 @@ func TestWorkspaceOwnerNativeWindowsStreamPathsUseStagedWitnesses(t *testing.T) 
 	owner := &workspaceOwner{target: target, key: workspaceOwnerKey("cbx_windows_stream_transport"), token: strings.Repeat("f", 64)}
 	ctx := contextWithWorkspaceOwner(context.Background(), owner)
 	payload := strings.Repeat("Write-Output stream\n", 512)
-	if code, err := runSSHStreamResult(ctx, target, payload, io.Discard, io.Discard); err != nil || code != 0 {
+	if code, err := runSSHStreamResult(ctx, target, payload, nil, io.Discard, io.Discard); err != nil || code != 0 {
 		t.Fatalf("output stream code=%d err=%v", code, err)
 	}
 	streamInput := "streamed user input\n"

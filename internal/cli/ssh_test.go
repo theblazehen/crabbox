@@ -1501,7 +1501,7 @@ func TestSSHAllProbeFailureReportsOnlyFinalDiagnostic(t *testing.T) {
 			return err
 		}},
 		{name: "stream", run: func(ctx context.Context, target SSHTarget, stdout, stderr *bytes.Buffer) error {
-			_, err := runSSHStreamResult(ctx, target, "true", stdout, stderr)
+			_, err := runSSHStreamResult(ctx, target, "true", nil, stdout, stderr)
 			return err
 		}},
 	}
@@ -1640,7 +1640,7 @@ printf 'executed once\n'
 				FallbackPorts:   []string{},
 				NoControlMaster: test.noControlMaster,
 				AuthSecret:      test.authSecret,
-			}, "true", &stdout, stderrWriter)
+			}, "true", nil, &stdout, stderrWriter)
 			if code != test.wantCode {
 				t.Fatalf("exit=%d err=%v stderr=%q, want exit %d", code, err, stderr.String(), test.wantCode)
 			}
@@ -1753,7 +1753,7 @@ done
 		User: "crabbox",
 		Host: "203.0.113.10",
 		Port: "22",
-	}, "true", &output, &output)
+	}, "true", nil, &output, &output)
 	if code != 0 || err != nil {
 		t.Fatalf("exit=%d err=%v", code, err)
 	}
@@ -2480,7 +2480,7 @@ exit 0
 		User: "crabbox",
 		Host: "203.0.113.10",
 		Port: "22",
-	}, "true", failingWriter{}, io.Discard)
+	}, "true", nil, failingWriter{}, io.Discard)
 	if code != 1 {
 		t.Fatalf("code=%d want 1", code)
 	}
@@ -3283,13 +3283,13 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
 printf 'call\n' >> "$CRABBOX_FAKE_SSH_CALLS"
 if [ "$(wc -l < "$CRABBOX_FAKE_SSH_CALLS")" -eq 1 ]; then exit 255; fi
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CRABBOX_FAKE_SSH_CALLS", callsPath)
 
-	out, err := runIdempotentSSHCombinedOutput(context.Background(), SSHTarget{
+	out, err := runIdempotentSSHSyncScriptCombinedOutput(context.Background(), SSHTarget{
 		User: "crabbox",
 		Host: "gateway.example",
 		Port: "22",

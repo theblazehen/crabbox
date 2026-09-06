@@ -6,6 +6,43 @@
 [![Release verification](https://github.com/openclaw/crabbox/actions/workflows/release-assets.yml/badge.svg)](https://github.com/openclaw/crabbox/actions/workflows/release-assets.yml)
 [![Latest release](https://badgen.net/github/release/openclaw/crabbox/stable)](https://github.com/openclaw/crabbox/releases/latest)
 
+## Changes in this fork
+
+[theblazehen/crabbox](https://github.com/theblazehen/crabbox) is a fork of
+[openclaw/crabbox](https://github.com/openclaw/crabbox) with three focused changes:
+
+- **Agent Sandbox over SSH:** the separate
+  [`agent-sandbox-ssh` provider](docs/providers/agent-sandbox.md#ssh-variant-agent-sandbox-ssh)
+  uploads a static initializer and starts private, key-only Dropbear in the
+  existing container, with pinned identity and managed Kubernetes port-forwarding.
+  It adds missing tools without installing packages, changing account files, or
+  replacing existing tools. The archive-based `agent-sandbox` provider is unchanged.
+- **Uploaded sync scripts:** generated POSIX sync and workspace-ownership scripts
+  travel as private files instead of oversized SSH commands, preserving streamed
+  manifests, ownership checks, and cleanup.
+- **Workload stdin:** [POSIX SSH commands and `--script`](docs/commands/run.md#scripts)
+  receive piped binary or line input without control commands consuming it or
+  replaying it. `--script-stdin` remains source-only; Windows/WSL and delegated
+  input paths are unchanged.
+
+The SSH provider requires a compatible **root Linux amd64** container with an
+existing executable login shell and writable runtime/workspace paths; see its
+[prerequisites](docs/providers/agent-sandbox.md#ssh-variant-agent-sandbox-ssh).
+It does not support arbitrary images or ARM. The
+[live smoke harness](scripts/test-agent-sandbox-runtime.py) verified existing Git
+seed/overlay workflows, sync, scripts, captures/downloads, and local Actions
+hydration against the bundled Debian daemon; Git seed/overlay are upstream
+features, not new implementations in this fork. Nix-pool lifecycle and SSH
+workflows were also tested separately.
+
+**Build this fork from source:** the badges above and release/install references
+below describe upstream. Upstream prebuilt releases do **not** contain these
+changes; no fork release is published. From this fork's checkout:
+
+```sh
+go build -trimpath -o bin/crabbox ./cmd/crabbox
+```
+
 **Warm a box, sync the diff, run the suite.**
 
 Crabbox is a generic remote software testing and execution control plane. It is

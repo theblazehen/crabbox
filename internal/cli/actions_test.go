@@ -558,7 +558,7 @@ for arg do last="$arg"; done
 printf '%s\n' "$last" >> "$CRABBOX_ACTIONS_SSH_LOG"
 cat >/dev/null
 `
-	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(sshScript), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tools, "rsync"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -602,7 +602,7 @@ for arg do last="$arg"; done
 printf '%s\n' "$last" >> "$CRABBOX_ACTIONS_SSH_LOG"
 cat >/dev/null
 `
-	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(sshScript), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tools, "rsync"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -1458,7 +1458,7 @@ esac
 /bin/cat >/dev/null || true
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -1659,7 +1659,7 @@ esac
 /bin/cat >/dev/null || true
 exit 0
 `
-			if err := os.WriteFile(sshPath, []byte(sshScript), 0o755); err != nil {
+			if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(tools, "rsync"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -1846,7 +1846,7 @@ case "$*" in
   *"workflow run"*) : > "$CRABBOX_FAKE_DISPATCHED" ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(sshScript), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(syncScriptAwareSSHFixture(t, sshScript)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tools, "gh"), []byte(ghScript), 0o755); err != nil {
@@ -2272,7 +2272,7 @@ if [ "$(wc -l < "$CRABBOX_FAKE_SSH_CALLS")" -eq 1 ]; then
 fi
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -2310,7 +2310,7 @@ printf 'call\n' >> "$CRABBOX_FAKE_SSH_CALLS"
 printf 'permission denied for opaque-access-token@gateway.example\n' >&2
 exit 255
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -2353,7 +2353,7 @@ func TestActionsHydrationWaitsHonorCancellationDuringBackoff(t *testing.T) {
 	script := `#!/bin/sh
 exit 255
 `
-	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

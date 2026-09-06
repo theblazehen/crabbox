@@ -80,7 +80,7 @@ func TestRunLiteralArgumentsSurviveNativeStdinTransport(t *testing.T) {
 			}
 			cmd := exec.Command(sh, "-s")
 			cmd.Stdin = strings.NewReader(string(fake.execInput[0]))
-			cmd.Env = []string{"HOME=" + workdir, "PATH=" + workdir + ":/usr/bin:/bin", "ENV=" + os.DevNull}
+			cmd.Env = []string{"HOME=" + workdir, "PATH=" + workdir + ":" + os.Getenv("PATH"), "ENV=" + os.DevNull}
 			out, runErr := cmd.CombinedOutput()
 			code := 0
 			if runErr != nil {

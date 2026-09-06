@@ -291,7 +291,7 @@ func TestWorkspaceOwnerSSHWorkloadExit74IsNotSetupFailure(t *testing.T) {
 	payload := `(i=0; while [ "$i" -lt 2000 ]; do printf 'stdout\n'; i=$((i+1)); done) &
 i=0; while [ "$i" -lt 2000 ]; do printf 'stderr\n' >&2; i=$((i+1)); done
 wait`
-	code, err := runSSHStreamResult(ctx, target, payload, &combined, &combined)
+	code, err := runSSHStreamResult(ctx, target, payload, nil, &combined, &combined)
 	if err != nil || code != 0 || strings.Count(combined.String(), "stdout\n") != 2000 || strings.Count(combined.String(), "stderr\n") != 2000 {
 		t.Fatal("owner protocol lost shared stdout/stderr output")
 	}
@@ -323,7 +323,7 @@ func TestWorkspaceOwnerGitSeedPreservesOriginFailure(t *testing.T) {
 			if err := os.Mkdir(workdir, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, plan), 0)
+			out, err := runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteGitSeed(workdir, plan), 0)
 			t.Logf("owned Git seed exit=%d combined diagnostics:\n%s", exitCode(err), out)
 			if got := exitCode(err); got != gitOriginRuntimeFallbackExitCode {
 				t.Fatalf("owned Git seed exit=%d want=%d diagnostic-bytes=%d", got, gitOriginRuntimeFallbackExitCode, len(out))

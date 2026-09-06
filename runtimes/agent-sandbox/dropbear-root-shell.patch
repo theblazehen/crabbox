@@ -1,0 +1,36 @@
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -311,6 +311,25 @@
+ 		usershell = "/bin/sh";
+ 	}
+ 
++	/* This private, key-only daemon owns root's shell policy, not the
++	 * image's global login-shell list. Keep all earlier account checks
++	 * and continue through the normal authentication path at goodshell. */
++	if (ses.authstate.pw_uid == 0 && strcmp(username, "root") == 0) {
++		struct stat shellstat;
++		const char *shellname;
++
++		if (usershell[0] != '/' || stat(usershell, &shellstat) != 0
++				|| !S_ISREG(shellstat.st_mode) || access(usershell, X_OK) != 0) {
++			goto badshell;
++		}
++		shellname = strrchr(usershell, '/') + 1;
++		if (strcmp(shellname, "false") == 0
++				|| strcmp(shellname, "nologin") == 0) {
++			goto badshell;
++		}
++		goto goodshell;
++	}
++
+ 	/* check the shell is valid. If /etc/shells doesn't exist, getusershell()
+ 	 * should return some standard shells like "/bin/sh" and "/bin/csh" (this
+ 	 * is platform-specific) */
+@@ -325,6 +344,7 @@
+ 		}
+ 	}
+ 	/* no matching shell */
++badshell:
+ 	endusershell();
+ 	TRACE(("no matching shell"))
+ 	ses.authstate.checkusername_failed = 1;

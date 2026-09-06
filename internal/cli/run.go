@@ -2010,7 +2010,7 @@ retrySync:
 				fmt.Fprintf(a.Stderr, "warning: sync fingerprint failed: %v\n", err)
 			} else if !overlayDecision.Enabled && !fullResyncRequested && fingerprint != "" {
 				stepStart = time.Now()
-				remoteFingerprint, err := runSSHOutput(ctx, target, remoteReadSyncFingerprint(workdir, coherence))
+				remoteFingerprint, err := runSSHSyncScriptOutput(ctx, target, remoteReadSyncFingerprint(workdir, coherence))
 				timings.syncSteps.fingerprintRemote = time.Since(stepStart)
 				if err == nil && remoteFingerprint == fingerprint {
 					timings.sync = time.Since(syncStart)
@@ -2039,7 +2039,13 @@ retrySync:
 			if isWindowsNativeTarget(target) {
 				resetCommand = windowsRemoteResetWorkdir(workdir)
 			}
-			if err := runSSHQuiet(ctx, target, resetCommand); err != nil {
+			var resetErr error
+			if target.TargetOS == targetWindows {
+				resetErr = runSSHQuiet(ctx, target, resetCommand)
+			} else {
+				resetErr = runSSHSyncScriptInput(ctx, target, resetCommand, nil, io.Discard, io.Discard)
+			}
+			if err := resetErr; err != nil {
 				return recordFailure(exit(7, "reset remote workdir: %v", err))
 			}
 			timings.syncSteps.reset = time.Since(stepStart)
@@ -2063,7 +2069,7 @@ retrySync:
 		}
 		if overlayDecision.Enabled {
 			stepStart = time.Now()
-			output, overlayErr := runIdempotentSSHCombinedOutput(ctx, target, remotePrepareGitOverlayWithHint(workdir, coherence, cfg.Sync.BaseRef, gitHydrateBaseSHA(repo, cfg.Sync.BaseRef), fingerprint), idempotentSSHRetryDelay)
+			output, overlayErr := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remotePrepareGitOverlayWithHint(workdir, coherence, cfg.Sync.BaseRef, gitHydrateBaseSHA(repo, cfg.Sync.BaseRef), fingerprint), idempotentSSHRetryDelay)
 			timings.syncSteps.gitSeed += time.Since(stepStart)
 			if overlayErr != nil {
 				if reason, fallback, mutated := gitOverlayFallbackOutcome(output, overlayErr); fallback {
@@ -2121,7 +2127,7 @@ retrySync:
 		}
 		if !overlayDecision.Enabled && !plainManifestMode && coherence.seedEnabled() {
 			stepStart = time.Now()
-			if out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
+			if out, err := runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
 				if reason, fallback := gitOriginRuntimeFallbackResult(coherence.RemoteURL, out, err); fallback {
 					usePlainManifestForOrigin(reason)
 				} else {
@@ -2177,7 +2183,7 @@ retrySync:
 			if cleanupGitOverlay {
 				cleanupCommand = remoteDiscardGitOverlaySyncPendingMetadata(cleanupWorkdir, finalizeToken)
 			}
-			if _, cleanupErr := runIdempotentSSHCombinedOutput(
+			if _, cleanupErr := runIdempotentSSHSyncScriptCombinedOutput(
 				cleanupCtx,
 				cleanupTarget,
 				cleanupCommand,
@@ -2193,7 +2199,7 @@ retrySync:
 		} else if plainManifestMode {
 			manifestCommand = remoteWriteSyncManifestsNewForTargetMode(target, workdir, finalizeToken, true)
 		}
-		manifestErr := runSSHInput(manifestCtx, target, manifestCommand, strings.NewReader(manifestInput), io.Discard, a.Stderr)
+		manifestErr := runSSHSyncScriptInput(manifestCtx, target, manifestCommand, strings.NewReader(manifestInput), io.Discard, a.Stderr)
 		stopManifestHeartbeat()
 		if cancelManifest != nil {
 			cancelManifest()
@@ -2209,7 +2215,7 @@ retrySync:
 			// Full resync can git-seed files that are absent from the local manifest.
 			// Seed the old manifest from git so prune removes those resurrected paths.
 			if !overlayDecision.Enabled && !plainManifestMode && shouldSeedRemotePruneManifest(hydratedByActions, fullResyncRequested) {
-				if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteSeedSyncManifestFromGit(workdir), idempotentSSHRetryDelay); err != nil {
+				if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteSeedSyncManifestFromGit(workdir), idempotentSSHRetryDelay); err != nil {
 					return recordFailure(exit(6, "remote sync seed manifest failed: %v", err))
 				}
 			}
@@ -2220,7 +2226,7 @@ retrySync:
 			} else if plainManifestMode {
 				pruneCommand = remotePruneSyncManifestForTargetMode(target, workdir, finalizeToken, true, allowRemoteSyncMassDeletions(cfg, hydratedByActions))
 			}
-			if _, err := runIdempotentSSHCombinedOutput(ctx, target, pruneCommand, idempotentSSHRetryDelay); err != nil {
+			if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, pruneCommand, idempotentSSHRetryDelay); err != nil {
 				return recordFailure(exit(6, "remote sync prune failed: %v", err))
 			}
 			timings.syncSteps.prune = time.Since(stepStart)
@@ -2239,7 +2245,7 @@ retrySync:
 		baseSHA := gitHydrateBaseSHA(repo, cfg.Sync.BaseRef)
 		hydrateGit := true
 		if !plainManifestMode && hydratedByActions {
-			reason, err := runSSHOutput(ctx, target, remoteGitHydrateStatus(workdir, cfg.Sync.BaseRef, baseSHA))
+			reason, err := runSSHSyncScriptOutput(ctx, target, remoteGitHydrateStatus(workdir, cfg.Sync.BaseRef, baseSHA))
 			if err == nil && reason != "" {
 				timings.syncSteps.gitHydrateSkipped = true
 				timings.syncSteps.gitHydrateSkipReason = reason
@@ -2279,7 +2285,7 @@ retrySync:
 	}
 afterSync:
 	if !*syncOnly && !*noSync {
-		if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifestMode), idempotentSSHRetryDelay); err != nil {
+		if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifestMode), idempotentSSHRetryDelay); err != nil {
 			return recordFailure(exit(7, "invalidate reusable sync fingerprint before execution: %v", err))
 		}
 	}
@@ -2363,7 +2369,7 @@ afterSync:
 		if _, err := runIdempotentSSHCombinedOutput(ctx, target, mkdirCommand, idempotentSSHRetryDelay); err != nil {
 			return recordFailure(exit(7, "create remote workdir: %v", err))
 		}
-		if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifestMode), idempotentSSHRetryDelay); err != nil {
+		if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifestMode), idempotentSSHRetryDelay); err != nil {
 			return recordFailure(exit(7, "invalidate reusable sync fingerprint before execution: %v", err))
 		}
 	}
@@ -2546,7 +2552,11 @@ afterSync:
 	for i := range beforeArtifacts {
 		beforeArtifacts[i].data = nil
 	}
-	code, streamErr := runSSHStreamResult(ctx, commandTarget, remote, stdout, stderr)
+	var workloadInput io.Reader
+	if !*scriptStdin && commandTarget.TargetOS != targetWindows {
+		workloadInput = a.Stdin
+	}
+	code, streamErr := runSSHStreamResult(ctx, commandTarget, remote, workloadInput, stdout, stderr)
 	failureDownloadEligible := false
 	if witness != nil {
 		code, streamErr, failureDownloadEligible = witness.finish(ctx, code, streamErr)
