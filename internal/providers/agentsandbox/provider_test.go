@@ -11,6 +11,27 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
+func TestSelectedProviderOnlyOptsIntoSSHExplicitly(t *testing.T) {
+	base := core.BaseConfig()
+	for _, configured := range []string{"", base.Provider, "hetzner", "unrelated-provider", providerName} {
+		cfg := base
+		cfg.Provider = configured
+		if got := selectedProvider(cfg); got != providerName {
+			t.Fatalf("configured=%q selected=%q want=%q", configured, got, providerName)
+		}
+		if strings.Contains(claimScope(cfg), "|provider:") {
+			t.Fatalf("configured=%q changed historical claim scope: %s", configured, claimScope(cfg))
+		}
+		if got := claimLabels(cfg, "asbx_legacy", "legacy")[labelProvider]; got != providerName {
+			t.Fatalf("configured=%q claim provider=%q", configured, got)
+		}
+	}
+	base.Provider = sshProviderName
+	if got := selectedProvider(base); got != sshProviderName {
+		t.Fatalf("explicit SSH selected=%q", got)
+	}
+}
+
 func TestProviderSpecMatchesFoundationContract(t *testing.T) {
 	provider := Provider{}
 	if provider.Name() != providerName {

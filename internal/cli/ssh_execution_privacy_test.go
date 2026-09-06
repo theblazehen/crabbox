@@ -62,7 +62,7 @@ cat
 			var err error
 			switch operation {
 			case "command":
-				_, err = runSSHStreamResult(t.Context(), target, "true", &stdout, io.Discard)
+				_, err = runSSHStreamResult(t.Context(), target, "true", nil, &stdout, io.Discard)
 			case "input":
 				err = runSSHInput(t.Context(), target, "cat", strings.NewReader("private-script-input"), &stdout, io.Discard)
 			case "control":
@@ -77,7 +77,7 @@ cat
 			case "wsl-probe":
 				err = probeWSLStageTransport(t.Context(), target, "10", "3")
 			case "failure":
-				_, err = runSSHStreamResult(t.Context(), target, "exit 23", &stdout, io.Discard)
+				_, err = runSSHStreamResult(t.Context(), target, "exit 23", nil, &stdout, io.Discard)
 			case "cancel":
 				ctx, cancel := context.WithCancel(t.Context())
 				done := make(chan error, 1)
@@ -88,7 +88,10 @@ cat
 						<-done
 					}
 				})
-				go func() { _, runErr := runSSHStreamResult(ctx, target, "sleep 60", &stdout, io.Discard); done <- runErr }()
+				go func() {
+					_, runErr := runSSHStreamResult(ctx, target, "sleep 60", nil, &stdout, io.Discard)
+					done <- runErr
+				}()
 				deadline := time.Now().Add(5 * time.Second)
 				for {
 					if _, statErr := os.Stat(filepath.Join(dir, "started")); statErr == nil {

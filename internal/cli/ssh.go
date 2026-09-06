@@ -630,7 +630,8 @@ func resolveSSHPortNoInput(ctx context.Context, target *SSHTarget, connectTimeou
 type sshTransportPreparation struct {
 	command     string
 	setupMarker string
-	direct      io.ReadSeeker
+	direct      io.Reader
+	stream      bool
 	stage       *wslStageSpool
 }
 
@@ -674,12 +675,21 @@ func (d *sshMuxFailureDetector) failed() bool {
 	return false
 }
 
-func prepareSSHTransport(target SSHTarget, command string, input io.ReadSeeker, size int64, limit sshCommandLimit) (sshTransportPreparation, error) {
-	if size < 0 || limit.execution < 0 || limit.control && (int64(len(command))+size > sshControlMetadataLimit || limit.execution <= 0) {
+func prepareSSHTransport(target SSHTarget, command string, input io.Reader, size int64, limit sshCommandLimit) (sshTransportPreparation, error) {
+	stream := size == -1 && input != nil && target.TargetOS != targetWindows && !limit.control
+	if size < 0 && !stream || limit.execution < 0 || limit.control && (int64(len(command))+size > sshControlMetadataLimit || limit.execution <= 0) {
 		return sshTransportPreparation{}, errors.New("command exceeds finite transport limits")
 	}
 	if isWindowsWSL2Target(target) {
-		spool, err := newWSLStageSpool(command, nil, input, size, limit)
+		var seekable io.ReadSeeker
+		if input != nil {
+			var ok bool
+			seekable, ok = input.(io.ReadSeeker)
+			if !ok {
+				return sshTransportPreparation{}, errors.New("WSL input must be finite and seekable")
+			}
+		}
+		spool, err := newWSLStageSpool(command, nil, seekable, size, limit)
 		if err == nil && limit.control {
 			if spool.size > sshControlMetadataLimit {
 				_ = spool.close()
@@ -688,7 +698,7 @@ func prepareSSHTransport(target SSHTarget, command string, input io.ReadSeeker, 
 		}
 		return sshTransportPreparation{stage: spool}, err
 	}
-	return sshTransportPreparation{command: wrapRemoteForTarget(target, command), direct: input}, nil
+	return sshTransportPreparation{command: wrapRemoteForTarget(target, command), direct: input, stream: stream}, nil
 }
 
 func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, connectTimeout, connectionAttempts string, stdout, stderr io.Writer) error {
@@ -706,7 +716,7 @@ func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, co
 			probe.NoControlMaster = true
 		}
 		muxFailure, err := p.runOnce(ctx, probe, connectTimeout, connectionAttempts, stdout, stderr, multiplexed && attempt < 2)
-		if err == nil || ctx.Err() != nil || exitCode(err) != 255 || !muxFailure || attempt == 2 {
+		if err == nil || ctx.Err() != nil || exitCode(err) != 255 || !muxFailure || attempt == 2 || p.stream {
 			return err
 		}
 	}
@@ -737,6 +747,39 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 		return false, err
 	}
 	cmd.Stdin = input
+	var afterStart func()
+	if p.stream {
+		if _, file := input.(*os.File); !file {
+			// A borrowed reader may block indefinitely. Keep its copy outside
+			// exec.Cmd's Wait group; never close the caller's input on exit.
+			readPipe, pipe, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				return false, pipeErr
+			}
+			defer readPipe.Close()
+			defer pipe.Close()
+			cmd.Stdin = readPipe
+			copied := make(chan error, 1)
+			afterStart = func() {
+				go func() {
+					_, copyErr := io.Copy(pipe, input)
+					copied <- copyErr
+					_ = pipe.Close()
+				}()
+			}
+			defer func() {
+				select {
+				case copyErr := <-copied:
+					if !errors.Is(copyErr, os.ErrClosed) && !errors.Is(copyErr, syscall.EPIPE) {
+						err = errors.Join(err, copyErr)
+					}
+				default:
+					// An arbitrary borrowed Read cannot be interrupted safely.
+					// The owned pipe closes on return; do not wait for that Read.
+				}
+			}()
+		}
+	}
 	stdout, stderr, finish := workspaceOwnerSetupStreams(p.setupMarker, stdout, stderr)
 	defer func() {
 		err = finish(err)
@@ -746,15 +789,21 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 		}
 	}()
 	if captureLocalDiagnostics {
-		return runSSHCommandWithLocalDiagnostics(cmd, stdout, stderr)
+		return runSSHCommandWithLocalDiagnostics(cmd, stdout, stderr, afterStart)
 	}
-	return false, runSSHCommand(cmd, stdout, stderr)
+	return false, runSSHCommand(cmd, stdout, stderr, afterStart)
 }
 
 func (p *sshTransportPreparation) reset() (io.Reader, error) {
 	if p.direct != nil {
-		if _, err := p.direct.Seek(0, io.SeekStart); err != nil {
-			return nil, err
+		if !p.stream {
+			seekable, ok := p.direct.(io.ReadSeeker)
+			if !ok {
+				return nil, errors.New("finite SSH input must be seekable")
+			}
+			if _, err := seekable.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
 		}
 		return p.direct, nil
 	}
@@ -795,7 +844,7 @@ func (e sshPreparationError) Unwrap() error { return e.error }
 
 // executeSSH owns workspace preparation; executePreparedSSH is the lower,
 // generic transport boundary and has no knowledge of workspace ownership.
-func executeSSH(ctx context.Context, target *SSHTarget, remote string, input io.ReadSeeker, size int64, limit time.Duration, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {
+func executeSSH(ctx context.Context, target *SSHTarget, remote string, input io.Reader, size int64, limit time.Duration, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {
 	var inputSize *int64
 	if input != nil {
 		inputSize = &size
@@ -857,6 +906,15 @@ func runSSHOutput(ctx context.Context, target SSHTarget, remote string) (string,
 	return runSSHOutputWithRemoteWaitTimeout(ctx, target, remote, 0, "10", "3")
 }
 
+func runSSHSyncScriptOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
+	if target.TargetOS == targetWindows {
+		return runSSHOutput(ctx, target, remote)
+	}
+	var out bytes.Buffer
+	err := runSSHSyncScriptInput(ctx, target, remote, nil, &out, io.Discard)
+	return strings.TrimSpace(out.String()), err
+}
+
 func runSSHOutputWithRemoteWaitTimeout(ctx context.Context, target SSHTarget, remote string, waitTimeout time.Duration, connectTimeout, connectionAttempts string) (string, error) {
 	var out bytes.Buffer
 	err := executeSSH(ctx, &target, remote, nil, 0, waitTimeout, connectTimeout, connectionAttempts, &out, io.Discard)
@@ -880,10 +938,22 @@ func runIdempotentSSHCombinedOutput(ctx context.Context, target SSHTarget, remot
 }
 
 func runIdempotentSSHCombinedOutputLimit(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration, maxBytes int) (string, error) {
+	return runIdempotentSSHAttempt(ctx, retryDelay, func() (string, error) {
+		return runSSHCombinedOutputLimit(ctx, target, remote, maxBytes)
+	})
+}
+
+func runIdempotentSSHSyncScriptCombinedOutput(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	return runIdempotentSSHAttempt(ctx, retryDelay, func() (string, error) {
+		return runSSHSyncScriptCombinedOutput(ctx, target, remote)
+	})
+}
+
+func runIdempotentSSHAttempt(ctx context.Context, retryDelay time.Duration, run func() (string, error)) (string, error) {
 	var lastOut string
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		lastOut, lastErr = runSSHCombinedOutputLimit(ctx, target, remote, maxBytes)
+		lastOut, lastErr = run()
 		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
 			return lastOut, lastErr
 		}
@@ -932,11 +1002,11 @@ func runSSHInputStream(ctx context.Context, target SSHTarget, remote string, inp
 }
 
 func runSSHStream(ctx context.Context, target SSHTarget, remote string, stdout, stderr io.Writer) int {
-	code, _ := runSSHStreamResult(ctx, target, remote, stdout, stderr)
+	code, _ := runSSHStreamResult(ctx, target, remote, nil, stdout, stderr)
 	return code
 }
 
-func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, stdout, stderr io.Writer) (code int, err error) {
+func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, stdin io.Reader, stdout, stderr io.Writer) (code int, err error) {
 	// Some streaming callers retain only the exit code. Report proven setup
 	// failures here, once, without changing workload stderr or exit semantics.
 	defer func() {
@@ -951,7 +1021,11 @@ func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, st
 		}
 		err = errors.Join(err, writeErr)
 	}()
-	err = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", stdout, stderr)
+	size := int64(0)
+	if stdin != nil {
+		size = -1 // Live POSIX workload input has no finite framing or replay.
+	}
+	err = executeSSH(ctx, &target, remote, stdin, size, 0, "10", "3", stdout, stderr)
 	var preparation sshPreparationError
 	if errors.As(err, &preparation) {
 		return 7, err
@@ -959,8 +1033,8 @@ func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, st
 	return exitCode(err), err
 }
 
-func runSSHCommand(cmd *exec.Cmd, stdout, stderr io.Writer) error {
-	return runCommandWithPlatformStreams(cmd, stdout, stderr)
+func runSSHCommand(cmd *exec.Cmd, stdout, stderr io.Writer, afterStart ...func()) error {
+	return runCommandWithPlatformStreams(cmd, stdout, stderr, afterStart...)
 }
 
 func sameCommandStreamWriter(left, right io.Writer) bool {
@@ -1025,7 +1099,7 @@ func (e *gitOriginDiagnosticsTruncatedError) Unwrap() error {
 	return e.err
 }
 
-func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+func runIdempotentSSHSyncScriptGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
 	var (
 		out       synchronizedBuffer
 		lastErr   error
@@ -1033,7 +1107,7 @@ func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, rem
 	)
 	for attempt := 0; attempt < 2; attempt++ {
 		out = synchronizedBuffer{limit: gitSeedDiagnosticLimit}
-		lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		lastErr = runSSHSyncScriptInputTarget(ctx, &target, remote, nil, &out, &out)
 		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
 			break
 		}
@@ -2497,14 +2571,14 @@ coherence_committed=1
 }
 
 func runRemoteFinalizeSync(ctx context.Context, target SSHTarget, workdir string, opts remoteSyncFinalizeOptions) (string, error, string, bool) {
-	out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	out, err := runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
 	reason, fallback := gitOriginRuntimeFallbackResult(opts.Coherence.RemoteURL, out, err)
 	if !fallback {
 		return out, err, "", false
 	}
 	opts.HydrateGit, opts.GitOverlay, opts.PlainManifest = false, false, true
 	opts.Fingerprint, opts.Coherence = "", gitCoherencePlan{}
-	out, err = runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	out, err = runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
 	return out, err, reason, true
 }
 

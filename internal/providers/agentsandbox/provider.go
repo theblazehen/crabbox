@@ -12,9 +12,63 @@ import (
 
 func init() {
 	core.RegisterProvider(Provider{})
+	core.RegisterProvider(SSHProvider{})
 }
 
 type Provider struct{}
+
+type SSHProvider struct{}
+
+func selectedProvider(cfg Config) string {
+	if strings.TrimSpace(cfg.Provider) == sshProviderName {
+		return sshProviderName
+	}
+	return providerName
+}
+
+func (SSHProvider) Name() string      { return sshProviderName }
+func (SSHProvider) Aliases() []string { return nil }
+func (SSHProvider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Name:             sshProviderName,
+		Family:           "agent-sandbox",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureRunSession},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+	}
+}
+func (SSHProvider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return registerFlags(fs, defaults)
+}
+func (SSHProvider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return applyFlags(cfg, fs, values)
+}
+func (SSHProvider) ValidateConfig(cfg core.Config) error { return validateConfig(cfg) }
+func (SSHProvider) ClaimScope(cfg core.Config) string {
+	cfg.Provider = sshProviderName
+	return claimScope(cfg)
+}
+func (SSHProvider) RouteConfig(cfg *core.Config, _ *flag.FlagSet, _ any) error {
+	cfg.WorkRoot = cfg.AgentSandbox.Workdir
+	return nil
+}
+func (p SSHProvider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return nil, core.Exit(2, "provider=%s supports target=linux only", sshProviderName)
+	}
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+	cfg.Provider = sshProviderName
+	cfg.TargetOS = core.TargetLinux
+	cfg.WorkRoot = cfg.AgentSandbox.Workdir
+	return &sshLeaseBackend{lifecycle: &backend{spec: p.Spec(), cfg: cfg, rt: rt, newClient: newKubernetesClient}}, nil
+}
+func (p SSHProvider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
+	return shared.ConfigureDoctor(sshProviderName, func() (core.Backend, error) { return p.Configure(cfg, rt) })
+}
 
 func (Provider) Name() string      { return providerName }
 func (Provider) Aliases() []string { return nil }

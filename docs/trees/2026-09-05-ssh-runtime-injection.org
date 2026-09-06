@@ -1,0 +1,181 @@
+#+TITLE: Portable SSH runtime injection
+#+TODO: OPEN ACTIVE REVIEW PARKED | RESOLVED
+
+* RESOLVED Inject SSH without turning the workload image into a base image
+:PROPERTIES:
+:ID: ssh-injection-goal
+:SOURCE: user
+:TREE_ROOT: t
+:TREE_VERSION: 1
+:END:
+The user wanted injection rather than package-manager bootstrap, while keeping the fork maintainable and usable with independently built images. They proposed starting the sandbox, copying and running an initializer, adding only missing static tools, and starting an independent SSH daemon. Existing Agent Sandbox lifecycle and Kubernetes exec carry bootstrap bytes and configuration; standard Crabbox SSH carries subsequent workloads. No pre-existing SSH access is needed.
+
+The user authorized implementation with "go for it", accepted the measured bundle size, and subsequently said "aight good shit, keep going". The additive implementation exists in the separate =agent-sandbox-ssh= provider. The original archive/exec =agent-sandbox= provider remains unchanged. Preserve existing tools, account files, image entrypoint and environment; no custom SSH engine, workload-command rewriting, Mutagen, image rebuild or template mutation. The user subsequently authorized uploading generated sync scripts and explicitly approved amd64-only scope.
+
+The native runtime passes real Debian SSH, transfer, Git/HTTPS, forwarding, preservation and reuse checks, including absent or nonmatching =/etc/shells=. Raw Alpine is an explicit incompatible-tool rejection. The real Kubernetes provider also passes sync, workload execution, captures, exact-byte downloads and a reused 65-second workload returning exit 37 on the unchanged Nix image. The supported target is Linux amd64 only; ARM payloads and build targets were removed rather than shipping an outdated artifact.
+
+** RESOLVED Additive post-start initialization with static tools
+:PROPERTIES:
+:ID: ssh-injection-additive-init
+:SOURCE: user
+:END:
+Implemented after the user's authorization: a static Go initializer embeds a compressed amd64 static musl tool payload. Kubernetes exec uploads the initializer and passes lease ID, public key and expected host key/port as JSON stdin. The client private key stays local; the daemon host private key stays remote. Three exact response markers convey the SSH user, host public key and dynamically selected loopback port for identity pinning.
+
+The initializer verifies root, architecture, existing root/login-shell compatibility and trusted writable paths. It stages a content-addressed runtime under =/opt/crabbox-runtime=, probes existing tools, and creates only missing compatible aliases. Incompatible existing tools cause rejection, not replacement or PATH shadowing. It never edits =/etc/passwd=, =/etc/shadow=, =/etc/group= or =/etc/shells=. Root and the small existing =uname/sh/mkdir/cat/chmod/rm/rmdir= delivery foothold remain required.
+
+A bundled Dropbear 2026.94 daemon uses private authorization, host key, PID and log state under =/var/lib/crabbox-ssh/<lease-id>= and an available loopback port. Normal upstream multiuser support is retained: disabling it requires a kernel built without multiuser support and is not a root-only authentication mode. Password/PAM login is disabled; public-key login works with a locked root password without changing account files. A narrow root-shell policy patch removes dependence on the system shell allowlist, not authentication. Dropbear's configured default PATH preserves the inherited image PATH. Core's existing login-shell semantics are unchanged.
+
+Repeated initialization verifies the runtime and daemon identity and retains the pinned host key and port. The entire initializer is uploaded even on reuse; only missing tools are added. The final uploaded ELF is 36,221,054 bytes; its embedded gzip is 33,428,022 bytes. No incremental initializer-transfer optimization is implemented.
+
+*** RESOLVED Keep root authentication independent of the global shell allowlist
+:PROPERTIES:
+:ID: ssh-injection-private-root-policy
+:SOURCE: user
+:END:
+The first stock-Dropbear attempt rejected the Nix worker's existing root =/bin/bash= because =/etc/shells= was absent. The user challenged this coupling: "we're supposed to be independent no?" Stock Dropbear has no private runtime flag for this check. The bundled source now bypasses only =getusershell= approval for the exact =root= account with UID 0, requiring an absolute regular executable shell and rejecting =false= or =nologin=. Earlier account checks and later public-key authentication remain intact; non-root shell policy is unchanged. The initializer no longer duplicates the global allowlist check. No account file is edited or created.
+
+Real Debian variants with absent and nonmatching shell lists authenticate the existing root shell, preserve original files and reuse the same endpoint. The unchanged Nix worker likewise authenticates without =/etc/shells=. A source-only security review found no actionable issues in this policy or the uploaded-script transport.
+
+*** RESOLVED Ship only the architecture currently needed
+:PROPERTIES:
+:ID: ssh-injection-amd64-scope
+:SOURCE: user
+:END:
+The user asked "is arm really needed?" and approved dropping it with "yeah sounds good". Only =x86_64= and =amd64= target architecture names are accepted. ARM and other targets fail before initializer upload. The CLI embeds exactly the amd64 asset; the ARM asset and flake target are removed. The build script defaults to amd64, accepts explicit =amd64=, and rejects =arm64= or =all=. The final native-only recipe reproduced identical native artifact hashes and passed all 24 static ELF checks.
+
+** RESOLVED Lower maintenance through an explicit supported-image contract
+:PROPERTIES:
+:ID: ssh-injection-maintainable-scope
+:SOURCE: user
+:END:
+The user introduces fork-maintenance cost and asks whether to lower scope. The agent recommended a prepared worker image and provider-local SSH integration, but the user clarified, "I still want someone else to be able to use it without being tied to our exact image". The revised proposal is a public, checkable image capability contract with reusable image-build recipes, not an image identity allowlist or mandatory base image. Keep shared SSH execution unchanged and use an established SSH server; provide tools, accounts and necessary paths at image-build time. The provider prepares private SSH state and transport, and checks prerequisites without silently installing packages. Test independently built common-distribution images as well as our Nix worker before claiming support. This gives up zero-preparation arbitrary-image portability, not third-party usability. The user has not yet accepted image preparation as the compromise.
+
+The user's subsequently authorized additive initialization after Pod startup supersedes the image-build-first recommendation. Bounded prerequisites and a small provider-local integration remain goals, but image rebuilds are not mandatory. The implementation and Debian/Nix evidence above establish this choice; the earlier unaccepted image-preparation compromise is retained only as history.
+
+*** RESOLVED Tie the integration to our exact worker image
+:PROPERTIES:
+:ID: ssh-injection-exact-image
+:SOURCE: agent
+:END:
+The agent's previous recommendation centered support and verification on our prepared worker image. The user rejects exact-image coupling: "I still want someone else to be able to use it without being tied to our exact image". Our worker may be one verified implementation of an open prerequisite contract, but must not be a required base image or the sole basis for a general compatibility claim.
+
+*** PARKED Reusable image preparation and capability checks
+:PROPERTIES:
+:ID: ssh-injection-image-recipes
+:SOURCE: agent
+:END:
+Proposed middle ground: users retain their application image and SandboxTemplate, adding a small build-time preparation step only if prerequisites are missing. Publish recipes for independently built common Linux images and our Nix worker, backed by a behavioral prerequisite check for required paths, tool options, SSH account/launch permissions and writable state/workspace. No digest allowlist, compulsory Crabbox base image, runtime package installation or core execution rewrite. Existing compatible images need no modification. The user asks what this looks like and whether a sidecar volume could ship the tools instead. Image recipes are therefore an alternative under review, not an accepted requirement. Shared-volume delivery could avoid rebuilding the application image while retaining a bounded runtime contract.
+
+** RESOLVED Image-dependent OpenSSH bootstrap
+:PROPERTIES:
+:ID: ssh-injection-existing-bootstrap
+:SOURCE: agent
+:END:
+Superseded and removed. The earlier OpenSSH bootstrap installed packages, changed account lock markers and used a fixed port. The user challenged this as different from injection. Those earlier smokes are not evidence for the replacement. Claim lifecycle and Kubernetes port-forward transport remain; the independently verified replacement ships static tools and starts private Dropbear without package or account mutation.
+
+** PARKED Private runtime bundle with an embedded SSH server
+:PROPERTIES:
+:ID: ssh-injection-private-runtime
+:SOURCE: agent
+:END:
+Proposed direction: deliver a versioned architecture-specific runtime in a private writable directory. The user's "Sounds good" supported exploring this direction, not a specific server implementation. A static Go server using existing SSH and SFTP libraries could authenticate lease keys directly and launch processes as its existing container UID, without PAM, system accounts, or global sshd configuration. It must implement the actual SSH session, exit, PTY, file-transfer and forwarding behavior Crabbox uses; this is not merely an exec demo. Normal workspace sync also needs a remote rsync endpoint, not just SFTP. Bundled control tools need a relocatable runtime; existing unmodified Nix store closures are not automatically relocatable. The user now asks, "okay but consider this is a fork we need to maintain. Should we lower our sights a little?" This puts the custom server and portable bundle under review; the agent recommends retaining an established SSH server and narrowing supported images instead. No replacement has been chosen.
+
+** PARKED Separate Crabbox control tools from workload tools
+:PROPERTIES:
+:ID: ssh-injection-control-boundary
+:SOURCE: agent
+:END:
+Core workspace ownership and Git overlay currently invoke absolute /bin/sh and /usr/bin tools. Injecting sshd alone does not eliminate those assumptions. The user supports the broad direction and asks, "What does it try and actually do over ssh? is it arbitrary shell etc?" Source inspection shows generated shell for control operations and bash login-shell execution for workloads, even when preserving argv boundaries. Control operations include ownership/renewal/process witnesses, Git and rsync synchronization, manifest reconciliation, script upload and base64 downloads. Proposed change: explicitly route Crabbox control scripts to private bundled tools while preserving the workload's original PATH, environment, UID, shell and working directory. Do not globally prepend bundled tools or pretend missing workload tools have been provisioned. The existing bash login-shell behavior makes the eventual workload-shell contract an explicit design question. The user's fork-maintenance concern now puts this cross-cutting change under review; the agent recommends leaving core execution semantics unchanged for a bounded supported-image approach.
+
+** RESOLVED Minimal bootstrap contract and proof
+:PROPERTIES:
+:ID: ssh-injection-boundary-proof
+:SOURCE: agent
+:END:
+The supported boundary is root Linux amd64 with writable executable/private/FHS paths, the existing byte-delivery foothold, and a valid existing root account and executable login shell. Membership in the global shell allowlist is not required. Missing global paths may be added, but existing paths are neither overwritten nor shadowed. ARM, non-root, read-only and shell-free images are not promised. BusyBox tools lacking Crabbox-required flags are genuine conflicts.
+
+=scripts/test-agent-sandbox-runtime.py= passed real Debian bookworm-slim SSH pinning, foreign-key rejection, exit status, literal arguments/environment, interactive PTY input, rsync and SFTP roundtrips, bundled Git commit/reset and verified HTTPS, bundled tar/gzip roundtrip, TCP forwarding and endpoint reuse. Original tool/account bytes, metadata and symlinks remained unchanged; an unrelated SSH daemon on port 2222 remained accessible. Raw Alpine 3.22 was rejected for incompatible existing tools with those preservation checks intact. Fixture containers and processes were cleaned.
+
+The final amd64 build passed inspection of 24 unique static ELF binaries with no dynamic loader, shared-library dependency or Nix store references. The initializer gzip SHA-256 is =28f4bd36d7ce8e36ded65d9d18ba952c295f17f963a6c700cb7dc9c22860c616=; the native payload SHA-256 is =5027fc7d4384c6dadc98be8569cb1e681bf78d28fda89031cb5583a15ab5f691=. The final provider and initializer test suites passed. Earlier race tests passed; broad CLI-suite attempts exposed fixture/environment failures and are not claimed green.
+
+Actual =agent-sandbox-ssh= lease =asbx_baed34fd68e2= on Pod =crabbox-cpu-48bl6= used unchanged image =sha256:2b5e702fad8e6f9c8c581e29ec400ea4a74bf4ad4b5211594c9ed20f60ea34e3=. It synced 2,238 source files (96.8 MiB), preserved exact argv/environment/cwd, captured stdout and downloaded 7,955 exact binary bytes. The original Docker daemon still reported 29.6.2. Account-file hashes, symlink targets, modes, ownership and absence matched an untouched same-image runner: passwd/group remain Nix-store symlinks and shadow/gshadow/shells remain absent. Reuse kept port 42987; a 65-second workload returned exact exit 37 with successful owner release. The proof lease was then released.
+
+One initial live sync failed closed during workspace-owner renewal; an unchanged retry and the longer reused session passed. No timeout was relaxed, and no unproven cause is asserted. Git origin seeding fell back to normal manifest sync, so this Nix run does not establish Git metadata seeding. The independent Debian smoke does establish bundled Git commit/reset/HTTPS behavior.
+
+** RESOLVED Upload generated sync scripts rather than expanding SSH exec requests
+:PROPERTIES:
+:ID: ssh-injection-sync-script-upload
+:SOURCE: user
+:END:
+The user twice asked "should it scp-ish the thing?" and authorized uploaded-file transport with "go for it". POSIX sync helpers now upload the complete prepared workspace-owner envelope into an exclusively created private directory, then execute a short file command while preserving the original streamed manifest stdin. Upload and detached bounded cleanup bypass owner wrapping; execution retains setup-marker classification, fallback-port changes, output and exit status. Cleanup checks an independent ownership token and symlinks and removes only owned files. The background rsync witness uses the same transport; its launched child carries its own command body and does not depend on the staging file remaining present.
+
+Real CLI initial sync and modified/deleted resync against initialized Debian passed with every sync-phase SSH request below 9,000 bytes (maximum 8,498). This uploaded-script change retains normal user command framing and the explicitly configured 256-KiB Dropbear bound; the workload smoke observed maximum 12,454 bytes. Binary manifest stdin, upload failure without input consumption, collisions, cancellation, cleanup errors, ownership guards and fallback-port behavior passed regression tests. Windows/WSL transport is unchanged. Subsequent live testing found and repaired a separate workload-stdin omission described below.
+
+** RESOLVED Prove actual Git and remaining workflows rather than accepting fallback
+:PROPERTIES:
+:ID: ssh-injection-expanded-live-proof
+:SOURCE: user
+:END:
+The user asked to "test the git stuff somewhere, and the other stuff?". The expanded =--crabbox= Docker harness now runs real smart-HTTP Git origins with filtering advertised, actual bundled Git/SSH and rsync, and isolated static leases. Both ordinary Git seeding and opt-in overlay passed matching origin, HEAD, index, content and finalization checks. Unchanged ordinary sync skipped transfer without HTTP requests; unchanged overlay reused the checkout without source overlay payload. Dirty tracked/untracked/deleted paths, executable bits, symlink targets and exact binary bytes/status passed. A new commit was fetched and applied over HTTP, and full resync removed old metadata and reseeded successfully. This is independent Debian/static-SSH proof, not a reinterpretation of the earlier Nix fallback.
+
+The same real CLI matrix passed initial/change/delete sync, dirty fingerprint reuse after a sync-only receipt, full-resync stale-state removal, standalone scripts and literal arguments, binary and line workload stdin, source-only =--script-stdin= returning exit 37, exact stdout/stderr captures and downloads, and two local Actions hydrations with changed source plus step/environment handoff into a reused workload. Ownership and staged sync files returned to their expected released baseline. Original image/account preservation, unrelated daemon availability, shell-list variants and incompatible Alpine rejection also passed again. The native verification lease was =asbx_af63b5a6e18e=; fixture servers, static leases and containers were cleaned by the harness.
+
+** RESOLVED Forward input only to the actual POSIX SSH workload
+:PROPERTIES:
+:ID: ssh-injection-workload-stdin-fix
+:SOURCE: user
+:END:
+Live tests exposed that ordinary =run= and =--script= discarded piped input: their streaming helper always passed nil and selected SSH =-n=. The user authorized fixing discovered bugs. POSIX SSH workload dispatch now passes the borrowed application input explicitly; sync, script upload, probes and ownership commands retain separate or nil input. =--script-stdin= still consumes source without replaying it as runtime data. Windows/native-WSL and provider-native delegated input behavior remain unchanged. Live input is not replayed after ambiguous transport or multiplexing failure.
+
+The implementation preserves borrowed input ownership and closes its own pipe descriptors. Focused review found an avoidable prelaunch pipe leak/premature Read; copying now begins only after successful process start, and repeated failed diagnostic/exec launches prove zero reads and no descriptor growth. An arbitrary borrowed reader already blocked in Read cannot be forcibly canceled without taking ownership; the command returns without waiting for that reader and closes only its owned pipe. The final source passed the SSH/workspace-owner regression selection, live matrix, scoped go vet, Windows test-binary cross-compilation, and race-enabled stdin regression cases. Source review reports no outstanding actionable findings. No full-repository or live-Windows pass is claimed.
+
+** PARKED Existing binary shipping tools
+:PROPERTIES:
+:ID: ssh-injection-exodus
+:SOURCE: user
+:END:
+The user recalls Exodus and asks about the current scene. [[https://github.com/intoli/exodus][Exodus]] bundles ELF dependencies and the loader behind relocatable launchers; it does not remap arbitrary absolute paths or script shebangs. [[https://staticx.readthedocs.io/en/latest/introduction.html][StaticX]] makes a self-extracting executable with a private dynamic runtime; dlopen dependencies require explicit attention. Repository metadata reports last pushes in November 2023 and May 2026 respectively, not proof of maintenance quality. [[https://nix.dev/manual/nix/latest/command-ref/new-cli/nix3-bundle.html][Nix bundle]] packages closures using a selected bundler. [[https://github.com/DavHau/nix-portable][nix-portable]] can virtualize /nix/store with bwrap or PRoot; [[https://proot-me.github.io/][PRoot]] can remap hardcoded paths but introduces ptrace-mediated execution. These are packaging options, not a chosen runtime. The user has not yet reacted to this comparison.
+
+** RESOLVED BusyBox as a control-runtime component
+:PROPERTIES:
+:ID: ssh-injection-busybox
+:SOURCE: user
+:END:
+The user asks whether "a busybox or smth" could provide required tools. It covers much of the basic utility set, but not unchanged Crabbox: Bash syntax and login-shell behavior, Git, rsync and the SSH server remain separate. BusyBox flock lacks the -w timeout used by workspace ownership, and BusyBox ps lacks its lstart field and -p selector. Manifest pruning also has Python-or-Perl interpreter paths. A static multicall utility remains a useful component after auditing exact flags, not a drop-in replacement for the present runtime. The user has not yet reacted to these findings.
+
+** RESOLVED Hardcoded paths versus NixOS
+:PROPERTIES:
+:ID: ssh-injection-nixos-paths
+:SOURCE: user
+:END:
+The user asks, "Damn, crabbox tools have hardcoded paths, so even on nixos it'd struggle?" Git overlay explicitly checks /bin/bash, /usr/bin/git and other FHS paths, then runs Git under env -i with PATH=/usr/bin:/bin. Stock NixOS packages live under /run/current-system/sw and /nix/store, so having tools on the normal PATH is insufficient for these paths. The custom Nix worker smoke does not establish stock NixOS portability. The hermetic Git environment also intentionally disables hostile ambient configuration, hooks and helpers; replacing it with inherited PATH would undo that boundary. Explicit trusted runtime paths are the proposed correction. The user has not yet reacted to this explanation.
+
+** RESOLVED Provider authority versus core execution contract
+:PROPERTIES:
+:ID: ssh-injection-provider-boundary
+:SOURCE: user
+:END:
+The user asks, "does our position as a provider allow us to modify / edge those constraints? or what's the most idiomatic way to do this". Current SSHLeaseBackend owns acquisition, resolution, touch and release; SSHTarget carries connection settings, readiness and local child environment, but no remote control-runtime descriptor. SSHProxyBackend provides the raw SSH transport, not a command translation hook. The provider can prepare and launch an injected runtime but cannot make core's absolute executable paths resolve through a PATH adjustment. The agent proposed a provider-neutral runtime capability with shared control/workload distinction and explicit injected tool paths. The user responded, "okay but consider this is a fork we need to maintain. Should we lower our sights a little?" This challenges the maintenance cost rather than the technical boundary. The revised agent recommendation is a provider-local integration against an explicit supported-image contract, leaving core sync, ownership and shell semantics alone. The generic capability remains a technically sound option, not the current recommendation or an implemented hook.
+
+*** PARKED Provider-only compatibility environment
+:PROPERTIES:
+:ID: ssh-injection-provider-compatibility
+:SOURCE: agent
+:END:
+A provider could arrange filesystem compatibility or a private mount/PRoot view and run existing SSH commands there, avoiding core changes. This exposes compatibility tools and path semantics to workloads unless the caller explicitly distinguishes the two execution kinds; guessing from incoming shell text is not a stable protocol. Originally the agent recommended against this for pristine-image semantics. The user's shared-volume question makes explicit per-file Kubernetes compatibility mounts worth considering as a narrower alternative to PRoot or whole-directory replacement. This accepts workload-visible tool changes, not a new control/workload protocol. The user has not chosen that tradeoff.
+
+** PARKED Ship a tool bundle through a shared volume
+:PROPERTIES:
+:ID: ssh-injection-shared-volume
+:SOURCE: user
+:END:
+The user asks whether "a sidecar volume or smth" can provide the tools. Kubernetes init containers can populate an emptyDir before the workload starts, and the workload can mount that bundle read-only at a fixed private path. This needs Pod/template configuration but not an application-image rebuild or a persistent copying sidecar. An SSH server running only in a sidecar would execute workloads in the wrong container by default; a shared workspace alone does not transfer the application's root filesystem or environment. Proposed direction to prototype: ship a self-contained runtime bundle through an init container, launch its established SSH server in the workload container, and use explicit individual subPath compatibility mounts for required absolute tool paths. Do not mount over entire /bin or /usr/bin directories. The mounts can replace visible tools and must be intentional; merged-/usr layouts, existing symlinks, library/loader dependencies, Git subprocesses, executable-volume policy and SSH account/UID requirements need verification. A volume supplies files, not binary portability or account compatibility. The user now asks, "does agent-sandbox expose init container? idk if a initcontainer + volume is really nice. How involved is the container setup?" This questions operational complexity rather than accepting the volume design. Upstream docs/api.md establishes SandboxTemplate.spec.podTemplate.spec as a full Kubernetes PodSpec, so initContainers, volumes and volumeMounts are available. SandboxWarmPool refers to that template. Current Crabbox only submits warmPoolRef and lifecycle in its claim, so the operator must configure the template before pool Pods exist; there is no claim-level init-container injection hook here. The simple copy-volume part is routine, but the full SSH and compatibility-mount integration is a nontrivial template addition. The proposal remains under review, not implemented or proven.
+
+The user has now proposed copying and running an additive initializer after startup instead. That avoids template mount changes on supported writable containers, so the volume approach remains an alternative under review rather than the active recommendation.
+
+*** PARKED Full delegated execution
+:PROPERTIES:
+:ID: ssh-injection-provider-delegated
+:SOURCE: agent
+:END:
+DelegatedRunBackend is the existing escape hatch for provider-owned Run and Warmup. The original archive agent-sandbox backend uses it; the SSH adapter deliberately excludes those methods. It permits a different execution/sync implementation but does not automatically preserve shared SSH feature behavior. Agent recommendation is to use delegation only if a distinct backend execution model is intended, rather than duplicating core ownership and sync to avoid runtime path changes. The user has not chosen or rejected it.

@@ -7,6 +7,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 type backend struct {
@@ -50,7 +52,7 @@ func (b *backend) Doctor(ctx context.Context, _ DoctorRequest) (DoctorResult, er
 	}
 	checks, err := b.doctorChecks(ctx, client)
 	result := DoctorResult{
-		Provider: providerName,
+		Provider: selectedProvider(b.cfg),
 		Status:   "ready",
 		Checks:   checks,
 		Message: fmt.Sprintf("kubernetes=ready crds=ready rbac=ready warm_pool=%s namespace=%s context=%s mutation=false",
@@ -76,7 +78,7 @@ func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
 	if err != nil {
 		return err
 	}
-	leaseID, claimName, slug, ready, claim, unlockOperation, err := b.createClaim(ctx, client, req.RequestedSlug, req.Repo, req.Reclaim)
+	leaseID, claimName, slug, ready, claim, unlockOperation, err := b.createClaim(ctx, client, req.RequestedSlug, req.Repo, req.Reclaim, nil)
 	if err != nil {
 		return err
 	}
@@ -119,14 +121,14 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 		}
 	}()
 	if req.ID == "" {
-		leaseID, claimName, slug, ready, claim, unlockOperation, err = b.createClaim(ctx, client, req.RequestedSlug, req.Repo, req.Reclaim)
+		leaseID, claimName, slug, ready, claim, unlockOperation, err = b.createClaim(ctx, client, req.RequestedSlug, req.Repo, req.Reclaim, nil)
 		if err != nil {
 			return RunResult{}, err
 		}
 		fmt.Fprintf(b.rt.Stderr, "leased %s slug=%s provider=%s claim=%s sandbox=%s pod=%s\n", leaseID, slug, providerName, claimName, ready.SandboxName, ready.PodName)
 		acquired = true
 	} else {
-		claim, err = resolveLocalClaim(req.ID)
+		claim, err = resolveLocalClaim(b.cfg, req.ID)
 		if err != nil {
 			return RunResult{}, err
 		}
@@ -134,7 +136,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 		if err != nil {
 			return RunResult{}, err
 		}
-		claim, err = resolveLocalClaim(claim.LeaseID)
+		claim, err = resolveLocalClaim(b.cfg, claim.LeaseID)
 		if err != nil {
 			return RunResult{}, err
 		}
@@ -166,7 +168,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 			if errors.As(err, &ttlErr) {
 				cleanupCtx, cancel := b.cleanupContext(ctx)
 				defer cancel()
-				if cleanupErr := b.deleteOwnedClaim(cleanupCtx, client, claim, claim.LeaseID, claimName, false); cleanupErr != nil {
+				if _, cleanupErr := b.deleteOwnedClaim(cleanupCtx, client, claim, claim.LeaseID, claimName, false); cleanupErr != nil {
 					return RunResult{}, errors.Join(err, fmt.Errorf("release expired agent-sandbox claim %s: %w", claim.LeaseID, cleanupErr))
 				}
 				return RunResult{}, err
@@ -337,7 +339,8 @@ func (b *backend) deleteCurrentRunClaim(ctx context.Context, client kubernetesCl
 	if claim.LeaseID == "" {
 		return exit(4, "agent-sandbox lease %s disappeared before release", leaseID)
 	}
-	return b.deleteOwnedClaim(ctx, client, claim, leaseID, claimName, false)
+	_, err = b.deleteOwnedClaim(ctx, client, claim, leaseID, claimName, false)
+	return err
 }
 
 func (b *backend) refreshRetainedFailureActivity(claim LeaseClaim, leaseID string, shouldStop bool, cause error) error {
@@ -358,7 +361,7 @@ func (b *backend) releaseExpiredRunClaim(ctx context.Context, client kubernetesC
 	cleanupCtx, cancel := b.cleanupContext(ctx)
 	defer cancel()
 	cause := exit(4, "agent-sandbox claim %s reached its TTL expiry; command not run", claim.LeaseID)
-	if err := b.deleteOwnedClaim(cleanupCtx, client, claim, claim.LeaseID, claimName, false); err != nil {
+	if _, err := b.deleteOwnedClaim(cleanupCtx, client, claim, claim.LeaseID, claimName, false); err != nil {
 		return true, errors.Join(cause, fmt.Errorf("release expired agent-sandbox claim %s: %w", claim.LeaseID, err))
 	}
 	return true, cause
@@ -375,7 +378,7 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 	}
 	servers := make([]Server, 0, len(claims))
 	for _, claim := range claims {
-		if claim.Provider != providerName || claim.ProviderScope != claimScope(b.cfg) {
+		if claim.Provider != selectedProvider(b.cfg) || claim.ProviderScope != claimScope(b.cfg) {
 			continue
 		}
 		claimName := claimNameFromLocalClaim(claim)
@@ -410,7 +413,7 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 			stateReason = stateErr.Error()
 		}
 		labels := map[string]string{
-			"provider":  providerName,
+			"provider":  selectedProvider(b.cfg),
 			"lease":     claim.LeaseID,
 			"slug":      claim.Slug,
 			"pond":      claim.Pond,
@@ -425,7 +428,7 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 		if stateReason != "" {
 			labels["reason"] = stateReason
 		}
-		servers = append(servers, Server{Provider: providerName, CloudID: claimName, Name: claimName, Status: state, Labels: labels})
+		servers = append(servers, Server{Provider: selectedProvider(b.cfg), CloudID: claimName, Name: claimName, Status: state, Labels: labels})
 	}
 	return servers, nil
 }
@@ -435,7 +438,7 @@ func (b *backend) Status(ctx context.Context, req StatusRequest) (StatusView, er
 	if err != nil {
 		return StatusView{}, err
 	}
-	claim, err := resolveLocalClaim(req.ID)
+	claim, err := resolveLocalClaim(b.cfg, req.ID)
 	if err != nil {
 		return StatusView{}, err
 	}
@@ -453,8 +456,8 @@ func (b *backend) Status(ctx context.Context, req StatusRequest) (StatusView, er
 	}
 	defer cancel()
 	claimName := claimNameFromLocalClaim(claim)
-	baseView := StatusView{ID: claim.LeaseID, Slug: claim.Slug, Provider: providerName, TargetOS: targetLinux, ServerID: claimName, Pond: claim.Pond, Network: networkPublic, Labels: map[string]string{
-		"provider":  providerName,
+	baseView := StatusView{ID: claim.LeaseID, Slug: claim.Slug, Provider: selectedProvider(b.cfg), TargetOS: targetLinux, ServerID: claimName, Pond: claim.Pond, Network: networkPublic, Labels: map[string]string{
+		"provider":  selectedProvider(b.cfg),
 		"lease":     claim.LeaseID,
 		"pond":      claim.Pond,
 		"claim":     claimName,
@@ -541,7 +544,7 @@ func (b *backend) Stop(ctx context.Context, req StopRequest) error {
 	if err != nil {
 		return err
 	}
-	claim, err := resolveLocalClaim(req.ID)
+	claim, err := resolveLocalClaim(b.cfg, req.ID)
 	if err != nil {
 		return err
 	}
@@ -550,7 +553,7 @@ func (b *backend) Stop(ctx context.Context, req StopRequest) error {
 		return err
 	}
 	defer unlockOperation()
-	claim, err = resolveLocalClaim(claim.LeaseID)
+	claim, err = resolveLocalClaim(b.cfg, claim.LeaseID)
 	if err != nil {
 		return err
 	}
@@ -558,7 +561,7 @@ func (b *backend) Stop(ctx context.Context, req StopRequest) error {
 		return err
 	}
 	claimName := claimNameFromLocalClaim(claim)
-	if err := b.deleteOwnedClaim(ctx, client, claim, claim.LeaseID, claimName, true); err != nil {
+	if _, err := b.deleteOwnedClaim(ctx, client, claim, claim.LeaseID, claimName, true); err != nil {
 		return err
 	}
 	fmt.Fprintf(b.rt.Stderr, "released lease=%s claim=%s\n", claim.LeaseID, claimName)
@@ -577,7 +580,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 	now := b.now().UTC()
 	checked, removed, claimsRemoved := 0, 0, 0
 	for _, listedClaim := range claims {
-		if listedClaim.Provider != providerName || listedClaim.ProviderScope != claimScope(b.cfg) {
+		if listedClaim.Provider != selectedProvider(b.cfg) || listedClaim.ProviderScope != claimScope(b.cfg) {
 			continue
 		}
 		var checkedOne, removedOne, claimRemovedOne bool
@@ -591,7 +594,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 			if err != nil {
 				return err
 			}
-			if claim.LeaseID == "" || claim.Provider != providerName || claim.ProviderScope != claimScope(b.cfg) {
+			if claim.LeaseID == "" || claim.Provider != selectedProvider(b.cfg) || claim.ProviderScope != claimScope(b.cfg) {
 				return nil
 			}
 			checkedOne = true
@@ -629,7 +632,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 				fmt.Fprintf(b.rt.Stdout, "would delete claim=%s lease=%s reason=%s\n", claimName, claim.LeaseID, reason)
 				return nil
 			}
-			if err := b.deleteOwnedClaim(ctx, client, claim, claim.LeaseID, claimName, false); err != nil {
+			if _, err := b.deleteOwnedClaim(ctx, client, claim, claim.LeaseID, claimName, false); err != nil {
 				return err
 			}
 			fmt.Fprintf(b.rt.Stdout, "delete claim=%s lease=%s reason=%s\n", claimName, claim.LeaseID, reason)
@@ -650,12 +653,12 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 		}
 	}
 	if !req.DryRun {
-		fmt.Fprintf(b.rt.Stdout, "%s cleanup removed=%d claims_removed=%d checked=%d\n", providerName, removed, claimsRemoved, checked)
+		fmt.Fprintf(b.rt.Stdout, "%s cleanup removed=%d claims_removed=%d checked=%d\n", selectedProvider(b.cfg), removed, claimsRemoved, checked)
 	}
 	return nil
 }
 
-func (b *backend) createClaim(ctx context.Context, client kubernetesClient, requestedSlug string, repo Repo, reclaim bool) (
+func (b *backend) createClaim(ctx context.Context, client kubernetesClient, requestedSlug string, repo Repo, reclaim bool, onAcquired func(LeaseClaim) error) (
 	string, string, string, sandboxReadiness, LeaseClaim, func(), error,
 ) {
 	unlockSlug, err := lockAgentSandboxSlugAllocation(ctx, requestedSlug)
@@ -710,7 +713,7 @@ func (b *backend) createClaim(ctx context.Context, client kubernetesClient, requ
 		Metadata: objectMeta{
 			Name:        claimResourceName,
 			Namespace:   b.cfg.AgentSandbox.Namespace,
-			Labels:      claimLabels(leaseID, slug),
+			Labels:      claimLabels(b.cfg, leaseID, slug),
 			Annotations: claimAnnotationsWithRecoveryNonce(b.cfg, recoveryNonce),
 		},
 		Spec: spec,
@@ -734,6 +737,7 @@ func (b *backend) createClaim(ctx context.Context, client kubernetesClient, requ
 	}
 	identity := claimIdentity{
 		LeaseID:       leaseID,
+		Provider:      selectedProvider(b.cfg),
 		ProviderScope: claimScope(b.cfg),
 		UID:           strings.TrimSpace(created.Metadata.UID),
 		WarmPool:      b.cfg.AgentSandbox.WarmPool,
@@ -741,6 +745,15 @@ func (b *backend) createClaim(ctx context.Context, client kubernetesClient, requ
 		Container:     strings.TrimSpace(b.cfg.AgentSandbox.Container),
 	}
 	pending := sandboxReadiness{ClaimName: claimResourceName, ClaimUID: identity.UID}
+	if err := validateClaimIdentity(created, identity); err != nil {
+		return "", "", "", sandboxReadiness{}, LeaseClaim{}, nil, b.rollbackCreatedClaim(client, leaseID, slug, repo, reclaim, claimResourceName, pending, expiresAt, recoveryNonce, err)
+	}
+	if onAcquired != nil {
+		raw := LeaseClaim{LeaseID: leaseID, Slug: slug, Provider: selectedProvider(b.cfg), ProviderScope: claimScope(b.cfg), RepoRoot: repo.Root, Labels: claimMetadataLabels(b.cfg, leaseID, pending, claimResourceName, expiresAt, recoveryNonce)}
+		if err := onAcquired(raw); err != nil {
+			return "", "", "", sandboxReadiness{}, LeaseClaim{}, nil, b.rollbackCreatedClaim(client, leaseID, slug, repo, reclaim, claimResourceName, pending, expiresAt, recoveryNonce, err)
+		}
+	}
 	pendingClaim, err := writeClaimLease(b.cfg, leaseID, slug, repo, reclaim, pending, claimResourceName, expiresAt, recoveryNonce)
 	if err != nil {
 		return "", "", "", sandboxReadiness{}, LeaseClaim{}, nil, b.rollbackCreatedClaim(client, leaseID, slug, repo, reclaim, claimResourceName, pending, expiresAt, recoveryNonce, err)
@@ -807,6 +820,7 @@ func (b *backend) reconcileCreatedClaim(ctx context.Context, client kubernetesCl
 		if err == nil {
 			identity := claimIdentity{
 				LeaseID:       leaseID,
+				Provider:      selectedProvider(b.cfg),
 				ProviderScope: claimScope(b.cfg),
 				UID:           strings.TrimSpace(live.Metadata.UID),
 				WarmPool:      b.cfg.AgentSandbox.WarmPool,
@@ -982,36 +996,43 @@ func (b *backend) claimIdentityForLiveClaim(claim LeaseClaim, live *kubernetesOb
 	return updated, identity, nil
 }
 
-func (b *backend) deleteOwnedClaim(ctx context.Context, client kubernetesClient, claim LeaseClaim, leaseID, claimName string, forgetMissing bool) error {
+// The terminal result records confirmed deletion or explicitly accepted absence,
+// independently of errors finalizing local claims and credentials.
+func (b *backend) deleteOwnedClaim(ctx context.Context, client kubernetesClient, claim LeaseClaim, leaseID, claimName string, forgetMissing bool) (bool, error) {
 	live, err := client.Get(ctx, sandboxClaimGVR(), b.cfg.AgentSandbox.Namespace, claimName)
 	if err != nil {
 		if isNotFound(err) {
 			if forgetMissing && b.cfg.AgentSandbox.ForgetMissing {
 				fmt.Fprintf(b.rt.Stderr, "warning: forgetting missing agent-sandbox claim=%s after explicit request\n", claimName)
-				return b.removeLocalClaim(leaseID, claim)
+				return true, b.removeLocalClaim(leaseID, claim)
 			}
 			if claim.LeaseID != "" {
-				return retainMissingClaim(b.cfg, claim)
+				return b.cfg.AgentSandbox.ForgetMissing, retainMissingClaim(b.cfg, claim)
 			}
 		}
-		return err
+		return false, err
 	}
 	claim, identity, err := b.claimIdentityForLiveClaim(claim, live, true)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := client.Delete(ctx, sandboxClaimGVR(), b.cfg.AgentSandbox.Namespace, claimName, identity.UID); err != nil && !isNotFound(err) {
-		return err
+		return false, err
 	}
 	if err := b.removeLocalClaim(leaseID, claim); err != nil {
-		return fmt.Errorf("agent-sandbox claim %s/%s deleted but local lease %s removal failed: %w", b.cfg.AgentSandbox.Namespace, claimName, leaseID, err)
+		return true, fmt.Errorf("agent-sandbox claim %s/%s deleted but local lease %s removal failed: %w", b.cfg.AgentSandbox.Namespace, claimName, leaseID, err)
 	}
-	return nil
+	if selectedProvider(b.cfg) == sshProviderName {
+		if err := core.RemoveStoredTestboxConnectionArtifacts(leaseID); err != nil {
+			return true, fmt.Errorf("agent-sandbox claim %s deleted but SSH credential cleanup failed: %w", leaseID, err)
+		}
+	}
+	return true, nil
 }
 
-func validateClaimOwnership(obj *kubernetesObject, leaseID, providerScope string) error {
+func validateClaimOwnership(obj *kubernetesObject, leaseID, provider, providerScope string) error {
 	labels := obj.Metadata.Labels
-	if labels[labelProvider] != providerName || labels[labelLeaseID] != safeLabelValue(leaseID) {
+	if labels[labelProvider] != blank(provider, providerName) || labels[labelLeaseID] != safeLabelValue(leaseID) {
 		return exit(4, "agent-sandbox SandboxClaim %s is not owned by Crabbox lease %s", obj.Metadata.Name, leaseID)
 	}
 	scope := strings.TrimSpace(obj.Metadata.Annotations[annotationScope])
@@ -1046,7 +1067,7 @@ func validateClaimIdentity(obj *kubernetesObject, identity claimIdentity) error 
 			return resourceIdentityError{err: exit(4, "agent-sandbox SandboxClaim %s lifecycle changed from shutdownTime=%s shutdownPolicy=Retain to shutdownTime=%s shutdownPolicy=%s", obj.Metadata.Name, identity.ExpiresAt, blank(shutdownTime, "<empty>"), blank(shutdownPolicy, "<empty>"))}
 		}
 	}
-	if err := validateClaimOwnership(obj, identity.LeaseID, identity.ProviderScope); err != nil {
+	if err := validateClaimOwnership(obj, identity.LeaseID, identity.Provider, identity.ProviderScope); err != nil {
 		return resourceIdentityError{err: err}
 	}
 	return nil
@@ -1178,7 +1199,11 @@ func (b *backend) doctorChecks(ctx context.Context, client kubernetesClient) ([]
 		return checks, err
 	}
 	add("ok", "warm_pool", "found", map[string]string{"namespace": cfg.Namespace, "name": cfg.WarmPool})
-	for _, rule := range doctorRBACRules(cfg.Namespace) {
+	rules := doctorRBACRules(cfg.Namespace)
+	if selectedProvider(b.cfg) == sshProviderName {
+		rules = append(rules, rbacRule{Resource: podResource, Subresource: "portforward", Namespace: cfg.Namespace, Verbs: []string{"create"}})
+	}
+	for _, rule := range rules {
 		allowed, err := client.CanI(ctx, rule)
 		if err != nil {
 			add("blocked", "rbac."+rule.String(), err.Error(), nil)

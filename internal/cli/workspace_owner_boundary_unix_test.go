@@ -78,7 +78,7 @@ func TestWorkspaceOwnerStreamingSetupDiagnostic(t *testing.T) {
 					if scenario == "legacy-stream" {
 						code = runSSHStream(ctx, target, remote, &stdout, destination)
 					} else {
-						code, err = runSSHStreamResult(ctx, target, remote, &stdout, destination)
+						code, err = runSSHStreamResult(ctx, target, remote, nil, &stdout, destination)
 					}
 					if stage != nil {
 						stage.requireCalls(t, 1, 1, map[bool]int{true: 1, false: 0}[code != 0])

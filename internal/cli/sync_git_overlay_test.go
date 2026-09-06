@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3214,6 +3215,9 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			clearConfigEnv(t)
 			fixture := newGitOverlayFixture(t)
+			// This matrix requires an eligible checkout unless its case opts out.
+			// An image-level autocrlf setting must not select a different path.
+			runGit(t, fixture.root, "config", "core.autocrlf", "false")
 			ordinary := strings.HasPrefix(mode, "ordinary-")
 			reused := ordinary && strings.HasSuffix(mode, "-reused")
 			hiddenFingerprint := strings.HasSuffix(mode, "-hidden-fingerprint")
@@ -3512,10 +3516,13 @@ case "$cmd" in
 	      classified-fallback) printf '%%scheckout_failed\n' %s >&2; exit %d ;;
 	      remote-inspection-hidden-fingerprint) printf '%%sindex_inspection_failed\n' %s >&2; exit %d ;;
       checkout-file-obstruction)
-        /bin/chmod 0555 "$CRABBOX_FAKE_OVERLAY_WORKDIR"
+        # Root can write through mode 0555. An index lock instead makes the
+        # real checkout fail for every runner UID, leaving the stale shape
+        # file for the ordinary fallback to prune before recovery.
+        : > "$CRABBOX_FAKE_OVERLAY_WORKDIR/.git/index.lock"
         /usr/bin/env HOME="$CRABBOX_FAKE_ATTACK_HOME" PATH="$CRABBOX_FAKE_ATTACK_BIN:/usr/bin:/bin" /bin/bash --noprofile --norc -c "$cmd"
         code=$?
-        /bin/chmod 0755 "$CRABBOX_FAKE_OVERLAY_WORKDIR"
+        /bin/rm -f "$CRABBOX_FAKE_OVERLAY_WORKDIR/.git/index.lock"
         exit "$code"
         ;;
       late-local-edit) printf 'late local change\n' > "$CRABBOX_FAKE_REPO_ROOT/clean.txt" ;;
@@ -3591,7 +3598,8 @@ done < "$tmp"
 				counter := filepath.Join(testRoot, "snapshot-git.count")
 				script := fmt.Sprintf(`#!/bin/sh
 count=0
-if [ -f %s ]; then count="$(cat %s)"; fi
+# Snapshot Git has no PATH; use shell builtins rather than the runner's cat.
+if [ -f %s ]; then IFS= read -r count < %s; fi
 count=$((count + 1))
 printf '%%s\n' "$count" > %s
 printf '%%s\n' "$*" >> %s
@@ -4047,6 +4055,27 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 	remoteRoot := filepath.Join(testRoot, "remote")
 	leaseIDs := []string{"cbx_missing_first", "cbx_missing_replacement"}
 	providerName := runReadyPoolPreflightTestProvider{}.Name()
+	// Coordinator leases use the direct TCP readiness check, unlike the
+	// provider-local fixture's SSHConfigProxy path. Supply its own reachable
+	// endpoint rather than depending on a workstation SSH daemon on port 22.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, sshPort, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
 	var (
 		acquires atomic.Int32
 		receipt  terminalRunReceipt
@@ -4057,7 +4086,7 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 		lease := func(id, state string) CoordinatorLease {
 			return CoordinatorLease{
 				ID: id, Provider: providerName, TargetOS: targetLinux, State: state,
-				Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: "22", WorkRoot: remoteRoot,
+				Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: sshPort, WorkRoot: remoteRoot,
 			}
 		}
 		switch {
@@ -4164,12 +4193,11 @@ done <"$tmp"
 	t.Setenv("CRABBOX_FAKE_REPO_ROOT", fixture.root)
 	t.Setenv("CRABBOX_FAKE_TRANSFERRED", transferred)
 	t.Setenv("CRABBOX_FAKE_FAILED_READY", failedReady)
-	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
-	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", sshPort)
 
 	var stdout, stderr bytes.Buffer
 	if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
-		"--provider", providerName, "--no-hydrate", "--", "true",
+		"--provider", providerName, "--target", targetLinux, "--no-hydrate", "--", "true",
 	}); err != nil {
 		commands, _ := os.ReadFile(sshLog)
 		t.Fatalf("replacement run: %v\nstdout=%s\nstderr=%s\nssh=%s", err, stdout.String(), stderr.String(), commands)

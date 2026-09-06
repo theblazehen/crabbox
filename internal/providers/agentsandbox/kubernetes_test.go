@@ -1183,7 +1183,7 @@ func readyFakeClient(cfg Config) *fakeKubernetesClient {
 	claim := &kubernetesObject{Metadata: objectMeta{
 		Name:        "claim-a",
 		UID:         identity.UID,
-		Labels:      claimLabels(identity.LeaseID, "test"),
+		Labels:      claimLabels(cfg, identity.LeaseID, "test"),
 		Annotations: claimAnnotations(cfg),
 	}, Spec: map[string]any{"warmPoolRef": map[string]any{"name": cfg.AgentSandbox.WarmPool}}}
 	claim.Status.Sandbox.Name = "sandbox-a"

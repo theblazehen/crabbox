@@ -152,11 +152,11 @@ func TestGitOriginAttemptRetainsBoundedTruncatedDiagnosticsWithoutFallback(t *te
 	}
 	dir := t.TempDir()
 	script := "#!/bin/sh\nprintf 'fatal: Authentication failed\\n'\nhead -c 1048576 /dev/zero\nexit 78\n"
-	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	out, err := runIdempotentSSHGitOriginAttempt(t.Context(), SSHTarget{Host: "fixture.invalid", Port: "22", FallbackPorts: []string{}}, "true", 0)
+	out, err := runIdempotentSSHSyncScriptGitOriginAttempt(t.Context(), SSHTarget{Host: "fixture.invalid", Port: "22", FallbackPorts: []string{}}, "true", 0)
 	if err == nil || len(out) != gitSeedDiagnosticLimit {
 		t.Fatalf("diagnostic bytes=%d err=%v", len(out), err)
 	}
@@ -196,7 +196,7 @@ esac
 cat >/dev/null
 `
 	for name, script := range map[string]string{
-		"ssh":   ssh,
+		"ssh":   syncScriptAwareSSHFixture(t, ssh),
 		"rsync": "#!/bin/sh\nprintf 'rsync\\n' >> \"$SEED_TEST_CALLS\"\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {

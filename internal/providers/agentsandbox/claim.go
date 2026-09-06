@@ -39,6 +39,7 @@ const (
 
 type claimIdentity struct {
 	LeaseID       string
+	Provider      string
 	ProviderScope string
 	UID           string
 	WarmPool      string
@@ -83,7 +84,7 @@ func claimScope(cfg Config) string {
 	if container != "" {
 		containerMode = "explicit"
 	}
-	return strings.Join([]string{
+	scope := strings.Join([]string{
 		"kubeconfig:" + effectiveKubeconfigIdentity(values),
 		"context:" + strings.TrimSpace(values.Context),
 		"namespace:" + strings.TrimSpace(values.Namespace),
@@ -91,13 +92,17 @@ func claimScope(cfg Config) string {
 		"containerMode:" + containerMode,
 		"container:" + container,
 	}, "|")
+	if selectedProvider(cfg) == sshProviderName {
+		scope += "|provider:" + sshProviderName
+	}
+	return scope
 }
 
-func claimLabels(leaseID, slug string) map[string]string {
+func claimLabels(cfg Config, leaseID, slug string) map[string]string {
 	return map[string]string{
 		labelLeaseID:  safeLabelValue(leaseID),
 		labelSlug:     safeLabelValue(slug),
-		labelProvider: providerName,
+		labelProvider: selectedProvider(cfg),
 	}
 }
 
@@ -136,10 +141,22 @@ func safeLabelValue(value string) string {
 }
 
 func claimLeaseForRepo(cfg Config, leaseID, slug string, repo Repo, reclaim bool) error {
-	return claimLeaseForRepoProviderScopePond(leaseID, slug, providerName, claimScope(cfg), cfg.Pond, repo.Root, cfg.IdleTimeout, reclaim)
+	return claimLeaseForRepoProviderScopePond(leaseID, slug, selectedProvider(cfg), claimScope(cfg), cfg.Pond, repo.Root, cfg.IdleTimeout, reclaim)
 }
 
 func writeClaimLease(cfg Config, leaseID, slug string, repo Repo, reclaim bool, ready sandboxReadiness, claimName, expiresAt, recoveryNonce string) (LeaseClaim, error) {
+	if selectedProvider(cfg) == sshProviderName && repo.Root == "" {
+		// Controller acquisitions can precede repository attachment. The
+		// repository-scoped helper intentionally does nothing for an empty
+		// root, so use the explicit unbound-claim transaction instead.
+		existing, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+		if err != nil {
+			return LeaseClaim{}, err
+		}
+		labels := claimMetadataLabels(cfg, leaseID, ready, claimName, expiresAt, recoveryNonce)
+		lease := sshLeaseFromClaim(LeaseClaim{LeaseID: leaseID, Slug: slug, Pond: cfg.Pond, Labels: labels})
+		return core.ClaimLeaseTargetForConfigScopeIfUnchanged(leaseID, slug, cfg, claimScope(cfg), lease.Server, lease.SSH, cfg.IdleTimeout, existing, exists)
+	}
 	if err := claimLeaseForRepo(cfg, leaseID, slug, repo, reclaim); err != nil {
 		return LeaseClaim{}, err
 	}
@@ -155,7 +172,7 @@ func refreshClaimLeaseActivity(cfg Config, claim LeaseClaim) error {
 	if idleTimeout <= 0 && claim.IdleTimeoutSeconds > 0 {
 		idleTimeout = time.Duration(claim.IdleTimeoutSeconds) * time.Second
 	}
-	if err := claimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, providerName, claim.ProviderScope, claim.Pond, claim.RepoRoot, idleTimeout, false); err != nil {
+	if err := claimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, selectedProvider(cfg), claim.ProviderScope, claim.Pond, claim.RepoRoot, idleTimeout, false); err != nil {
 		return err
 	}
 	updated, err := readLeaseClaim(claim.LeaseID)
@@ -183,7 +200,7 @@ func claimMetadataLabels(cfg Config, leaseID string, ready sandboxReadiness, cla
 		state = "not-ready"
 	}
 	labels := map[string]string{
-		"provider":                providerName,
+		"provider":                selectedProvider(cfg),
 		"lease":                   leaseID,
 		claimLabelClaimName:       claimName,
 		claimLabelClaimUID:        ready.ClaimUID,
@@ -245,12 +262,12 @@ func claimIdentityFromLocalClaimWithUID(claim LeaseClaim, uid string) (claimIden
 	if !containerPinned && strings.Contains(claim.ProviderScope, "containerMode:implicit|") {
 		container = ""
 	}
-	return claimIdentity{LeaseID: claim.LeaseID, ProviderScope: claim.ProviderScope, UID: uid, WarmPool: warmPool, ExpiresAt: expiresAt, Container: container}, nil
+	return claimIdentity{LeaseID: claim.LeaseID, Provider: blank(claim.Provider, providerName), ProviderScope: claim.ProviderScope, UID: uid, WarmPool: warmPool, ExpiresAt: expiresAt, Container: container}, nil
 }
 
 func authorizeClaimScope(cfg Config, claim LeaseClaim) error {
-	if claim.Provider != "" && claim.Provider != providerName {
-		return exit(2, "lease %s belongs to provider=%s, not %s", claim.LeaseID, claim.Provider, providerName)
+	if claim.Provider != "" && claim.Provider != selectedProvider(cfg) {
+		return exit(2, "lease %s belongs to provider=%s, not %s", claim.LeaseID, claim.Provider, selectedProvider(cfg))
 	}
 	if got, want := strings.TrimSpace(claim.ProviderScope), claimScope(cfg); got != "" && got != want {
 		return exit(2, "lease %s belongs to a different agent-sandbox scope", claim.LeaseID)
@@ -275,13 +292,13 @@ func retainMissingClaim(cfg Config, claim LeaseClaim) error {
 	return fmt.Errorf("agent-sandbox claim %s is missing in Kubernetes; local claim retained because forgetMissing=false", claim.LeaseID)
 }
 
-func resolveLocalClaim(identifier string) (LeaseClaim, error) {
-	claim, ok, err := resolveLeaseClaimForProvider(identifier, providerName)
+func resolveLocalClaim(cfg Config, identifier string) (LeaseClaim, error) {
+	claim, ok, err := resolveLeaseClaimForProvider(identifier, selectedProvider(cfg))
 	if err != nil {
 		return LeaseClaim{}, err
 	}
 	if !ok {
-		claim, ok, err = resolveLocalClaimByClaimName(identifier)
+		claim, ok, err = resolveLocalClaimByClaimName(cfg, identifier)
 		if err != nil {
 			return LeaseClaim{}, err
 		}
@@ -292,7 +309,7 @@ func resolveLocalClaim(identifier string) (LeaseClaim, error) {
 	return claim, nil
 }
 
-func resolveLocalClaimByClaimName(identifier string) (LeaseClaim, bool, error) {
+func resolveLocalClaimByClaimName(cfg Config, identifier string) (LeaseClaim, bool, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
 		return LeaseClaim{}, false, nil
@@ -303,7 +320,7 @@ func resolveLocalClaimByClaimName(identifier string) (LeaseClaim, bool, error) {
 	}
 	var match LeaseClaim
 	for _, claim := range claims {
-		if claim.Provider != providerName || strings.TrimSpace(claim.Labels[claimLabelClaimName]) != identifier {
+		if claim.Provider != selectedProvider(cfg) || strings.TrimSpace(claim.Labels[claimLabelClaimName]) != identifier {
 			continue
 		}
 		if match.LeaseID != "" {

@@ -168,7 +168,8 @@ If the local SSH multiplexing socket is temporarily full before a command
 starts, Crabbox retries that same session once, then disables multiplexing for
 that invocation if the exact file-descriptor handoff failure recurs. The
 existing lease and command are preserved; ordinary remote command failures do
-not trigger this multiplexing recovery.
+not trigger this multiplexing recovery. Workloads with live stdin are not
+replayed, including after a multiplexing failure.
 
 Crabbox records a local repo claim for each reused lease. If a lease is already
 claimed by another repo, pass `--reclaim` to move the claim intentionally.
@@ -440,6 +441,24 @@ workdir as its process PWD. `$0` identifies the generated upload path, so
 directory. That directory component is not preserved in the uploaded copy and
 cannot be recovered from `$0`. Standalone uploaded scripts should resolve
 synced project assets from `$PWD`.
+
+**Workload stdin on POSIX SSH leases:**
+
+Piped stdin reaches the actual remote command, `--shell` program, or uploaded
+`--script` without being consumed by sync, script upload, or workspace-owner
+control commands. Binary bytes and line input are preserved:
+
+```sh
+printf 'first line\nsecond line\n' | crabbox run --id swift-crab -- cat
+cat payload.bin | crabbox run --id swift-crab --script ./scripts/consume-input.py
+```
+
+`--script-stdin` instead consumes stdin as the complete script source; it does
+not replay that source to the workload or provide a separate runtime input
+stream. Use `--script <file>` when the script also needs piped data. This
+forwarding applies only to POSIX SSH workloads; native Windows, WSL, and
+delegated-provider input paths are unchanged. Live workload input is never
+replayed after a transport failure, and caller-owned input is not closed.
 
 If a Git-managed script needs its synced repository path or adjacent assets,
 invoke it as trailing argv so the project copy runs in place:

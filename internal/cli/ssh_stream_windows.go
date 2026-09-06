@@ -25,7 +25,7 @@ var commandStreamRotateSize int64 = 64 * 1024 * 1024
 // Windows inbox OpenSSH can hang after the remote command exits when Go
 // connects its output to pipes. Regular files preserve the client's EOF
 // behavior; briefly suspending the client lets drained spools rotate in place.
-func runCommandWithPlatformStreams(cmd *exec.Cmd, stdout, stderr io.Writer) error {
+func runCommandWithPlatformStreams(cmd *exec.Cmd, stdout, stderr io.Writer, afterStart ...func()) error {
 	sharedOutput := stderr != nil && sameCommandStreamWriter(stdout, stderr)
 	if stdout == nil {
 		stdout = io.Discard
@@ -56,6 +56,11 @@ func runCommandWithPlatformStreams(cmd *exec.Cmd, stdout, stderr io.Writer) erro
 
 	if err := cmd.Start(); err != nil {
 		return err
+	}
+	for _, started := range afterStart {
+		if started != nil {
+			started()
+		}
 	}
 	done := make(chan struct{})
 	copyResults := make(chan error, copyCount)

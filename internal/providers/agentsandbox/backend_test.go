@@ -63,7 +63,7 @@ func TestCreateClaimReturnsPersistedLocalLease(t *testing.T) {
 	backend.rt.Clock = fixedClock{now: now}
 	repo := testGitRepo(t)
 
-	leaseID, claimName, slug, ready, claim, unlock, err := backend.createClaim(context.Background(), fake, "returned-claim", repo, false)
+	leaseID, claimName, slug, ready, claim, unlock, err := backend.createClaim(context.Background(), fake, "returned-claim", repo, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestAmbiguousCreateRecoveryAdoptsExactClaimUID(t *testing.T) {
 		Metadata: objectMeta{
 			Name:        resourceName,
 			Namespace:   cfg.AgentSandbox.Namespace,
-			Labels:      claimLabels(leaseID, slug),
+			Labels:      claimLabels(cfg, leaseID, slug),
 			Annotations: claimAnnotationsWithRecoveryNonce(cfg, recoveryNonce),
 		},
 		Spec: map[string]any{"warmPoolRef": map[string]any{"name": cfg.AgentSandbox.WarmPool}},
@@ -225,7 +225,7 @@ func TestAmbiguousCreateRecoveryRefusesNonceMismatch(t *testing.T) {
 		Metadata: objectMeta{
 			Name:        resourceName,
 			Namespace:   cfg.AgentSandbox.Namespace,
-			Labels:      claimLabels(leaseID, slug),
+			Labels:      claimLabels(cfg, leaseID, slug),
 			Annotations: claimAnnotationsWithRecoveryNonce(cfg, recoveryNonce),
 		},
 		Spec: map[string]any{"warmPoolRef": map[string]any{"name": cfg.AgentSandbox.WarmPool}},
@@ -510,7 +510,7 @@ func TestRunKeepOnFailureRefreshesLeaseActivity(t *testing.T) {
 	if err == nil || result.ExitCode != 42 {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
-	claim, resolveErr := resolveLocalClaim(result.LeaseID)
+	claim, resolveErr := resolveLocalClaim(cfg, result.LeaseID)
 	if resolveErr != nil {
 		t.Fatal(resolveErr)
 	}
@@ -543,7 +543,7 @@ func TestRunKeepOnFailureRefreshesLeaseActivityAfterSetupFailure(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "setup failed") {
 				t.Fatalf("result=%#v err=%v", result, err)
 			}
-			claim, resolveErr := resolveLocalClaim(result.LeaseID)
+			claim, resolveErr := resolveLocalClaim(cfg, result.LeaseID)
 			if resolveErr != nil {
 				t.Fatal(resolveErr)
 			}
@@ -842,7 +842,7 @@ func TestStopLegacyClaimValidatesCurrentProviderScope(t *testing.T) {
 			Name:      resourceName,
 			Namespace: cfg.AgentSandbox.Namespace,
 			UID:       uid,
-			Labels:    claimLabels(leaseID, slug),
+			Labels:    claimLabels(cfg, leaseID, slug),
 			Annotations: map[string]string{
 				annotationScope:     scopeFingerprint("different-scope"),
 				annotationWorkdir:   cfg.AgentSandbox.Workdir,
@@ -961,7 +961,7 @@ func TestExistingRunReleasesClaimExpiringDuringReadiness(t *testing.T) {
 	if err := backend.Warmup(context.Background(), WarmupRequest{Repo: repo, RequestedSlug: "expiry-readiness"}); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := resolveLocalClaim("expiry-readiness")
+	claim, err := resolveLocalClaim(cfg, "expiry-readiness")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1002,7 +1002,7 @@ func TestStatusAndListReportRetainedTTLExpiry(t *testing.T) {
 	if err := backend.Warmup(context.Background(), WarmupRequest{Repo: repo, RequestedSlug: "expired-status"}); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := resolveLocalClaim("expired-status")
+	claim, err := resolveLocalClaim(cfg, "expired-status")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1038,7 +1038,7 @@ func TestStatusReportsControllerClaimExpiredCondition(t *testing.T) {
 			if err := backend.Warmup(context.Background(), WarmupRequest{Repo: repo, RequestedSlug: slug}); err != nil {
 				t.Fatal(err)
 			}
-			claim, err := resolveLocalClaim(slug)
+			claim, err := resolveLocalClaim(cfg, slug)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1079,7 +1079,7 @@ func TestStatusAndListReportDirectSandboxExpiry(t *testing.T) {
 	if err := backend.Warmup(context.Background(), WarmupRequest{Repo: repo, RequestedSlug: "sandbox-expired"}); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := resolveLocalClaim("sandbox-expired")
+	claim, err := resolveLocalClaim(cfg, "sandbox-expired")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1351,7 +1351,7 @@ func TestRunRejectsAndReleasesExpiredLiveClaimBeforeExec(t *testing.T) {
 	if fake.deletes != 1 {
 		t.Fatalf("deletes=%d want=1", fake.deletes)
 	}
-	if claim, readErr := resolveLocalClaim("expired-live"); readErr == nil || claim.LeaseID != "" {
+	if claim, readErr := resolveLocalClaim(cfg, "expired-live"); readErr == nil || claim.LeaseID != "" {
 		t.Fatalf("expired local claim retained: claim=%#v err=%v", claim, readErr)
 	}
 }

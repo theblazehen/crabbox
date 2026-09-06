@@ -2,20 +2,25 @@
 
 Read this when:
 
-- choosing `provider: agent-sandbox`;
+- choosing `provider: agent-sandbox` or `provider: agent-sandbox-ssh`;
 - configuring a Kubernetes-backed Agent Sandbox warm pool;
 - changing `internal/providers/agentsandbox`.
 
-Agent Sandbox is a delegated-run provider. Crabbox invokes `kubectl` against
+`agent-sandbox` is a delegated-run provider. Crabbox invokes `kubectl` against
 the configured cluster, creates a `SandboxClaim` from a configured
 `SandboxWarmPool`, waits for the resulting `Sandbox` and pod to become ready,
 archive-syncs the local repository through `kubectl exec` and `tar`, runs the
 command in the sandbox pod, and deletes the claim on release by default.
 
-There is no Crabbox SSH lease. Kubernetes and Agent Sandbox own the runtime,
+That archive variant has no Crabbox SSH lease. Kubernetes and Agent Sandbox own the runtime,
 sandbox pod, and command transport. Crabbox owns local config, repo claims,
 slug allocation, claim ownership labels and annotations, sync guardrails,
 timing summaries, and normalized `list` / `status` output.
+
+`agent-sandbox-ssh` is a separate SSH-lease provider using the same warm pools
+and configuration. It bootstraps a private SSH daemon in the claimed container
+and uses Crabbox's normal SSH sync and run path. Existing `agent-sandbox`
+claims are not converted or reused by the SSH variant.
 
 ## When To Use
 
@@ -24,9 +29,295 @@ wants Crabbox's local workflow, archive sync, repo claims, and command
 streaming against a warm pool. It fits short Linux command execution where a
 `SandboxClaim` is the durable unit of ownership.
 
-Use an SSH-lease provider such as AWS, Hetzner, KubeVirt, Incus, Static SSH, or
-Local Container when you need `crabbox ssh`, VNC, code-server, Actions runner
-hydration, Tailscale, or the normal SSH/rsync data plane.
+Use `agent-sandbox-ssh` when you want `crabbox ssh`, SSH/rsync repository sync,
+scripts, captures, and downloads against the same Kubernetes warm pool. It
+does not provision desktop, browser, code-server, or Tailscale capabilities;
+choose a provider advertising those features when you need them.
+
+## SSH Variant: `agent-sandbox-ssh`
+
+Select `provider: agent-sandbox-ssh` in the [config below](#config), or pass
+`--provider agent-sandbox-ssh`. Keep the same `agentSandbox` config block,
+`--agent-sandbox-*` flags, and `CRABBOX_AGENT_SANDBOX_*` environment variables;
+there is no separate SSH-variant flag namespace. For example:
+
+```sh
+crabbox warmup --provider agent-sandbox-ssh \
+  --agent-sandbox-context agent-cluster \
+  --agent-sandbox-namespace sandboxes \
+  --agent-sandbox-warm-pool linux-pool \
+  --agent-sandbox-container worker \
+  --slug linux-ssh-smoke
+# Keep these routing settings in trusted config, or repeat them on reuse.
+crabbox run --provider agent-sandbox-ssh --id linux-ssh-smoke -- go test ./...
+crabbox run --provider agent-sandbox-ssh --id linux-ssh-smoke \
+  --script ./scripts/check.sh --capture-stdout /tmp/check.stdout
+crabbox ssh --provider agent-sandbox-ssh --id linux-ssh-smoke
+crabbox stop --provider agent-sandbox-ssh linux-ssh-smoke
+```
+
+In addition to the Kubernetes prerequisites below, this variant requires:
+
+- Local OpenSSH, `ssh-keygen`, and rsync, plus the configured `kubectl`.
+  Generated SSH commands invoke the absolute path of the Crabbox executable
+  that generated them as their proxy. Keep that executable and the local lease
+  credentials available; a temporary build cannot be removed while its
+  generated commands are still in use.
+- RBAC `create` on `pods/portforward`, in addition to `pods/exec` and the
+  claim/discovery permissions below. `doctor --provider agent-sandbox-ssh`
+  checks the additional permission. No public SSH Service or ingress is needed.
+- A Linux amd64 (`x86_64`) container running as root, with an existing UID-0
+  `root` account and an absolute login shell resolving to an executable regular
+  file. Empty account shell fields default to `/bin/sh`. `false` and `nologin`
+  shells are rejected. The private daemon owns its root-shell policy and does
+  not require an `/etc/shells` entry; it does not change another daemon's policy.
+  The initializer never edits `/etc/passwd`, `/etc/shadow`, `/etc/group`, or
+  `/etc/shells`, unlocks an account, or creates a service account.
+- Initially available `uname`, `sh`, `mkdir`, `cat`, `chmod`, `rm`, and `rmdir`
+  for architecture detection, byte upload, and cleanup. `/tmp` must be writable
+  and allow execution. The workspace, private runtime/state paths, and any FHS
+  directories needing missing tool links must be writable. Private directory
+  ancestors must have safe root ownership and permissions.
+- An image `PATH` containing only nonempty absolute directories, and compatible
+  existing tools. A present tool that lacks required behavior is an error, not
+  permission to replace it or select a bundled copy earlier in `PATH`.
+
+### Additive initialization and SSH transport
+
+The existing authenticated Kubernetes exec channel uploads a Linux amd64
+static Go initializer to a new private directory under `/tmp`. The
+initializer contains a compressed static tool payload; no target package
+manager, package repository, shared-library installation, or Nix store is
+needed. A separate exec invokes it with JSON on stdin carrying the lease ID,
+client public key, and, on reuse, the expected host public key and port. The
+client private key stays local. The host private key is generated and retained
+only in the container; the returned host public key is pinned in the local
+private per-lease `known_hosts` file.
+
+The initializer stages a content-addressed runtime under
+`/opt/crabbox-runtime/<payload-sha256>`. It checks existing command paths and
+adds only missing `/bin` and `/usr/bin` symlinks, reusing a compatible image
+tool where available and otherwise pointing to the bundled static executable.
+Private SFTP and Git helper links live under `/usr/libexec`. Existing image
+files and symlinks are neither replaced nor shadowed; conflicting tools or
+helper paths fail initialization. The additions are visible to workloads and
+remain for the Pod's lifetime. They are not a separate control-only filesystem.
+
+A standalone Dropbear daemon runs independently of any existing SSH daemon,
+with key-only root authentication and password authentication disabled. Its
+host key, authorized keys, launch state, PID, and `dropbear.log` live under
+`/var/lib/crabbox-ssh/<lease-id>`. It selects an available unprivileged loopback
+port on first initialization and pins that port with the host key for reuse;
+there is no fixed SSH port requirement. Initialization never takes over an
+unrelated daemon or its port. Changes to the pinned identity, port, or owned
+daemon state are rejected rather than silently adopted.
+
+Every preparation uploads the full initializer again, including on reuse;
+verified installed runtime content and the matching lease endpoint are reused,
+not reinstalled or assigned a new identity. The temporary upload is removed
+after invocation. The amd64 initializer upload is approximately 36.2 MB, and
+its compressed embedded asset is approximately 33.4 MB. These are approximate
+artifact sizes, not total CLI binary sizes or a promise of incremental uploads.
+
+The daemon inherits the container's pod-exec environment rather than a bounded
+image-variable allowlist. Existing image `PATH` order is preserved; `/usr/bin`
+and `/bin` are appended only if absent, without prepending the private runtime.
+This does not forward the entire local client environment: local variables
+still use Crabbox's normal explicit environment-forwarding rules. Core SSH
+execution and bash-login-shell semantics are unchanged, so shell startup files
+can still affect the eventual workload environment.
+
+Kubernetes port-forwarding supplies the SSH transport, with claim, Sandbox,
+pod, and container identity checks. SSH then carries repository sync, command
+execution, scripts, captures, and downloads through the existing core paths.
+`agentSandbox.workdir` is the SSH work root; the run output prints the actual
+lease/repository workdir beneath it. The image entrypoint and existing
+processes, including Docker and unrelated SSH daemons, are not replaced. No
+image rebuild, Pod-template mount changes, cluster rollout, Mutagen, or
+`sandboxd` is involved in initialization.
+
+This is a bounded supported-image contract, not an arbitrary-image adapter:
+non-root, read-only-rootfs, shell-free/distroless, incompatible account/shell,
+and incompatible-existing-tool images are rejected. Only Linux amd64 is
+supported; other architectures are rejected before upload. The variant is
+direct-only. It retains the shared TTL and UID-guarded claim cleanup rules.
+With `agentSandbox.deleteOnRelease: false`, release retains the claim and its
+SSH credentials rather than deleting them.
+
+### Bundled tool limits
+
+The payload supplies Bash, core shell/process utilities, rsync, Python and its
+standard library, tar/gzip, a minimal Git with HTTP(S) helpers and CA data,
+Dropbear, and an SFTP server. It is not a complete development environment:
+
+- Bundled Git provides built-in commands and HTTP(S) transport, not Git's
+  shell/Perl command suite or a full distribution Git installation.
+- Its libcurl has no Unicode hostname conversion; use ASCII or punycode
+  hostnames. It also lacks libpsl cookie public-suffix checking and libcurl
+  SCP/SFTP transport. The SSH daemon's SFTP subsystem is independently
+  supported; it does not rely on libcurl.
+- Bundled tar does not preserve POSIX ACLs.
+
+Compatible existing image tools remain in use and retain their own features;
+the bundle does not upgrade or replace them.
+
+### Building and checking the runtime
+
+From the repository root, use the pinned Nix development environment and
+runtime derivations through the build script:
+
+```sh
+bash scripts/build-agent-sandbox-runtime.sh
+# Equivalent explicit architecture selection:
+bash scripts/build-agent-sandbox-runtime.sh amd64
+```
+
+The script requires Nix with flakes/development-shell support and fetch access
+to its pinned sources or caches. It supplies build tooling, checks payload ELF
+architecture/static linkage and portable paths without executing payload code,
+and generates `internal/providers/agentsandbox/assets/initializer-linux-amd64.gz`
+for embedding in the CLI. Do not run concurrent producers: the build uses
+`runtimes/agent-sandbox/payload.tar.gz` as a fixed intermediate, and the script
+enforces an exclusive build lock. Only amd64 is accepted. Rebuild the CLI after
+regenerating assets.
+
+The Dropbear build includes a root-only shell-policy patch. For the existing
+UID-0 `root` account, it accepts an absolute executable regular-file shell
+without consulting the image's `/etc/shells`; `false` and `nologin` remain
+rejected. Earlier account checks and the normal public-key authentication path
+remain intact. This changes only the bundled private daemon, not the image's
+account files, global shell policy, or unrelated SSH services.
+
+The build also makes a narrow upstream numeric-bound adjustment:
+`MAX_CMD_LEN` in `src/sysoptions.h` changes from 9,000 bytes to 256 KiB. That
+upstream definition is unguarded, so it requires a checked source substitution
+rather than a `localoptions.h` override. `RECV_MAX_PAYLOAD_LEN` is configured as
+that bound plus 1 KiB for exec-request framing. Core sync now uploads generated
+shell programs separately, but normal workload/ownership command wrappers can
+still exceed the original limit. The numeric adjustment keeps a finite bound
+without changing command parsing or authentication; it does not remove
+operating-system argument-size limits.
+
+Separately, POSIX core SSH sync stages generated scripts and their workspace
+ownership checks in exclusive private `/tmp/crabbox-sync-script-*` directories,
+then invokes a short `/bin/sh` command with sync data on stdin. Cleanup is
+ownership-guarded and runs on success or failure. This is shared core behavior,
+not an Agent Sandbox-specific command rewrite; normal workload execution and
+Windows sync are unchanged. It keeps large sync source out of SSH exec
+requests, rather than depending on the bundled daemon's larger command bound.
+
+The Docker smoke requires native Linux amd64, a working Docker daemon, local
+`ssh`, `ssh-keygen`, `sftp`, rsync, and Python 3. Generate matching initializer
+and intermediate payload artifacts before running it:
+
+```sh
+bash scripts/build-agent-sandbox-runtime.sh amd64
+uv run --no-project scripts/test-agent-sandbox-runtime.py
+# Optional: build the CLI and also exercise its core SSH sync/run path.
+env CGO_ENABLED=0 go build -trimpath -o bin/crabbox ./cmd/crabbox
+uv run --no-project scripts/test-agent-sandbox-runtime.py --crabbox bin/crabbox
+# Alternate matching artifacts or image references:
+uv run --no-project scripts/test-agent-sandbox-runtime.py \
+  --initializer internal/providers/agentsandbox/assets/initializer-linux-amd64.gz \
+  --payload runtimes/agent-sandbox/payload.tar.gz \
+  --debian-image debian:bookworm-slim --alpine-image alpine:3.22
+```
+
+The harness creates disposable Docker containers and fixture processes and
+cleans up those it owns. Image pulls and the HTTPS Git check need network
+access; runtime installation itself does not download packages. The Debian
+case expects success; the raw Alpine case expects rejection for incompatible
+existing `ps`/`flock`, not automatic replacement.
+
+The optional `--crabbox` mode requires an existing executable CLI and local Git
+including `git-http-backend` (plus Go to build the CLI as above). It uses isolated local config/state and
+`provider=ssh` against the initialized Debian fixture with its pinned host key.
+It checks initial `--sync-only` and changed/deleted-file resync with SSH exec
+requests bounded to 9,000 bytes. Separate normal `--id --no-sync` workloads
+check literal argv/environment/cwd, stdout capture, exact-byte downloads,
+reuse, and exit status under the bundled daemon's 256 KiB bound. It does not
+claim every CLI command fits the original 9,000-byte limit. This is a separate
+core SSH-path check, not an
+`agent-sandbox-ssh` Kubernetes lifecycle or port-forwarding check.
+
+The same mode runs `scripts/agent_sandbox_git_smoke.py` against a real local
+smart-HTTP Git origin with filtering advertised. The runner and host-networked
+Debian container share that loopback endpoint; SSH, Git and rsync are not
+mocked. Separate static leases exercise ordinary Git seeding and opt-in
+`sync.gitOverlay`, rejecting unintended manifest fallback through CLI timing
+reports and checking remote origin, HEAD, index tree, exact file bytes/types,
+executable bits, status and completed sync metadata. It checks unchanged
+fingerprint reuse without HTTP fetch, dirty tracked/untracked/deleted paths,
+symlink changes, fetching the next committed revision, and full-resync/reseed.
+Full resync intentionally selects ordinary manifest sync even when overlay is
+enabled. Phase stdout/stderr remain in the fixture's temporary directory;
+owned leases, remote workspaces and the HTTP server are cleaned up.
+
+The same mode also runs `scripts/agent_sandbox_workflow_smoke.py`: initial and
+changed/deleted-file sync, unchanged fingerprint reuse, full-resync removal of
+stale workspace state, standalone scripts with literal arguments and binary
+workload stdin, ordinary commands with line stdin, and source-only
+`--script-stdin`. It checks exact stdout/stderr captures, binary downloads,
+exit status 37, and two local Actions hydration runs with changed source and
+step-to-step/environment handoff into a reused workload. Each phase checks
+workspace-owner release and return of sync staging to its baseline; owned
+leases and fixture state are cleaned up.
+
+Verified scope: the Debian bookworm-slim amd64 runtime smoke passed pinned
+key-only SSH and foreign-key rejection, exit status, exec above 16 KiB, literal argv/environment,
+PTY, rsync, SFTP, Git commit/reset/HTTPS, tar/gzip, TCP forwarding, and endpoint
+reuse. It also verified original tools/account files and an unrelated SSH
+daemon remained intact. Existing root `/bin/bash` worked both without
+`/etc/shells` and with a nonmatching shell list, preserving the original account
+and tool files and unrelated SSH service. Raw Alpine 3.22 was correctly
+rejected while preserving those originals. The native payload passed its
+24-static-ELF build gate. Provider and initializer Go race tests and the
+targeted uploaded-sync-script tests passed.
+
+The optional actual core CLI smoke also passed against initialized Debian:
+initial and changed/deleted-file sync requests peaked at 8,498 bytes; separate
+normal no-sync workload requests peaked at 12,454 bytes while proving literal
+argv/environment/cwd, exact-byte downloads, reuse, and exit status 37. Those
+measurements describe the fixture, not universal maximum command sizes.
+
+The additional script/input/capture/download/full-resync and two-run local
+Actions hydration matrix above also passed through the real CLI against the
+bundled Debian daemon. POSIX workload stdin now reaches only workload
+execution, not upload, sync, or ownership controls, and is not replayed;
+`--script-stdin` remains script source without a separate runtime input stream.
+Native Windows, WSL, and delegated-provider input paths are unchanged. This
+does not establish live Windows or additional Kubernetes lifecycle coverage.
+
+The real smart-HTTP Git lane also passed all of the scenarios above against
+the bundled Debian daemon: successful ordinary seed and Git overlay, both
+unchanged reuse modes, dirty overlay bytes/types/status, committed advancement
+and full-resync/reseed. This establishes successful Git workflow execution
+through the public CLI's static-SSH path, independently of the earlier Nix
+run's Git-seed fallback described below.
+
+Separately, real `agent-sandbox-ssh` validation passed against the existing Nix
+warm-pool worker with the final amd64-only CLI: warmup took 12.877 seconds,
+2,238 repository files (96.8 MiB) synced, and Python asserted literal
+argv/environment and the exact nested working directory. Local checks verified
+an 870-byte stdout capture and exact 7,955-byte binary download. The same
+pinned port, 42987, was reused successfully; that observed port is not a
+configured default. A subsequent 65-second workload stayed connected through
+renewal, returned exactly exit status 37, and released its workspace owner.
+Docker 29.6.2 remained usable. `/etc/passwd` and
+`/etc/group` remained their original Nix-store symlinks; `/etc/shadow`,
+`/etc/gshadow`, and `/etc/shells` remained absent, with root still using
+`/bin/bash`. The worker image matched the untouched archive-provider runner;
+comparisons of those five account/policy paths matched byte hashes, symlink
+targets, modes, UID/GID, and absence against that untouched runner. No account,
+image, or template change was needed.
+
+This live run used the existing plain-manifest sync fallback after a Git-seed
+warning, so it does not prove metadata-based Git seeding. An initial run failed
+closed on workspace renewal/context cancellation; an unchanged retry passed,
+not evidence of a diagnosed or fixed cause. This verifies that worker image
+and exercised paths, not arbitrary Nix images or failure-free operation. The
+Docker runtime/static-SSH harness and the archive provider's live smoke below
+remain distinct from this Kubernetes-provider proof.
 
 ## Prerequisites
 
@@ -50,7 +341,7 @@ hydration, Tailscale, or the normal SSH/rsync data plane.
   - `get` on `sandboxes`
   - `get` and `list` on pods
   - `create` on `pods/exec`
-- A sandbox image that provides `/bin/sh`, `bash`, `tar`, `cp`, and a writable
+- For the archive variant, a sandbox image that provides `/bin/sh`, `bash`, `tar`, `cp`, and a writable
   workdir. Crabbox uses `/bin/sh` for transport scripts and `bash -lc` for
   user shell-mode and auto-shell commands.
   Quoted and interpolated profile arguments remain literal through the stdin
@@ -75,6 +366,8 @@ Official project and release references:
 - [Agent Sandbox v0.5.0rc1 release](https://github.com/kubernetes-sigs/agent-sandbox/releases/tag/v0.5.0rc1)
 
 ## Commands
+
+These examples select the original archive/exec provider:
 
 ```sh
 crabbox doctor --provider agent-sandbox
@@ -118,6 +411,10 @@ A `run` without `--id` creates a claim and deletes it after the command unless
 reuse/retention state, and exact cleanup command for orchestration handoff.
 
 ## Config
+
+Both variants use this configuration; change only `provider` to
+`agent-sandbox-ssh` to select SSH for new leases. `execTimeoutSecs` bounds
+provider pod-exec operations, including SSH bootstrap, not SSH workload runtime.
 
 ```yaml
 provider: agent-sandbox
@@ -186,6 +483,10 @@ such as `/`, `/tmp`, `/usr`, `/var`, or `/home`. `namespace`, `warmPool`, and
 
 ## Lifecycle
 
+The sequence below describes `agent-sandbox` archive/exec operations. The SSH
+variant shares claim acquisition, readiness, and guarded release, but replaces
+steps 4–5 with SSH bootstrap and the core SSH sync/run workflow above.
+
 1. `doctor` uses `kubectl` discovery, verifies the exact `v1beta1` Agent
    Sandbox resources, verifies the configured warm pool, and checks the
    required RBAC verbs. It does not create a claim.
@@ -240,7 +541,8 @@ waiting for missing downstream resources.
 
 ## Claim Scope And Cleanup Safety
 
-Local claim IDs use the `asbx_` prefix. The provider scope includes the
+Both variants' local claim IDs use the `asbx_` prefix. Provider identity keeps
+their claims separate. The provider scope includes the
 kubeconfig identity, context, namespace, warm pool, and container. Reusing,
 listing, status-checking, stopping, or cleaning up a retained claim only
 matches claims from the same scope. Kubernetes stores only a SHA-256
@@ -248,7 +550,8 @@ fingerprint of that scope, not the local kubeconfig path.
 
 Before deleting a live `SandboxClaim`, Crabbox verifies:
 
-- `crabbox.dev/provider=agent-sandbox`
+- `crabbox.dev/provider` matches the selected variant (`agent-sandbox` or
+  `agent-sandbox-ssh`)
 - `crabbox.dev/lease-id=<local lease id>`
 - `crabbox.dev/provider-scope=<SHA-256 scope fingerprint>`
 - the current `metadata.uid` matches the UID pinned in the local claim
@@ -278,6 +581,9 @@ enabled, and reports every skipped or removed claim.
 
 ## Capabilities
 
+The following list applies to the original `agent-sandbox` archive variant;
+see [SSH Variant](#ssh-variant-agent-sandbox-ssh) for the SSH provider.
+
 - SSH: no.
 - Crabbox sync: yes, delegated archive upload and `tar` extraction through pod
   exec.
@@ -291,7 +597,7 @@ enabled, and reports every skipped or removed claim.
 
 ## Gotchas
 
-- `--actions-runner` and Tailscale options are rejected because the provider is
+- For `agent-sandbox`, `--actions-runner` and Tailscale options are rejected because the provider is
   delegated-run only.
 - `kubectl` is a runtime prerequisite, but Crabbox does not embed the
   Kubernetes Go client libraries. This keeps the CLI dependency and binary

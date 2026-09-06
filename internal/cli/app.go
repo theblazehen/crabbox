@@ -41,6 +41,8 @@ func (a App) Run(ctx context.Context, args []string) error {
 		return a.webVNCDaemonSupervisor(ctx, args[1:])
 	case "__namespace-instance-proxy":
 		return a.namespaceInstanceProxy(ctx, args[1:])
+	case "__provider-ssh-proxy":
+		return a.providerSSHProxy(ctx, args[1:])
 	case "__phala-proxy":
 		return a.phalaProxy(ctx, args[1:])
 	case "__herdr-plugin":
