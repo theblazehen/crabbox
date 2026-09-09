@@ -157,10 +157,11 @@ func (f *fakeKubernetesClient) Create(_ context.Context, ref resourceRef, namesp
 			f.pods = map[string][]podState{}
 		}
 		f.pods[namespace+"/claim="+obj.Metadata.Name] = []podState{{
-			Name:       podName,
-			UID:        "uid-" + podName,
-			Labels:     map[string]string{agentSandboxClaimUIDLabel: created.Metadata.UID},
-			Containers: []string{testPodContainer(obj.Metadata.Annotations[annotationContainer])},
+			Name:         podName,
+			UID:          "uid-" + podName,
+			Labels:       map[string]string{agentSandboxClaimUIDLabel: created.Metadata.UID},
+			Containers:   []string{testPodContainer(obj.Metadata.Annotations[annotationContainer])},
+			ContainerIDs: map[string]string{testPodContainer(obj.Metadata.Annotations[annotationContainer]): "containerd://" + podName},
 			OwnerReferences: []ownerReference{{
 				APIVersion: agentSandboxCoreGroupVersion,
 				Kind:       "Sandbox",
@@ -505,6 +506,80 @@ func TestSandboxReadinessPreservesDiagnostics(t *testing.T) {
 	}
 }
 
+func TestPodRuntimeIDsDecodeBySelectedContainerName(t *testing.T) {
+	var object kubernetesObject
+	if err := json.Unmarshal([]byte(`{
+		"metadata":{"name":"pod-a","annotations":{"kubectl.kubernetes.io/default-container":"worker"}},
+		"spec":{"containers":[{"name":"sidecar"},{"name":"worker"}]},
+		"status":{"containerStatuses":[
+			{"name":"worker","containerID":"containerd://worker-runtime"},
+			{"name":"sidecar","containerID":"containerd://sidecar-runtime"}
+		]}
+	}`), &object); err != nil {
+		t.Fatal(err)
+	}
+	pod := podStateFromObject(object)
+	for _, pinned := range []string{"", "sidecar"} {
+		container, err := resolvePodContainer(pod, pinned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready := newSandboxReadiness(sandboxResourceReadiness{Sandbox: &kubernetesObject{}}, pod, claimIdentity{}, container)
+		want := "containerd://worker-runtime"
+		if pinned == "sidecar" {
+			want = "containerd://sidecar-runtime"
+		}
+		if ready.ContainerID != want {
+			t.Fatalf("selected %q runtime=%q want %q", container, ready.ContainerID, want)
+		}
+	}
+}
+
+func TestSandboxReadinessRevalidatesSelectedContainerRuntime(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		before     string
+		after      string
+		replaced   bool
+		podChanged bool
+	}{
+		{name: "same runtime", before: "containerd://old", after: "containerd://old"},
+		{name: "restarted container", before: "containerd://old", after: "containerd://new", replaced: true},
+		{name: "runtime disappeared", before: "containerd://old", replaced: true},
+		{name: "archive without runtime"},
+		{name: "runtime first observed", after: "containerd://new"},
+		{name: "pod replacement remains fatal", before: "containerd://old", after: "containerd://new", podChanged: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := core.BaseConfig()
+			cfg.AgentSandbox.Namespace = "sandboxes"
+			cfg.AgentSandbox.WarmPool = "linux-pool"
+			fake := readyFakeClient(cfg)
+			pod := &fake.pods["sandboxes/app=agent-sandbox"][0]
+			pod.Containers = []string{"default", "sidecar"}
+			pod.ContainerIDs = map[string]string{"default": tt.before, "sidecar": "containerd://sidecar-old"}
+			ready, err := sandboxReadinessOnce(context.Background(), fake, "sandboxes", "claim-a", fakeClaimIdentity(cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pod.ContainerIDs["default"] = tt.after
+			pod.ContainerIDs["sidecar"] = "containerd://sidecar-new"
+			if tt.podChanged {
+				pod.UID = "uid-pod-replacement"
+			}
+			err = revalidateSandboxReadiness(context.Background(), fake, "sandboxes", ready)
+			var runtimeChanged containerRuntimeChangedError
+			var identityChanged resourceIdentityError
+			if errors.As(err, &runtimeChanged) != tt.replaced || errors.As(err, &identityChanged) != tt.podChanged {
+				t.Fatalf("revalidation error=%T %v", err, err)
+			}
+			if !tt.replaced && !tt.podChanged && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestWaitForSandboxReadinessRetriesTransientKubernetesErrors(t *testing.T) {
 	cfg := core.BaseConfig()
 	cfg.AgentSandbox.Context = "agent-context"
@@ -784,6 +859,11 @@ func TestExecPodRevalidatesPinnedDownstreamUIDs(t *testing.T) {
 			err = backend.execPod(context.Background(), fake, ready, podExecRequest{Command: []string{"true"}})
 			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 				t.Fatalf("err=%v want substring %q", err, tt.wantError)
+			}
+			var identityChanged resourceIdentityError
+			var runtimeChanged containerRuntimeChangedError
+			if !errors.As(err, &identityChanged) || errors.As(err, &runtimeChanged) {
+				t.Fatalf("ownership change must remain fatal, got %T: %v", err, err)
 			}
 			if len(fake.execs) != 1 {
 				t.Fatalf("replacement reached exec: %#v", fake.execs)
@@ -1220,10 +1300,11 @@ func readyFakeClient(cfg Config) *fakeKubernetesClient {
 		rbac: map[string]bool{},
 		pods: map[string][]podState{
 			"sandboxes/app=agent-sandbox": {{
-				Name:       "pod-a",
-				UID:        "uid-pod-a",
-				Labels:     map[string]string{agentSandboxClaimUIDLabel: identity.UID},
-				Containers: []string{testPodContainer(cfg.AgentSandbox.Container)},
+				Name:         "pod-a",
+				UID:          "uid-pod-a",
+				Labels:       map[string]string{agentSandboxClaimUIDLabel: identity.UID},
+				Containers:   []string{testPodContainer(cfg.AgentSandbox.Container)},
+				ContainerIDs: map[string]string{testPodContainer(cfg.AgentSandbox.Container): "containerd://pod-a"},
 				OwnerReferences: []ownerReference{{
 					APIVersion: agentSandboxCoreGroupVersion,
 					Kind:       "Sandbox",

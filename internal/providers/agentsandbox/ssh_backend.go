@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -23,10 +24,76 @@ func (b *sshLeaseBackend) Doctor(ctx context.Context, req DoctorRequest) (Doctor
 	return b.lifecycle.Doctor(ctx, req)
 }
 func (b *sshLeaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseView, error) {
-	return b.lifecycle.List(ctx, req)
+	views, err := b.lifecycle.List(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	for i := range views {
+		view := &views[i]
+		view.Labels["pod_ready"] = fmt.Sprint(view.Status == statusViewReady)
+		view.Labels["ssh_ready"] = "false"
+		if view.Status != statusViewReady {
+			continue
+		}
+		claim, err := resolveLocalClaim(b.lifecycle.cfg, view.Labels["lease"])
+		if err == nil {
+			err = b.lifecycle.sshHealth(ctx, claim)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil {
+			view.Status = "ssh-unavailable"
+			view.Labels["state"] = view.Status
+			view.Labels["reason"] = err.Error()
+		} else {
+			view.Labels["ssh_ready"] = "true"
+		}
+	}
+	return views, nil
 }
 func (b *sshLeaseBackend) Status(ctx context.Context, req StatusRequest) (StatusView, error) {
-	return b.lifecycle.Status(ctx, req)
+	if req.Wait {
+		timeout := req.WaitTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Minute
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	for {
+		view, err := b.lifecycle.Status(ctx, req)
+		if err != nil {
+			return StatusView{}, err
+		}
+		view.Labels["pod_ready"] = fmt.Sprint(view.Ready)
+		view.Labels["ssh_ready"] = "false"
+		if !view.Ready {
+			return view, nil
+		}
+		claim, err := resolveLocalClaim(b.lifecycle.cfg, req.ID)
+		if err == nil {
+			err = b.lifecycle.sshHealth(ctx, claim)
+		}
+		if ctx.Err() != nil {
+			return StatusView{}, ctx.Err()
+		}
+		if err == nil {
+			view.Labels["ssh_ready"] = "true"
+			return view, nil
+		}
+		view.State, view.Ready = "ssh-unavailable", false
+		view.Labels["reason"] = err.Error()
+		if !req.Wait {
+			return view, nil
+		}
+		select {
+		case <-ctx.Done():
+			return StatusView{}, ctx.Err()
+		case <-time.After(agentSandboxStatusPoll):
+		}
+	}
 }
 func (b *sshLeaseBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
 	return b.lifecycle.Cleanup(ctx, req)
@@ -186,6 +253,22 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 		lease.SSH, err = lifecycle.sshTarget(claim)
 		if err != nil && !req.StatusOnly {
 			return core.LeaseTarget{}, err
+		}
+		if err == nil {
+			err = lifecycle.probeSSH(ctx, client, ready, claim)
+		}
+		if ctx.Err() != nil {
+			return core.LeaseTarget{}, ctx.Err()
+		}
+		lease.Server.Labels["pod_ready"] = "true"
+		lease.Server.Labels["ssh_ready"] = fmt.Sprint(err == nil)
+		if err != nil {
+			if !req.StatusOnly {
+				return core.LeaseTarget{}, err
+			}
+			lease.Server.Status = "ssh-unavailable"
+			lease.Server.Labels["state"] = lease.Server.Status
+			lease.Server.Labels["reason"] = err.Error()
 		}
 		core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
 		return lease, nil

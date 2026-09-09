@@ -35,10 +35,8 @@ const runtimeParent = "/opt/crabbox-runtime"
 const stateParent = "/var/lib/crabbox-ssh"
 
 type request struct {
-	LeaseID         string `json:"lease_id"`
-	PublicKey       string `json:"public_key"`
-	ExpectedHostKey string `json:"expected_host_key"`
-	ExpectedPort    string `json:"expected_port"`
+	LeaseID   string `json:"lease_id"`
+	PublicKey string `json:"public_key"`
 }
 
 func main() {
@@ -86,14 +84,14 @@ func initialize(input io.Reader, output io.Writer) error {
 	if err := installTools(runtimeRoot, state, environment); err != nil {
 		return err
 	}
-	hostKey, err := prepareHostKey(runtimeRoot, state, r.ExpectedHostKey)
+	hostKey, err := prepareHostKey(runtimeRoot, state)
 	if err != nil {
 		return err
 	}
 	if err := ensurePrivateContents(filepath.Join(state, "authorized_keys"), []byte(r.PublicKey+"\n")); err != nil {
 		return err
 	}
-	port, err := startDaemon(runtimeRoot, state, hostKey, r.ExpectedPort, environment)
+	port, err := startDaemon(runtimeRoot, state, hostKey, environment)
 	if err != nil {
 		return err
 	}
@@ -133,10 +131,6 @@ func decodeRequest(input io.Reader) (request, error) {
 			destination = &r.LeaseID
 		case "public_key":
 			destination = &r.PublicKey
-		case "expected_host_key":
-			destination = &r.ExpectedHostKey
-		case "expected_port":
-			destination = &r.ExpectedPort
 		default:
 			return r, fmt.Errorf("unknown initialization field %q", name)
 		}
@@ -162,18 +156,6 @@ func decodeRequest(input io.Reader) (request, error) {
 	r.PublicKey, err = canonicalKey(r.PublicKey)
 	if err != nil {
 		return r, fmt.Errorf("public_key: %w", err)
-	}
-	if r.ExpectedHostKey != "" {
-		r.ExpectedHostKey, err = canonicalKey(r.ExpectedHostKey)
-		if err != nil {
-			return r, fmt.Errorf("expected_host_key: %w", err)
-		}
-	}
-	if r.ExpectedPort != "" && !validPort(r.ExpectedPort) {
-		return r, errors.New("expected_port must be canonical decimal 1024..65535")
-	}
-	if (r.ExpectedHostKey == "") != (r.ExpectedPort == "") {
-		return r, errors.New("expected_host_key and expected_port must be provided together")
 	}
 	return r, nil
 }
@@ -846,12 +828,9 @@ func (b *boundedBuffer) Write(data []byte) (int, error) {
 	return n, nil
 }
 
-func prepareHostKey(root, state, expected string) (string, error) {
+func prepareHostKey(root, state string) (string, error) {
 	keyfile := filepath.Join(state, "host_ed25519")
 	if _, err := privateRead(keyfile); errors.Is(err, os.ErrNotExist) {
-		if expected != "" {
-			return "", errors.New("pinned host private key disappeared; refusing to generate a replacement")
-		}
 		temporary, err := os.MkdirTemp(state, ".host-key-*")
 		if err != nil {
 			return "", err
@@ -889,9 +868,6 @@ func prepareHostKey(root, state, expected string) (string, error) {
 	}
 	if public == "" {
 		return "", errors.New("dropbearkey did not return an ed25519 host public key")
-	}
-	if expected != "" && expected != public {
-		return "", errors.New("host key differs from the pinned lease identity")
 	}
 	return public, nil
 }
@@ -990,7 +966,7 @@ func verifyListener(port, expected string) error {
 	return fmt.Errorf("private SSH listener verification: %w", err)
 }
 
-func startDaemon(root, state, hostKey, expectedPort string, environment []string) (string, error) {
+func startDaemon(root, state, hostKey string, environment []string) (string, error) {
 	binary := filepath.Join(root, "bin/dropbear")
 	portfile := filepath.Join(state, "port")
 	port := ""
@@ -1002,13 +978,7 @@ func startDaemon(root, state, hostKey, expectedPort string, environment []string
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if expectedPort != "" {
-		if port != "" && port != expectedPort {
-			return "", errors.New("stored SSH port differs from pinned endpoint")
-		}
-		port = expectedPort
-	}
-	pinnedPort := port != ""
+	storedPort := port != ""
 	if port != "" {
 		_, live, err := ownDaemon(binary, state, port)
 		if err != nil {
@@ -1026,7 +996,7 @@ func startDaemon(root, state, hostKey, expectedPort string, environment []string
 		return "", err
 	}
 	for range 8 {
-		if !pinnedPort {
+		if !storedPort {
 			listener, err := net.Listen("tcp4", "127.0.0.1:0")
 			if err != nil {
 				return "", err
@@ -1112,7 +1082,7 @@ func startDaemon(root, state, hostKey, expectedPort string, environment []string
 			}
 		}
 		detail := daemonLogSince(filepath.Join(state, "dropbear.log"), position)
-		if !pinnedPort && exited && strings.Contains(detail, "Address already in use") {
+		if !storedPort && exited && strings.Contains(detail, "Address already in use") {
 			if err := os.Remove(pidfile); err != nil && !os.IsNotExist(err) {
 				return "", err
 			}

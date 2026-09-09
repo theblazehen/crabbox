@@ -355,20 +355,147 @@ func TestSSHProxyRejectsMissingOrInvalidPortBeforeClientCreation(t *testing.T) {
 	}
 }
 
-func TestSSHProxyRejectsClaimUIDChangeBeforeAndAfterForwarding(t *testing.T) {
-	for _, phase := range []string{"before", "after"} {
-		t.Run(phase, func(t *testing.T) {
-			b, fake := testSSHBackend(t)
-			claim := createSSHTestClaim(t, b, fake)
-			labels := cloneStringMap(claim.Labels)
-			labels[claimLabelSSHPort] = "43210"
-			claim, err := updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+func TestSSHReadOnlyHealthRequiresPinnedAuthenticatedEndpoint(t *testing.T) {
+	for _, scenario := range []string{"healthy", "wrong host key", "rejected client key", "daemon absent", "container restarted"} {
+		t.Run(scenario, func(t *testing.T) {
+			lifecycle, client, ready, claim := newSSHBootstrapTestSetup(t)
+			b := &sshLeaseBackend{lifecycle: lifecycle}
+			_, hostPrivate, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hostSigner, err := xssh.NewSignerFromKey(hostPrivate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.output = bootstrapTestOutput(strings.TrimSpace(string(xssh.MarshalAuthorizedKey(hostSigner.PublicKey()))), "43210")
+			claim, err = lifecycle.prepareSSH(t.Context(), client, ready, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := lifecycle.sshTarget(claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			priorTrust, err := os.ReadFile(target.KnownHostsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, publicKey, err := core.EnsureTestboxKey(claim.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorized, _, _, _, err := xssh.ParseAuthorizedKey([]byte(publicKey))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "wrong host key" {
+				_, private, err := ed25519.GenerateKey(rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				hostSigner, err = xssh.NewSignerFromKey(private)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "container restarted" {
+				client.pods[lifecycle.cfg.AgentSandbox.Namespace+"/claim="+ready.ClaimName][0].ContainerIDs[ready.Container] = "containerd://restarted"
+			}
+			serverConfig := &xssh.ServerConfig{PublicKeyCallback: func(meta xssh.ConnMetadata, key xssh.PublicKey) (*xssh.Permissions, error) {
+				if scenario == "rejected client key" || meta.User() != "root" || !bytes.Equal(key.Marshal(), authorized.Marshal()) {
+					return nil, errors.New("unauthorized client")
+				}
+				return nil, nil
+			}}
+			serverConfig.AddHostKey(hostSigner)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, port, _ := net.SplitHostPort(listener.Addr().String())
+			if scenario == "daemon absent" {
+				listener.Close()
+			}
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				for {
+					tcp, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					conn, channels, requests, err := xssh.NewServerConn(tcp, serverConfig)
+					if err == nil {
+						go xssh.DiscardRequests(requests)
+						for channel := range channels {
+							t.Error("read-only health attempted to open an SSH channel")
+							channel.Reject(xssh.Prohibited, "read-only health")
+						}
+						conn.Close()
+					}
+					tcp.Close()
+				}
+			}()
+			defer func() { listener.Close(); <-serverDone }()
+			lifecycle.rt.Exec = sshTransportRunnerFunc(func(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+				fmt.Fprintf(req.Stdout, "Forwarding from 127.0.0.1:%s -> 43210\n", port)
+				<-ctx.Done()
+				return LocalCommandResult{}, ctx.Err()
+			})
+			bootstrapExecs := len(client.execs)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			view, err := b.Status(ctx, StatusRequest{ID: claim.LeaseID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReady := scenario == "healthy"
+			if view.Ready != wantReady || view.Labels["pod_ready"] != "true" || view.Labels["ssh_ready"] != fmt.Sprint(wantReady) {
+				t.Fatalf("incorrect readiness: %#v", view)
+			}
+			lease, err := b.Resolve(ctx, core.ResolveRequest{ID: claim.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil || (lease.Server.Status == statusViewReady) != wantReady {
+				t.Fatalf("inspect readiness=%#v, err=%v", lease.Server, err)
+			}
+			views, err := b.List(ctx, ListRequest{})
+			if err != nil || len(views) != 1 || (views[0].Status == statusViewReady) != wantReady {
+				t.Fatalf("list readiness=%#v, err=%v", views, err)
+			}
+			stored, err := readLeaseClaim(claim.LeaseID)
+			if err != nil || !reflect.DeepEqual(stored, claim) {
+				t.Fatalf("read-only health changed claim: %#v, %v", stored, err)
+			}
+			trust, err := os.ReadFile(target.KnownHostsFile)
+			if err != nil || !bytes.Equal(trust, priorTrust) || len(client.execs) != bootstrapExecs {
+				t.Fatalf("read-only health bootstrapped or repinned: %v", err)
+			}
+		})
+	}
+}
+
+func TestSSHProxyRejectsIdentityChangesBeforeAndAfterForwarding(t *testing.T) {
+	for _, scenario := range []string{"before claim", "after claim", "before container", "after container"} {
+		t.Run(scenario, func(t *testing.T) {
+			parts := strings.Split(scenario, " ")
+			phase, identity := parts[0], parts[1]
+			lifecycle, client, ready, claim := newSSHBootstrapTestSetup(t)
+			b := &sshLeaseBackend{lifecycle: lifecycle}
+			fake := client.fakeKubernetesClient
+			claim, err := lifecycle.prepareSSH(t.Context(), client, ready, claim)
 			if err != nil {
 				t.Fatal(err)
 			}
 			live := fake.objects[sandboxClaimResource+"/"+b.lifecycle.cfg.AgentSandbox.Namespace+"/"+claimNameFromLocalClaim(claim)]
+			mutate := func() {
+				if identity == "claim" {
+					live.Metadata.UID = "replacement-claim-uid"
+				} else {
+					fake.pods[lifecycle.cfg.AgentSandbox.Namespace+"/claim="+ready.ClaimName][0].ContainerIDs[ready.Container] = "containerd://replacement"
+				}
+			}
 			if phase == "before" {
-				live.Metadata.UID = "replacement-claim-uid"
+				mutate()
 			}
 			started := false
 			reaped := make(chan struct{})
@@ -377,7 +504,7 @@ func TestSSHProxyRejectsClaimUIDChangeBeforeAndAfterForwarding(t *testing.T) {
 				if req.Args[len(req.Args)-1] != ":43210" {
 					t.Errorf("proxy ignored persisted port: args=%q", req.Args)
 				}
-				live.Metadata.UID = "replacement-claim-uid"
+				mutate()
 				fmt.Fprintln(req.Stdout, "Forwarding from 127.0.0.1:12345 -> 43210")
 				<-ctx.Done()
 				close(reaped)
@@ -386,8 +513,8 @@ func TestSSHProxyRejectsClaimUIDChangeBeforeAndAfterForwarding(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			err = b.ProxySSH(ctx, claim.LeaseID, strings.NewReader(""), io.Discard, io.Discard)
-			if err == nil || !strings.Contains(err.Error(), "UID changed") {
-				t.Fatalf("%s forwarding: error=%v, want pinned UID rejection", phase, err)
+			if err == nil {
+				t.Fatalf("%s forwarding accepted changed %s identity", phase, identity)
 			}
 			if started != (phase == "after") {
 				t.Fatalf("%s forwarding: started=%t", phase, started)

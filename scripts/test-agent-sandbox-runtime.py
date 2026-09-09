@@ -666,7 +666,7 @@ def image_smoke(image, reject, initializer, payload, directory, crabbox=None, sh
         unrelated = ssh_options(client, known_hosts, "unrelated-" + alias, 2222)
         wait_ssh(unrelated, "unrelated-before")
         before = snapshot(container)
-        request = {"lease_id": lease, "public_key": public, "expected_host_key": "", "expected_port": ""}
+        request = {"lease_id": lease, "public_key": public}
         result = docker("exec", "-i", container, fixture_path + "/initialize", data=json.dumps(request).encode(), timeout=240, check=False)
         assert_unchanged(before, snapshot(container))
         if reject:
@@ -693,11 +693,46 @@ def image_smoke(image, reject, initializer, payload, directory, crabbox=None, sh
         else:
             identity = ssh_command(options, 'printf "%s\\n" "$SHELL"; id -u')
             require(identity.stdout == b"/bin/bash\n0\n", "shell-independence SSH did not retain the existing root account and Bash shell")
-        request.update(expected_host_key=host_key, expected_port=str(port))
         repeated = docker("exec", "-i", container, fixture_path + "/initialize", data=json.dumps(request).encode(), timeout=240)
-        require(parse_endpoint(repeated.stdout) == (host_key, port), "reinitialization changed the pinned endpoint")
+        require(parse_endpoint(repeated.stdout) == (host_key, port), "reinitialization changed the healthy endpoint")
         wait_ssh(options, "lease-reused")
         wait_ssh(unrelated, "unrelated-after-reuse")
+        if shells_fixture is None:
+            state = "/var/lib/crabbox-ssh/" + lease
+            pid_before = docker("exec", container, "/bin/cat", state + "/dropbear.pid").stdout
+            docker("exec", container, "/bin/mv", state + "/port", state + "/port.saved")
+            ambiguous = docker("exec", "-i", container, fixture_path + "/initialize",
+                               data=json.dumps(request).encode(), timeout=240, check=False)
+            require(ambiguous.returncode != 0 and b"CRABBOX_SSH_" not in ambiguous.stdout,
+                    "initializer published an endpoint while a daemon had lost its port state")
+            require(docker("exec", container, "/bin/cat", state + "/dropbear.pid").stdout == pid_before,
+                    "missing port state replaced the live daemon PID")
+            wait_ssh(options, "lease-preserved-without-port-state")
+            wait_ssh(unrelated, "unrelated-preserved-without-port-state")
+            docker("exec", container, "/bin/mv", state + "/port.saved", state + "/port")
+
+            # Restart only this owned fixture container, then discard the old
+            # ephemeral key/listener state. No old process survives the restart.
+            docker("restart", container, timeout=60)
+            docker("exec", "-d", container, "/bin/sh", "-c", daemon_start)
+            wait_ssh(unrelated, "unrelated-after-container-restart")
+            docker("exec", container, "/bin/rm", "-f", state + "/host_ed25519", state + "/port", state + "/dropbear.pid")
+            recovered = docker("exec", "-i", container, fixture_path + "/initialize",
+                               data=json.dumps(request).encode(), timeout=240)
+            recovered_key, recovered_port = parse_endpoint(recovered.stdout)
+            require(recovered_key != host_key, "missing host private key was not regenerated")
+            require(recovered_port != 2222, "recovery commandeered the unrelated SSH listener")
+            recovered_alias = alias + "-recovered"
+            with known_hosts.open("a") as output:
+                output.write(recovered_alias + " " + recovered_key + "\n")
+            recovered_options = ssh_options(client, known_hosts, recovered_alias, recovered_port)
+            wait_ssh(recovered_options, "lease-recovered-from-missing-state")
+            reused = docker("exec", "-i", container, fixture_path + "/initialize",
+                            data=json.dumps(request).encode(), timeout=240)
+            require(parse_endpoint(reused.stdout) == (recovered_key, recovered_port),
+                    "reinitialization changed the recovered endpoint")
+            wait_ssh(unrelated, "unrelated-after-state-recovery")
+            print("PASS Debian: ambiguous live-daemon recovery rejected without replacement; missing ephemeral state re-bootstrapped after container restart", flush=True)
         assert_unchanged(before, snapshot(container))
         label = "Debian" if shells_fixture is None else "Debian /etc/shells " + shells_fixture + ": existing root /bin/bash key authentication"
         print(f"PASS {label}: endpoint reuse, original tools/accounts unchanged, unrelated SSH still accessible", flush=True)

@@ -16,12 +16,15 @@ import (
 )
 
 const (
-	claimLabelSSHUser    = "ssh_user"
-	claimLabelSSHHostKey = "ssh_host_key"
-	sshUserMarker        = "CRABBOX_SSH_USER="
-	sshHostKeyMarker     = "CRABBOX_SSH_HOST_KEY="
-	sshPortMarker        = "CRABBOX_SSH_PORT="
-	sshSeedInitializer   = "/opt/crabbox-seed/initialize"
+	claimLabelSSHUser        = "ssh_user"
+	claimLabelSSHHostKey     = "ssh_host_key"
+	claimLabelSSHSandboxUID  = "ssh_sandbox_uid"
+	claimLabelSSHPodUID      = "ssh_pod_uid"
+	claimLabelSSHContainerID = "ssh_container_id"
+	sshUserMarker            = "CRABBOX_SSH_USER="
+	sshHostKeyMarker         = "CRABBOX_SSH_HOST_KEY="
+	sshPortMarker            = "CRABBOX_SSH_PORT="
+	sshSeedInitializer       = "/opt/crabbox-seed/initialize"
 )
 
 // Compatibility discovery reads the image executable without running it. A
@@ -43,43 +46,51 @@ type sshBootstrapInfo struct {
 }
 
 type sshInitializationRequest struct {
-	LeaseID         string `json:"lease_id"`
-	PublicKey       string `json:"public_key"`
-	ExpectedHostKey string `json:"expected_host_key"`
-	ExpectedPort    string `json:"expected_port"`
+	LeaseID   string `json:"lease_id"`
+	PublicKey string `json:"public_key"`
 }
 
 func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (LeaseClaim, error) {
-	oldUser, oldKey, oldPort := claim.Labels[claimLabelSSHUser], claim.Labels[claimLabelSSHHostKey], claim.Labels[claimLabelSSHPort]
-	if oldUser != "" || oldKey != "" || oldPort != "" {
-		if oldUser != "root" || oldKey == "" || !validSSHBootstrapPort(oldPort) {
-			return LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh lease %s has incomplete SSH identity metadata; acquire a new lease", claim.LeaseID)
-		}
-	}
 	_, publicKey, err := core.EnsureTestboxKey(claim.LeaseID)
 	if err != nil {
 		return LeaseClaim{}, err
 	}
-	request, err := sshInitializationInput(claim.LeaseID, publicKey, oldKey, oldPort)
+	request, err := sshInitializationInput(claim.LeaseID, publicKey)
 	if err != nil {
 		return LeaseClaim{}, err
 	}
 	execCtx, cancel := b.execContext(ctx)
 	defer cancel()
-	info, err := b.initializeSSH(execCtx, client, ready, request)
-	if err != nil {
-		return LeaseClaim{}, err
+	var info sshBootstrapInfo
+	for attempt := 0; ; attempt++ {
+		if ready.ContainerID == "" {
+			return LeaseClaim{}, fmt.Errorf("%w: agent-sandbox-ssh pod %s has no running container identity", errNotReady, ready.PodName)
+		}
+		info, err = b.initializeSSH(execCtx, client, ready, request)
+		if err == nil {
+			err = revalidateSandboxReadiness(execCtx, client, b.cfg.AgentSandbox.Namespace, ready)
+		}
+		if err == nil {
+			break
+		}
+		if attempt == 2 || execCtx.Err() != nil {
+			return LeaseClaim{}, err
+		}
+		// Retry only an endpoint replacement authenticated under the same
+		// immutable claim. Never replay a workload or accept an SSH-presented key.
+		current, checkErr := b.waitForClaimReadiness(execCtx, client, ready.ClaimName, ready.identity)
+		if checkErr != nil || sameSSHRuntime(ready, current) {
+			return LeaseClaim{}, errors.Join(err, checkErr)
+		}
+		ready = current
 	}
-	if oldKey != "" && (oldKey != info.HostKey || oldPort != info.Port) {
-		return LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh lease %s SSH identity or port changed; refusing to replace its pinned endpoint", claim.LeaseID)
-	}
-	if err := revalidateSandboxReadiness(execCtx, client, b.cfg.AgentSandbox.Namespace, ready); err != nil {
-		return LeaseClaim{}, err
-	}
-	labels := cloneStringMap(claim.Labels)
+	labels := claimReadinessLabels(claim.Labels, ready)
 	labels[claimLabelSSHUser] = info.User
 	labels[claimLabelSSHHostKey] = info.HostKey
 	labels[claimLabelSSHPort] = info.Port
+	labels[claimLabelSSHSandboxUID] = ready.SandboxUID
+	labels[claimLabelSSHPodUID] = ready.PodUID
+	labels[claimLabelSSHContainerID] = ready.ContainerID
 	updated, err := updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 	if err != nil {
 		return LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh publish SSH identity: %w", err)
@@ -92,6 +103,17 @@ func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready
 		return LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh prepare pinned host trust: %w", err)
 	}
 	return updated, nil
+}
+
+func sameSSHRuntime(a, b sandboxReadiness) bool {
+	return a.SandboxUID == b.SandboxUID && a.PodUID == b.PodUID && a.Container == b.Container && a.ContainerID == b.ContainerID
+}
+
+func validateSSHRuntime(claim LeaseClaim, ready sandboxReadiness) error {
+	if ready.ContainerID == "" || claim.Labels[claimLabelSSHSandboxUID] != ready.SandboxUID || claim.Labels[claimLabelSSHPodUID] != ready.PodUID || claim.Labels[claimLabelSSHContainerID] != ready.ContainerID {
+		return fmt.Errorf("agent-sandbox-ssh lease %s endpoint is unverified or its container changed; prepare the lease again through Kubernetes", claim.LeaseID)
+	}
+	return nil
 }
 
 // Kubernetes exec is the authenticated bootstrap channel. Only the lease public
@@ -193,7 +215,7 @@ func validateBootstrapPublicKey(value string) error {
 	return nil
 }
 
-func sshInitializationInput(leaseID, publicKey, expectedHostKey, expectedPort string) ([]byte, error) {
+func sshInitializationInput(leaseID, publicKey string) ([]byte, error) {
 	if leaseID == "" || len(leaseID) > 128 || strings.Trim(leaseID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != "" {
 		return nil, fmt.Errorf("agent-sandbox-ssh invalid lease ID")
 	}
@@ -201,13 +223,5 @@ func sshInitializationInput(leaseID, publicKey, expectedHostKey, expectedPort st
 	if err := validateBootstrapPublicKey(publicKey); err != nil {
 		return nil, err
 	}
-	if expectedHostKey != "" {
-		if err := validateBootstrapPublicKey(expectedHostKey); err != nil {
-			return nil, err
-		}
-	}
-	if (expectedHostKey == "") != (expectedPort == "") || (expectedPort != "" && !validSSHBootstrapPort(expectedPort)) {
-		return nil, fmt.Errorf("agent-sandbox-ssh incomplete pinned initializer endpoint")
-	}
-	return json.Marshal(sshInitializationRequest{LeaseID: leaseID, PublicKey: publicKey, ExpectedHostKey: expectedHostKey, ExpectedPort: expectedPort})
+	return json.Marshal(sshInitializationRequest{LeaseID: leaseID, PublicKey: publicKey})
 }

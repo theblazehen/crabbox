@@ -93,11 +93,12 @@ under `/tmp`; actual Kubernetes exec/transport failures remain hard errors,
 not evidence of seed absence. The initializer contains a compressed static
 tool payload; no target package manager, package repository, shared-library
 installation, or Nix store is needed. A separate exec invokes the selected
-initializer with JSON on stdin carrying the lease ID,
-client public key, and, on reuse, the expected host public key and port. The
-client private key stays local. The host private key is generated and retained
-only in the container; the returned host public key is pinned in the local
-private per-lease `known_hosts` file.
+initializer with JSON on stdin carrying only the lease ID and client public
+key. The client private key stays local. The host private key is generated and
+retained only in the container; the returned host public key is pinned in the
+local private per-lease `known_hosts` file. Kubernetes authentication and the
+verified claim-to-sandbox-to-pod/container binding authorize this bootstrap,
+not a key presented by an SSH connection.
 
 The initializer can also reuse an optional sibling `payload` directory beside
 its resolved executable, verified against the embedded payload before use.
@@ -118,16 +119,20 @@ A standalone Dropbear daemon runs independently of any existing SSH daemon,
 with key-only root authentication and password authentication disabled. Its
 host key, authorized keys, launch state, PID, and `dropbear.log` live under
 `/var/lib/crabbox-ssh/<lease-id>`. It selects an available unprivileged loopback
-port on first initialization and pins that port with the host key for reuse;
-there is no fixed SSH port requirement. Initialization never takes over an
-unrelated daemon or its port. Changes to the pinned identity, port, or owned
-daemon state are rejected rather than silently adopted.
+port on first initialization and reuses the stored port and actual host key
+while healthy; there is no fixed SSH port requirement. If a container restart
+loses this ephemeral state, normal lease preparation generates a fresh key and
+listener and refreshes the local endpoint and private `known_hosts` pin from
+authenticated Kubernetes exec output. It requires no Kubernetes Secret or
+manual pin reset. Initialization never takes over an unrelated daemon or its
+port, and still rejects unsafe private files, conflicting process ownership,
+and ambiguous PID-without-port state.
 
 Every preparation checks seed compatibility, including on reuse. An exact
 seed skips the initializer upload; fallback uploads the full initializer and
 removes the temporary upload after invocation. Verified runtime content and
-the matching lease endpoint are reused, not reinstalled or assigned a new
-identity. The amd64 initializer upload is approximately 36.2 MB, and
+the matching healthy lease endpoint are reused, not reinstalled or assigned a
+new identity. The amd64 initializer upload is approximately 36.2 MB, and
 its compressed embedded asset is approximately 33.4 MB. These are approximate
 artifact sizes, not total CLI binary sizes or a promise of incremental uploads.
 
@@ -140,8 +145,24 @@ execution and bash-login-shell semantics are unchanged, so shell startup files
 can still affect the eventual workload environment.
 
 Kubernetes port-forwarding supplies the SSH transport, with claim, Sandbox,
-pod, and container identity checks. SSH then carries repository sync, command
-execution, scripts, captures, and downloads through the existing core paths.
+pod, and container runtime identity checks before bootstrap, after bootstrap,
+and before exposing a forwarded stream. A same-pod container restart invalidates
+the prepared endpoint too. Bootstrap may re-resolve and retry a verified
+replacement up to three attempts within the existing readiness/exec deadlines;
+the original claim UID must still match. SSH host-key checking remains strict,
+and workload commands are never replayed by this recovery path.
+
+Read-only `status`, `list`, and `inspect` distinguish `pod_ready` from
+`ssh_ready`. Their SSH check performs a pinned, client-key-authenticated
+handshake but runs no remote command, initializes no daemon, and changes no
+claim or trust file. A ready pod with a changed/unverified endpoint or unavailable
+SSH is reported as `ssh-unavailable` (`status.ready=false`). A normal run,
+copy, or SSH acquisition prepares the lease through Kubernetes again. Leases
+created by an older CLI initially lack the runtime binding and need this normal
+preparation before the new read-only checks can report SSH ready.
+
+SSH then carries repository sync, command execution, scripts, captures, and
+downloads through the existing core paths.
 `agentSandbox.workdir` is the SSH work root; the run output prints the actual
 lease/repository workdir beneath it. The image entrypoint and existing
 processes, including Docker and unrelated SSH daemons, are not replaced. No

@@ -164,6 +164,9 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 	if err != nil {
 		return err
 	}
+	if err := validateSSHRuntime(claim, ready); err != nil {
+		return err
+	}
 	if claimTTLExpired(claim, lifecycle.now()) {
 		return fmt.Errorf("agent-sandbox-ssh lease %s has expired", claim.LeaseID)
 	}
@@ -174,6 +177,80 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 		return revalidateSandboxReadiness(ctx, client, lifecycle.cfg.AgentSandbox.Namespace, ready)
 	}
 	return lifecycle.forwardSSH(ctx, ready.PodName, port, input, output, stderr, checkIdentity)
+}
+
+// Probe the actual authenticated SSH endpoint, without running a remote command,
+// bootstrapping, or rewriting local trust. Pod readiness alone is insufficient.
+func (b *backend) probeSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (resultErr error) {
+	if err := validateSSHRuntime(claim, ready); err != nil {
+		return err
+	}
+	target, err := b.sshTarget(claim)
+	if err != nil {
+		return err
+	}
+	key, err := os.ReadFile(target.Key)
+	if err != nil {
+		return err
+	}
+	signer, err := xssh.ParsePrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("read lease SSH authentication key: %w", err)
+	}
+	hostKey, _, _, _, err := xssh.ParseAuthorizedKey([]byte(target.SSHHostKey))
+	if err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, sshProxyReadyTimeout)
+	defer cancel()
+	local, proxy := net.Pipe()
+	stop := context.AfterFunc(probeCtx, func() { local.Close(); proxy.Close() })
+	defer stop()
+	done := make(chan error, 1)
+	check := func() error { return revalidateSandboxReadiness(probeCtx, client, b.cfg.AgentSandbox.Namespace, ready) }
+	go func() {
+		err := b.forwardSSH(probeCtx, ready.PodName, target.Port, proxy, proxy, io.Discard, check)
+		proxy.Close()
+		done <- err
+	}()
+	defer func() {
+		cancel()
+		local.Close()
+		proxy.Close()
+		forwardErr := <-done
+		if resultErr != nil && forwardErr != nil && !errors.Is(forwardErr, context.Canceled) {
+			resultErr = errors.Join(resultErr, forwardErr)
+		}
+	}()
+	conn, _, _, err := xssh.NewClientConn(local, claim.LeaseID, &xssh.ClientConfig{
+		User:            target.User,
+		Auth:            []xssh.AuthMethod{xssh.PublicKeys(signer)},
+		HostKeyCallback: xssh.FixedHostKey(hostKey),
+	})
+	if err != nil {
+		return fmt.Errorf("agent-sandbox-ssh endpoint unavailable: %w", err)
+	}
+	conn.Close()
+	return check()
+}
+
+func (b *backend) sshHealth(ctx context.Context, claim LeaseClaim) error {
+	identity, err := claimIdentityFromLocalClaim(claim)
+	if err != nil {
+		return err
+	}
+	if identity.ProviderScope == "" {
+		identity.ProviderScope = claimScope(b.cfg)
+	}
+	client, err := b.client(ctx)
+	if err != nil {
+		return err
+	}
+	ready, err := sandboxReadinessOnce(ctx, client, b.cfg.AgentSandbox.Namespace, claimNameFromLocalClaim(claim), identity)
+	if err != nil {
+		return err
+	}
+	return b.probeSSH(ctx, client, ready, claim)
 }
 
 func (b *backend) forwardSSH(ctx context.Context, pod, remotePort string, input io.Reader, output, stderr io.Writer, checkIdentity func() error) error {

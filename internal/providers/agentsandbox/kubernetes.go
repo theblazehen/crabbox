@@ -73,6 +73,18 @@ func (e resourceIdentityError) Unwrap() error {
 	return e.err
 }
 
+type containerRuntimeChangedError struct {
+	err error
+}
+
+func (e containerRuntimeChangedError) Error() string {
+	return e.err.Error()
+}
+
+func (e containerRuntimeChangedError) Unwrap() error {
+	return e.err
+}
+
 type resourceTerminalError struct {
 	err error
 }
@@ -108,10 +120,14 @@ type objectStatus struct {
 	Sandbox struct {
 		Name string `json:"name,omitempty"`
 	} `json:"sandbox,omitempty"`
-	Selector   string           `json:"selector,omitempty"`
-	Phase      string           `json:"phase,omitempty"`
-	PodIP      string           `json:"podIP,omitempty"`
-	Conditions []conditionState `json:"conditions,omitempty"`
+	Selector          string           `json:"selector,omitempty"`
+	Phase             string           `json:"phase,omitempty"`
+	PodIP             string           `json:"podIP,omitempty"`
+	Conditions        []conditionState `json:"conditions,omitempty"`
+	ContainerStatuses []struct {
+		Name        string `json:"name"`
+		ContainerID string `json:"containerID"`
+	} `json:"containerStatuses,omitempty"`
 }
 
 type kubernetesObject struct {
@@ -642,6 +658,14 @@ func podStateFromObject(object kubernetesObject) podState {
 		PodIP:           object.Status.PodIP,
 		Conditions:      append([]conditionState(nil), object.Status.Conditions...),
 	}
+	if len(object.Status.ContainerStatuses) > 0 {
+		state.ContainerIDs = make(map[string]string, len(object.Status.ContainerStatuses))
+		for _, container := range object.Status.ContainerStatuses {
+			if name := strings.TrimSpace(container.Name); name != "" {
+				state.ContainerIDs[name] = strings.TrimSpace(container.ContainerID)
+			}
+		}
+	}
 	for _, field := range []string{"containers", "initContainers", "ephemeralContainers"} {
 		if containers, ok := object.Spec[field].([]any); ok {
 			for _, item := range containers {
@@ -669,6 +693,7 @@ type podState struct {
 	Annotations     map[string]string
 	OwnerReferences []ownerReference
 	Containers      []string
+	ContainerIDs    map[string]string
 	Phase           string
 	PodIP           string
 	Ready           bool
@@ -696,6 +721,7 @@ type sandboxReadiness struct {
 	PodUID      string
 	PodIP       string
 	Container   string
+	ContainerID string
 	identity    claimIdentity
 }
 
@@ -1034,6 +1060,7 @@ func newSandboxReadiness(resource sandboxResourceReadiness, pod podState, identi
 		PodUID:      pod.UID,
 		PodIP:       pod.PodIP,
 		Container:   container,
+		ContainerID: pod.ContainerIDs[container],
 		identity:    identity,
 	}
 }
@@ -1069,6 +1096,16 @@ func revalidateSandboxReadiness(ctx context.Context, client kubernetesClient, na
 			"agent-sandbox pod container changed from %s to %s",
 			expected.Container,
 			current.Container,
+		)}
+	}
+	if expected.ContainerID != "" && current.ContainerID != expected.ContainerID {
+		return containerRuntimeChangedError{err: exit(
+			4,
+			"agent-sandbox pod %s container %s runtime changed from %s to %s",
+			expected.PodName,
+			expected.Container,
+			expected.ContainerID,
+			blank(current.ContainerID, "<empty>"),
 		)}
 	}
 	return nil

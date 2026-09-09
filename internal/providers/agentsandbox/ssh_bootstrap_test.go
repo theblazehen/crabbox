@@ -74,37 +74,14 @@ func TestParseSSHBootstrapOutputPinsOnlyCompleteIdentity(t *testing.T) {
 
 func TestSSHInitializationInputValidatesPublicOnlyProtocol(t *testing.T) {
 	key := bootstrapTestPublicKey(t, 1)
-	hostKey := bootstrapTestPublicKey(t, 2)
-	for _, endpoint := range [][2]string{{"", ""}, {hostKey, "1024"}, {hostKey, "65535"}} {
-		data, err := sshInitializationInput("asbx_test-1", key, endpoint[0], endpoint[1])
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got map[string]string
-		if err := json.Unmarshal(data, &got); err != nil {
-			t.Fatal(err)
-		}
-		want := map[string]string{"lease_id": "asbx_test-1", "public_key": key, "expected_host_key": endpoint[0], "expected_port": endpoint[1]}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("initializer request=%#v want=%#v", got, want)
-		}
-	}
 	for _, id := range []string{"", "../other", "lease;touch marker", "lease\nmarker", "lease with spaces", "lease\x00", strings.Repeat("a", 129)} {
-		if _, err := sshInitializationInput(id, key, "", ""); err == nil {
+		if _, err := sshInitializationInput(id, key); err == nil {
 			t.Fatalf("accepted unsafe lease ID %q", id)
 		}
 	}
 	for _, invalid := range []string{"", "not a key", key + "\n" + key, "command=evil " + key, key + "\r\nother"} {
-		if _, err := sshInitializationInput("asbx_test", invalid, "", ""); err == nil {
+		if _, err := sshInitializationInput("asbx_test", invalid); err == nil {
 			t.Fatalf("accepted unsafe authorized key %q", invalid)
-		}
-		if _, err := sshInitializationInput("asbx_test", key, invalid, "43210"); err == nil {
-			t.Fatalf("accepted unsafe/incomplete pinned key %q", invalid)
-		}
-	}
-	for _, endpoint := range [][2]string{{hostKey, ""}, {"", "43210"}, {hostKey, "1023"}, {hostKey, "65536"}, {hostKey, "043210"}, {hostKey, "-1"}, {hostKey, "43210\n"}} {
-		if _, err := sshInitializationInput("asbx_test", key, endpoint[0], endpoint[1]); err == nil {
-			t.Fatalf("accepted invalid pinned endpoint %#v", endpoint)
 		}
 	}
 }
@@ -224,7 +201,7 @@ func TestInitializeSSHArchitectureSelection(t *testing.T) {
 		t.Run(architecture, func(t *testing.T) {
 			b, client, ready, claim := newSSHBootstrapTestSetup(t)
 			client.architecture = architecture
-			input, err := sshInitializationInput(claim.LeaseID, bootstrapTestPublicKey(t, 2), "", "")
+			input, err := sshInitializationInput(claim.LeaseID, bootstrapTestPublicKey(t, 2))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -277,7 +254,7 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 			}
 			trustPath := filepath.Join(filepath.Dir(keyPath), "known_hosts")
 			var priorTrust []byte
-			if scenario == "reuse" || scenario == "host key changed" || scenario == "port changed" {
+			if scenario != "publish" {
 				labels := cloneStringMap(claim.Labels)
 				labels[claimLabelSSHUser] = "root"
 				labels[claimLabelSSHHostKey] = key
@@ -299,10 +276,13 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 				}
 			}
 			if scenario == "host key changed" {
-				client.output = bootstrapTestOutput(bootstrapTestPublicKey(t, 2), "43210")
+				key = bootstrapTestPublicKey(t, 2)
+				client.output = bootstrapTestOutput(key, "43210")
 			}
+			port := "43210"
 			if scenario == "port changed" {
-				client.output = bootstrapTestOutput(key, "43211")
+				port = "43211"
+				client.output = bootstrapTestOutput(key, port)
 			}
 			if scenario == "claim changed" {
 				client.during = func() error {
@@ -326,10 +306,6 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 			if !seeded && (client.uploadHeader != [4]byte{0x7f, 'E', 'L', 'F'} || client.uploadBytes <= 4) {
 				t.Fatalf("initializer upload is not a decoded ELF: header=%x size=%d", client.uploadHeader, client.uploadBytes)
 			}
-			wantRequest := sshInitializationRequest{LeaseID: claim.LeaseID, PublicKey: strings.TrimSpace(publicKey), ExpectedHostKey: claim.Labels[claimLabelSSHHostKey], ExpectedPort: claim.Labels[claimLabelSSHPort]}
-			if client.request != wantRequest {
-				t.Fatalf("initializer request=%#v want=%#v", client.request, wantRequest)
-			}
 			privateKey, err := os.ReadFile(keyPath)
 			if err != nil {
 				t.Fatal(err)
@@ -347,8 +323,8 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			trust, trustErr := os.ReadFile(trustPath)
-			if scenario == "publish" || scenario == "reuse" {
-				if prepareErr != nil || updated.Labels[claimLabelSSHUser] != "root" || updated.Labels[claimLabelSSHHostKey] != key || updated.Labels[claimLabelSSHPort] != "43210" || stored.Labels[claimLabelSSHHostKey] != key || stored.Labels[claimLabelSSHPort] != "43210" {
+			if scenario != "claim changed" {
+				if prepareErr != nil || updated.Labels[claimLabelSSHUser] != "root" || updated.Labels[claimLabelSSHHostKey] != key || updated.Labels[claimLabelSSHPort] != port || stored.Labels[claimLabelSSHHostKey] != key || stored.Labels[claimLabelSSHPort] != port {
 					t.Fatalf("updated=%#v stored=%#v error=%v", updated.Labels, stored.Labels, prepareErr)
 				}
 				if trustErr != nil || strings.TrimSpace(string(trust)) != claim.LeaseID+" "+key {
@@ -356,7 +332,7 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 				}
 			} else {
 				if prepareErr == nil {
-					t.Fatal("changed identity/port/claim was accepted")
+					t.Fatal("concurrent claim update was overwritten")
 				}
 				if priorTrust != nil {
 					if trustErr != nil || !bytes.Equal(trust, priorTrust) {
@@ -394,7 +370,7 @@ func TestInitializeSSHSeedSelection(t *testing.T) {
 			b, client, ready, claim := newSSHBootstrapTestSetup(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			input, err := sshInitializationInput(claim.LeaseID, bootstrapTestPublicKey(t, 2), "", "")
+			input, err := sshInitializationInput(claim.LeaseID, bootstrapTestPublicKey(t, 2))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -574,7 +550,71 @@ func TestInitializeSSHUploadFailureDoesNotCleanUnownedPath(t *testing.T) {
 	}
 }
 
-func TestPrepareSSHRejectsIncompletePinnedEndpointBeforeExec(t *testing.T) {
+func TestPrepareSSHRetriesOnlyAuthenticatedRuntimeReplacement(t *testing.T) {
+	for _, scenario := range []string{"replacement", "replacement becoming ready", "continuous replacement", "claim replacement", "initializer failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			b, client, ready, claim := newSSHBootstrapTestSetup(t)
+			// Start with real persisted trust so every failure must preserve it.
+			claim, err := b.prepareSSH(t.Context(), client, ready, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := b.sshTarget(claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			priorTrust, err := os.ReadFile(target.KnownHostsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempts := 0
+			client.during = func() error {
+				attempts++
+				if scenario == "claim replacement" {
+					client.objects[sandboxClaimResource+"/"+b.cfg.AgentSandbox.Namespace+"/"+ready.ClaimName].Metadata.UID = "replaced-claim"
+				} else if scenario == "continuous replacement" || (strings.HasPrefix(scenario, "replacement") && attempts == 1) {
+					pods := client.pods[b.cfg.AgentSandbox.Namespace+"/claim="+ready.ClaimName]
+					pods[0].ContainerIDs[ready.Container] = fmt.Sprintf("containerd://replacement-%d", attempts)
+					if scenario == "replacement becoming ready" {
+						client.podListErrs = []error{errNotReady, errNotReady}
+					}
+				}
+				client.output = bootstrapTestOutput(bootstrapTestPublicKey(t, byte(attempts+1)), "43211")
+				return nil
+			}
+			if scenario == "initializer failure" {
+				client.initializeErr = errors.New("authenticated initialization failed")
+			}
+			_, prepareErr := b.prepareSSH(t.Context(), client, ready, claim)
+			stored, err := readLeaseClaim(claim.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			trust, err := os.ReadFile(target.KnownHostsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(scenario, "replacement") {
+				if prepareErr != nil || attempts != 2 || stored.Labels[claimLabelSSHHostKey] != bootstrapTestPublicKey(t, 3) {
+					t.Fatalf("replacement was not freshly authenticated: attempts=%d key=%s err=%v", attempts, stored.Labels[claimLabelSSHHostKey], prepareErr)
+				}
+				if strings.TrimSpace(string(trust)) != claim.LeaseID+" "+bootstrapTestPublicKey(t, 3) {
+					t.Fatal("host trust retained the abandoned runtime's key")
+				}
+			} else {
+				wantAttempts := 1
+				if scenario == "continuous replacement" {
+					wantAttempts = 3
+				}
+				if prepareErr == nil || attempts != wantAttempts || !reflect.DeepEqual(stored, claim) || !bytes.Equal(trust, priorTrust) {
+					t.Fatalf("failure escaped retry or publication boundary: attempts=%d err=%v stored=%#v", attempts, prepareErr, stored)
+				}
+			}
+		})
+	}
+}
+
+func TestPrepareSSHRepairsIncompleteEndpointThroughKubernetes(t *testing.T) {
 	key := bootstrapTestPublicKey(t, 1)
 	for name, endpoint := range map[string]map[string]string{
 		"user only":                    {claimLabelSSHUser: "root"},
@@ -590,12 +630,18 @@ func TestPrepareSSHRejectsIncompletePinnedEndpointBeforeExec(t *testing.T) {
 			for key, value := range endpoint {
 				labels[key] = value
 			}
-			claim.Labels = labels
-			if _, err := b.prepareSSH(t.Context(), client, ready, claim); err == nil {
-				t.Fatal("incomplete or invalid pinned endpoint accepted")
+			var err error
+			claim, err = updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if len(client.phases) != 0 {
-				t.Fatalf("invalid metadata triggered remote execution: %v", client.phases)
+			updated, err := b.prepareSSH(t.Context(), client, ready, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := b.sshTarget(updated)
+			if err != nil || target.User != "root" || target.SSHHostKey != key || target.Port != "43210" {
+				t.Fatalf("authenticated endpoint was not restored: %#v, %v", target, err)
 			}
 		})
 	}
