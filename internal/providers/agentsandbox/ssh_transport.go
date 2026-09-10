@@ -83,8 +83,9 @@ func (b *backend) sshTarget(claim LeaseClaim) (core.SSHTarget, error) {
 		ChildEnv:       childEnv,
 		// Every connection must execute the identity-checking proxy rather than
 		// silently reusing an older control socket after a claim transition.
-		NoControlMaster: true,
-		ReadyCheck:      "command -v bash >/dev/null && command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null",
+		NoControlMaster:        true,
+		RunScopedControlMaster: true,
+		ReadyCheck:             "command -v bash >/dev/null && command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null",
 	}
 	return target, nil
 }

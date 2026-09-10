@@ -892,6 +892,30 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var hydratedByActions bool
 	var lifecycleOwner *workspaceOwner
 	ownerParentCtx := ctx
+	var closeRunScopedSSHControlMaster func(context.Context) error
+	configureRunScopedSSHControlMaster := func() error {
+		if closeRunScopedSSHControlMaster != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), sshCommandWaitDelay)
+			err := closeRunScopedSSHControlMaster(cleanupCtx)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("close replaced run-scoped SSH transport: %w", err)
+			}
+		}
+		var configureErr error
+		target, closeRunScopedSSHControlMaster, configureErr = enableRunScopedSSHControlMaster(target)
+		return configureErr
+	}
+	defer func() {
+		if closeRunScopedSSHControlMaster == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), sshCommandWaitDelay)
+		defer cancel()
+		if cleanupErr := closeRunScopedSSHControlMaster(cleanupCtx); cleanupErr != nil {
+			fmt.Fprintf(a.Stderr, "warning: close run-scoped SSH transport: %v\n", cleanupErr)
+		}
+	}()
 	defer func() {
 		if lifecycleOwner == nil {
 			return
@@ -1459,6 +1483,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			fmt.Fprintf(a.Stderr, "warning: direct touch failed for %s: %v\n", leaseID, touchErr)
 		}
 	}
+	if err := configureRunScopedSSHControlMaster(); err != nil {
+		return recordFailure(err)
+	}
 	if envHelperName != "" {
 		// Reject target-specific helper gaps before SSH wait or sync mutates the remote.
 		if err := validateRunEnvHelperTarget(target, runEnvHelperPath(envHelperName)); err != nil {
@@ -1788,6 +1815,9 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		runReq.RunID = executionRunID
 		runReq.Env = envSelection.Effective
 		if err := a.claimRunLeaseTargetForRepoAndRegister(ctx, leaseID, serverSlug(server), cfg, &server, target, repo.Root, *reclaim, false); err != nil {
+			return true, err
+		}
+		if err := configureRunScopedSSHControlMaster(); err != nil {
 			return true, err
 		}
 		workdir = remoteJoin(cfg, leaseID, repo.Name)

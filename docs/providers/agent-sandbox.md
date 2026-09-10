@@ -128,13 +128,18 @@ manual pin reset. Initialization never takes over an unrelated daemon or its
 port, and still rejects unsafe private files, conflicting process ownership,
 and ambiguous PID-without-port state.
 
-Every preparation checks seed compatibility, including on reuse. An exact
-seed skips the initializer upload; fallback uploads the full initializer and
-removes the temporary upload after invocation. Verified runtime content and
-the matching healthy lease endpoint are reused, not reinstalled or assigned a
-new identity. The amd64 initializer upload is approximately 36.2 MB, and
-its compressed embedded asset is approximately 33.4 MB. These are approximate
-artifact sizes, not total CLI binary sizes or a promise of incremental uploads.
+On reuse, preparation first verifies the recorded claim, Sandbox, pod, and
+container runtime identity, then performs a pinned, client-key-authenticated
+SSH probe. A matching healthy endpoint returns directly without uploading or
+invoking the initializer. Failed authentication, a missing endpoint, or a
+changed runtime falls back to the authenticated Kubernetes recovery path,
+which checks seed compatibility and either uses an exact seed or uploads the
+initializer and removes the temporary upload after invocation. Verified runtime
+content and the matching healthy lease endpoint are reused, not reinstalled or
+assigned a new identity. The amd64 initializer upload is approximately 36.2 MB,
+and its compressed embedded asset is approximately 33.4 MB. These are
+approximate artifact sizes, not total CLI binary sizes or a promise of
+incremental uploads.
 
 The daemon inherits the container's pod-exec environment rather than a bounded
 image-variable allowlist. Existing image `PATH` order is preserved; `/usr/bin`
@@ -150,7 +155,11 @@ and before exposing a forwarded stream. A same-pod container restart invalidates
 the prepared endpoint too. Bootstrap may re-resolve and retry a verified
 replacement up to three attempts within the existing readiness/exec deadlines;
 the original claim UID must still match. SSH host-key checking remains strict,
-and workload commands are never replayed by this recovery path.
+and workload commands are never replayed by this recovery path. Within one
+`run`, Crabbox shares a private, uniquely named OpenSSH control master after the
+first authenticated connection, so sync, ownership, workload, and capture
+helpers do not each open a new port-forward. The master is run-scoped rather
+than lease-scoped and is closed after remote workspace ownership cleanup.
 
 Read-only `status`, `list`, and `inspect` distinguish `pod_ready` from
 `ssh_ready`. Their SSH check performs a pinned, client-key-authenticated

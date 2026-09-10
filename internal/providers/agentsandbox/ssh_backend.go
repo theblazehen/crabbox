@@ -173,6 +173,23 @@ func (b *sshLeaseBackend) prepare(ctx context.Context, client kubernetesClient, 
 	return lease, nil
 }
 
+func (b *sshLeaseBackend) reusePreparedSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (core.LeaseTarget, bool) {
+	if validateSSHRuntime(claim, ready) != nil || b.lifecycle.probeSSH(ctx, client, ready, claim) != nil {
+		return core.LeaseTarget{}, false
+	}
+	lease := sshLeaseFromClaim(claim)
+	var err error
+	lease.SSH, err = b.lifecycle.sshTarget(claim)
+	if err != nil {
+		return core.LeaseTarget{}, false
+	}
+	if err := core.PrepareLeaseSSHTrust(&lease.SSH, claim.LeaseID); err != nil {
+		return core.LeaseTarget{}, false
+	}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
+	return lease, true
+}
+
 // Ordinary resolution owns its short operation fence and uses compare-and-swap
 // publication. It must not opt into RunLeaseClaimResolver: bootstrap publishes
 // host keys and cannot execute while core already holds the claim lock.
@@ -282,6 +299,12 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 		if err != nil {
 			return core.LeaseTarget{}, err
 		}
+	}
+	if lease, reused := b.reusePreparedSSH(ctx, client, ready, claim); reused {
+		return lease, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return core.LeaseTarget{}, err
 	}
 	return b.prepare(ctx, client, ready, claim)
 }

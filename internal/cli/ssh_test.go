@@ -2580,6 +2580,56 @@ func TestSSHControlPathIsScopedByKey(t *testing.T) {
 	}
 }
 
+func TestRunScopedSSHControlMasterUsesUniquePrivatePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("OpenSSH control sockets are unavailable on Windows")
+	}
+	target := SSHTarget{
+		User:                   "root",
+		Host:                   "lease",
+		Key:                    "/tmp/lease/id_ed25519",
+		NoControlMaster:        true,
+		RunScopedControlMaster: true,
+	}
+	first, closeFirst, err := enableRunScopedSSHControlMaster(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = closeFirst(context.Background()) })
+	second, closeSecond, err := enableRunScopedSSHControlMaster(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = closeSecond(context.Background()) })
+	if first.NoControlMaster || second.NoControlMaster {
+		t.Fatal("run-scoped targets should enable multiplexing")
+	}
+	if first.ControlPath == second.ControlPath {
+		t.Fatalf("independent runs reused control path %q", first.ControlPath)
+	}
+	for _, candidate := range []SSHTarget{first, second} {
+		info, err := os.Stat(filepath.Dir(candidate.ControlPath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Fatalf("control directory mode=%v", info.Mode())
+		}
+		args := strings.Join(sshBaseArgs(candidate), "\n")
+		for _, want := range []string{"ControlMaster=auto", "ControlPath=" + candidate.ControlPath} {
+			if !strings.Contains(args, want) {
+				t.Fatalf("SSH args missing %q: %s", want, args)
+			}
+		}
+	}
+	if err := closeFirst(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(first.ControlPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("closed run control directory remains: %v", err)
+	}
+}
+
 func TestSSHControlPathIsScopedByProxyAndCertificate(t *testing.T) {
 	base := SSHTarget{
 		User:            "tenki",

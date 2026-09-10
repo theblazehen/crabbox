@@ -50,6 +50,9 @@ func inspectSSHControlPath(path string, directory bool) error {
 }
 
 func ensureSSHControlDirectory(target SSHTarget) error {
+	if target.ControlPath != "" {
+		return inspectSSHControlPath(filepath.Dir(target.ControlPath), true)
+	}
 	leaseDir := sshControlLeaseDirectory(target)
 	if leaseDir == "" || target.AuthSecret || target.NoControlMaster {
 		return nil
@@ -67,8 +70,34 @@ func ensureSSHControlDirectory(target SSHTarget) error {
 	return inspectSSHControlPath(dir, true)
 }
 
+func enableRunScopedSSHControlMaster(target SSHTarget) (SSHTarget, func(context.Context) error, error) {
+	if !target.RunScopedControlMaster {
+		return target, func(context.Context) error { return nil }, nil
+	}
+	if target.AuthSecret || !target.NoControlMaster {
+		return SSHTarget{}, nil, errors.New("run-scoped SSH control master requires an independently non-multiplexed key target")
+	}
+	dir, err := os.MkdirTemp("", "crabbox-run-ssh-")
+	if err != nil {
+		return SSHTarget{}, nil, err
+	}
+	if err := inspectSSHControlPath(dir, true); err != nil {
+		_ = os.Remove(dir)
+		return SSHTarget{}, nil, err
+	}
+	target.NoControlMaster = false
+	target.ControlPath = filepath.Join(dir, "master-%C")
+	return target, func(ctx context.Context) error {
+		return closeSSHControlMastersInDirectory(ctx, dir)
+	}, nil
+}
+
 func closeLeaseSSHControlMasters(ctx context.Context, leaseDir string) error {
 	dir := sshControlDirectory(leaseDir)
+	return closeSSHControlMastersInDirectory(ctx, dir)
+}
+
+func closeSSHControlMastersInDirectory(ctx context.Context, dir string) error {
 	if err := inspectSSHControlPath(dir, true); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil

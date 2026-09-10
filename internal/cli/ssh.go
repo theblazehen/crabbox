@@ -41,6 +41,8 @@ type SSHTarget struct {
 	ReadyCheck             string
 	AuthSecret             bool
 	NoControlMaster        bool
+	RunScopedControlMaster bool
+	ControlPath            string
 	DisableHostKeyChecking bool
 	NetworkKind            NetworkMode
 	SSHConfigProxy         bool
@@ -1299,6 +1301,9 @@ func sshConfigFileValue(path string) string {
 }
 
 func sshControlPath(target SSHTarget) string {
+	if target.ControlPath != "" {
+		return target.ControlPath
+	}
 	scope := strings.Join([]string{
 		target.User,
 		target.Key,

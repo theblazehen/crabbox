@@ -470,6 +470,20 @@ func TestSSHReadOnlyHealthRequiresPinnedAuthenticatedEndpoint(t *testing.T) {
 			if err != nil || !bytes.Equal(trust, priorTrust) || len(client.execs) != bootstrapExecs {
 				t.Fatalf("read-only health bootstrapped or repinned: %v", err)
 			}
+			if scenario == "healthy" {
+				reuseCtx, reuseCancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer reuseCancel()
+				lease, reused := b.reusePreparedSSH(reuseCtx, client, ready, claim)
+				if !reused {
+					t.Fatal("healthy prepared endpoint was not reused")
+				}
+				if len(client.execs) != bootstrapExecs {
+					t.Fatalf("healthy reuse re-ran bootstrap: execs=%d want=%d", len(client.execs), bootstrapExecs)
+				}
+				if !lease.SSH.RunScopedControlMaster || !lease.SSH.NoControlMaster {
+					t.Fatalf("healthy mutable resolve returned incorrect SSH transport policy: %#v", lease.SSH)
+				}
+			}
 		})
 	}
 }
