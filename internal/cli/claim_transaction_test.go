@@ -55,6 +55,28 @@ func seedClaimContract(t *testing.T) leaseClaim {
 	return claim
 }
 
+func TestClaimEndpointRefreshPreservesRevisionOnlyWhenUnchanged(t *testing.T) {
+	claim := seedClaimContract(t)
+	server := Server{Provider: "aws", CloudID: "i-endpoint"}
+	target := SSHTarget{Host: "192.0.2.10", Port: "22"}
+	first, err := updateLeaseClaimEndpointIfUnchanged(claim.LeaseID, claim, server, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := updateLeaseClaimEndpointIfUnchanged(claim.LeaseID, first, server, target)
+	if err != nil || !reflect.DeepEqual(refreshed, first) {
+		t.Fatalf("unchanged refresh invalidated ownership snapshot: %v", err)
+	}
+	target.Port = "2222"
+	changed, err := updateLeaseClaimEndpointIfUnchanged(claim.LeaseID, first, server, target)
+	if err != nil || changed.SSHPort != 2222 || changed.Revision == first.Revision {
+		t.Fatalf("endpoint change not published with new revision: %#v, %v", changed, err)
+	}
+	if _, err := updateLeaseClaimEndpointIfUnchanged(claim.LeaseID, first, server, target); err == nil {
+		t.Fatal("stale ownership snapshot accepted after endpoint change")
+	}
+}
+
 func assertClaimContractStored(t *testing.T, id string, want leaseClaim) {
 	t.Helper()
 	path, err := leaseClaimPath(id)

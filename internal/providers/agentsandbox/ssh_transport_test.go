@@ -480,8 +480,8 @@ func TestSSHReadOnlyHealthRequiresPinnedAuthenticatedEndpoint(t *testing.T) {
 				if len(client.execs) != bootstrapExecs {
 					t.Fatalf("healthy reuse re-ran bootstrap: execs=%d want=%d", len(client.execs), bootstrapExecs)
 				}
-				if !lease.SSH.RunScopedControlMaster || !lease.SSH.NoControlMaster {
-					t.Fatalf("healthy mutable resolve returned incorrect SSH transport policy: %#v", lease.SSH)
+				if lease.SSH.ControlScope == "" || lease.SSH.NoControlMaster {
+					t.Fatalf("healthy reuse disabled persistent transport: %#v", lease.SSH)
 				}
 			}
 		})

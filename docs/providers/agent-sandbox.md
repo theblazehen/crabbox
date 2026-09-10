@@ -155,11 +155,14 @@ and before exposing a forwarded stream. A same-pod container restart invalidates
 the prepared endpoint too. Bootstrap may re-resolve and retry a verified
 replacement up to three attempts within the existing readiness/exec deadlines;
 the original claim UID must still match. SSH host-key checking remains strict,
-and workload commands are never replayed by this recovery path. Within one
-`run`, Crabbox shares a private, uniquely named OpenSSH control master after the
-first authenticated connection, so sync, ownership, workload, and capture
-helpers do not each open a new port-forward. The master is run-scoped rather
-than lease-scoped and is closed after remote workspace ownership cleanup.
+and workload commands are never replayed by this recovery path. Crabbox shares
+a private, lease-scoped OpenSSH control master across retained runs, so sync,
+ownership, workload, and capture helpers reuse the authenticated port-forward.
+A healthy local master is checked before Kubernetes resolution. Its identity
+binds the claim, Sandbox, pod, container runtime, endpoint, and lease expiry;
+the forwarding process periodically revalidates runtime identity and stops at
+expiry. Runtime replacement and lease release retire the old masters. Remote
+workspace ownership remains run-scoped and is released after each command.
 
 Read-only `status`, `list`, and `inspect` distinguish `pod_ready` from
 `ssh_ready`. Their SSH check performs a pinned, client-key-authenticated

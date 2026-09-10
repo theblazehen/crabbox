@@ -221,6 +221,27 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 	if err := core.ValidateLeaseTargetProviderIdentity(lease, req.ExpectedProviderIdentity); err != nil {
 		return core.LeaseTarget{}, err
 	}
+	if !readOnly && !req.Reclaim {
+		if claimTTLExpired(claim, lifecycle.now().UTC()) {
+			if closeErr := closeClaimSSHMasters(ctx, claim); closeErr != nil {
+				return core.LeaseTarget{}, closeErr
+			}
+			return core.LeaseTarget{}, exit(4, "agent-sandbox lease %s expired", claim.LeaseID)
+		}
+		target, targetErr := lifecycle.sshTarget(claim)
+		if targetErr == nil {
+			active, controlErr := core.SSHControlMasterReady(ctx, target)
+			if controlErr != nil {
+				return core.LeaseTarget{}, controlErr
+			}
+			if active {
+				target.RequireControlMaster = true
+				lease.SSH = target
+				core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
+				return lease, nil
+			}
+		}
+	}
 	client, err := lifecycle.client(ctx)
 	if err != nil {
 		return core.LeaseTarget{}, err
@@ -332,6 +353,27 @@ func (b *sshLeaseBackend) BeginSSHRunActivity(ctx context.Context, lease core.Le
 		return nil, err
 	}
 	claim, err := b.currentClaimForTarget(lease)
+	if err == nil && !claimTTLExpired(claim, b.lifecycle.now().UTC()) {
+		target, targetErr := b.lifecycle.sshTarget(claim)
+		if targetErr != nil && lease.SSH.Host != "" {
+			unlock()
+			return nil, targetErr
+		}
+		if targetErr == nil {
+			if lease.SSH.Host != "" && (lease.SSH.ControlScope != target.ControlScope || lease.SSH.SSHHostKey != target.SSHHostKey || lease.SSH.Port != target.Port || lease.SSH.Host != target.Host || lease.SSH.User != target.User || lease.SSH.Key != target.Key || lease.SSH.KnownHostsFile != target.KnownHostsFile || lease.SSH.HostKeyAlias != target.HostKeyAlias || lease.SSH.ProxyCommand != target.ProxyCommand || lease.SSH.CertificateFile != target.CertificateFile) {
+				unlock()
+				return nil, errors.Join(core.ErrReleaseLeaseOwnershipChanged, errors.New("SSH runtime changed after session admission"))
+			}
+			active, controlErr := core.SSHControlMasterReady(ctx, target)
+			if controlErr != nil {
+				unlock()
+				return nil, controlErr
+			}
+			if active {
+				return unlock, nil
+			}
+		}
+	}
 	if err == nil {
 		var client kubernetesClient
 		client, err = b.lifecycle.client(ctx)
@@ -451,6 +493,9 @@ func (b *sshLeaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.
 		if cleanupLease.SSH.Host != "" {
 			req.GuardedRemoteCleanup(ctx, cleanupLease)
 		}
+	}
+	if err := closeClaimSSHMasters(ctx, claim); err != nil {
+		return core.ReleaseLeaseOutcome{}, err
 	}
 	terminal, err := b.lifecycle.deleteOwnedClaim(ctx, client, claim, claim.LeaseID, name, false)
 	return core.ReleaseLeaseOutcome{Terminal: terminal}, err

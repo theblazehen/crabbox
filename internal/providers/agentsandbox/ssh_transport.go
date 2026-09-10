@@ -29,6 +29,14 @@ func validSSHBootstrapPort(port string) bool {
 	return err == nil && n >= 1024 && n <= 65535 && strconv.Itoa(n) == port
 }
 
+func closeClaimSSHMasters(ctx context.Context, claim LeaseClaim) error {
+	key, err := core.TestboxKeyPath(claim.LeaseID)
+	if err != nil {
+		return err
+	}
+	return core.CloseSSHControlMasters(ctx, core.SSHTarget{Key: key})
+}
+
 func (b *backend) sshTarget(claim LeaseClaim) (core.SSHTarget, error) {
 	if err := authorizeClaimScope(b.cfg, claim); err != nil {
 		return core.SSHTarget{}, err
@@ -81,11 +89,18 @@ func (b *backend) sshTarget(claim LeaseClaim) (core.SSHTarget, error) {
 		SSHConfigProxy: true,
 		ProxyCommand:   strings.Join(quoted, " "),
 		ChildEnv:       childEnv,
-		// Every connection must execute the identity-checking proxy rather than
-		// silently reusing an older control socket after a claim transition.
-		NoControlMaster:        true,
-		RunScopedControlMaster: true,
-		ReadyCheck:             "command -v bash >/dev/null && command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null",
+		// Multiplex only within the exact Kubernetes runtime and pinned endpoint.
+		// A fresh connection still passes through the identity-checking proxy.
+		ControlScope: strings.Join([]string{claim.ProviderScope, claim.Labels[claimLabelClaimUID],
+			claim.Labels[claimLabelSSHSandboxUID], claim.Labels[claimLabelSSHPodUID],
+			claim.Labels[claimLabelSSHContainerID], claim.Labels[claimLabelExpiresAt]}, "\x00"),
+		ReadyCheck: "command -v bash >/dev/null && command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null",
+	}
+	for _, label := range []string{claimLabelClaimUID, claimLabelSSHSandboxUID, claimLabelSSHPodUID, claimLabelSSHContainerID} {
+		if claim.Labels[label] == "" {
+			target.NoControlMaster = true
+			break
+		}
 	}
 	return target, nil
 }
@@ -145,6 +160,15 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 	if claimTTLExpired(claim, lifecycle.now()) {
 		return fmt.Errorf("agent-sandbox-ssh lease %s has expired", claim.LeaseID)
 	}
+	if expiry := claim.Labels[claimLabelExpiresAt]; expiry != "" {
+		deadline, err := time.Parse(time.RFC3339, expiry)
+		if err != nil {
+			return fmt.Errorf("invalid SSH lease expiry: %w", err)
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	// A proxy cannot finish recovery or bootstrap: that would mutate local
 	// state while a run holds its operation lock. Require an already pinned UID.
 	identity, err := claimIdentityFromLocalClaim(claim)
@@ -177,7 +201,30 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 		}
 		return revalidateSandboxReadiness(ctx, client, lifecycle.cfg.AgentSandbox.Namespace, ready)
 	}
-	return lifecycle.forwardSSH(ctx, ready.PodName, port, input, output, stderr, checkIdentity)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := checkIdentity(); err != nil {
+					cancel(err)
+					return
+				}
+			}
+		}
+	}()
+	err = lifecycle.forwardSSH(ctx, ready.PodName, port, input, output, stderr, checkIdentity)
+	cause := context.Cause(ctx)
+	cancel(nil)
+	<-monitorDone
+	return errors.Join(err, cause)
 }
 
 // Probe the actual authenticated SSH endpoint, without running a remote command,

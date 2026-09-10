@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Speed up retained `agent-sandbox-ssh` runs by probing and directly reusing a healthy identity-fenced endpoint, and share one private SSH control master across each run's helpers while retaining authenticated Kubernetes recovery for changed or unavailable runtimes.
+- Reuse lease-scoped, identity-fenced SSH control masters across retained `agent-sandbox-ssh` commands, checking healthy sessions before Kubernetes resolution and retiring transports on runtime replacement, expiry, or release; skip unchanged endpoint claim writes while preserving ownership guards and authenticated recovery.
 - Recover `agent-sandbox-ssh` after lost container SSH state through Kubernetes-authenticated key/port refresh, with container-runtime fencing and strict SSH checks; read-only status, list, and inspect distinguish pod readiness from authenticated SSH availability without repairing or repinning.
 - Add `agent-sandbox-ssh` for SSH/rsync sync, scripts, captures, and downloads on compatible Linux amd64 Agent Sandbox warm pools, with an additive static initializer, independent key-only Dropbear and private root-shell policy on a pinned dynamic loopback port, and Kubernetes port-forwarding; existing image tools and accounts are preserved, and the archive provider remains unchanged.
 - Reuse an optional image-seeded SSH initializer and verified immutable pre-extracted runtime, skipping initializer uploads only for an exact embedded-byte match and retaining safe upload fallback for absent or incompatible seeds.

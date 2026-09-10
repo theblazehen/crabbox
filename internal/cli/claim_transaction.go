@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 )
 
 // Revision timing is observable by provider endpoint preparation. Ordinary
@@ -47,6 +48,7 @@ type leaseClaimTransaction struct {
 	revision      claimRevisionPhase
 	directory     claimDirectoryPolicy
 	publication   claimPublicationPolicy
+	skipUnchanged bool
 	write         func(string, leaseClaim) error
 	syncDirectory func(string) error
 }
@@ -125,6 +127,16 @@ func transactLeaseClaim(leaseID string, tx leaseClaimTransaction) (leaseClaim, e
 		}
 		if err := tx.mutate(&claim); err != nil {
 			return err
+		}
+		if tx.skipUnchanged && exists {
+			revision := claim.Revision
+			claim.Revision = original.Revision
+			unchanged := reflect.DeepEqual(claim, original)
+			claim.Revision = revision
+			if unchanged {
+				updated = original
+				return nil
+			}
 		}
 		if tx.publication == claimSkipEmpty && claim.LeaseID == "" {
 			return nil

@@ -892,30 +892,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var hydratedByActions bool
 	var lifecycleOwner *workspaceOwner
 	ownerParentCtx := ctx
-	var closeRunScopedSSHControlMaster func(context.Context) error
-	configureRunScopedSSHControlMaster := func() error {
-		if closeRunScopedSSHControlMaster != nil {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), sshCommandWaitDelay)
-			err := closeRunScopedSSHControlMaster(cleanupCtx)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("close replaced run-scoped SSH transport: %w", err)
-			}
-		}
-		var configureErr error
-		target, closeRunScopedSSHControlMaster, configureErr = enableRunScopedSSHControlMaster(target)
-		return configureErr
-	}
-	defer func() {
-		if closeRunScopedSSHControlMaster == nil {
-			return
-		}
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), sshCommandWaitDelay)
-		defer cancel()
-		if cleanupErr := closeRunScopedSSHControlMaster(cleanupCtx); cleanupErr != nil {
-			fmt.Fprintf(a.Stderr, "warning: close run-scoped SSH transport: %v\n", cleanupErr)
-		}
-	}()
 	defer func() {
 		if lifecycleOwner == nil {
 			return
@@ -1483,9 +1459,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			fmt.Fprintf(a.Stderr, "warning: direct touch failed for %s: %v\n", leaseID, touchErr)
 		}
 	}
-	if err := configureRunScopedSSHControlMaster(); err != nil {
-		return recordFailure(err)
-	}
 	if envHelperName != "" {
 		// Reject target-specific helper gaps before SSH wait or sync mutates the remote.
 		if err := validateRunEnvHelperTarget(target, runEnvHelperPath(envHelperName)); err != nil {
@@ -1539,7 +1512,10 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	if shouldAcquireWorkspaceOwner(target, acquired, acquiredRunMayRetainLease(*keep, *keepOnFailure, *stopAfter), sshBackend) {
 		target = bootstrapNetworkTarget(cfg, server, target)
 		connectStartedAt := time.Now()
-		waitErr := waitForSSHReady(ctx, &target, a.Stderr, "workspace owner", 2*time.Minute)
+		var waitErr error
+		if !target.RequireControlMaster {
+			waitErr = waitForSSHReady(ctx, &target, a.Stderr, "workspace owner", 2*time.Minute)
+		}
 		runnerConnectDuration += time.Since(connectStartedAt)
 		if waitErr != nil {
 			return recordFailure(waitErr)
@@ -1815,9 +1791,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		runReq.RunID = executionRunID
 		runReq.Env = envSelection.Effective
 		if err := a.claimRunLeaseTargetForRepoAndRegister(ctx, leaseID, serverSlug(server), cfg, &server, target, repo.Root, *reclaim, false); err != nil {
-			return true, err
-		}
-		if err := configureRunScopedSSHControlMaster(); err != nil {
 			return true, err
 		}
 		workdir = remoteJoin(cfg, leaseID, repo.Name)
@@ -2356,7 +2329,10 @@ afterSync:
 	recorder.Event("bootstrap.waiting", "bootstrap", "waiting for SSH before command")
 	target = bootstrapNetworkTarget(cfg, server, target)
 	bootstrapStartedAt := time.Now()
-	bootstrapErr := waitForSSHReady(ctx, &target, a.Stderr, "before command", runBeforeCommandSSHReadyTimeout)
+	var bootstrapErr error
+	if !target.RequireControlMaster {
+		bootstrapErr = waitForSSHReady(ctx, &target, a.Stderr, "before command", runBeforeCommandSSHReadyTimeout)
+	}
 	connectDuration := time.Since(bootstrapStartedAt)
 	timings.bootstrap += connectDuration
 	timings.connect += connectDuration
@@ -2395,12 +2371,16 @@ afterSync:
 		mkdirCommand := remoteMkdir(workdir)
 		if isWindowsNativeTarget(target) {
 			mkdirCommand = windowsRemoteMkdir(workdir)
-		}
-		if _, err := runIdempotentSSHCombinedOutput(ctx, target, mkdirCommand, idempotentSSHRetryDelay); err != nil {
-			return recordFailure(exit(7, "create remote workdir: %v", err))
-		}
-		if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifestMode), idempotentSSHRetryDelay); err != nil {
-			return recordFailure(exit(7, "invalidate reusable sync fingerprint before execution: %v", err))
+			if _, err := runIdempotentSSHCombinedOutput(ctx, target, mkdirCommand, idempotentSSHRetryDelay); err != nil {
+				return recordFailure(exit(7, "create remote workdir: %v", err))
+			}
+		} else {
+			// Both steps are idempotent and share one owner witness. Never enter
+			// the workload until directory creation and invalidation both succeed.
+			prepareCommand := mkdirCommand + " && " + remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifestMode)
+			if _, err := runIdempotentSSHCombinedOutput(ctx, target, prepareCommand, idempotentSSHRetryDelay); err != nil {
+				return recordFailure(exit(7, "prepare remote workdir and invalidate reusable sync fingerprint before execution: %v", err))
+			}
 		}
 	}
 	if err := preflightRawJSRuntime(target); err != nil {
@@ -2748,8 +2728,18 @@ afterSync:
 	if code != 0 {
 		commandFailurePhases = timings.commandPhases
 	}
-	if err := waitWorkspaceOwnerNoChild(ctx, lifecycleOwner, lifecycleOwner.callTimeout()); err != nil {
-		return recordFailure(exit(7, "remote command child ownership remains active; refusing collection and cleanup: %v", err))
+	// With no remote collection, the final owner release already checks the
+	// token and witnessed child's death under the same remote gate. Keep that
+	// ownership until cleanup, but do not precede it with an identical read-only
+	// inspection on successful retained no-sync runs. Failure, pool return and
+	// lease teardown keep their existing quiescence checks.
+	needsRemoteCollection := failureDownloadEligible || cfg.Results.Auto || len(cfg.Results.JUnit) > 0 ||
+		len(requiredArtifactChanges) > 0 || len(requiredArtifactGlobs) > 0 || len(loadedArtifactSchemas) > 0 ||
+		len(downloads) > 0 || len(runArtifactGlobs) > 0
+	if !*noSync || acquired || useCoordinator || borrowedPool != nil || code != 0 || streamErr != nil || needsRemoteCollection {
+		if err := waitWorkspaceOwnerNoChild(ctx, lifecycleOwner, lifecycleOwner.callTimeout()); err != nil {
+			return recordFailure(exit(7, "remote command child ownership remains active; refusing collection and cleanup: %v", err))
+		}
 	}
 	artifactStartedAt := time.Now()
 	artifactTimingDone := false

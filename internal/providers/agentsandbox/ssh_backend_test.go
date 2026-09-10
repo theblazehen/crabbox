@@ -167,6 +167,42 @@ func TestSSHRunOperationFenceBlocksRelease(t *testing.T) {
 	}
 }
 
+func TestSSHRunActivityRejectsChangedTransportBeforeKubernetes(t *testing.T) {
+	b, fake := testSSHBackend(t)
+	claim := createSSHTestClaim(t, b, fake)
+	if _, _, err := core.EnsureTestboxKey(claim.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	labels := map[string]string{}
+	for key, value := range claim.Labels {
+		labels[key] = value
+	}
+	labels[claimLabelSSHUser] = "root"
+	labels[claimLabelSSHPort] = "43210"
+	labels[claimLabelSSHHostKey] = bootstrapTestPublicKey(t, 1)
+	labels[claimLabelSSHSandboxUID] = "sandbox-uid"
+	labels[claimLabelSSHPodUID] = "pod-uid"
+	labels[claimLabelSSHContainerID] = "containerd://container-a"
+	claim, err := updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := sshLeaseFromClaim(claim)
+	lease.SSH, err = b.lifecycle.sshTarget(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
+	lease.SSH.ControlScope = "stale-runtime"
+	b.lifecycle.newClient = func(context.Context, Config, Runtime) (kubernetesClient, error) {
+		t.Fatal("changed transport reached Kubernetes admission")
+		return nil, errors.New("unexpected Kubernetes client")
+	}
+	if _, err := b.BeginSSHRunActivity(context.Background(), lease); !errors.Is(err, core.ErrReleaseLeaseOwnershipChanged) {
+		t.Fatalf("changed transport err=%v", err)
+	}
+}
+
 func TestSSHReleaseReportsTerminalDespiteLocalFinalizationFailure(t *testing.T) {
 	b, fake := testSSHBackend(t)
 	claim := createSSHTestClaim(t, b, fake)

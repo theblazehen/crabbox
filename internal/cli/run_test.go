@@ -510,7 +510,7 @@ case "$current" in
     esac
     exit 0
     ;;
-  *"protocol_action='release'"*) printf RELEASED; exit 0 ;;
+  *"protocol_action='release'"*) printf %s "${CRABBOX_FAKE_OWNER_RELEASE:-RELEASED}"; exit 0 ;;
   *"rsync-stop."*"phase_live="*) : > "$(dirname "$0")/owner-child"; printf '123\n'; exit 0 ;;
   *'touch "$HOME/.crabbox/workspace-owners/'*"rsync-stop."*) rm -f "$(dirname "$0")/owner-child"; exit 0 ;;
   *"kill -0"*"exit=unknown"*) printf 'exit=unknown\nno marker written\n'; exit 0 ;;
@@ -2125,6 +2125,50 @@ func TestRunCommandWritesReusedLocalContainerLeaseOutput(t *testing.T) {
 				t.Fatalf("reused run released lease %d time(s)", releases)
 			}
 		})
+	}
+}
+
+func TestRetainedNoSyncRunRequiresConfirmedOwnerRelease(t *testing.T) {
+	for _, response := range []string{"RELEASED", "CHILD", "MISMATCH", "AMBIGUOUS"} {
+		t.Run(response, func(t *testing.T) {
+			setupLocalContainerRunSessionTest(t, "")
+			t.Setenv("CRABBOX_FAKE_OWNER_RELEASE", response)
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), []string{
+				"--provider", "local-container", "--id", localContainerRunSessionTestLeaseID,
+				"--no-sync", "--no-hydrate", "--", "true",
+			})
+			if response == "RELEASED" {
+				if err != nil {
+					t.Fatalf("confirmed release failed: %v\nstderr=%s", err, stderr.String())
+				}
+				return
+			}
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 7 {
+				t.Fatalf("unconfirmed owner release accepted: %v\nstderr=%s", err, stderr.String())
+			}
+		})
+	}
+}
+
+func TestRetainedNoSyncPreparationFailureDoesNotStartWorkload(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "workload-started")
+	setupLocalContainerRunSessionTest(t, "#!/bin/sh\ncase \"$1\" in\n"+
+		"  *sync-fingerprint*) exit 74;;\n"+
+		"  *no-sync-must-not-run*) touch "+shellQuote(marker)+";;\n"+
+		"esac\nexit 0\n")
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), []string{
+		"--provider", "local-container", "--id", localContainerRunSessionTestLeaseID,
+		"--no-sync", "--no-hydrate", "--", "no-sync-must-not-run",
+	})
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 7 {
+		t.Fatalf("preparation failure accepted: %v\nstderr=%s", err, stderr.String())
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("workload ran after failed preparation: %v", statErr)
 	}
 }
 

@@ -51,6 +51,9 @@ type sshInitializationRequest struct {
 }
 
 func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (LeaseClaim, error) {
+	if err := closeClaimSSHMasters(ctx, claim); err != nil {
+		return LeaseClaim{}, fmt.Errorf("close previous SSH transport before recovery: %w", err)
+	}
 	_, publicKey, err := core.EnsureTestboxKey(claim.LeaseID)
 	if err != nil {
 		return LeaseClaim{}, err

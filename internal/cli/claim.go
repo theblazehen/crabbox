@@ -700,10 +700,11 @@ func updateLeaseClaimEndpointIfUnchangedMode(leaseID string, expected leaseClaim
 		return leaseClaim{}, nil
 	}
 	return transactLeaseClaim(leaseID, leaseClaimTransaction{
-		guard:       endpointClaimGuard(leaseID, unchangedLeaseClaimGuard(leaseID, expected, true)),
-		revision:    claimRevisionBeforeMutation,
-		directory:   claimDirectoryCreate,
-		publication: claimSkipEmpty,
+		guard:         endpointClaimGuard(leaseID, unchangedLeaseClaimGuard(leaseID, expected, true)),
+		revision:      claimRevisionBeforeMutation,
+		directory:     claimDirectoryCreate,
+		publication:   claimSkipEmpty,
+		skipUnchanged: true,
 		mutate: func(claim *leaseClaim) error {
 			return transformLeaseClaimEndpoint(claim, server, target, policy)
 		},

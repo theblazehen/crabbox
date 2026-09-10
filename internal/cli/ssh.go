@@ -27,21 +27,24 @@ import (
 )
 
 type SSHTarget struct {
-	User                   string
-	Host                   string
-	SSHHostKey             string
-	Key                    string
-	CertificateFile        string
-	KnownHostsFile         string
-	HostKeyAlias           string
-	Port                   string
-	FallbackPorts          []string
-	TargetOS               string
-	WindowsMode            string
-	ReadyCheck             string
-	AuthSecret             bool
-	NoControlMaster        bool
-	RunScopedControlMaster bool
+	User            string
+	Host            string
+	SSHHostKey      string
+	Key             string
+	CertificateFile string
+	KnownHostsFile  string
+	HostKeyAlias    string
+	Port            string
+	FallbackPorts   []string
+	TargetOS        string
+	WindowsMode     string
+	ReadyCheck      string
+	AuthSecret      bool
+	NoControlMaster bool
+	// ControlScope binds a persistent literal mux path to provider runtime identity.
+	ControlScope string
+	// RequireControlMaster forbids reconnecting if an admitted mux disappears.
+	RequireControlMaster   bool
 	ControlPath            string
 	DisableHostKeyChecking bool
 	NetworkKind            NetworkMode
@@ -721,8 +724,10 @@ func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, co
 		p.stage.setupMarker = p.setupMarker
 		return p.stage.run(ctx, target, connectTimeout, connectionAttempts, stdout, stderr)
 	}
-	if err := resolveSSHPortNoInput(ctx, target, connectTimeout, connectionAttempts, stderr); err != nil {
-		return err
+	if !target.RequireControlMaster {
+		if err := resolveSSHPortNoInput(ctx, target, connectTimeout, connectionAttempts, stderr); err != nil {
+			return err
+		}
 	}
 	multiplexed := runtime.GOOS != "windows" && !target.AuthSecret && !target.NoControlMaster
 	for attempt := 0; ; attempt++ {
@@ -1213,9 +1218,15 @@ func sshBaseArgsWithOptions(target SSHTarget, connectTimeout, connectionAttempts
 			"-o", "ControlPersist=no",
 		)
 	} else {
+		controlPersist := "10m"
+		if target.ControlScope != "" {
+			// Provider-scoped masters are retired explicitly on replacement,
+			// release, or the proxy's hard lease deadline.
+			controlPersist = "yes"
+		}
 		args = append(args,
 			"-o", "ControlMaster=auto",
-			"-o", "ControlPersist=10m",
+			"-o", "ControlPersist="+controlPersist,
 			"-o", "ControlPath="+sshControlPath(target),
 		)
 	}
@@ -1225,7 +1236,9 @@ func sshBaseArgsWithOptions(target SSHTarget, connectTimeout, connectionAttempts
 	if target.CertificateFile != "" {
 		args = append(args, "-o", "CertificateFile="+target.CertificateFile)
 	}
-	if target.ProxyCommand != "" {
+	if target.RequireControlMaster {
+		args = append(args, "-o", "ProxyCommand=/usr/bin/false")
+	} else if target.ProxyCommand != "" {
 		args = append(args, "-o", "ProxyCommand="+target.ProxyCommand)
 	}
 	return args
@@ -1313,6 +1326,15 @@ func sshControlPath(target SSHTarget) string {
 		strings.TrimSpace(target.SSHHostKey),
 		target.ProxyCommand,
 	}, "\x00")
+	if target.ControlScope != "" {
+		scope += "\x00" + target.ControlScope + "\x00" + target.Host + "\x00" + blank(target.Port, "22")
+		sum := sha256.Sum256([]byte(scope))
+		leaseDir := sshControlLeaseDirectory(target)
+		if leaseDir == "" {
+			leaseDir = scope
+		}
+		return filepath.Join(sshControlDirectory(leaseDir), base64.RawURLEncoding.EncodeToString(sum[:24]))
+	}
 	if leaseDir := sshControlLeaseDirectory(target); leaseDir != "" {
 		sum := sha256.Sum256([]byte(scope))
 		return filepath.Join(sshControlDirectory(leaseDir), base64.RawURLEncoding.EncodeToString(sum[:16])+"-%C")

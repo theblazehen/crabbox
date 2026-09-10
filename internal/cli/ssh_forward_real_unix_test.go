@@ -443,6 +443,70 @@ func testCoordinatorReleaseJoinsSSHControlMasters(t *testing.T, modes ...string)
 	}
 }
 
+func TestPersistentSSHControlMasterLifecycle(t *testing.T) {
+	isolateTestUserDirs(t)
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("OpenSSH is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	server := newForwardSSHServer(t, "persistent-owner")
+	close(server.release)
+	const leaseID = "cbx_001122334455"
+	key, _, err := ensureTestboxKey(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := SSHTarget{User: "persistent-owner", Host: "127.0.0.1", Port: strconv.Itoa(server.port()), Key: key, SSHHostKey: server.hostKey, ControlScope: "claim/pod/container"}
+	if err := prepareLeaseSSHTrust(&target, leaseID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = CloseSSHControlMasters(context.Background(), target) })
+	if ready, err := SSHControlMasterReady(ctx, target); err != nil || ready {
+		t.Fatalf("absent master readiness=%v err=%v", ready, err)
+	}
+	args := append([]string{"-F", os.DevNull, "-fN"}, sshBaseArgs(target)...)
+	args = append(args, target.User+"@"+target.Host)
+	if output, err := sshCommandContext(ctx, target, args...).CombinedOutput(); err != nil {
+		t.Fatalf("start persistent master: %v: %s", err, output)
+	}
+	for range 2 {
+		if ready, err := SSHControlMasterReady(ctx, target); err != nil || !ready {
+			t.Fatalf("retained master readiness=%v err=%v", ready, err)
+		}
+	}
+	replacement := target
+	replacement.ControlScope = "claim/pod/restarted-container"
+	if ready, err := SSHControlMasterReady(ctx, replacement); err != nil || ready {
+		t.Fatalf("replacement reused original master: ready=%v err=%v", ready, err)
+	}
+	if err := CloseSSHControlMasters(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := SSHControlMasterReady(ctx, target); err != nil || ready {
+		t.Fatalf("closed master readiness=%v err=%v", ready, err)
+	}
+	hot := target
+	hot.RequireControlMaster = true
+	hotArgs := append([]string{"-F", os.DevNull, "-fN"}, sshBaseArgs(hot)...)
+	hotArgs = append(hotArgs, hot.User+"@"+hot.Host)
+	if output, err := sshCommandContext(ctx, hot, hotArgs...).CombinedOutput(); err == nil {
+		t.Fatalf("lost mux reconnected to live SSH server: %s", output)
+	}
+	if err := ensureSSHControlDirectory(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sshControlPath(target), []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := SSHControlMasterReady(ctx, target); ready || err == nil {
+		t.Fatalf("unsafe socket readiness=%v err=%v", ready, err)
+	}
+	if err := os.Remove(sshControlPath(target)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSSHControlCleanupRejectsMalformedMuxWithoutNetworkFallback(t *testing.T) {
 	isolateTestUserDirs(t)
 	sshExecutable, err := exec.LookPath("ssh")
@@ -510,6 +574,13 @@ func TestSSHControlCleanupRejectsMalformedMuxWithoutNetworkFallback(t *testing.T
 	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target.ControlScope, target.ControlPath = "malformed-mux", socket
+	if ready, err := SSHControlMasterReady(ctx, target); ready || err != nil {
+		t.Errorf("malformed master readiness=%v err=%v", ready, err)
+	}
 	if err := closeSSHControlMaster(ctx, socket); err == nil {
 		t.Error("malformed live mux endpoint was accepted as cleaned up")
 	}

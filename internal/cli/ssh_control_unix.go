@@ -54,8 +54,18 @@ func ensureSSHControlDirectory(target SSHTarget) error {
 		return inspectSSHControlPath(filepath.Dir(target.ControlPath), true)
 	}
 	leaseDir := sshControlLeaseDirectory(target)
-	if leaseDir == "" || target.AuthSecret || target.NoControlMaster {
+	if target.AuthSecret || target.NoControlMaster {
 		return nil
+	}
+	if leaseDir == "" {
+		if target.ControlScope == "" {
+			return nil
+		}
+		dir := filepath.Dir(sshControlPath(target))
+		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		return inspectSSHControlPath(dir, true)
 	}
 	if _, err := inspectTestboxLeaseDirectory(filepath.Base(leaseDir)); err != nil {
 		return err
@@ -70,26 +80,79 @@ func ensureSSHControlDirectory(target SSHTarget) error {
 	return inspectSSHControlPath(dir, true)
 }
 
-func enableRunScopedSSHControlMaster(target SSHTarget) (SSHTarget, func(context.Context) error, error) {
-	if !target.RunScopedControlMaster {
-		return target, func(context.Context) error { return nil }, nil
+// SSHControlMasterReady probes only a literal local mux socket. A failed probe
+// never establishes an SSH connection and never replays a remote operation.
+func SSHControlMasterReady(ctx context.Context, target SSHTarget) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	if target.AuthSecret || !target.NoControlMaster {
-		return SSHTarget{}, nil, errors.New("run-scoped SSH control master requires an independently non-multiplexed key target")
+	if target.AuthSecret || target.NoControlMaster || target.ControlScope == "" {
+		return false, nil
 	}
-	dir, err := os.MkdirTemp("", "crabbox-run-ssh-")
+	path := sshControlPath(target)
+	if strings.Contains(path, "%") {
+		return false, errors.New("SSH master readiness requires a literal control path")
+	}
+	for _, candidate := range []struct {
+		path      string
+		directory bool
+	}{{filepath.Dir(path), true}, {path, false}} {
+		if err := inspectSSHControlPath(candidate.path, candidate.directory); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, sshCommandWaitDelay)
+	defer cancel()
+	_, err := sshLocalControl(ctx, path, "check")
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if err != nil {
-		return SSHTarget{}, nil, err
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return false, nil
+		}
+		return false, err
 	}
-	if err := inspectSSHControlPath(dir, true); err != nil {
-		_ = os.Remove(dir)
-		return SSHTarget{}, nil, err
+	return true, nil
+}
+
+// CloseSSHControlMasters retires the target lease's locally owned masters,
+// including prior identity scopes, without attempting a network connection.
+func CloseSSHControlMasters(ctx context.Context, target SSHTarget) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	target.NoControlMaster = false
-	target.ControlPath = filepath.Join(dir, "master-%C")
-	return target, func(ctx context.Context) error {
-		return closeSSHControlMastersInDirectory(ctx, dir)
-	}, nil
+	if target.ControlPath != "" {
+		if strings.Contains(target.ControlPath, "%") {
+			return errors.New("SSH master cleanup requires a literal control path")
+		}
+		if err := inspectSSHControlPath(filepath.Dir(target.ControlPath), true); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if err := inspectSSHControlPath(target.ControlPath, false); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		ctx, cancel := context.WithTimeout(ctx, sshCommandWaitDelay)
+		defer cancel()
+		return closeSSHControlMaster(ctx, target.ControlPath)
+	}
+	if leaseDir := sshControlLeaseDirectory(target); leaseDir != "" {
+		return closeLeaseSSHControlMasters(ctx, leaseDir)
+	}
+	if target.ControlScope != "" && target.ControlPath == "" {
+		return closeSSHControlMastersInDirectory(ctx, filepath.Dir(sshControlPath(target)))
+	}
+	return nil
 }
 
 func closeLeaseSSHControlMasters(ctx context.Context, leaseDir string) error {
@@ -164,24 +227,25 @@ func removeInactiveSSHControlSocket(ctx context.Context, path string) (bool, err
 	return true, os.Remove(path)
 }
 
-func closeSSHControlMaster(ctx context.Context, path string) error {
-	control := func(operation string) (string, error) {
-		// OpenSSH can fall through to ssh_connect after a failed mux handshake.
-		// A nonconnecting proxy and explicit identity exclusions keep cleanup local.
-		cmd := exec.CommandContext(ctx, directSSHExecutable(), "-F", os.DevNull,
-			"-o", "ProxyCommand=/usr/bin/false", "-o", "IdentityFile=none",
-			"-o", "CertificateFile=none", "-o", "IdentityAgent=none",
-			"-S", path, "-O", operation, "--", "localhost")
-		cmd.Env, cmd.WaitDelay = systemInspectionEnvironment(), sshCommandWaitDelay
-		out := boundedSSHOutput{limit: 1024}
-		cmd.Stdout, cmd.Stderr = &out, &out
-		err := cmd.Run()
-		if out.exceeded {
-			return "", ErrSSHOutputLimit
-		}
-		return strings.TrimSpace(out.String()), err
+func sshLocalControl(ctx context.Context, path, operation string) (string, error) {
+	// OpenSSH can fall through to ssh_connect after a failed mux handshake.
+	// A nonconnecting proxy and explicit identity exclusions keep cleanup local.
+	cmd := exec.CommandContext(ctx, directSSHExecutable(), "-F", os.DevNull,
+		"-o", "ProxyCommand=/usr/bin/false", "-o", "IdentityFile=none",
+		"-o", "CertificateFile=none", "-o", "IdentityAgent=none",
+		"-S", path, "-O", operation, "--", "localhost")
+	cmd.Env, cmd.WaitDelay = systemInspectionEnvironment(), sshCommandWaitDelay
+	out := boundedSSHOutput{limit: 1024}
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	if out.exceeded {
+		return "", ErrSSHOutputLimit
 	}
-	output, err := control("check")
+	return strings.TrimSpace(out.String()), err
+}
+
+func closeSSHControlMaster(ctx context.Context, path string) error {
+	output, err := sshLocalControl(ctx, path, "check")
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -207,7 +271,7 @@ func closeSSHControlMaster(ctx context.Context, path string) error {
 		}
 		return fmt.Errorf("inspect SSH master start identity: %w", err)
 	}
-	_, exitErr := control("exit")
+	exitOutput, exitErr := sshLocalControl(ctx, path, "exit")
 	for {
 		current, err := inspectProcessSnapshot(pid)
 		// Orphaned masters can remain zombies under a non-reaping container PID 1.
@@ -217,10 +281,10 @@ func closeSSHControlMaster(ctx context.Context, path string) error {
 				return absentErr
 			}
 		}
-		if exitErr != nil {
-			return fmt.Errorf("close lease SSH master: %w", exitErr)
-		}
 		if err := sleepContext(ctx, 10*time.Millisecond); err != nil {
+			if exitErr != nil {
+				return errors.Join(fmt.Errorf("close lease SSH master: %w: %s", exitErr, exitOutput), fmt.Errorf("wait for lease SSH master exit: %w", err))
+			}
 			return fmt.Errorf("wait for lease SSH master exit: %w", err)
 		}
 	}
