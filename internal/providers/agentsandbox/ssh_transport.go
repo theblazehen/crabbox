@@ -157,7 +157,7 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 	if !validSSHBootstrapPort(port) {
 		return fmt.Errorf("agent-sandbox-ssh lease %s has no valid pinned SSH port; prepare the lease again", claim.LeaseID)
 	}
-	if claimTTLExpired(claim, lifecycle.now()) {
+	if claimTTLExpired(claim, core.ClockNow(lifecycle.rt.Clock)) {
 		return fmt.Errorf("agent-sandbox-ssh lease %s has expired", claim.LeaseID)
 	}
 	if expiry := claim.Labels[claimLabelExpiresAt]; expiry != "" {
@@ -192,11 +192,11 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 	if err := validateSSHRuntime(claim, ready); err != nil {
 		return err
 	}
-	if claimTTLExpired(claim, lifecycle.now()) {
+	if claimTTLExpired(claim, core.ClockNow(lifecycle.rt.Clock)) {
 		return fmt.Errorf("agent-sandbox-ssh lease %s has expired", claim.LeaseID)
 	}
 	checkIdentity := func() error {
-		if claimTTLExpired(claim, lifecycle.now()) {
+		if claimTTLExpired(claim, core.ClockNow(lifecycle.rt.Clock)) {
 			return fmt.Errorf("agent-sandbox-ssh lease %s has expired", claim.LeaseID)
 		}
 		return revalidateSandboxReadiness(ctx, client, lifecycle.cfg.AgentSandbox.Namespace, ready)

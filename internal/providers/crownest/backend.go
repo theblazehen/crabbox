@@ -61,7 +61,7 @@ func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
 	if req.Options.Tailscale.Enabled {
 		return exit(2, "provider=crownest is delegated-run only and does not support Tailscale options")
 	}
-	started := b.now()
+	started := core.ClockNow(b.rt.Clock)
 	api, err := b.client()
 	if err != nil {
 		return err
@@ -74,18 +74,13 @@ func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
 	if !req.Keep {
 		fmt.Fprintf(b.rt.Stderr, "warning: crownest warmup keeps the sandbox until explicit stop\n")
 	}
-	total := b.now().Sub(started)
-	fmt.Fprintf(b.rt.Stdout, "warmup complete total=%s\n", total.Round(time.Millisecond))
-	if req.TimingJSON {
-		return writeTimingJSON(b.rt.Stderr, timingReport{
-			Provider: providerName,
-			LeaseID:  leaseID,
-			Slug:     slug,
-			TotalMs:  total.Milliseconds(),
-			ExitCode: 0,
-		})
-	}
-	return nil
+	total := core.ClockNow(b.rt.Clock).Sub(started)
+	return shared.CompleteWarmup(b.rt, req.TimingJSON, shared.WarmupCompletion{
+		Provider: providerName,
+		LeaseID:  leaseID,
+		Slug:     slug,
+		Total:    total,
+	})
 }
 
 func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, retErr error) {
@@ -101,7 +96,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 	if req.Options.Tailscale.Enabled {
 		return RunResult{}, exit(2, "provider=crownest is delegated-run only and does not support Tailscale options")
 	}
-	started := b.now()
+	started := core.ClockNow(b.rt.Clock)
 	api, err := b.client()
 	if err != nil {
 		return RunResult{}, err
@@ -150,12 +145,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 	defer func() {
 		result, retErr = shared.PinDelegatedRunFailure(result, retErr)
 		appendFailure := func(err error) {
-			code := 1
-			var public ExitError
-			if errors.As(err, &public) && public.Code != 0 {
-				code = public.Code
-			}
-			result, retErr = shared.AppendDelegatedRunFailure(result, retErr, err, code)
+			result, retErr = shared.AppendDelegatedRunFailure(result, retErr, err, core.ExitCodeForError(err, 1))
 		}
 		if cancelActiveRun && (ctx.Err() != nil || streamErr != nil) {
 			cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
@@ -178,7 +168,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 			}
 			appendFailure(cleanupErr)
 		}
-		result.Total = b.now().Sub(started)
+		result.Total = core.ClockNow(b.rt.Clock).Sub(started)
 		result = core.FinalizeRunResult(result, retErr)
 		if !commandRan {
 			return
@@ -212,7 +202,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 	archive, archiveSHA, archiveBytes, phases, duration, err := b.prepareArchive(ctx, req)
 	syncPhases, syncDuration = phases, duration
 	if err != nil {
-		return RunResult{Total: b.now().Sub(started), SyncDelegated: true}, err
+		return RunResult{Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true}, err
 	}
 	defer func() {
 		_ = archive.Close()
@@ -290,11 +280,11 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 		}
 	}
 	session := b.crownestRunSession(leaseID, slug, !acquired, req.Keep || !acquired)
-	commandStart := b.now()
+	commandStart := core.ClockNow(b.rt.Clock)
 	commandRan, cancelActiveRun = true, true
 	cancelRunID = workspaceRun.ID
 	terminal, streamErr := b.streamRun(ctx, api, workspaceRun.ID)
-	commandDuration := b.now().Sub(commandStart)
+	commandDuration := core.ClockNow(b.rt.Clock).Sub(commandStart)
 	if terminal.ID == "" && ctx.Err() == nil {
 		if latest, getErr := api.GetWorkspaceRun(ctx, workspaceRun.ID); getErr == nil {
 			terminal = latest
@@ -318,7 +308,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (result RunResult, re
 		CommandText:   commandText,
 		ExitCode:      exitCode,
 		Command:       commandDuration,
-		Total:         b.now().Sub(started),
+		Total:         core.ClockNow(b.rt.Clock).Sub(started),
 		SyncDelegated: true,
 		Session:       session,
 	}
@@ -375,7 +365,7 @@ func (b *backend) claimAcquiredSandbox(ctx context.Context, api client, req RunR
 func (b *backend) setupFailure(ctx context.Context, req RunRequest, api client, cause error, started time.Time, acquired bool, leaseID, sandboxID, slug string, shouldStop *bool) (RunResult, error) {
 	if acquired && sandboxID != "" && leaseID == "" {
 		if err := b.claimAcquiredSandbox(ctx, api, req, leaseID, sandboxID, slug, &leaseID, &slug); err != nil {
-			return RunResult{Provider: providerName, ExitCode: 1, Total: b.now().Sub(started), SyncDelegated: true}, errors.Join(cause, err)
+			return RunResult{Provider: providerName, ExitCode: 1, Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true}, errors.Join(cause, err)
 		}
 	}
 	if leaseID != "" {
@@ -386,7 +376,7 @@ func (b *backend) setupFailure(ctx context.Context, req RunRequest, api client, 
 		LeaseID:       leaseID,
 		Slug:          slug,
 		ExitCode:      1,
-		Total:         b.now().Sub(started),
+		Total:         core.ClockNow(b.rt.Clock).Sub(started),
 		SyncDelegated: true,
 		Session:       b.crownestRunSession(leaseID, slug, !acquired, leaseID != "" && !*shouldStop),
 	}, cause
@@ -549,7 +539,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 		return err
 	}
 	scope := claimScope(api.BaseURL(), b.cfg)
-	now := b.now().UTC()
+	now := core.ClockNow(b.rt.Clock).UTC()
 	checked := 0
 	removed := 0
 	claimsRemoved := 0
@@ -668,7 +658,7 @@ func (b *backend) cleanupCreateFailure(ctx context.Context, api client, sandboxI
 }
 
 func (b *backend) prepareArchive(ctx context.Context, req RunRequest) (*os.File, string, int64, []timingPhase, time.Duration, error) {
-	start := b.now()
+	start := core.ClockNow(b.rt.Clock)
 	syncCtx := ctx
 	cancel := func() {}
 	if b.cfg.Sync.Timeout > 0 {
@@ -679,30 +669,30 @@ func (b *backend) prepareArchive(ctx context.Context, req RunRequest) (*os.File,
 	if err != nil {
 		return nil, "", 0, nil, 0, err
 	}
-	manifestStart := b.now()
+	manifestStart := core.ClockNow(b.rt.Clock)
 	manifest, err := syncManifest(req.Repo.Root, excludes, b.cfg.Sync.Includes)
 	if err != nil {
 		return nil, "", 0, nil, 0, exit(6, "build sync file list: %v", err)
 	}
-	manifestDuration := b.now().Sub(manifestStart)
-	preflightStart := b.now()
+	manifestDuration := core.ClockNow(b.rt.Clock).Sub(manifestStart)
+	preflightStart := core.ClockNow(b.rt.Clock)
 	if err := checkSyncPreflight(manifest, b.cfg, req.ForceSyncLarge, b.rt.Stderr); err != nil {
 		return nil, "", 0, nil, 0, err
 	}
-	preflightDuration := b.now().Sub(preflightStart)
-	archiveStart := b.now()
+	preflightDuration := core.ClockNow(b.rt.Clock).Sub(preflightStart)
+	archiveStart := core.ClockNow(b.rt.Clock)
 	archive, err := createPortableSyncArchive(syncCtx, req.Repo, manifest, "crabbox-crownest-sync-*.tgz")
 	if err != nil {
 		return nil, "", 0, nil, 0, err
 	}
-	archiveDuration := b.now().Sub(archiveStart)
+	archiveDuration := core.ClockNow(b.rt.Clock).Sub(archiveStart)
 	sum, size, err := hashArchive(archive)
 	if err != nil {
 		_ = archive.Close()
 		_ = os.Remove(archive.Name())
 		return nil, "", 0, nil, 0, err
 	}
-	total := b.now().Sub(start)
+	total := core.ClockNow(b.rt.Clock).Sub(start)
 	return archive, sum, size, []timingPhase{
 		{Name: "manifest", Ms: manifestDuration.Milliseconds()},
 		{Name: "preflight", Ms: preflightDuration.Milliseconds()},
@@ -966,11 +956,4 @@ func repoName(repo Repo) string {
 
 func randomSuffix() string {
 	return shared.RandomSuffix()
-}
-
-func (b *backend) now() time.Time {
-	if b.rt.Clock != nil {
-		return b.rt.Clock.Now()
-	}
-	return time.Now()
 }

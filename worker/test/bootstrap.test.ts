@@ -523,10 +523,8 @@ describe("cloud-init bootstrap", () => {
   it("starts ssh before optional desktop and browser bootstrap", () => {
     const got = cloudInit({ ...config, desktop: true, browser: true });
     const sshIndex = got.indexOf("systemctl restart ssh");
-    const desktopIndex = got.indexOf(
-      "retry apt-get install -y --no-install-recommends tigervnc-standalone-server",
-    );
-    const browserIndex = got.indexOf("retry apt-get install -y --no-install-recommends gnupg");
+    const desktopIndex = got.indexOf("crabbox_install_packages tigervnc-standalone-server");
+    const browserIndex = got.indexOf("crabbox_install_packages gnupg");
     const bootstrappedIndex = got.indexOf("touch /var/lib/crabbox/bootstrapped");
     expect(sshIndex).toBeGreaterThanOrEqual(0);
     expect(desktopIndex).toBeGreaterThanOrEqual(0);
@@ -835,6 +833,11 @@ describe("cloud-init bootstrap", () => {
       "Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath",
     );
     const restartIndex = got.indexOf("Restart-Service sshd -Force");
+    const nodeIndex = got.indexOf("\nEnsure-CrabboxNode\n");
+    const pathIndex = got.lastIndexOf('SetEnvironmentVariable("Path", $machinePath, "Machine")');
+    expect(nodeIndex).toBeGreaterThan(0);
+    expect(pathIndex).toBeGreaterThan(nodeIndex);
+    expect(restartIndex).toBeGreaterThan(pathIndex);
     expect(setupIndex).toBeGreaterThanOrEqual(0);
     expect(setupIndex).toBeLessThan(restartIndex);
     expect(got).not.toContain("tightvnc-2.8.85-gpl-setup-64bit.msi");
@@ -882,6 +885,14 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("sha256sum -c -");
     expect(got).toContain('mv -f "$trufflehog_candidate" /usr/local/bin/trufflehog');
     expect(got).toContain("trufflehog --no-update --version >/dev/null");
+    const nodeInstall = got.indexOf(
+      "bash /var/lib/crabbox/install-linux-developer-tools.sh --node-only",
+    );
+    const readyScript = got.indexOf("cat >/usr/local/bin/crabbox-ready <<'READY'");
+    expect(nodeInstall).toBeGreaterThan(got.indexOf("$linuxSetup = @'"));
+    expect(readyScript).toBeGreaterThan(nodeInstall);
+    expect(got.slice(readyScript)).toContain("node --version >/dev/null");
+    expect(got.slice(readyScript)).toContain("npm --version >/dev/null");
     expect(got).toContain("test -e /proc/sys/fs/binfmt_misc/WSLInterop");
     expect(got).toContain("test -w '/work/crabbox'");
     expect(got).toContain("PubkeyAuthentication yes");
@@ -961,5 +972,13 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("com.openssh.sshd");
     expect(got).toContain("com.apple.screensharing");
     expect(got).toContain("/usr/local/bin/crabbox-ready");
+    expect(got).toContain("node_version=24.19.0");
+    expect(got).toContain("UsePAM yes");
+    expect(got).toContain("KbdInteractiveAuthentication no");
+    expect(got).toContain("node_arch=x64");
+    expect(got).toContain("node_arch=arm64");
+    expect(got).toContain("shasum -a 256 -c -");
+    expect(got).toContain("node --version >/dev/null");
+    expect(got).toContain("npm --version >/dev/null");
   });
 });

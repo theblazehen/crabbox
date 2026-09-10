@@ -198,7 +198,7 @@ printf 'script-err\n' >&2
 			}
 			args = append(args, "--", "literal $arg; with spaces", "single quote ' argument")
 			err := app.runCommand(t.Context(), args)
-			if exitCodeForError(err, 0) != tc.code {
+			if ExitCodeForError(err, 0) != tc.code {
 				t.Fatalf("run=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 			}
 			if b.acquired != 1 || len(b.requests) != 0 || b.starts != 1 || b.joined != 1 {
@@ -256,7 +256,7 @@ func TestHybridSSHScriptRejectsInvalidRouteBeforeInputOrActivity(t *testing.T) {
 			b.spec = p.spec
 			input := strings.NewReader("must remain unread")
 			err := (App{Stdout: io.Discard, Stderr: io.Discard, Stdin: input}).runCommand(t.Context(), []string{"--provider", p.Name(), "--no-sync", "--script-stdin"})
-			if exitCodeForError(err, 0) != 2 || !strings.Contains(err.Error(), "SSH") || input.Len() != len("must remain unread") || b.acquired != 0 || b.starts != 0 {
+			if ExitCodeForError(err, 0) != 2 || !strings.Contains(err.Error(), "SSH") || input.Len() != len("must remain unread") || b.acquired != 0 || b.starts != 0 {
 				t.Fatalf("error=%v unread=%d acquired=%d activity=%d", err, input.Len(), b.acquired, b.starts)
 			}
 		})
@@ -271,7 +271,7 @@ func TestHybridSSHScriptPrewarmAdmissionUsesScriptRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.spec.Features = FeatureSet{FeatureSSH, FeatureSSHScriptRun, FeatureModuleRun}
-	if err := admitPrewarmProbe(args); exitCodeForError(err, 0) != 2 {
+	if err := admitPrewarmProbe(args); ExitCodeForError(err, 0) != 2 {
 		t.Fatalf("invalid route accepted: %v", err)
 	}
 	if b.acquired != 0 || b.starts != 0 || len(b.requests) != 0 {

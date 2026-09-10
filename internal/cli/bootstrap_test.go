@@ -148,7 +148,7 @@ func TestCloudInitStartsSSHBeforeOptionalDesktopBootstrap(t *testing.T) {
 	cfg.Desktop = true
 	got := cloudInit(cfg, "ssh-ed25519 test")
 	sshIndex := strings.Index(got, "timeout 30s systemctl restart ssh")
-	desktopIndex := strings.Index(got, "retry apt-get install -y --no-install-recommends tigervnc-standalone-server")
+	desktopIndex := strings.Index(got, "crabbox_install_packages tigervnc-standalone-server")
 	bootstrappedIndex := strings.Index(got, "touch /var/lib/crabbox/bootstrapped")
 	if sshIndex < 0 || desktopIndex < 0 || bootstrappedIndex < 0 {
 		t.Fatalf("cloudInit(desktop) missing expected bootstrap markers")
@@ -863,7 +863,7 @@ func TestAWSUserDataWindowsWSL2Profile(t *testing.T) {
 		`$wslSetup = "C:\ProgramData\crabbox\wsl\linux-setup.sh"`,
 		"WriteAllText($wslSetup",
 		"wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh",
-		"apt-get install -y --no-install-recommends ca-certificates curl git jq python3-minimal rsync",
+		"apt-get install -y --no-install-recommends ca-certificates curl git jq python3 rsync sudo",
 		"trufflehog_version='3.95.9'",
 		"trufflehog_${trufflehog_version}_linux_amd64.tar.gz",
 		wslTruffleHogAMD64SHA256,
@@ -901,6 +901,66 @@ func TestAWSUserDataWindowsWSL2Profile(t *testing.T) {
 	}
 	if sftpIndex, readyIndex := strings.Index(got, "Subsystem sftp internal-sftp"), strings.Index(got, "crabbox-ready"); sftpIndex < 0 || readyIndex < 0 || sftpIndex > readyIndex {
 		t.Fatalf("windows WSL2 bootstrap must configure SFTP before checking WSL readiness")
+	}
+}
+
+func TestManagedWindowsWSL2BootstrapInstallsNodeBeforeReadiness(t *testing.T) {
+	for _, mode := range []string{windowsModeNormal, windowsModeWSL2} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.TargetOS, cfg.WindowsMode = targetWindows, mode
+			script := windowsBootstrapPowerShell(cfg, "ssh-ed25519 test")
+			install := "bash /var/lib/crabbox/install-linux-developer-tools.sh --node-only"
+			if mode == windowsModeNormal {
+				if strings.Contains(script, install) {
+					t.Fatal("native Windows unexpectedly installs a Linux runtime")
+				}
+				return
+			}
+			setupStart := strings.Index(script, "$linuxSetup = @'")
+			installIndex := strings.Index(script, install)
+			readyIndex := strings.Index(script, "cat >/usr/local/bin/crabbox-ready <<'READY'")
+			if setupStart < 0 || installIndex <= setupStart || readyIndex <= installIndex {
+				t.Fatal("WSL distro must install the shared Node baseline before readiness")
+			}
+			ready := script[readyIndex:]
+			for _, probe := range []string{"node --version >/dev/null", "npm --version >/dev/null"} {
+				if !strings.Contains(ready, probe) {
+					t.Errorf("WSL readiness missing %s", probe)
+				}
+			}
+		})
+	}
+}
+
+func TestManagedWindowsWSL2BootstrapOwnsDistroInitialization(t *testing.T) {
+	for _, mode := range []string{windowsModeNormal, windowsModeWSL2} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.TargetOS, cfg.WindowsMode = targetWindows, mode
+			script := windowsBootstrapPowerShell(cfg, "ssh-ed25519 test")
+			steps := []string{
+				"touch /etc/cloud/cloud-init.disabled",
+				"wsl.exe --terminate $wslDistro",
+				"wsl.exe -d $wslDistro --exec /usr/local/bin/crabbox-ready",
+				"WSL cold-start readiness failed with exit $LASTEXITCODE",
+				"Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath",
+			}
+			last := -1
+			for _, step := range steps {
+				index := strings.Index(script, step)
+				if mode == windowsModeNormal {
+					if index >= 0 && step != steps[len(steps)-1] {
+						t.Fatalf("native Windows unexpectedly configures WSL: %s", step)
+					}
+					continue
+				}
+				if index <= last {
+					t.Fatalf("missing or out-of-order WSL initialization step: %s", step)
+				}
+				last = index
+			}
+		})
 	}
 }
 

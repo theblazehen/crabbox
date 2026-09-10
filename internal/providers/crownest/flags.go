@@ -1,5 +1,7 @@
 package crownest
 
+import core "github.com/openclaw/crabbox/internal/cli"
+
 import (
 	"flag"
 	"net/url"
@@ -28,30 +30,27 @@ func registerFlags(fs *flag.FlagSet, defaults Config) any {
 
 func applyFlags(cfg *Config, fs *flag.FlagSet, values any) error {
 	if strings.EqualFold(strings.TrimSpace(cfg.Provider), providerName) {
-		if flagWasSet(fs, "class") {
-			return exit(2, "--class is not supported for provider=crownest; use --crownest-template")
-		}
-		if flagWasSet(fs, "type") {
-			return exit(2, "--type is not supported for provider=crownest; use --crownest-template")
+		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "use --crownest-template", "use --crownest-template"); err != nil {
+			return err
 		}
 	}
 	v, ok := values.(flagValues)
 	if !ok {
 		return nil
 	}
-	if flagWasSet(fs, "crownest-url") {
+	if core.FlagWasSet(fs, "crownest-url") {
 		cfg.Crownest.APIURL = *v.APIURL
 	}
-	if flagWasSet(fs, "crownest-project-id") {
+	if core.FlagWasSet(fs, "crownest-project-id") {
 		cfg.Crownest.ProjectID = *v.ProjectID
 	}
-	if flagWasSet(fs, "crownest-template") {
+	if core.FlagWasSet(fs, "crownest-template") {
 		cfg.Crownest.Template = *v.Template
 	}
-	if flagWasSet(fs, "crownest-timeout-secs") {
+	if core.FlagWasSet(fs, "crownest-timeout-secs") {
 		cfg.Crownest.TimeoutSecs = *v.TimeoutSecs
 	}
-	if flagWasSet(fs, "crownest-forget-missing") {
+	if core.FlagWasSet(fs, "crownest-forget-missing") {
 		cfg.Crownest.ForgetMissing = *v.ForgetMissing
 	}
 	return validateConfig(*cfg)

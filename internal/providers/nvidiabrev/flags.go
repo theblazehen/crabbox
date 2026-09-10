@@ -1,6 +1,11 @@
 package nvidiabrev
 
-import "flag"
+import (
+	"flag"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
 
 type nvidiaBrevFlagValues struct {
 	CLI           *string
@@ -37,57 +42,54 @@ func RegisterNvidiaBrevProviderFlags(fs *flag.FlagSet, defaults Config) any {
 }
 
 func ApplyNvidiaBrevProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
-	if isNvidiaBrevProviderName(cfg.Provider) {
-		if flagWasSet(fs, "class") {
-			return exit(2, "--class is not supported for provider=%s; use --nvidia-brev-gpu-name", providerName)
-		}
-		if flagWasSet(fs, "type") {
-			return exit(2, "--type is not supported for provider=%s; use --nvidia-brev-type", providerName)
+	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
+		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "use --nvidia-brev-gpu-name", "use --nvidia-brev-type"); err != nil {
+			return err
 		}
 	}
 	v, ok := values.(nvidiaBrevFlagValues)
 	if !ok {
 		return nil
 	}
-	if flagWasSet(fs, "nvidia-brev-cli") {
+	if core.FlagWasSet(fs, "nvidia-brev-cli") {
 		cfg.NvidiaBrev.CLI = *v.CLI
 	}
-	if flagWasSet(fs, "nvidia-brev-org") {
+	if core.FlagWasSet(fs, "nvidia-brev-org") {
 		cfg.NvidiaBrev.Org = *v.Org
 	}
-	if flagWasSet(fs, "nvidia-brev-type") {
+	if core.FlagWasSet(fs, "nvidia-brev-type") {
 		cfg.NvidiaBrev.Type = *v.Type
 	}
-	if flagWasSet(fs, "nvidia-brev-gpu-name") {
+	if core.FlagWasSet(fs, "nvidia-brev-gpu-name") {
 		cfg.NvidiaBrev.GPUName = *v.GPUName
 	}
-	if flagWasSet(fs, "nvidia-brev-provider") {
+	if core.FlagWasSet(fs, "nvidia-brev-provider") {
 		cfg.NvidiaBrev.Provider = *v.Provider
 	}
-	if flagWasSet(fs, "nvidia-brev-mode") {
+	if core.FlagWasSet(fs, "nvidia-brev-mode") {
 		cfg.NvidiaBrev.Mode = *v.Mode
 	}
-	if flagWasSet(fs, "nvidia-brev-launchable") {
+	if core.FlagWasSet(fs, "nvidia-brev-launchable") {
 		cfg.NvidiaBrev.Launchable = *v.Launchable
 	}
-	if flagWasSet(fs, "nvidia-brev-startup-script") {
+	if core.FlagWasSet(fs, "nvidia-brev-startup-script") {
 		cfg.NvidiaBrev.StartupScript = *v.StartupScript
 	}
-	if flagWasSet(fs, "nvidia-brev-release-action") {
+	if core.FlagWasSet(fs, "nvidia-brev-release-action") {
 		cfg.NvidiaBrev.ReleaseAction = *v.ReleaseAction
 		markReleaseActionExplicit(cfg)
 	}
-	if flagWasSet(fs, "nvidia-brev-target") {
+	if core.FlagWasSet(fs, "nvidia-brev-target") {
 		cfg.NvidiaBrev.Target = *v.Target
 	}
-	if flagWasSet(fs, "nvidia-brev-user") {
+	if core.FlagWasSet(fs, "nvidia-brev-user") {
 		cfg.NvidiaBrev.User = *v.User
 	}
-	if flagWasSet(fs, "nvidia-brev-work-root") {
+	if core.FlagWasSet(fs, "nvidia-brev-work-root") {
 		cfg.NvidiaBrev.WorkRoot = *v.WorkRoot
 		markNvidiaBrevWorkRootExplicit(cfg)
 	}
-	if isNvidiaBrevProviderName(cfg.Provider) {
+	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
 		applyNvidiaBrevDefaults(cfg)
 		return Provider{}.ValidateConfig(*cfg)
 	}

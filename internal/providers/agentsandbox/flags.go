@@ -32,37 +32,37 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if !ok {
 		return nil
 	}
-	if flagWasSet(fs, "agent-sandbox-kubectl") {
+	if core.FlagWasSet(fs, "agent-sandbox-kubectl") {
 		cfg.AgentSandbox.Kubectl = registered.Lookup("agent-sandbox-kubectl").Value.(flag.Getter).Get().(string)
 	}
-	if flagWasSet(fs, "agent-sandbox-kubeconfig") {
+	if core.FlagWasSet(fs, "agent-sandbox-kubeconfig") {
 		cfg.AgentSandbox.Kubeconfig = expandUserPath(registered.Lookup("agent-sandbox-kubeconfig").Value.(flag.Getter).Get().(string))
 	}
-	if flagWasSet(fs, "agent-sandbox-context") {
+	if core.FlagWasSet(fs, "agent-sandbox-context") {
 		cfg.AgentSandbox.Context = registered.Lookup("agent-sandbox-context").Value.(flag.Getter).Get().(string)
 	}
-	if flagWasSet(fs, "agent-sandbox-namespace") {
+	if core.FlagWasSet(fs, "agent-sandbox-namespace") {
 		cfg.AgentSandbox.Namespace = registered.Lookup("agent-sandbox-namespace").Value.(flag.Getter).Get().(string)
 	}
-	if flagWasSet(fs, "agent-sandbox-warm-pool") {
+	if core.FlagWasSet(fs, "agent-sandbox-warm-pool") {
 		cfg.AgentSandbox.WarmPool = registered.Lookup("agent-sandbox-warm-pool").Value.(flag.Getter).Get().(string)
 	}
-	if flagWasSet(fs, "agent-sandbox-container") {
+	if core.FlagWasSet(fs, "agent-sandbox-container") {
 		cfg.AgentSandbox.Container = registered.Lookup("agent-sandbox-container").Value.(flag.Getter).Get().(string)
 	}
-	if flagWasSet(fs, "agent-sandbox-workdir") {
+	if core.FlagWasSet(fs, "agent-sandbox-workdir") {
 		cfg.AgentSandbox.Workdir = registered.Lookup("agent-sandbox-workdir").Value.(flag.Getter).Get().(string)
 	}
-	if flagWasSet(fs, "agent-sandbox-sandbox-ready-timeout") {
+	if core.FlagWasSet(fs, "agent-sandbox-sandbox-ready-timeout") {
 		cfg.AgentSandbox.SandboxReadyTimeout = registered.Lookup("agent-sandbox-sandbox-ready-timeout").Value.(flag.Getter).Get().(time.Duration)
 	}
-	if flagWasSet(fs, "agent-sandbox-pod-ready-timeout") {
+	if core.FlagWasSet(fs, "agent-sandbox-pod-ready-timeout") {
 		cfg.AgentSandbox.PodReadyTimeout = registered.Lookup("agent-sandbox-pod-ready-timeout").Value.(flag.Getter).Get().(time.Duration)
 	}
-	if flagWasSet(fs, "agent-sandbox-exec-timeout-secs") {
+	if core.FlagWasSet(fs, "agent-sandbox-exec-timeout-secs") {
 		cfg.AgentSandbox.ExecTimeoutSecs = registered.Lookup("agent-sandbox-exec-timeout-secs").Value.(flag.Getter).Get().(int)
 	}
-	if flagWasSet(fs, "agent-sandbox-delete-on-release") {
+	if core.FlagWasSet(fs, "agent-sandbox-delete-on-release") {
 		cfg.AgentSandbox.DeleteOnRelease = registered.Lookup("agent-sandbox-delete-on-release").Value.(flag.Getter).Get().(bool)
 		provider := providerName
 		if cfg.Provider == sshProviderName {
@@ -70,7 +70,7 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 		}
 		core.MarkDeleteOnReleaseExplicit(cfg, provider)
 	}
-	if flagWasSet(fs, "agent-sandbox-forget-missing") {
+	if core.FlagWasSet(fs, "agent-sandbox-forget-missing") {
 		cfg.AgentSandbox.ForgetMissing = registered.Lookup("agent-sandbox-forget-missing").Value.(flag.Getter).Get().(bool)
 	}
 	return validateConfig(*cfg)

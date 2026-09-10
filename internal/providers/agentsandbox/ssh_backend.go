@@ -157,7 +157,7 @@ func (b *sshLeaseBackend) prepare(ctx context.Context, client kubernetesClient, 
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	if claimTTLExpired(updated, b.lifecycle.now().UTC()) {
+	if claimTTLExpired(updated, core.ClockNow(b.lifecycle.rt.Clock).UTC()) {
 		return core.LeaseTarget{}, exit(4, "agent-sandbox claim %s reached its TTL expiry during SSH preparation", claim.LeaseID)
 	}
 	lease := sshLeaseFromClaim(updated)
@@ -222,7 +222,7 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 		return core.LeaseTarget{}, err
 	}
 	if !readOnly && !req.Reclaim {
-		if claimTTLExpired(claim, lifecycle.now().UTC()) {
+		if claimTTLExpired(claim, core.ClockNow(lifecycle.rt.Clock).UTC()) {
 			if closeErr := closeClaimSSHMasters(ctx, claim); closeErr != nil {
 				return core.LeaseTarget{}, closeErr
 			}
@@ -265,7 +265,7 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 		core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
 		return lease, nil
 	}
-	if expired, reason := sandboxClaimExpired(claim, live, lifecycle.now().UTC()); expired {
+	if expired, reason := sandboxClaimExpired(claim, live, core.ClockNow(lifecycle.rt.Clock).UTC()); expired {
 		if !req.StatusOnly {
 			return core.LeaseTarget{}, exit(4, "agent-sandbox lease %s expired: %s", claim.LeaseID, reason)
 		}
@@ -353,7 +353,7 @@ func (b *sshLeaseBackend) BeginSSHRunActivity(ctx context.Context, lease core.Le
 		return nil, err
 	}
 	claim, err := b.currentClaimForTarget(lease)
-	if err == nil && !claimTTLExpired(claim, b.lifecycle.now().UTC()) {
+	if err == nil && !claimTTLExpired(claim, core.ClockNow(b.lifecycle.rt.Clock).UTC()) {
 		target, targetErr := b.lifecycle.sshTarget(claim)
 		if targetErr != nil && lease.SSH.Host != "" {
 			unlock()
@@ -384,7 +384,7 @@ func (b *sshLeaseBackend) BeginSSHRunActivity(ctx context.Context, lease core.Le
 				_, err = sandboxReadinessOnce(ctx, client, b.lifecycle.cfg.AgentSandbox.Namespace, claimNameFromLocalClaim(claim), identity)
 			}
 		}
-		if err == nil && claimTTLExpired(claim, b.lifecycle.now().UTC()) {
+		if err == nil && claimTTLExpired(claim, core.ClockNow(b.lifecycle.rt.Clock).UTC()) {
 			err = exit(4, "agent-sandbox lease %s reached its TTL expiry; command not run", claim.LeaseID)
 		}
 	}
@@ -474,6 +474,9 @@ func (b *sshLeaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.
 	live, err := client.Get(ctx, sandboxClaimGVR(), b.lifecycle.cfg.AgentSandbox.Namespace, name)
 	if err != nil {
 		if isNotFound(err) && b.lifecycle.cfg.AgentSandbox.ForgetMissing {
+			if err := closeClaimSSHMasters(ctx, claim); err != nil {
+				return core.ReleaseLeaseOutcome{}, err
+			}
 			err = b.lifecycle.removeLocalClaim(claim.LeaseID, claim)
 			return core.ReleaseLeaseOutcome{Terminal: true}, err
 		}

@@ -4,7 +4,6 @@ import (
 	"flag"
 	"os"
 	"strconv"
-	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -32,26 +31,26 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if !ok {
 		return nil
 	}
-	if flagWasSet(fs, "tart-image") {
+	if core.FlagWasSet(fs, "tart-image") {
 		cfg.Tart.Image = *v.Image
 		core.MarkTartImageExplicit(cfg)
 	}
-	if flagWasSet(fs, "tart-user") {
+	if core.FlagWasSet(fs, "tart-user") {
 		cfg.Tart.User = *v.User
 	}
-	if flagWasSet(fs, "tart-cpu") {
+	if core.FlagWasSet(fs, "tart-cpu") {
 		if *v.CPUs < 4 {
 			return exit(2, "--tart-cpu must be at least 4 (got %d)", *v.CPUs)
 		}
 		cfg.Tart.CPUs = *v.CPUs
 	}
-	if flagWasSet(fs, "tart-memory") {
+	if core.FlagWasSet(fs, "tart-memory") {
 		if *v.Memory < 4096 {
 			return exit(2, "--tart-memory must be at least 4096 MB (got %d)", *v.Memory)
 		}
 		cfg.Tart.Memory = *v.Memory
 	}
-	if flagWasSet(fs, "tart-disk") {
+	if core.FlagWasSet(fs, "tart-disk") {
 		if *v.Disk < 0 {
 			return exit(2, "--tart-disk must be non-negative (got %d)", *v.Disk)
 		}
@@ -60,7 +59,7 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 			core.MarkTartDiskExplicit(cfg)
 		}
 	}
-	if isTartProviderName(cfg.Provider) {
+	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
 		if core.IsTargetExplicit(cfg) && cfg.TargetOS != targetMacOS {
 			return exit(2, "provider=%s supports target=%s only (got %s)", providerName, targetMacOS, cfg.TargetOS)
 		}
@@ -118,13 +117,4 @@ func validateTartEnvIntNonNegative(name string, msg string) error {
 		return exit(2, "%s (got %d)", msg, n)
 	}
 	return nil
-}
-
-func isTartProviderName(provider string) bool {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case providerName, "local-tart", "macos-vm":
-		return true
-	default:
-		return false
-	}
 }

@@ -16,6 +16,15 @@ runtime composition. Code lives in `internal/cli/bootstrap.go` and
 Bootstrapped boxes carry no coordinator credentials. The box never calls the
 broker; the CLI connects to it directly over SSH.
 
+Managed WSL2 distributions additionally install Node/npm through the bundled
+`--node-only` entrypoint of `scripts/install-linux-developer-tools.sh`. The
+bootstrap generator reads that canonical script into both runtimes; regenerate
+with `node scripts/generate-bootstrap.mjs` after changing it, and refresh its
+input SHA-256 in `recipes/devtools/v1/linux-x86_64.json`. The default amd64
+Node version and archive verification match Linux developer images. WSL2's
+ready check requires Node and npm, but its setup omits the full developer image's
+Docker, Go, browser tools, pnpm activation, and offline pnpm archive set.
+
 ## The minimal Linux contract
 
 Brokered and direct cloud Linux runners are Ubuntu machines configured by
@@ -150,6 +159,15 @@ checks, and is gated by the provider's declared feature set.
   verifies the wrapper runs `--version`.
 - `--code` — installs `code-server` (managed Linux only) for the authenticated
   [portal](portal.md) editor; readiness verifies `code-server --version`.
+
+Desktop and browser prerequisite package installation is skipped only when dpkg
+reports every required package fully installed. A supported, package-installed
+browser must also pass a bounded `--version` probe before bootstrap skips its
+repository and download work. These checks read current machine state without
+creating another capability marker. Missing or broken prerequisites still use
+the installation path, and installation failures remain failures. Bootstrap
+always configures the requested services and runs the complete readiness check;
+reusing an image does not implicitly update its working browser.
 
 Crabbox owns these machine capabilities; scenario systems still own browser
 automation and proof artifacts. For slow QA lanes, bake these capabilities into
