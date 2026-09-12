@@ -196,8 +196,12 @@ func prepareWorkspaceOwnerRemote(ctx context.Context, target SSHTarget, remote s
 			return workspaceOwnerRemotePreparation{}, fmt.Errorf("create workspace witness diagnostic marker: %w", err)
 		}
 		marker := workspaceOwnerSetupPrefix + nonce
+		// Finite inputs are staged so ownership registration cannot consume or
+		// replay them. Live input (size -1) must remain attached to the user
+		// command: staging it would block on terminal EOF before the command runs.
+		stageInput := inputSize != nil && *inputSize >= 0
 		return workspaceOwnerRemotePreparation{
-			command:     owner.wrapPOSIXCommand(remote, inputSize != nil, marker),
+			command:     owner.wrapPOSIXCommand(remote, stageInput, marker),
 			setupMarker: marker,
 		}, nil
 	}

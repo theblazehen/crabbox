@@ -114,6 +114,59 @@ func TestSSHWorkloadStdinDoesNotWaitForBorrowedReader(t *testing.T) {
 	}
 }
 
+func TestSSHWorkspaceOwnerLiveStdinDoesNotRequireEOF(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX workspace-owner witness")
+	}
+	for _, test := range []struct {
+		name, command, input, output string
+	}{
+		{name: "command ignores stdin", command: "printf 'done\\n'", output: "done\n"},
+		{name: "command reads one line", command: "IFS= read -r line; printf '%s\\n' \"$line\"", input: "one line\n", output: "one line\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			home := filepath.Join(dir, "home")
+			if err := os.Mkdir(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", home)
+			installWorkspaceOwnerAwareSSH(t, filepath.Join(dir, "ssh"), "#!/bin/sh\nexec /bin/sh -c \"$1\"\n")
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			target := SSHTarget{Host: "127.0.0.1", User: "test", Port: "22", TargetOS: targetLinux, NoControlMaster: true}
+			key := workspaceOwnerKey("cbx_live_stdin")
+			token := strings.Repeat("a", 64)
+			transport := localPOSIXWorkspaceOwnerTransport{home: home}
+			if response, err := transport.Do(t.Context(), workspaceOwnerRemoteRequest{Action: workspaceOwnerAcquire, Key: key, Token: token, TTL: time.Minute}); err != nil || response != "ACQUIRED" {
+				t.Fatalf("acquire workspace owner: response=%q err=%v", response, err)
+			}
+			t.Cleanup(func() {
+				_, _ = transport.Do(context.Background(), workspaceOwnerRemoteRequest{Action: workspaceOwnerRelease, Key: key, Token: token})
+			})
+			ctx, cancel := context.WithTimeout(contextWithWorkspaceOwner(t.Context(), &workspaceOwner{target: target, key: key, token: token}), 2*time.Second)
+			defer cancel()
+
+			input, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer input.Close()
+			defer writer.Close()
+			if test.input != "" {
+				if _, err := io.WriteString(writer, test.input); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var output bytes.Buffer
+			code, err := runSSHStreamResult(ctx, target, test.command, input, &output, io.Discard)
+			if code != 0 || err != nil || ctx.Err() != nil || output.String() != test.output {
+				t.Fatalf("code=%d err=%v context=%v output=%q want=%q", code, err, ctx.Err(), output.String(), test.output)
+			}
+		})
+	}
+}
+
 func TestSSHWorkloadStdinCancellationKeepsBorrowedFileOpen(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX fake SSH subprocess")

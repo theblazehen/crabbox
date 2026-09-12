@@ -408,6 +408,14 @@ func TestWorkspaceOwnerContextWrapsEverySSHChild(t *testing.T) {
 	if script := remoteWorkspaceOwnerPOSIXWitnessScript(owner.key, owner.token, "cat", "", true); !strings.Contains(script, `cat >"$run_dir/input"`) || !strings.Contains(script, `<"$run_dir/input"`) {
 		t.Fatalf("input SSH child witness lost stdin preservation:\n%s", script)
 	}
+	liveInputSize := int64(-1)
+	prepared, err = prepareWorkspaceOwnerRemote(ctx, owner.target, "cat", &liveInputSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prepared.command, owner.wrapPOSIXCommand("cat", false, prepared.setupMarker); got != want || prepared.setupMarker == "" {
+		t.Fatal("live input SSH child was staged before command execution")
+	}
 	prepared, err = prepareWorkspaceOwnerRemote(contextWithoutWorkspaceOwner(ctx), owner.target, "printf raw", nil)
 	if err != nil {
 		t.Fatal(err)
