@@ -43,16 +43,26 @@ specific provider contract; other providers have their own files there.
 
 ## Normal retained-workspace loop
 
+**Default to one retained lease per session and repository.** Use `--keep` on
+runs and reuse the recorded lease ID for setup, edits, verification and artifact
+collection. Do not create and destroy a sandbox for every command. Reuse an
+existing task-owned lease when its provider, repository, capabilities and
+remaining lifetime fit; use separate leases for genuinely independent work.
+
 ```sh
 crabbox warmup --slug example-check --ttl 24h
-crabbox run --id example-check -- mise run verify
+crabbox run --id example-check --keep -- mise run verify
 crabbox cp --id example-check SANDBOX:/absolute/remote/result.json ./result.json
 ```
 
 Use the actual per-lease/per-repository workdir printed by Crabbox; do not assume
 `/workspace/crabbox` is the checkout. Warmup allocates a lease; it does not sync
-source. New one-shot runs may release automatically; explicitly retain a lease
-when later commands or artifact collection require it.
+source. If starting directly with `run`, pass `--keep` on that first invocation
+too. Keep the lease across intermediate replies and handoffs; record its ID,
+provider, repository, remote workdir and expiry. Release it explicitly at session
+closeout only after required outputs are safe and no promised retained service
+depends on it. Disposable one-shot runs are an intentional exception, not the
+default. `--keep` does not extend hard TTL or prevent configured idle cleanup.
 
 - **After local edits, use normal sync.** `--no-sync` deliberately runs retained
   remote source, not the new local files.
