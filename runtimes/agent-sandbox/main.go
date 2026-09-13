@@ -321,6 +321,12 @@ func ensurePrivateContents(name string, data []byte) error {
 type archiveLink struct{ name, target string }
 
 func installRuntime() (string, error) {
+	// An initializer update may move identical payload bytes from an image seed
+	// to an uploaded runtime. Keep the installed payload identity so its helper
+	// aliases and live daemon remain valid; never rewrite image-owned paths.
+	if root, err := installedHelperRuntime(); err != nil || root != "" {
+		return root, err
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locate initializer executable: %w", err)
@@ -354,6 +360,38 @@ func installRuntime() (string, error) {
 	}
 	if err := os.Rename(stage, root); err != nil {
 		return "", err
+	}
+	return root, nil
+}
+
+func installedHelperRuntime() (string, error) {
+	for _, helper := range []toolLink{
+		{"bin/sftp-server", "/usr/libexec/crabbox-sftp-server"},
+		{"libexec/git-core", "/usr/libexec/crabbox-git-core"},
+	} {
+		root, err := verifiedHelperRuntime(helper.destination, helper.source)
+		if err != nil || root != "" {
+			return root, err
+		}
+	}
+	return "", nil
+}
+
+func verifiedHelperRuntime(destination, relative string) (string, error) {
+	target, err := os.Readlink(destination)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	suffix := string(filepath.Separator) + relative
+	if err != nil || !filepath.IsAbs(target) || !strings.HasSuffix(target, suffix) {
+		return "", fmt.Errorf("existing helper %s is not a bundled runtime alias; preserving it", destination)
+	}
+	root := strings.TrimSuffix(target, suffix)
+	if err := secureSeedDirectory(root); err != nil {
+		return "", fmt.Errorf("existing helper %s has an unsafe runtime: %w", destination, err)
+	}
+	if err := unpackRuntime(root, true); err != nil {
+		return "", fmt.Errorf("existing helper %s runtime does not match the bundled payload; preserving the retained runtime: %w", destination, err)
 	}
 	return root, nil
 }
@@ -669,7 +707,8 @@ func installTools(root, state string, environment []string) error {
 		}
 		if _, err := os.Lstat(helper.destination); err == nil {
 			existing, err := filepath.EvalSymlinks(helper.destination)
-			if err != nil || existing != helper.source {
+			expected, sourceErr := filepath.EvalSymlinks(helper.source)
+			if err != nil || sourceErr != nil || existing != expected {
 				return fmt.Errorf("existing helper path %s conflicts with this runtime; refusing to replace", helper.destination)
 			}
 		} else if os.IsNotExist(err) {

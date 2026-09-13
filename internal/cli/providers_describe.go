@@ -149,6 +149,9 @@ func describeProvider(requestedName string) (providerDescription, error) {
 		if allProviderFlags[item.Name] && !providerOwned[canonical][item.Name] {
 			return
 		}
+		if !runFlagVisibleForProvider(spec, item.Name) {
+			return
+		}
 		record, recordErr := describeRegisteredFlag(item)
 		if recordErr != nil {
 			metadataErr = recordErr

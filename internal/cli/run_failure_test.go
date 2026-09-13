@@ -540,7 +540,6 @@ func TestFailureDigestNextCommandsRespectRunHistoryAvailability(t *testing.T) {
 	}
 	leaseCommands := []string{
 		"crabbox ssh --provider local-container --id retained-direct",
-		"crabbox run --provider local-container --id retained-direct --fresh-sync -- go test ./...",
 		"crabbox stop --provider local-container retained-direct",
 	}
 	tests := []struct {
@@ -664,8 +663,6 @@ func TestPrintRunFailureDigestExplainsAndChainShortCircuit(t *testing.T) {
 		"area: user_command",
 		"shell_chain: pnpm check && pnpm test",
 		"would_skip_if_left_failed: pnpm test",
-		"chain_semantics: && only runs later segments if all earlier segments succeed",
-		"next: crabbox run --id cbx_123 --fresh-sync --shell -- 'pnpm check && pnpm test'",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("digest missing %q:\n%s", want, out)
@@ -770,7 +767,7 @@ func TestFailureDigestPreservesRecoveryIntent(t *testing.T) {
 		noSync, shell, script, stopped, noRetry bool
 		globs                                   []string
 	}{
-		{name: "default keeps fresh sync"},
+		{name: "default preserves remote workspace"},
 		{name: "no sync", noSync: true},
 		{name: "requirements", globs: []string{"reports/manifest.json", "reports/proof-*.json"}},
 		{name: "no sync requirements shell", noSync: true, shell: true, globs: []string{"reports/manifest.json", "reports/proof-*.json"}},
@@ -831,11 +828,10 @@ func TestFailureDigestPreservesRecoveryIntent(t *testing.T) {
 				t.Fatal(err)
 			}
 			args := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
-			syncFlag := "--fresh-sync"
+			want := append(append([]string{"run"}, routing.Args...), "--id", "cbx_fixture")
 			if tc.noSync {
-				syncFlag = "--no-sync"
+				want = append(want, "--no-sync")
 			}
-			want := append(append([]string{"run"}, routing.Args...), "--id", "cbx_fixture", syncFlag)
 			for _, glob := range tc.globs {
 				want = append(want, "--require-artifact", glob)
 			}
@@ -864,7 +860,6 @@ func TestFailureDigestRoutesNextCommands(t *testing.T) {
 	joined := strings.Join(commands, "\n")
 	for _, want := range []string{
 		"crabbox ssh --provider aws --target windows --windows-mode wsl2 --id cbx_123",
-		"crabbox run --provider aws --target windows --windows-mode wsl2 --id cbx_123 --fresh-sync -- go test ./...",
 		"crabbox stop --provider aws --target windows --windows-mode wsl2 cbx_123",
 	} {
 		if !strings.Contains(joined, want) {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Reuse an existing immutable Agent Sandbox SSH payload after full content verification when an initializer update changes its extraction path, preserving image helper aliases and live daemon identity instead of rejecting retained workers.
+- Restore generated SSH sync output capture and include remote diagnostics in failed sync errors while preserving exit-code and retry classification.
+- Keep ordinary failure retries non-destructive: preserve `--no-sync` when requested and never suggest a workspace reset by default.
+- Omit unsupported stdout/stderr capture flags from delegated-provider run help and provider descriptions.
+- Consolidate Crabbox agent guidance into one entry point, with explicit sync, input, lifetime and evidence contracts instead of duplicated incident workarounds.
 - Keep live POSIX terminal input attached to the witnessed workload instead of staging until EOF before command execution; finite script and payload input retains its guarded non-replay staging.
 - Reuse lease-scoped, identity-fenced SSH control masters across retained `agent-sandbox-ssh` commands, checking healthy sessions before Kubernetes resolution and retiring transports on runtime replacement, expiry, or release; skip unchanged endpoint claim writes while preserving ownership guards and authenticated recovery.
 - Recover `agent-sandbox-ssh` after lost container SSH state through Kubernetes-authenticated key/port refresh, with container-runtime fencing and strict SSH checks; read-only status, list, and inspect distinguish pod readiness from authenticated SSH availability without repairing or repinning.

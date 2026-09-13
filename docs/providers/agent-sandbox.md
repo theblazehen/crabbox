@@ -115,6 +115,15 @@ files and symlinks are neither replaced nor shadowed; conflicting tools or
 helper paths fail initialization. The additions are visible to workloads and
 remain for the Pod's lifetime. They are not a separate control-only filesystem.
 
+If private helper aliases already point to a bundled immutable runtime, an
+updated initializer first verifies that entire runtime against its embedded
+payload and reuses its original directory. Identical bytes in an image seed and
+an uploaded initializer therefore do not conflict merely because their paths
+differ. This preserves the existing helper aliases and daemon executable
+identity. Unsafe or genuinely mismatched installed payloads still fail closed;
+do not delete the helpers or reset a retained workspace to work around that
+error.
+
 A standalone Dropbear daemon runs independently of any existing SSH daemon,
 with key-only root authentication and password authentication disabled. Its
 host key, authorized keys, launch state, PID, and `dropbear.log` live under

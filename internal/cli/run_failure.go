@@ -443,11 +443,10 @@ func failureDigestNextCommands(input runFailureDigestInput, retry string) []stri
 			if len(routing.Args) == 0 {
 				routing = fallbackFailureDigestRouting(input, CommandRoutingRetry)
 			}
-			syncFlag := "--fresh-sync"
+			runArgs := append(append([]string{"crabbox", "run"}, routing.Args...), "--id", leaseRef)
 			if input.NoSync {
-				syncFlag = "--no-sync"
+				runArgs = append(runArgs, "--no-sync")
 			}
-			runArgs := append(append([]string{"crabbox", "run"}, routing.Args...), "--id", leaseRef, syncFlag)
 			for _, glob := range input.RequiredArtifactGlobs {
 				runArgs = append(runArgs, "--require-artifact", glob)
 			}

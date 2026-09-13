@@ -1079,9 +1079,13 @@ func runIdempotentSSHCombinedOutputLimit(ctx context.Context, target SSHTarget, 
 }
 
 func runIdempotentSSHSyncScriptCombinedOutput(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
-	return runIdempotentSSHAttempt(ctx, retryDelay, func() (string, error) {
+	output, err := runIdempotentSSHAttempt(ctx, retryDelay, func() (string, error) {
 		return runSSHSyncScriptCombinedOutput(ctx, target, remote)
 	})
+	if err != nil && output != "" {
+		err = fmt.Errorf("%w: %s", err, output)
+	}
+	return output, err
 }
 
 func runIdempotentSSHAttempt(ctx context.Context, retryDelay time.Duration, run func() (string, error)) (string, error) {

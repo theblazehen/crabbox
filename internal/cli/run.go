@@ -383,6 +383,16 @@ func runRequestFromFlags(cfg Config, flags runFlagValues, command []string) RunR
 	}
 }
 
+func runFlagVisibleForProvider(spec ProviderSpec, name string) bool {
+	if spec.Kind == ProviderKindDelegatedRun {
+		switch name {
+		case "capture-stdout", "capture-stderr", "capture-on-fail":
+			return false
+		}
+	}
+	return true
+}
+
 func (a App) runCommand(ctx context.Context, args []string) error {
 	return a.runCommandWithBenchmarkRecord(ctx, args, benchmarkRecordContext{})
 }
@@ -391,6 +401,20 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	defaults := defaultConfig()
 	fs := newFlagSet("run", a.Stderr)
 	runFlags := registerRunFlags(fs, defaults, ordinaryLeaseCreateFlagRegistrationOptions())
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage of %s:\n", fs.Name())
+		provider, providerErr := ProviderFor(*runFlags.Lease.Provider)
+		visible := flag.NewFlagSet(fs.Name(), flag.ContinueOnError)
+		visible.SetOutput(fs.Output())
+		fs.VisitAll(func(item *flag.Flag) {
+			if providerErr == nil && !runFlagVisibleForProvider(provider.Spec(), item.Name) {
+				return
+			}
+			visible.Var(item.Value, item.Name, item.Usage)
+			visible.Lookup(item.Name).DefValue = item.DefValue
+		})
+		visible.PrintDefaults()
+	}
 	var requiredArtifactChanges stringListFlag
 	fs.Var(&requiredArtifactChanges, "require-artifact-change", "require created or changed bytes at an exact relative file path after successful Linux SSH execution; identical rewrites fail; repeatable")
 	var failureDownloads stringListFlag

@@ -83,6 +83,10 @@ func TestPreseededRuntimeAbsentPreservesUploadFallback(t *testing.T) {
 	if err != nil || root != "" {
 		t.Fatalf("missing sibling should select upload fallback, got %q, %v", root, err)
 	}
+	root, err = verifiedHelperRuntime(filepath.Join(t.TempDir(), "missing-helper"), "bin/tool")
+	if err != nil || root != "" {
+		t.Fatalf("missing helper should allow fresh initialization, got %q, %v", root, err)
+	}
 }
 
 func TestPreseededRuntimeVerification(t *testing.T) {
@@ -174,6 +178,21 @@ func TestPreseededRuntimeVerification(t *testing.T) {
 				t.Fatal(err)
 			}
 			selected, err := preseededRuntime(entrypoint)
+			helper := filepath.Join(base, "helper-"+strings.ReplaceAll(name, " ", "-"))
+			if err := os.Symlink(tool, helper); err != nil {
+				t.Fatal(err)
+			}
+			helperRoot, helperErr := verifiedHelperRuntime(helper, "bin/tool")
+			if name == "immutable" {
+				if helperErr != nil || helperRoot != root {
+					t.Fatalf("retained runtime alias was not reused: %q, %v", helperRoot, helperErr)
+				}
+			} else if helperErr == nil {
+				t.Fatal("retained alias bypassed payload verification")
+			}
+			if target, err := os.Readlink(helper); err != nil || target != tool {
+				t.Fatalf("retained helper was modified: %q, %v", target, err)
+			}
 			if name == "immutable" {
 				if err != nil || selected != root {
 					t.Fatalf("immutable resolved sibling rejected: %q, %v", selected, err)

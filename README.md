@@ -9,7 +9,7 @@
 ## Changes in this fork
 
 [theblazehen/crabbox](https://github.com/theblazehen/crabbox) is a fork of
-[openclaw/crabbox](https://github.com/openclaw/crabbox) with three focused changes:
+[openclaw/crabbox](https://github.com/openclaw/crabbox) with these focused changes:
 
 - **Agent Sandbox over SSH:** the separate
   [`agent-sandbox-ssh` provider](docs/providers/agent-sandbox.md#ssh-variant-agent-sandbox-ssh)
@@ -17,13 +17,22 @@
   existing container, with pinned identity and managed Kubernetes port-forwarding.
   It adds missing tools without installing packages, changing account files, or
   replacing existing tools. The archive-based `agent-sandbox` provider is unchanged.
+  Initializer upgrades reuse verified identical image-seeded payloads, preserving
+  private helper links and the running daemon instead of rejecting retained workers.
 - **Uploaded sync scripts:** generated POSIX sync and workspace-ownership scripts
   travel as private files instead of oversized SSH commands, preserving streamed
-  manifests, ownership checks, and cleanup.
+  manifests, ownership checks, and cleanup. Failed syncs retain remote diagnostic
+  output and the original exit status.
 - **Workload stdin:** [POSIX SSH commands and `--script`](docs/commands/run.md#scripts)
   receive piped binary or line input without control commands consuming it or
-  replaying it. `--script-stdin` remains source-only; Windows/WSL and delegated
-  input paths are unchanged.
+  replaying it, and live input no longer delays startup until EOF. `--script-stdin`
+  remains source-only; Windows/WSL and delegated input paths are unchanged.
+- **Safer recovery and capability help:** retry suggestions preserve `--no-sync`
+  when requested and never reset the workspace by default. Delegated-provider
+  help omits unsupported stdout/stderr capture options.
+- **One agent entry point:** the [Crabbox skill](.agents/skills/crabbox/SKILL.md)
+  covers execution, sync, input, lifetime and recovery, with specialized material
+  loaded only when needed.
 
 The SSH provider requires a compatible **root Linux amd64** container with an
 existing executable login shell and writable runtime/workspace paths; see its

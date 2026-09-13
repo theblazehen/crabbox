@@ -220,6 +220,15 @@ func TestSSHSyncScriptCombinedOutputAndSuccessCleanup(t *testing.T) {
 	f.assertRemoved(t)
 }
 
+func TestSSHSyncFailurePreservesDiagnosticsAndExit(t *testing.T) {
+	f := newSyncScriptSSHFixture(t, "normal")
+	_, err := runIdempotentSSHSyncScriptCombinedOutput(t.Context(), f.target, "printf 'manifest path is not a directory' >&2; exit 23", 0)
+	if exitCode(err) != 23 || !strings.Contains(err.Error(), "manifest path is not a directory") {
+		t.Fatalf("lost sync failure cause: %v", err)
+	}
+	f.assertRemoved(t)
+}
+
 func TestSSHSyncScriptStagesAndEnforcesWorkspaceWitness(t *testing.T) {
 	for _, valid := range []bool{true, false} {
 		t.Run(strconv.FormatBool(valid), func(t *testing.T) {

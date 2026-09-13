@@ -104,7 +104,7 @@ func runSSHSyncScriptCombinedOutput(ctx context.Context, target SSHTarget, remot
 	if target.TargetOS == targetWindows {
 		return runSSHCombinedOutput(ctx, target, remote)
 	}
-	var out synchronizedBuffer
+	out := newSynchronizedBuffer(0)
 	err := runSSHSyncScriptInput(ctx, target, remote, nil, &out, &out)
 	return strings.TrimSpace(out.String()), err
 }
