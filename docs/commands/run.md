@@ -391,8 +391,9 @@ states alongside transport errors. Unrecognized response text is omitted.
 Release errors also retain recognized denial states, including `CHILD`.
 Owner-call errors identify canceled or expired call contexts without printing
 caller-provided cancellation causes; the original transport error is preserved.
-Workspace-owner protocol calls disable SSH connection multiplexing. Sync and
-command transport keep their existing connection policy.
+Workspace-owner protocol calls reuse an admitted SSH control master; before one
+exists, they use an independent connection. Sync and command transport keep
+their existing connection policy.
 WSL2 renewal uses a compact marker-only helper with a 60-second execution
 allowance for CPU and disk contention. It retries confirmed lock contention at
 most twice within the original bounded call deadline; that deadline is included
