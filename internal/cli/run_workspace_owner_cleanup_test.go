@@ -311,7 +311,13 @@ func TestRunCommandLeaseCleanupQuiescesWorkspaceOwner(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dir := setupRunCleanupWorkspaceOwnerTest(t)
-			remote := newRunCleanupWorkspaceOwnerTransport(2, test.renewErr)
+			inspectAt := 1
+			// Evidence collection inspects the owner before the destructive
+			// cleanup inspection; runs without downloads inspect only at cleanup.
+			if test.download {
+				inspectAt = 2
+			}
+			remote := newRunCleanupWorkspaceOwnerTransport(inspectAt, test.renewErr)
 			remote.releaseReply, remote.releaseErr = test.releaseReply, test.releaseErr
 			runEnvProfileTestPreservesSSHWorkspace = test.preservesSSHWorkspace
 			var cancelParent context.CancelFunc

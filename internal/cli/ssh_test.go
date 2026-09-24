@@ -5785,10 +5785,18 @@ func TestRemoteFinalizeRuntimeOriginFallbackRetriesCommittedManifest(t *testing.
 
 			tools := t.TempDir()
 			logPath := filepath.Join(tools, "ssh.log")
+			scriptLogPath := filepath.Join(tools, "staged-scripts.log")
 			ssh := `#!/bin/sh
 remote=""
 for arg do remote="$arg"; done
 printf '%s\n---\n' "$remote" >> "$CRABBOX_FINALIZE_SSH_LOG"
+case "$remote" in
+  *'cat > "$dir/script"'*)
+    script="$(/bin/cat)"
+    printf '%s\n---\n' "$script" >> "$CRABBOX_FINALIZE_SCRIPT_LOG"
+    printf '%s\n' "$script" | /bin/bash --noprofile --norc -c "$remote"
+    exit $? ;;
+esac
 exec /bin/bash --noprofile --norc -c "$remote"
 `
 			if err := os.WriteFile(filepath.Join(tools, "ssh"), []byte(ssh), 0o755); err != nil {
@@ -5796,6 +5804,7 @@ exec /bin/bash --noprofile --norc -c "$remote"
 			}
 			t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("CRABBOX_FINALIZE_SSH_LOG", logPath)
+			t.Setenv("CRABBOX_FINALIZE_SCRIPT_LOG", scriptLogPath)
 			out, err, reason, fallback := runRemoteFinalizeSync(context.Background(), SSHTarget{
 				User: "crabbox", Host: "example.test", Port: "22", TargetOS: targetLinux, NoControlMaster: true,
 			}, workdir, remoteSyncFinalizeOptions{
@@ -5820,12 +5829,26 @@ exec /bin/bash --noprofile --norc -c "$remote"
 			if wantFallback {
 				wantAttempts = 2
 			}
-			if len(commands) != wantAttempts {
-				t.Fatalf("finalize attempts=%d want %d:\n%s", len(commands), wantAttempts, logData)
-			}
+			var finalizeAttempts int
 			for _, command := range commands {
-				if !strings.Contains(command, token) {
-					t.Fatalf("finalize retry changed token:\n%s", logData)
+				if strings.HasPrefix(command, "/bin/sh '") && strings.HasSuffix(strings.TrimSpace(command), "/script'") {
+					finalizeAttempts++
+				}
+			}
+			if finalizeAttempts != wantAttempts {
+				t.Fatalf("finalize attempts=%d want %d:\n%s", finalizeAttempts, wantAttempts, logData)
+			}
+			scriptData, readErr := os.ReadFile(scriptLogPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			stagedScripts := strings.Split(strings.TrimSuffix(string(scriptData), "---\n"), "---\n")
+			if len(stagedScripts) != wantAttempts {
+				t.Fatalf("staged finalize scripts=%d want %d", len(stagedScripts), wantAttempts)
+			}
+			for _, script := range stagedScripts {
+				if !strings.Contains(script, token) {
+					t.Fatal("finalize retry changed token")
 				}
 			}
 			if !wantFallback {

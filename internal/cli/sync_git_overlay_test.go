@@ -4352,9 +4352,10 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 	remoteRoot := filepath.Join(testRoot, "remote")
 	var leaseIDs [2]string
 	providerName := runReadyPoolPreflightTestProvider{}.Spec().Name
-	// Coordinator leases use the direct TCP readiness check, unlike the
-	// provider-local fixture's SSHConfigProxy path. Supply its own reachable
-	// endpoint rather than depending on a workstation SSH daemon on port 22.
+	// Coordinator leases use direct TCP readiness, unlike the provider-local
+	// fixture's SSHConfigProxy path. Use a reachable endpoint and disable the
+	// default :22 fallback so its controlled readiness failure cannot recover
+	// through an unrelated workstation SSH daemon.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -4457,7 +4458,7 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 
 	configPath := filepath.Join(testRoot, "config.yaml")
 	mustWriteTestFile(t, configPath, fmt.Sprintf(
-		"coordinator: %q\ncoordinatorToken: test-token\nworkRoot: %q\nsync:\n  gitOverlay: true\n  gitSeed: true\n  delete: true\n  fingerprint: true\n",
+		"ssh:\n  fallbackPorts: []\ncoordinator: %q\ncoordinatorToken: test-token\nworkRoot: %q\nsync:\n  gitOverlay: true\n  gitSeed: true\n  delete: true\n  fingerprint: true\n",
 		server.URL,
 		remoteRoot,
 	))

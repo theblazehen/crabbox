@@ -694,40 +694,43 @@ func TestRunCommandRetriesIdempotentRemoteWorkdirCreation(t *testing.T) {
 	isolateRunTestUserDirs(t, dir)
 	sshPath := filepath.Join(dir, "ssh")
 	mkdirCallsPath := filepath.Join(dir, "mkdir-calls")
+	remoteCommandsPath := filepath.Join(dir, "remote-commands")
 	firstMkdirPath := filepath.Join(dir, "first-mkdir")
-	mkdirCommandPath := filepath.Join(dir, "mkdir-command")
+	workRoot := filepath.Join(dir, "remote work root")
 	script := `#!/bin/sh
 remote=""
 for arg do remote="$arg"; done
+printf '%s\n' "$remote" >> "$CRABBOX_FAKE_SSH_REMOTE_COMMANDS"
 case "$remote" in
-  "mkdir -p "*)
-    if [ ! -e "$CRABBOX_FAKE_SSH_MKDIR_COMMAND" ]; then
-      printf '%s\n' "$remote" > "$CRABBOX_FAKE_SSH_MKDIR_COMMAND"
-    fi
-    IFS= read -r mkdir_command < "$CRABBOX_FAKE_SSH_MKDIR_COMMAND"
-    if [ "$remote" = "$mkdir_command" ]; then
-      printf 'call\n' >> "$CRABBOX_FAKE_SSH_MKDIR_CALLS"
-      if [ ! -e "$CRABBOX_FAKE_SSH_FIRST_MKDIR" ]; then
-        : > "$CRABBOX_FAKE_SSH_FIRST_MKDIR"
-        exit 255
-      fi
+  *"mkdir -p '"*)
+    printf 'call\n' >> "$CRABBOX_FAKE_SSH_MKDIR_CALLS"
+    /usr/bin/env PATH=/usr/bin:/bin BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c "$remote" || exit $?
+    if [ ! -e "$CRABBOX_FAKE_SSH_FIRST_MKDIR" ]; then
+      : > "$CRABBOX_FAKE_SSH_FIRST_MKDIR"
+      exit 255
     fi
     ;;
 esac
 /bin/cat >/dev/null || true
 exit 0
 `
-	if err := os.WriteFile(sshPath, []byte(syncScriptAwareSSHFixture(t, script)), 0o755); err != nil {
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	t.Setenv("CRABBOX_WORK_ROOT", workRoot)
 	t.Setenv("CRABBOX_FAKE_SSH_MKDIR_CALLS", mkdirCallsPath)
+	t.Setenv("CRABBOX_FAKE_SSH_REMOTE_COMMANDS", remoteCommandsPath)
 	t.Setenv("CRABBOX_FAKE_SSH_FIRST_MKDIR", firstMkdirPath)
-	t.Setenv("CRABBOX_FAKE_SSH_MKDIR_COMMAND", mkdirCommandPath)
 	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
 	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
 
+	repo, err := findRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workdir := filepath.Join(workRoot, "cbx_env_profile_test", repo.Name)
 	var stdout, stderr bytes.Buffer
 	if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
 		"--provider", "run-env-profile-test",
@@ -740,10 +743,14 @@ exit 0
 	}
 	calls, err := os.ReadFile(mkdirCallsPath)
 	if err != nil {
-		t.Fatal(err)
+		commands, _ := os.ReadFile(remoteCommandsPath)
+		t.Fatalf("remote workdir mkdir was not observed: %v\nremote commands=%s", err, commands)
 	}
 	if got := strings.Count(string(calls), "call\n"); got != 2 {
 		t.Fatalf("remote mkdir calls=%d want 2", got)
+	}
+	if info, err := os.Stat(workdir); err != nil || !info.IsDir() {
+		t.Fatalf("remote workdir was not created at %q: info=%v err=%v", workdir, info, err)
 	}
 }
 
