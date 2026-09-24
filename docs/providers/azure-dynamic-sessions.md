@@ -177,7 +177,15 @@ earlier value unchanged. Its environment parser keeps the earlier value on
 malformed input but accepts parsed zero/negative values, as do explicit flags.
 The effective timeout uses a positive configured value first, otherwise a
 positive `--ttl` rounded up to seconds, otherwise 1800 seconds. This does not
-replace nonpositive values with 1800 before checking TTL.
+replace nonpositive values with 1800 before checking TTL. Command timeouts are
+converted to wire milliseconds only when the deadline also fits existing
+deployed runners: at most 9223372036 whole seconds. Larger explicit values or
+TTL values whose ceiling exceeds that bound are rejected before run authentication
+or session acquisition, never truncated or saturated. TTL rounding does not
+overflow. The bundled Azure/Cloudflare runner also rejects direct positive
+`timeoutMs` values above 9223372036854 before creating a working directory or
+opening a command stream; nonpositive values retain the no-deadline policy. Status,
+stop, and cleanup do not require a command timeout.
 
 API-version, workdir, and final timeout fallbacks share the compiled defaults.
 Azure backend routing, Linux-only handling, endpoint/legacy-pool validation,

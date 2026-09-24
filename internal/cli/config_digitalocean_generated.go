@@ -2,10 +2,6 @@
 
 package cli
 
-import (
-	"os"
-)
-
 type fileDigitalOceanConfig struct {
 	Region   string   `yaml:"region,omitempty"`
 	Image    string   `yaml:"image,omitempty"`
@@ -19,40 +15,18 @@ func defaultDigitalOceanConfig() DigitalOceanConfig {
 
 // DigitalOceanConfigApplied records accepted assignments during one application.
 type DigitalOceanConfigApplied struct {
-	Image bool
+	InputAccepted bool
+	Image         bool
 }
 
 func (cfg *DigitalOceanConfig) applyFile(file *fileDigitalOceanConfig) (DigitalOceanConfigApplied, error) {
 	var applied DigitalOceanConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.Region != "" {
-		cfg.Region = file.Region
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-		applied.Image = true
-	}
-	if file.VPCUUID != "" {
-		cfg.VPCUUID = file.VPCUUID
-	}
-	if len(file.SSHCIDRs) > 0 {
-		cfg.SSHCIDRs = file.SSHCIDRs
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "digitalocean")
+	return applied, err
 }
 
 func (cfg *DigitalOceanConfig) applyEnv() (DigitalOceanConfigApplied, error) {
 	var applied DigitalOceanConfigApplied
-	cfg.Region = getenv("CRABBOX_DIGITALOCEAN_REGION", cfg.Region)
-	if value, ok := firstNonEmptyEnv("CRABBOX_DIGITALOCEAN_IMAGE"); ok {
-		cfg.Image = value
-		applied.Image = true
-	}
-	cfg.VPCUUID = getenv("CRABBOX_DIGITALOCEAN_VPC", cfg.VPCUUID)
-	if value := os.Getenv("CRABBOX_DIGITALOCEAN_SSH_CIDRS"); value != "" {
-		cfg.SSHCIDRs = splitCommaList(value)
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 4)
+	return applied, err
 }

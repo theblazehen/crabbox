@@ -16,15 +16,30 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type field struct {
+	flagListAppendRaw                                                                                                                                                            bool
+	fileListPresentNormalized                                                                                                                                                    bool
+	envIntCheckedAlias                                                                                                                                                           bool
+	envIntCheckedSignedAlias                                                                                                                                                     bool
+	envSplitBefore                                                                                                                                                               bool
+	flagDurationRawPositive                                                                                                                                                      bool
+	fileListNonemptyNormalized, envListTrimmedNonempty, flagListCSV                                                                                                              bool
+	flagDurationRawZeroReset, flagListAppendTrimmed, flagListAppendTrimmedNonempty                                                                                               bool
+	flagDurationError                                                                                                                                                            string
+	envListCSV, flagListScalarEmptyNil                                                                                                                                           bool
 	fileStorageValue                                                                                                                                                             bool
 	fileListNonemptyRaw, flagListEmptyScalar                                                                                                                                     bool
 	fileIntNonzero                                                                                                                                                               bool
 	fileListRaw, envListPresence, flagListReplaceAppend                                                                                                                          bool
-	name, kind, key, configAlias, env, envAlias, envAlias2, flag, help, defaultExpr, flagFallbackExpr                                                                            string
+	name, kind, key, configAlias, env, envAlias, envAlias2, envAlias3, flag, help, defaultExpr, flagFallbackExpr                                                                 string
 	nonnegative, trustedFileOnly, noFile, noEnv, noFlag, fileIgnoreEmpty, reportApplied, envIntFallback, fileIntPositive, fileIntPresent, fileFloatPositive, envAliasAfterConfig bool
+}
+
+func (f field) stringDurationFlag() bool {
+	return f.flagDurationError != "" || f.flagDurationRawZeroReset || f.flagDurationRawPositive
 }
 
 type fileBinding struct {
@@ -43,6 +58,8 @@ func (f field) fileBindings() []fileBinding {
 }
 
 type schema struct {
+	flagOrder           []string
+	manualFlags         bool
 	pkg, name, provider string
 	fields              []field
 }
@@ -87,12 +104,13 @@ func run(source, output, name, provider string, check bool) error {
 }
 
 func parseSchema(source []byte, name, provider string) (schema, error) {
-	file, err := parser.ParseFile(token.NewFileSet(), "config.go", source, 0)
+	file, err := parser.ParseFile(token.NewFileSet(), "config.go", source, parser.ParseComments)
 	if err != nil {
 		return schema{}, err
 	}
 	s := schema{pkg: file.Name.Name, name: name, provider: provider}
 	var fields *ast.FieldList
+	allowedDirectives := map[*ast.Comment]bool{}
 	for _, decl := range file.Decls {
 		gen, ok := decl.(*ast.GenDecl)
 		if !ok {
@@ -108,10 +126,38 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 				return s, fmt.Errorf("%s must be a struct", name)
 			}
 			fields = st.Fields
+			doc := typ.Doc
+			if doc == nil && len(gen.Specs) == 1 {
+				doc = gen.Doc
+			}
+			if doc != nil {
+				for _, comment := range doc.List {
+					allowedDirectives[comment] = true
+				}
+			}
 		}
 	}
 	if fields == nil {
 		return s, fmt.Errorf("config type %s not found", name)
+	}
+	for _, group := range file.Comments {
+		for _, comment := range group.List {
+			if strings.HasPrefix(comment.Text, "//configgen:flag-order") {
+				const prefix = "//configgen:flag-order "
+				if !allowedDirectives[comment] || !strings.HasPrefix(comment.Text, prefix) || s.flagOrder != nil {
+					return s, fmt.Errorf("flag-order requires one exact field-order directive on the selected type")
+				}
+				s.flagOrder = strings.Split(strings.TrimPrefix(comment.Text, prefix), ",")
+				continue
+			}
+			if !strings.HasPrefix(comment.Text, "//configgen:flag-application") {
+				continue
+			}
+			if !allowedDirectives[comment] || comment.Text != "//configgen:flag-application manual" || s.manualFlags {
+				return s, fmt.Errorf("flag-application requires one exact manual directive on the selected type")
+			}
+			s.manualFlags = true
+		}
 	}
 	seen := map[string]bool{}
 	seenFileMembers := map[string]bool{}
@@ -124,11 +170,35 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 			return s, err
 		}
 		tags := reflect.StructTag(raw)
+		if tags.Get("sources") == "runtime" {
+			if raw != strings.TrimSpace(raw) {
+				return s, fmt.Errorf("%s: runtime fields require only sources:\"runtime\" and optional unique yaml/json omission tags", node.Names[0].Name)
+			}
+			seenTags := map[string]bool{}
+			// reflect.StructTag separates tags with ASCII spaces, not arbitrary whitespace.
+			for _, tag := range strings.Split(raw, " ") {
+				if tag == "" {
+					continue
+				}
+				if (tag != `sources:"runtime"` && tag != `yaml:"-"` && tag != `json:"-"`) || seenTags[tag] {
+					return s, fmt.Errorf("%s: runtime fields require only sources:\"runtime\" and optional unique yaml/json omission tags", node.Names[0].Name)
+				}
+				seenTags[tag] = true
+			}
+			continue
+		}
 		f := field{name: node.Names[0].Name, key: tags.Get("config"), env: tags.Get("env"), flag: tags.Get("flag"), help: tags.Get("help")}
 		// These exact grants preserve existing loader policy; they are not a
 		// general source-policy language or a default permission.
 		switch tags.Get("sources") {
 		case "user,repo,env,flag":
+		case "user,repo,flag":
+			f.noEnv = true
+			for _, tag := range []string{"env", "envAlias", "envAlias2", "envAlias3", "envAliasAfterConfig", "envInt", "envFloat", "envString", "envList", "envSplitBefore"} {
+				if _, ok := tags.Lookup(tag); ok {
+					return s, fmt.Errorf("%s: user,repo,flag sources require an absent %s tag", f.name, tag)
+				}
+			}
 		case "user,env,flag":
 			f.trustedFileOnly = true
 		case "env,flag":
@@ -153,13 +223,13 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 			}
 		case "flag":
 			f.noFile, f.noEnv = true, true
-			for _, tag := range []string{"config", "env", "envAlias", "envAlias2"} {
+			for _, tag := range []string{"config", "env", "envAlias", "envAlias2", "envAlias3"} {
 				if _, ok := tags.Lookup(tag); ok {
 					return s, fmt.Errorf("%s: flag sources require an absent %s tag", f.name, tag)
 				}
 			}
 		default:
-			return s, fmt.Errorf("%s requires explicit sources user,repo,env,flag, user,env,flag, env,flag, flag, env, user,repo,env, or user,env", f.name)
+			return s, fmt.Errorf("%s requires explicit sources user,repo,env,flag, user,env,flag, env,flag, flag, env, user,repo,env, user,env, or user,repo,flag", f.name)
 		}
 		var bindings []struct{ label, value string }
 		if !f.noFlag {
@@ -183,6 +253,14 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 			}
 			f.envAlias2 = alias2
 			bindings = append(bindings, struct{ label, value string }{"env", alias2})
+		}
+		alias3, hasAlias3 := tags.Lookup("envAlias3")
+		if hasAlias3 {
+			if !hasAlias2 {
+				return s, fmt.Errorf("%s: envAlias3 requires envAlias2", f.name)
+			}
+			f.envAlias3 = alias3
+			bindings = append(bindings, struct{ label, value string }{"env", alias3})
 		}
 		configAlias, hasConfigAlias := tags.Lookup("configAlias")
 		if hasConfigAlias {
@@ -208,12 +286,53 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 		}
 		f.kind = typeText.String()
 		switch f.kind {
-		case "string", "int", "int64", "float64", "bool", "[]string":
+		case "string", "int", "int64", "float64", "bool", "*bool", "[]string":
+		case "time.Duration":
+			standardTime := false
+			for _, spec := range file.Imports {
+				path, err := strconv.Unquote(spec.Path.Value)
+				if err == nil && path == "time" && (spec.Name == nil || spec.Name.Name == "time") {
+					standardTime = true
+				}
+			}
+			if !standardTime {
+				return s, fmt.Errorf("%s: time.Duration requires the standard time import named time", f.name)
+			}
 		default:
 			if _, ok := tags.Lookup("fileStorage"); ok {
 				return s, fmt.Errorf("%s: fileStorage does not support config type %s", f.name, f.kind)
 			}
 			return s, fmt.Errorf("%s: unsupported config type %s", f.name, f.kind)
+		}
+		if mode, present := tags.Lookup("duration"); f.kind == "time.Duration" {
+			if !present || (mode != "positive-overlay" && mode != "nonnegative-overlay") {
+				return s, fmt.Errorf("%s: time.Duration requires duration positive-overlay or nonnegative-overlay", f.name)
+			}
+			if !f.noFile && tags.Get("fileStorage") != "value" {
+				return s, fmt.Errorf("%s: duration file input requires fileStorage value", f.name)
+			}
+		} else if present {
+			return s, fmt.Errorf("%s: duration is supported only for time.Duration", f.name)
+		}
+		flagDuration, hasFlagDuration := tags.Lookup("flagDuration")
+		flagDurationError, hasFlagDurationError := tags.Lookup("flagDurationError")
+		if hasFlagDuration {
+			if f.kind != "time.Duration" || f.noFlag || (flagDuration != "trim-positive" && flagDuration != "raw-zero-reset" && flagDuration != "raw-positive") {
+				return s, fmt.Errorf("%s: flagDuration requires trim-positive, raw-zero-reset, or raw-positive on a flag-admitted time.Duration", f.name)
+			}
+			if flagDuration == "raw-zero-reset" || flagDuration == "raw-positive" {
+				if hasFlagDurationError {
+					return s, fmt.Errorf("%s: %s forbids flagDurationError", f.name, flagDuration)
+				}
+				f.flagDurationRawZeroReset = flagDuration == "raw-zero-reset"
+				f.flagDurationRawPositive = flagDuration == "raw-positive"
+			} else if !hasFlagDurationError || strings.TrimSpace(flagDurationError) == "" {
+				return s, fmt.Errorf("%s: flagDuration requires a nonempty flagDurationError", f.name)
+			} else {
+				f.flagDurationError = flagDurationError
+			}
+		} else if hasFlagDurationError {
+			return s, fmt.Errorf("%s: flagDurationError requires flagDuration", f.name)
 		}
 		if hasConfigAlias && (f.kind != "string" || f.noFile) {
 			return s, fmt.Errorf("%s: configAlias requires a string field with a file source", f.name)
@@ -224,38 +343,46 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 			}
 			seenFileMembers[binding.member] = true
 		}
-		if f.noFlag && f.kind != "string" && !(tags.Get("sources") == "user,repo,env" && f.kind == "[]string") {
+		if f.noFlag && f.kind != "string" && !(tags.Get("sources") == "user,repo,env" && (f.kind == "[]string" || f.kind == "bool" || f.kind == "time.Duration")) {
 			allowed := "string fields"
 			if tags.Get("sources") == "user,repo,env" {
-				allowed += " or []string fields"
+				allowed += ", []string, bool, or time.Duration fields"
 			}
 			return s, fmt.Errorf("%s: %s sources support only %s", f.name, tags.Get("sources"), allowed)
 		}
 		for _, mode := range []struct {
-			tag, accepted, alternative  string
-			admitted                    bool
-			enabled, alternativeEnabled *bool
+			tag      string
+			admitted bool
+			values   map[string]*bool
 		}{
-			{"fileList", "raw", "nonempty-raw", !f.noFile, &f.fileListRaw, &f.fileListNonemptyRaw},
-			{"envList", "presence", "", !f.noEnv, &f.envListPresence, nil},
-			{"flagList", "replace-append", "empty-scalar", !f.noFlag, &f.flagListReplaceAppend, &f.flagListEmptyScalar},
+			{"fileList", !f.noFile, map[string]*bool{"raw": &f.fileListRaw, "nonempty-raw": &f.fileListNonemptyRaw, "nonempty-normalized": &f.fileListNonemptyNormalized, "present-normalized": &f.fileListPresentNormalized}},
+			{"envList", !f.noEnv, map[string]*bool{"presence": &f.envListPresence, "csv": &f.envListCSV, "trimmed-nonempty": &f.envListTrimmedNonempty}},
+			{"flagList", !f.noFlag, map[string]*bool{"replace-append": &f.flagListReplaceAppend, "append-trimmed": &f.flagListAppendTrimmed, "append-raw": &f.flagListAppendRaw, "append-trimmed-nonempty": &f.flagListAppendTrimmedNonempty, "empty-scalar": &f.flagListEmptyScalar, "scalar-empty-nil": &f.flagListScalarEmptyNil, "csv": &f.flagListCSV}},
 		} {
 			if value, ok := tags.Lookup(mode.tag); ok {
-				if f.kind != "[]string" || !mode.admitted || (value != mode.accepted && (mode.alternative == "" || value != mode.alternative)) {
+				enabled := mode.values[value]
+				if f.kind != "[]string" || !mode.admitted || enabled == nil {
 					return s, fmt.Errorf("%s: %s requires a supported mode on a []string field with that source", f.name, mode.tag)
 				}
-				if value == mode.accepted {
-					*mode.enabled = true
-				} else {
-					*mode.alternativeEnabled = true
-				}
+				*enabled = true
+			}
+		}
+		if f.flagListAppendRaw && (!s.manualFlags || tags.Get("sources") != "flag") {
+			return s, fmt.Errorf("%s: flagList append-raw requires flag-only input and manual flag application", f.name)
+		}
+		if value, ok := tags.Lookup("envString"); ok {
+			if value != "presence" || f.kind != "string" || f.noEnv || hasAlias || hasAlias2 || hasAlias3 {
+				return s, fmt.Errorf("%s: envString requires presence on an environment-admitted string without aliases", f.name)
 			}
 		}
 		if value, ok := tags.Lookup("reportApplied"); ok {
-			if value != "true" || (f.kind != "string" && f.kind != "bool") {
-				return s, fmt.Errorf("%s: reportApplied is supported only as true for string or bool fields", f.name)
+			if value != "true" || (f.kind != "string" && f.kind != "bool" && f.kind != "int" && f.kind != "time.Duration") {
+				return s, fmt.Errorf("%s: reportApplied is supported only as true for string, bool, int, or time.Duration fields", f.name)
 			}
 			f.reportApplied = true
+			if f.name == "InputAccepted" {
+				return s, fmt.Errorf("InputAccepted is reserved for the generated acceptance report")
+			}
 		}
 		if value, ok := tags.Lookup("fileIgnoreEmpty"); ok {
 			if value != "true" || f.kind != "string" || f.noFile {
@@ -266,11 +393,29 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 		if hasAlias2 && (f.kind != "string" || f.noEnv) {
 			return s, fmt.Errorf("%s: envAlias2 requires an environment-admitted string field", f.name)
 		}
+		if hasAlias3 && (f.kind != "string" || f.noEnv) {
+			return s, fmt.Errorf("%s: envAlias3 requires an environment-admitted string field", f.name)
+		}
 		if value, ok := tags.Lookup("envAliasAfterConfig"); ok {
 			if value != "true" || f.kind != "string" || f.noEnv || !hasAlias || hasAlias2 {
 				return s, fmt.Errorf("%s: envAliasAfterConfig requires true on an environment-admitted string with exactly one envAlias", f.name)
 			}
 			f.envAliasAfterConfig = true
+		}
+		if tags.Get("envInt") == "checked-signed-alias" {
+			if f.kind != "int" || f.noEnv || !hasAlias || hasAlias2 {
+				return s, fmt.Errorf("%s: envInt checked-signed-alias requires an environment-admitted int with exactly one envAlias", f.name)
+			}
+			if _, ok := tags.Lookup("nonnegative"); ok {
+				return s, fmt.Errorf("%s: checked-signed-alias cannot use nonnegative policy", f.name)
+			}
+			label := tags.Get("envIntErrorLabel")
+			if label == "" || strings.TrimSpace(label) != label || strings.ContainsAny(label, "\r\n") {
+				return s, fmt.Errorf("%s: checked-signed-alias requires a nonempty single-line envIntErrorLabel", f.name)
+			}
+			f.envIntCheckedSignedAlias = true
+		} else if _, ok := tags.Lookup("envIntErrorLabel"); ok {
+			return s, fmt.Errorf("%s: envIntErrorLabel requires checked-signed-alias", f.name)
 		}
 		if value, ok := tags.Lookup("nonnegative"); ok {
 			if (f.kind != "int" && f.kind != "int64") || value != "true" {
@@ -278,11 +423,11 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 			}
 			f.nonnegative = true
 		}
-		if (f.kind == "int" || f.kind == "int64") && !f.nonnegative {
+		if (f.kind == "int" || f.kind == "int64") && !f.nonnegative && !f.envIntCheckedSignedAlias {
 			return s, fmt.Errorf("%s: pilot int fields require nonnegative policy", f.name)
 		}
 		if value, ok := tags.Lookup("fileInt"); ok {
-			if (value != "positive" && value != "present" && value != "nonzero") || (f.kind != "int" && f.kind != "int64") || f.noFile || !f.nonnegative {
+			if (value != "positive" && value != "present" && value != "nonzero") || (f.kind != "int" && f.kind != "int64") || f.noFile || (!f.nonnegative && !(f.envIntCheckedSignedAlias && value == "positive")) {
 				return s, fmt.Errorf("%s: fileInt is supported only as positive, present, or nonzero for file-admitted nonnegative int fields", f.name)
 			}
 			f.fileIntPositive = value == "positive"
@@ -290,22 +435,35 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 			f.fileIntNonzero = value == "nonzero"
 		}
 		if value, ok := tags.Lookup("fileFloat"); ok {
-			if value != "positive" || f.kind != "float64" || f.noFile {
-				return s, fmt.Errorf("%s: fileFloat is supported only as positive for file-admitted float64 fields", f.name)
+			if (value != "positive" && value != "nonnegative") || f.kind != "float64" || f.noFile {
+				return s, fmt.Errorf("%s: fileFloat is supported only as positive or nonnegative for file-admitted float64 fields", f.name)
 			}
-			f.fileFloatPositive = true
+			f.fileFloatPositive = value == "positive"
+		}
+		if value, ok := tags.Lookup("envFloat"); ok {
+			if value != "checked" || f.kind != "float64" || f.noEnv {
+				return s, fmt.Errorf("%s: envFloat requires checked on an environment-admitted float64 field", f.name)
+			}
 		}
 		if value, ok := tags.Lookup("envInt"); ok {
-			if value != "fallback" || (f.kind != "int" && f.kind != "int64") || f.noEnv || !f.nonnegative {
+			if value == "checked-signed-alias" {
+				// Admission and the literal diagnostic label were checked above.
+			} else if value == "checked-alias" {
+				if f.kind != "int" || !f.nonnegative || f.noEnv || !hasAlias || hasAlias2 {
+					return s, fmt.Errorf("%s: envInt checked-alias requires an environment-admitted nonnegative int with exactly one envAlias", f.name)
+				}
+				f.envIntCheckedAlias = true
+			} else if value != "fallback" || (f.kind != "int" && f.kind != "int64") || f.noEnv || !f.nonnegative {
 				return s, fmt.Errorf("%s: envInt is supported only as fallback for environment-admitted nonnegative int fields", f.name)
+			} else {
+				f.envIntFallback = true
 			}
-			f.envIntFallback = true
 		}
 		if f.kind == "int64" && !f.noEnv && !f.envIntFallback {
 			return s, fmt.Errorf("%s: int64 environment fields require envInt fallback", f.name)
 		}
-		if hasAlias && f.kind != "string" && !(f.kind == "int" && !f.noEnv && f.envIntFallback) {
-			return s, fmt.Errorf("%s: envAlias is supported only for string fields or environment-admitted int fields with envInt fallback", f.name)
+		if hasAlias && f.kind != "string" && !(f.kind == "bool" && !f.noEnv) && !(f.kind == "int" && !f.noEnv && (f.envIntFallback || f.envIntCheckedAlias || f.envIntCheckedSignedAlias)) {
+			return s, fmt.Errorf("%s: envAlias is supported only for string fields, environment-admitted bool fields, or int fields with envInt fallback or checked-alias", f.name)
 		}
 		if value, ok := tags.Lookup("flagFallback"); ok {
 			if value == "" || f.kind != "string" || f.noFlag {
@@ -325,27 +483,74 @@ func parseSchema(source []byte, name, provider string) (schema, error) {
 				return s, fmt.Errorf("%s default must be non-negative", f.name)
 			}
 		}
+		if f.fileListPresentNormalized && tags.Get("fileStorage") != "value" {
+			return s, fmt.Errorf("%s: fileList present-normalized requires fileStorage value", f.name)
+		}
 		if value, ok := tags.Lookup("fileStorage"); ok {
 			eligible := false
 			switch f.kind {
 			case "string":
 				eligible = f.fileIgnoreEmpty
 			case "[]string":
-				eligible = f.fileListNonemptyRaw
+				eligible = f.fileListNonemptyRaw || f.fileListRaw || f.fileListNonemptyNormalized || f.fileListPresentNormalized
 			case "int", "int64":
 				eligible = f.fileIntPositive || f.fileIntNonzero
 			case "float64":
 				eligible = f.fileFloatPositive
+			case "time.Duration":
+				eligible = true
 			}
 			if value != "value" || f.noFile || !eligible {
 				return s, fmt.Errorf("%s: fileStorage requires value on a file-admitted field with a zero-ignoring file rule", f.name)
 			}
 			f.fileStorageValue = true
 		}
+		if value, ok := tags.Lookup("envSplitBefore"); ok {
+			if value != "true" || f.noEnv {
+				return s, fmt.Errorf("%s: envSplitBefore requires true on an environment-admitted field", f.name)
+			}
+			f.envSplitBefore = true
+		}
 		s.fields = append(s.fields, f)
 	}
 	if len(s.fields) == 0 {
 		return s, fmt.Errorf("%s has no fields", name)
+	}
+	if s.flagOrder != nil {
+		admitted := map[string]bool{}
+		for _, f := range s.fields {
+			if !f.noFlag {
+				admitted[f.name] = true
+			}
+		}
+		for _, name := range s.flagOrder {
+			if !admitted[name] {
+				return s, fmt.Errorf("flag-order requires an exact permutation of flag fields; invalid or repeated field %q", name)
+			}
+			delete(admitted, name)
+		}
+		if len(admitted) != 0 {
+			return s, fmt.Errorf("flag-order requires every flag-admitted field exactly once")
+		}
+	}
+	if s.manualFlags {
+		hasFlags := false
+		for _, f := range s.fields {
+			hasFlags = hasFlags || !f.noFlag
+		}
+		if !hasFlags {
+			return s, fmt.Errorf("flag-application manual requires flag-admitted fields")
+		}
+	}
+	seenSplit, prefixEnv := false, false
+	for _, f := range s.fields {
+		if f.envSplitBefore {
+			if seenSplit || !prefixEnv {
+				return s, fmt.Errorf("%s: envSplitBefore requires one split with a nonempty environment prefix and suffix", f.name)
+			}
+			seenSplit = true
+		}
+		prefixEnv = prefixEnv || !f.noEnv
 	}
 	return s, nil
 }
@@ -369,6 +574,23 @@ func defaultExpression(kind, value string) (string, error) {
 	case "bool":
 		v, err := strconv.ParseBool(value)
 		return strconv.FormatBool(v), err
+	case "time.Duration":
+		v, err := time.ParseDuration(value)
+		if err != nil {
+			return "", err
+		}
+		if v <= 0 {
+			return "", fmt.Errorf("duration default must be positive")
+		}
+		for _, unit := range []struct {
+			value time.Duration
+			name  string
+		}{{time.Second, "Second"}, {time.Millisecond, "Millisecond"}, {time.Microsecond, "Microsecond"}} {
+			if v%unit.value == 0 {
+				return fmt.Sprintf("%d * time.%s", v/unit.value, unit.name), nil
+			}
+		}
+		return fmt.Sprintf("%d * time.Nanosecond", v), nil
 	default:
 		return "", fmt.Errorf("defaults for %s are not supported", kind)
 	}
@@ -378,24 +600,21 @@ func generate(s schema, source string) ([]byte, error) {
 	var out bytes.Buffer
 	p := func(pattern string, args ...any) { fmt.Fprintf(&out, pattern, args...) }
 	p("// Code generated by scripts/configgen from %s; DO NOT EDIT.\n\npackage %s\n\n", source, s.pkg)
-	hasFlags, needsOS, needsStrings := false, false, false
+	hasFlags, needsTime := false, false
 	for _, f := range s.fields {
 		hasFlags = hasFlags || !f.noFlag
-		if f.kind == "[]string" {
-			needsStrings = needsStrings || (!f.noFlag && !f.flagListReplaceAppend && !f.flagListEmptyScalar)
-			needsOS = needsOS || (!f.noEnv && !f.envListPresence)
+		if f.kind == "time.Duration" {
+			needsTime = needsTime || (!f.noFlag && !f.stringDurationFlag()) || f.defaultExpr != ""
 		}
+
 	}
-	if hasFlags || needsOS || needsStrings {
+	if hasFlags || needsTime {
 		p("import (")
 		if hasFlags {
 			p("\"flag\";")
 		}
-		if needsOS {
-			p("\"os\";")
-		}
-		if needsStrings {
-			p("\"strings\";")
+		if needsTime {
+			p("\"time\";")
 		}
 		p(")\n\n")
 	}
@@ -403,8 +622,14 @@ func generate(s schema, source string) ([]byte, error) {
 	for _, f := range s.fields {
 		for _, binding := range f.fileBindings() {
 			kind := "*" + f.kind
+			if f.kind == "*bool" {
+				kind = "*bool"
+			}
 			if f.fileStorageValue {
 				kind = f.kind
+			}
+			if f.kind == "time.Duration" {
+				kind = "string"
 			}
 			p("%s %s `yaml:%q`\n", binding.member, kind, binding.key+",omitempty")
 		}
@@ -425,24 +650,19 @@ func generate(s schema, source string) ([]byte, error) {
 		}
 	}
 	p("} }\n\n")
-	reportsApplied, trackedFlags := false, false
+	trackedFlags := false
 	for _, f := range s.fields {
-		reportsApplied = reportsApplied || f.reportApplied
 		trackedFlags = trackedFlags || (f.reportApplied && !f.noFlag)
 	}
-	resultType, resultPrefix, reportInit := "error", "", ""
-	if reportsApplied {
-		p("// %sApplied records accepted assignments during one application.\ntype %sApplied struct {\n", s.name, s.name)
-		for _, f := range s.fields {
-			if f.reportApplied {
-				p("%s bool\n", f.name)
-			}
+	p("// %sApplied records accepted assignments during one application.\ntype %sApplied struct {\nInputAccepted bool\n", s.name, s.name)
+	for _, f := range s.fields {
+		if f.reportApplied {
+			p("%s bool\n", f.name)
 		}
-		p("}\n\n")
-		resultType = "(" + s.name + "Applied, error)"
-		resultPrefix = "applied, "
-		reportInit = "var applied " + s.name + "Applied\n"
 	}
+	p("}\n\n")
+	resultType := "(" + s.name + "Applied, error)"
+	reportInit := "var applied " + s.name + "Applied\n"
 	trustedParameter := ""
 	for _, f := range s.fields {
 		if f.trustedFileOnly {
@@ -450,117 +670,28 @@ func generate(s schema, source string) ([]byte, error) {
 			break
 		}
 	}
-	p("func (cfg *%s) applyFile(file *file%s%s) %s {\n%sif file == nil { return %snil }\n", s.name, s.name, trustedParameter, resultType, reportInit, resultPrefix)
-	for _, f := range s.fields {
-		for _, binding := range f.fileBindings() {
-			member := "file." + binding.member
-			value := member
-			var conditions []string
-			if f.trustedFileOnly {
-				conditions = append(conditions, "trusted")
-			}
-			if !f.fileStorageValue {
-				conditions = append(conditions, member+" != nil")
-				value = "*" + member
-			}
-			if f.fileIgnoreEmpty {
-				conditions = append(conditions, value+" != \"\"")
-			}
-			if f.fileIntPositive || f.fileFloatPositive {
-				conditions = append(conditions, value+" > 0")
-			}
-			if f.fileIntNonzero {
-				conditions = append(conditions, value+" != 0")
-			}
-			if f.fileListNonemptyRaw {
-				conditions = append(conditions, "len("+value+") > 0")
-			}
-			p("if %s {\n", strings.Join(conditions, " && "))
-			if f.nonnegative && !f.fileIntPositive && !f.fileIntPresent && !f.fileIntNonzero {
-				p("if %s < 0 { return %sexit(2, %q) }\n", value, resultPrefix, s.provider+" "+f.key+" must be non-negative")
-			}
-			if f.kind == "[]string" {
-				if f.fileListRaw {
-					value = "append([]string(nil), (" + value + ")...)"
-				} else if !f.fileListNonemptyRaw {
-					value = "normalizeList(" + value + ")"
-				}
-			}
-			p("cfg.%s = %s\n", f.name, value)
-			if f.reportApplied {
-				p("applied.%s = true\n", f.name)
-			}
-			p("}\n")
+	fileTrust := "true"
+	if trustedParameter != "" {
+		fileTrust = "trusted"
+	}
+	p("func (cfg *%s) applyFile(file *file%s%s) %s {\n%s", s.name, s.name, trustedParameter, resultType, reportInit)
+	p("err := applyConfigFileOverlay(cfg, file, &applied, %s, %q)\nreturn applied, err\n}\n\n", fileTrust, s.provider)
+	emitEnv := func(name string, start, end int) {
+		p("func (cfg *%s) %s() %s {\n%s", s.name, name, resultType, reportInit)
+		p("err := applyConfigEnvironment(cfg, &applied, %d, %d)\nreturn applied, err\n}\n\n", start, end)
+	}
+	split := -1
+	for i, f := range s.fields {
+		if f.envSplitBefore {
+			split = i
 		}
 	}
-	p("return %snil\n}\n\n", resultPrefix)
-	p("func (cfg *%s) applyEnv() %s {\n%s", s.name, resultType, reportInit)
-	for _, f := range s.fields {
-		if f.noEnv {
-			continue
-		}
-		switch f.kind {
-		case "string":
-			if f.envAliasAfterConfig {
-				p("if value, ok := firstNonEmptyEnv(%q); ok {\ncfg.%s = value\n", f.env, f.name)
-				if f.reportApplied {
-					p("applied.%s = true\n", f.name)
-				}
-				p("} else if cfg.%s == \"\" {\nif value, ok := firstNonEmptyEnv(%q); ok {\ncfg.%s = value\n", f.name, f.envAlias, f.name)
-				if f.reportApplied {
-					p("applied.%s = true\n", f.name)
-				}
-				p("}\n}\n")
-				continue
-			}
-			if f.reportApplied {
-				names := strconv.Quote(f.env)
-				if f.envAlias != "" {
-					names += ", " + strconv.Quote(f.envAlias)
-				}
-				if f.envAlias2 != "" {
-					names += ", " + strconv.Quote(f.envAlias2)
-				}
-				p("if value, ok := firstNonEmptyEnv(%s); ok { cfg.%s = value; applied.%s = true }\n", names, f.name, f.name)
-				continue
-			}
-			fallback := "cfg." + f.name
-			if f.envAlias2 != "" {
-				fallback = fmt.Sprintf("getenv(%q, %s)", f.envAlias2, fallback)
-			}
-			if f.envAlias != "" {
-				fallback = fmt.Sprintf("getenv(%q, %s)", f.envAlias, fallback)
-			}
-			p("cfg.%s = getenv(%q, %s)\n", f.name, f.env, fallback)
-		case "float64":
-			p("cfg.%s = getenvFloat(%q, cfg.%s)\n", f.name, f.env, f.name)
-		case "int":
-			if f.envIntFallback {
-				fallback := "cfg." + f.name
-				if f.envAlias != "" {
-					fallback = fmt.Sprintf("getenvInt(%q, %s)", f.envAlias, fallback)
-				}
-				p("cfg.%s = getenvInt(%q, %s)\n", f.name, f.env, fallback)
-				continue
-			}
-			p("{ var err error; cfg.%s, err = getenvNonNegativeInt(%q, cfg.%s); if err != nil { return %serr } }\n", f.name, f.env, f.name, resultPrefix)
-		case "int64":
-			p("cfg.%s = getenvInt64(%q, cfg.%s)\n", f.name, f.env, f.name)
-		case "bool":
-			if f.reportApplied {
-				p("if value, ok := getenvBool(%q); ok { cfg.%s = value; applied.%s = true }\n", f.env, f.name, f.name)
-			} else {
-				p("if value, ok := getenvBool(%q); ok { cfg.%s = value }\n", f.env, f.name)
-			}
-		case "[]string":
-			if f.envListPresence {
-				p("if value, ok := getenvList(%q); ok { cfg.%s = value }\n", f.env, f.name)
-				continue
-			}
-			p("if value := os.Getenv(%q); value != \"\" { cfg.%s = splitCommaList(value) }\n", f.env, f.name)
-		}
+	if split < 0 {
+		emitEnv("applyEnv", 0, len(s.fields))
+	} else {
+		emitEnv("applyEnvPrefix", 0, split)
+		emitEnv("applyEnvSuffix", split, len(s.fields))
 	}
-	p("return %snil\n}\n\n", resultPrefix)
 	if hasFlags {
 		p("// %sFlagValues holds parsed values; only visited flags are applied.\ntype %sFlagValues struct {\n", s.name, s.name)
 		for _, f := range s.fields {
@@ -568,95 +699,50 @@ func generate(s schema, source string) ([]byte, error) {
 				continue
 			}
 			kind := f.kind
+			if kind == "*bool" {
+				kind = "bool"
+			}
+			if f.stringDurationFlag() {
+				kind = "string"
+			}
 			if kind == "[]string" {
 				kind = "string"
 				if f.flagListReplaceAppend {
 					kind = "replaceAppendListFlag"
 				}
+				if f.flagListAppendTrimmed {
+					kind = "appendTrimmedListFlag"
+				}
+				if f.flagListAppendTrimmedNonempty {
+					kind = "appendTrimmedNonemptyListFlag"
+				}
+				if f.flagListAppendRaw {
+					kind = "[]string"
+				}
 			}
 			p("%s *%s\n", f.name, kind)
 		}
 		p("}\n\n")
-		p("// Register%sFlags registers mechanical bindings without selecting a provider.\nfunc Register%sFlags(fs *flag.FlagSet, defaults %s) %sFlagValues {\n", s.name, s.name, s.name, s.name)
-		for _, f := range s.fields {
-			if f.flagListReplaceAppend {
-				p("list%s := newReplaceAppendListFlag(defaults.%s)\nfs.Var(list%s, %q, %q)\n", f.name, f.name, f.name, f.flag, f.help)
-			}
+		p("// Register%sFlags registers mechanical bindings without selecting a provider.\nfunc Register%sFlags(fs *flag.FlagSet, defaults %s) %sFlagValues {\nvar values %sFlagValues\nregisterConfigFlags(fs, defaults, &values", s.name, s.name, s.name, s.name, s.name)
+		for _, name := range s.flagOrder {
+			p(", %q", name)
 		}
-		p("return %sFlagValues{\n", s.name)
-		for _, f := range s.fields {
-			if f.noFlag {
-				continue
-			}
-			if f.flagListReplaceAppend {
-				p("%s: list%s,\n", f.name, f.name)
-				continue
-			}
-			method := map[string]string{"string": "String", "int": "Int", "int64": "Int64", "float64": "Float64", "bool": "Bool", "[]string": "String"}[f.kind]
-			value := "defaults." + f.name
-			if f.flagFallbackExpr != "" {
-				value = fmt.Sprintf("blank(%s, %sFlagFallback%s)", value, s.name, f.name)
-			}
-			if f.kind == "[]string" {
-				if f.flagListEmptyScalar {
-					value = "\"\""
-				} else {
-					value = "strings.Join(" + value + ", \",\")"
-				}
-			}
-			p("%s: fs.%s(%q, %s, %q),\n", f.name, method, f.flag, value, f.help)
-		}
-		p("}\n}\n\n")
-		applyResult := ""
-		if trackedFlags {
+		p(")\nreturn values\n}\n\n")
+
+		if trackedFlags || s.manualFlags {
 			p("// %sVisitedFlags records raw flag visits, independently of application.\ntype %sVisitedFlags struct {\n", s.name, s.name)
 			for _, f := range s.fields {
-				if f.reportApplied && !f.noFlag {
+				if (f.reportApplied || s.manualFlags) && !f.noFlag {
 					p("%s bool\n", f.name)
 				}
 			}
 			p("}\n\n")
-			p("// %sFlagPresence reports visits for tracked flag bindings.\nfunc %sFlagPresence(fs *flag.FlagSet) %sVisitedFlags {\nreturn %sVisitedFlags{\n", s.name, s.name, s.name, s.name)
-			for _, f := range s.fields {
-				if f.reportApplied && !f.noFlag {
-					p("%s: flagWasSet(fs, %q),\n", f.name, f.flag)
-				}
-			}
-			p("}\n}\n\n")
+			p("// %sFlagPresence reports visits for tracked flag bindings.\nfunc %sFlagPresence(fs *flag.FlagSet) %sVisitedFlags {\nvar visited %sVisitedFlags\nrecordConfigFlagVisits[%s](fs, &visited)\nreturn visited\n}\n\n", s.name, s.name, s.name, s.name, s.name)
 		}
-		if reportsApplied {
-			applyResult = " " + s.name + "Applied"
+		if !s.manualFlags {
+			p("// Apply copies explicit flag values. Provider validation must run afterward.\nfunc (values %sFlagValues) Apply(cfg *%s, fs *flag.FlagSet) %s {\n%s", s.name, s.name, resultType, reportInit)
+			p("err := applyConfigFlags(cfg, values, &applied, fs)\nreturn applied, err\n}\n")
 		}
-		p("// Apply copies explicit flag values. Provider validation must run afterward.\nfunc (values %sFlagValues) Apply(cfg *%s, fs *flag.FlagSet)%s {\n%s", s.name, s.name, applyResult, reportInit)
-		if trackedFlags {
-			p("visited := %sFlagPresence(fs)\n", s.name)
-		}
-		for _, f := range s.fields {
-			if f.noFlag {
-				continue
-			}
-			if f.flagListEmptyScalar {
-				p("if flagWasSet(fs, %q) { cfg.%s = splitCommaList(*values.%s); if len(cfg.%s) == 0 { cfg.%s = nil } }\n", f.flag, f.name, f.name, f.name, f.name)
-				continue
-			}
-			value := "*values." + f.name
-			if f.kind == "[]string" {
-				if f.flagListReplaceAppend {
-					value = "append([]string(nil), values." + f.name + ".values...)"
-				} else {
-					value = "splitCommaList(" + value + ")"
-				}
-			}
-			if f.reportApplied {
-				p("if visited.%s { cfg.%s = %s; applied.%s = true }\n", f.name, f.name, value, f.name)
-			} else {
-				p("if flagWasSet(fs, %q) { cfg.%s = %s }\n", f.flag, f.name, value)
-			}
-		}
-		if reportsApplied {
-			p("return applied\n")
-		}
-		p("}\n")
 	}
 	formatted, err := format.Source(out.Bytes())
 	if err != nil {

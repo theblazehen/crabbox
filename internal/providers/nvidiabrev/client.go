@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 type brevClient struct {
-	cfg Config
-	rt  Runtime
+	cfg core.Config
+	rt  core.Runtime
 }
 
 type brevWorkspace struct {
@@ -46,18 +48,18 @@ type brevWorkspaceMeta struct {
 
 var brevWorkspaceMetaPath = "/etc/meta/workspace.json"
 
-func newBrevClient(cfg Config, rt Runtime) (*brevClient, error) {
+func newBrevClient(cfg core.Config, rt core.Runtime) (*brevClient, error) {
 	applyNvidiaBrevDefaults(&cfg)
 	if rt.Exec == nil {
-		return nil, exit(2, "provider=%s requires Runtime.Exec", providerName)
+		return nil, core.Exit(2, "provider=%s requires Runtime.Exec", providerName)
 	}
 	if strings.TrimSpace(cfg.NvidiaBrev.CLI) == "" {
-		return nil, exit(2, "provider=%s requires nvidiaBrev.cli", providerName)
+		return nil, core.Exit(2, "provider=%s requires nvidiaBrev.cli", providerName)
 	}
 	return &brevClient{cfg: cfg, rt: rt}, nil
 }
 
-func (c *brevClient) version(ctx context.Context) (LocalCommandResult, error) {
+func (c *brevClient) version(ctx context.Context) (core.LocalCommandResult, error) {
 	return c.run(ctx, "--version")
 }
 
@@ -81,6 +83,15 @@ func (c *brevClient) list(ctx context.Context, all bool) ([]brevWorkspace, error
 }
 
 func (c *brevClient) activeOrg(ctx context.Context) (brevOrg, error) {
+	if strings.TrimSpace(os.Getenv("BREV_API_KEY")) != "" {
+		// Environment API keys override saved credentials. Brev owns their org
+		// lookup; its JSON org command supports OAuth only, so use the native table.
+		result, err := c.run(ctx, "org", "ls")
+		if err != nil {
+			return brevOrg{}, fmt.Errorf("brev API-key organization lookup failed: %w", err)
+		}
+		return parseBrevActiveOrgTable(result.Stdout)
+	}
 	org, found, err := readLocalEffectiveBrevOrg()
 	if err != nil {
 		return brevOrg{}, err
@@ -104,18 +115,36 @@ func (c *brevClient) activeOrg(ctx context.Context) (brevOrg, error) {
 			continue
 		}
 		if candidate.ID == "" {
-			return brevOrg{}, exit(2, "brev active organization has no id")
+			return brevOrg{}, core.Exit(2, "brev active organization has no id")
 		}
 		if active.ID != "" {
-			return brevOrg{}, exit(2, "brev returned multiple active organizations")
+			return brevOrg{}, core.Exit(2, "brev returned multiple active organizations")
 		}
 		active = candidate
 	}
 	if active.ID == "" {
 		if len(orgs) == 0 {
-			return brevOrg{}, exit(2, "brev returned no accessible organization")
+			return brevOrg{}, core.Exit(2, "brev returned no accessible organization")
 		}
-		return brevOrg{}, exit(2, "brev has no active organization; run `brev set` before nvidia-brev lifecycle operations")
+		return brevOrg{}, core.Exit(2, "brev has no active organization; run `brev set` before nvidia-brev lifecycle operations")
+	}
+	return active, nil
+}
+
+func parseBrevActiveOrgTable(stdout string) (brevOrg, error) {
+	var active brevOrg
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "*" {
+			continue
+		}
+		if len(fields) < 3 || active.ID != "" {
+			return brevOrg{}, core.Exit(2, "brev returned an invalid active organization table")
+		}
+		active = brevOrg{ID: fields[len(fields)-1], Name: strings.Join(fields[1:len(fields)-1], " "), IsActive: true}
+	}
+	if active.ID == "" {
+		return brevOrg{}, core.Exit(2, "brev returned no active API-key organization; verify BREV_API_KEY with `brev org ls`")
 	}
 	return active, nil
 }
@@ -128,7 +157,7 @@ func readLocalEffectiveBrevOrg() (brevOrg, bool, error) {
 	if foundCredentials && strings.HasPrefix(strings.TrimSpace(credentials.APIKey), "bak-") {
 		orgID := strings.TrimSpace(credentials.APIKeyOrgID)
 		if orgID == "" {
-			return brevOrg{}, false, exit(2, "Brev API-key credentials have no organization id")
+			return brevOrg{}, false, core.Exit(2, "Brev API-key credentials have no organization id")
 		}
 		return brevOrg{ID: orgID, Name: orgID, IsActive: true}, true, nil
 	}
@@ -255,13 +284,14 @@ func (c *brevClient) rejectOrgScopedMutation(operation string) error {
 	if strings.TrimSpace(c.cfg.NvidiaBrev.Org) == "" {
 		return nil
 	}
-	return exit(2, "nvidiaBrev.org scopes read-only Brev inventory only; brev %s does not support --org, so lifecycle mutation is unsafe. Run `brev set` for the desired active org or remove nvidiaBrev.org before using nvidia-brev lifecycle commands", operation)
+	return core.Exit(2, "nvidiaBrev.org scopes read-only Brev inventory only; brev %s does not support --org, so lifecycle mutation is unsafe. Run `brev set` for the desired active org or remove nvidiaBrev.org before using nvidia-brev lifecycle commands", operation)
 }
 
-func (c *brevClient) run(ctx context.Context, args ...string) (LocalCommandResult, error) {
-	result, err := c.rt.Exec.Run(ctx, LocalCommandRequest{
+func (c *brevClient) run(ctx context.Context, args ...string) (core.LocalCommandResult, error) {
+	result, err := c.rt.Exec.Run(ctx, core.LocalCommandRequest{
 		Name: strings.TrimSpace(c.cfg.NvidiaBrev.CLI),
 		Args: append([]string(nil), args...),
+		Env:  append(os.Environ(), "NO_COLOR=1"),
 	})
 	if err == nil {
 		return result, nil
@@ -285,9 +315,6 @@ type brevWorkspaceListJSON struct {
 
 func parseBrevWorkspaces(stdout string) ([]brevWorkspace, error) {
 	raw := strings.TrimSpace(stdout)
-	if raw == "" {
-		return nil, nil
-	}
 	if strings.HasPrefix(raw, "[") {
 		var out []brevWorkspace
 		if err := json.Unmarshal([]byte(raw), &out); err != nil {

@@ -584,14 +584,16 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
   checkpoint, changed create intent, ambiguous resources, or a released lease
   ID fails without allocating a replacement. A later fork failure preserves the
   known fixed-ID lease for recovery instead of deleting adopted work. Direct
-  AWS, Machine0, local-container, Incus containers, and coordinator-managed native
-  checkpoint backends support this checkpoint-bound contract. Managed forks bind the
+  AWS, Machine0, Daytona, local-container, Incus containers, and coordinator-managed native
+  checkpoint backends support this checkpoint-bound contract. Direct Daytona can
+  replay a successfully acquired child after its source snapshot is retired;
+  fresh and incomplete acquisitions still attest the exact native snapshot. Managed forks bind the
   checkpoint incarnation and immutable image to the coordinator's fixed intent;
   replay preserves the original provisioning claim and does not advance checkpoint
   usage again. A replacement use claim must still be valid and available; replay
   consumes it once. Only the exact original attempt claim can replay after its
   consumption. An older coordinator rejects the dedicated fixed-checkpoint route
-  without falling back to ordinary creation. A fresh CLI invocation still needs
+  without falling back to ordinary creation. A fresh managed-fork CLI invocation still needs
   a valid use claim and refuses a deleted checkpoint; an in-request retry can
   recover its already-created child after source deletion. Archive checkpoints, direct Hetzner,
   direct Parallels snapshots, legacy unmanaged brokered checkpoints, and external
@@ -719,8 +721,9 @@ crabbox checkpoint prune --older-than 30d --unused-for 14d --kind native
 
 At least one of `--older-than` or `--unused-for` is required; when both are
 present, a checkpoint must satisfy both. Durations accept Go syntax such as
-`720h` or a whole number of days such as `30d`. Native checkpoints prune through
-the same provider-first deletion path as `checkpoint delete`, so a provider
+`720h` or a whole number of days such as `30d`. Values beyond Go's duration
+range (more than 106751 whole days) are rejected before pruning. Native
+checkpoints prune through the same provider-first deletion path as `checkpoint delete`, so a provider
 failure keeps the local record. Preview the exact match set with `--dry-run`.
 
 The coordinator automatically expires only managed brokered native checkpoints

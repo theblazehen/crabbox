@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -51,8 +52,8 @@ func registerActionsHydrateTargetFlags(fs *flag.FlagSet, defaults Config) action
 	}
 }
 
-func (f actionsHydrateTargetFlags) loadConfig(fs *flag.FlagSet, leaseID string) (Config, error) {
-	cfg, err := loadLeaseTargetConfig(fs, *f.provider, f.target, f.network, leaseTargetConfigOptions{LeaseID: leaseID})
+func (f actionsHydrateTargetFlags) loadConfig(fs *flag.FlagSet, leaseID string, synthesized bool) (Config, error) {
+	cfg, err := loadLeaseTargetConfig(fs, *f.provider, f.target, f.network, leaseTargetConfigOptions{LeaseID: leaseID, SynthesizedInputs: synthesized})
 	if err != nil {
 		return Config{}, err
 	}
@@ -68,23 +69,18 @@ func (a App) actionsHydrate(ctx context.Context, args []string) (err error) {
 	fs := newFlagSet("actions hydrate", a.Stderr)
 	connectionFlags := registerActionsHydrateTargetFlags(fs, defaults)
 	leaseIDFlag := fs.String("id", "", "existing lease id or slug")
-	repoFlag := fs.String("repo", "", "GitHub repository owner/name")
-	workflowFlag := fs.String("workflow", "", "workflow file/name/id")
-	jobFlag := fs.String("job", "", "expected hydrate workflow job/input name")
-	refFlag := fs.String("ref", "", "workflow ref")
+	workflowFlags := registerActionsHydrateWorkflowFlags(fs)
 	waitTimeout := fs.Duration("wait-timeout", 20*time.Minute, "time to wait for Actions hydration")
 	keepAliveMinutes := fs.Int("keep-alive-minutes", 90, "minutes for workflow to keep the job alive")
 	githubRunner := fs.Bool("github-runner", false, "hydrate by registering a GitHub self-hosted runner instead of local SSH execution")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
 	timingJSON := fs.Bool("timing-json", false, "print final timing as JSON")
-	fieldFlags := stringListFlag{}
-	fs.Var(&fieldFlags, "f", "workflow input key=value")
-	fs.Var(&fieldFlags, "field", "workflow input key=value")
+	fieldFlags := registerActionsInputFields(fs)
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *leaseIDFlag == "" {
-		return exit(2, "actions hydrate requires --id")
+		return Exit(2, "actions hydrate requires --id")
 	}
 	if skipped, skippedID, err := shouldSkipBlacksmithActionsHydrate(*leaseIDFlag, *connectionFlags.provider); err != nil {
 		return err
@@ -104,28 +100,20 @@ func (a App) actionsHydrate(ctx context.Context, args []string) (err error) {
 		}
 		return nil
 	}
-	cfg, err := connectionFlags.loadConfig(fs, *leaseIDFlag)
+	cfg, err := connectionFlags.loadConfig(fs, *leaseIDFlag, a.synthesizedFlagInputs)
 	if err != nil {
 		return err
+	}
+	if effectiveGitSeedSource(cfg) == "local" {
+		return Exit(2, "Actions hydration owns Git metadata; set sync.gitSeedSource=origin for Actions hydration")
 	}
 	repo, err := findRepo()
 	if err != nil {
 		return err
 	}
-	if *repoFlag != "" {
-		cfg.Actions.Repo = *repoFlag
-	}
-	if *workflowFlag != "" {
-		cfg.Actions.Workflow = *workflowFlag
-	}
-	if *jobFlag != "" {
-		cfg.Actions.Job = *jobFlag
-	}
-	if *refFlag != "" {
-		cfg.Actions.Ref = *refFlag
-	}
+	workflowFlags.Apply(&cfg)
 	if cfg.Actions.Workflow == "" {
-		return exit(2, "actions hydrate requires --workflow or actions.workflow")
+		return Exit(2, "actions hydrate requires --workflow or actions.workflow")
 	}
 	server, target, leaseID, slug, err := a.resolveLeaseTargetForActions(ctx, cfg, *leaseIDFlag, repo, *reclaim)
 	if err != nil {
@@ -178,7 +166,7 @@ func (a App) actionsHydrate(ctx context.Context, args []string) (err error) {
 		fmt.Fprintln(a.Stderr, "workspace owner released")
 	}()
 	ctx = contextWithWorkspaceOwner(owner.Context(), owner)
-	updatedClaim, err := updateLeaseClaimEndpointIfUnchanged(leaseID, ownedClaim, server, target)
+	updatedClaim, err := UpdateLeaseClaimEndpointIfUnchanged(leaseID, ownedClaim, server, target)
 	if err != nil {
 		return err
 	}
@@ -204,7 +192,7 @@ func (a App) actionsHydrate(ctx context.Context, args []string) (err error) {
 	}
 	label := githubActionsLeaseLabel(leaseID)
 	ref := actionsRef(cfg, repo)
-	extraFields := mergeWorkflowInputFields(cfg.Actions.Fields, fieldFlags)
+	extraFields := mergeWorkflowInputFields(cfg.Actions.Fields, *fieldFlags)
 	fields := actionsHydrateFields(leaseID, label, cfg.Actions.Job, *keepAliveMinutes, extraFields)
 	if !*githubRunner {
 		localFields := actionsHydrateFields(leaseID, label, cfg.Actions.Job, 0, extraFields)
@@ -225,7 +213,7 @@ func (a App) actionsHydrate(ctx context.Context, args []string) (err error) {
 			}
 			return nil
 		} else {
-			return exit(ExitCodeForError(err, 7), "local Actions hydration failed for %s: %v; rerun with --github-runner when the workflow needs full GitHub Actions semantics", leaseID, err)
+			return Exit(ExitCodeForError(err, 7), "local Actions hydration failed for %s: %v; rerun with --github-runner when the workflow needs full GitHub Actions semantics", leaseID, err)
 		}
 	}
 	ghRepo, err := resolveGitHubRepo(repo, cfg.Actions.Repo)
@@ -275,7 +263,7 @@ func (a App) hydrateActionsWithGitHubRunner(ctx context.Context, cfg Config, rep
 		fields = filtered
 		for _, required := range []string{"crabbox_id", "crabbox_runner_label", "crabbox_keep_alive_minutes"} {
 			if !inputs[required] {
-				return actionsHydrationState{}, exit(2, "workflow %s at %s does not declare required hydrate input %s", cfg.Actions.Workflow, ref, required)
+				return actionsHydrationState{}, Exit(2, "workflow %s at %s does not declare required hydrate input %s", cfg.Actions.Workflow, ref, required)
 			}
 		}
 	}
@@ -286,11 +274,11 @@ func (a App) hydrateActionsWithGitHubRunner(ctx context.Context, cfg Config, rep
 	monitorStarted := false
 	if owner != nil {
 		if err := runSSHQuiet(ctx, target, remotePrepareActionsHydrationMonitorForTarget(target, leaseID, owner)); err != nil {
-			return actionsHydrationState{}, exit(7, "prepare Actions hydration child witness on %s: %v", target.Host, err)
+			return actionsHydrationState{}, Exit(7, "prepare Actions hydration child witness on %s: %v", target.Host, err)
 		}
 		monitor := remoteActionsHydrationMonitorForTarget(target, leaseID, waitTimeout, owner)
 		if _, err := runWorkspaceOwnerBackgroundOutput(ctx, target, owner, monitor); err != nil {
-			return actionsHydrationState{}, exit(7, "start Actions hydration child witness on %s: %v", target.Host, err)
+			return actionsHydrationState{}, Exit(7, "start Actions hydration child witness on %s: %v", target.Host, err)
 		}
 		monitorStarted = true
 	}
@@ -346,7 +334,7 @@ func (a App) actionsRegister(ctx context.Context, args []string) error {
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
 	leaseIDFlag := fs.String("id", "", "existing lease id or slug")
-	repoFlag := fs.String("repo", "", "GitHub repository owner/name")
+	workflowFlags := registerActionsRepositoryFlags(fs)
 	nameFlag := fs.String("name", "", "runner name")
 	labelsFlag := fs.String("labels", "", "comma-separated extra runner labels")
 	versionFlag := fs.String("version", "", "actions/runner version or latest")
@@ -356,7 +344,7 @@ func (a App) actionsRegister(ctx context.Context, args []string) error {
 		return err
 	}
 	if *leaseIDFlag == "" {
-		return exit(2, "actions register requires --id")
+		return Exit(2, "actions register requires --id")
 	}
 	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *leaseIDFlag})
 	if err != nil {
@@ -369,14 +357,14 @@ func (a App) actionsRegister(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *repoFlag != "" {
-		cfg.Actions.Repo = *repoFlag
-	}
+	workflowFlags.Apply(&cfg)
 	if *versionFlag != "" {
 		cfg.Actions.RunnerVersion = *versionFlag
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
 	}
 	if flagWasSet(fs, "ephemeral") {
 		cfg.Actions.Ephemeral = *ephemeralFlag
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
 	}
 	extraLabels := splitCommaList(*labelsFlag)
 	ghRepo, err := resolveGitHubRepo(repo, cfg.Actions.Repo)
@@ -398,12 +386,8 @@ func (a App) actionsRegister(ctx context.Context, args []string) error {
 
 func (a App) actionsDispatch(ctx context.Context, args []string) error {
 	fs := newFlagSet("actions dispatch", a.Stderr)
-	repoFlag := fs.String("repo", "", "GitHub repository owner/name")
-	workflowFlag := fs.String("workflow", "", "workflow file/name/id")
-	refFlag := fs.String("ref", "", "workflow ref")
-	fieldFlags := stringListFlag{}
-	fs.Var(&fieldFlags, "f", "workflow input key=value")
-	fs.Var(&fieldFlags, "field", "workflow input key=value")
+	workflowFlags := registerActionsDispatchWorkflowFlags(fs)
+	fieldFlags := registerActionsInputFields(fs)
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -415,24 +399,16 @@ func (a App) actionsDispatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *repoFlag != "" {
-		cfg.Actions.Repo = *repoFlag
-	}
-	if *workflowFlag != "" {
-		cfg.Actions.Workflow = *workflowFlag
-	}
-	if *refFlag != "" {
-		cfg.Actions.Ref = *refFlag
-	}
+	workflowFlags.Apply(&cfg)
 	ghRepo, err := resolveGitHubRepo(repo, cfg.Actions.Repo)
 	if err != nil {
 		return err
 	}
 	if cfg.Actions.Workflow == "" {
-		return exit(2, "actions dispatch requires --workflow or actions.workflow")
+		return Exit(2, "actions dispatch requires --workflow or actions.workflow")
 	}
 	ref := actionsRef(cfg, repo)
-	if err := dispatchGitHubActionsWorkflow(ctx, repo.Root, ghRepo, cfg.Actions.Workflow, ref, fieldFlags, externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)); err != nil {
+	if err := dispatchGitHubActionsWorkflow(ctx, repo.Root, ghRepo, cfg.Actions.Workflow, ref, *fieldFlags, externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)); err != nil {
 		return err
 	}
 	fmt.Fprintf(a.Stdout, "dispatched workflow=%s repo=%s ref=%s\n", cfg.Actions.Workflow, ghRepo.Slug(), ref)
@@ -445,7 +421,7 @@ func (a App) registerGitHubActionsRunner(ctx context.Context, cfg Config, target
 
 func (a App) registerGitHubActionsRunnerOwned(ctx context.Context, cfg Config, target SSHTarget, leaseID, slug string, ghRepo GitHubRepo, nameOverride string, extraLabels []string, owner *workspaceOwner) error {
 	if !supportsGitHubActionsRunnerTarget(target) {
-		return exit(2, "actions runner registration currently supports Linux and Windows targets only")
+		return Exit(2, "actions runner registration currently supports Linux and Windows targets only")
 	}
 	token, err := githubActionsRegistrationToken(ctx, ghRepo, target.ChildEnvDenylist)
 	if err != nil {
@@ -453,21 +429,17 @@ func (a App) registerGitHubActionsRunnerOwned(ctx context.Context, cfg Config, t
 	}
 	name := nameOverride
 	if name == "" {
-		name = leaseProviderName(leaseID, slug)
+		name = LeaseProviderName(leaseID, slug)
 	}
 	labels := githubActionsRunnerLabels(cfg, leaseID, slug, extraLabels)
 	script := githubActionsRunnerInstallScriptForTarget(cfg.Actions.RunnerVersion, cfg.Actions.Ephemeral, target)
 	remote := githubActionsRunnerInstallRemoteCommand(target)
 	input := githubActionsRunnerInstallInput(ghRepo.Slug(), name, strings.Join(labels, ","), token, script)
 	if err := runSSHInputQuiet(ctx, target, remote, input); err != nil {
-		return exit(7, "register GitHub Actions runner on %s: %v", target.Host, err)
+		return Exit(7, "register GitHub Actions runner on %s: %v", target.Host, err)
 	}
 	fmt.Fprintf(a.Stdout, "actions runner registered repo=%s name=%s labels=%s ephemeral=%t\n", ghRepo.Slug(), name, strings.Join(labels, ","), cfg.Actions.Ephemeral)
 	return nil
-}
-
-func supportsActionsRunnerTarget(target SSHTarget) bool {
-	return supportsGitHubActionsRunnerTarget(target)
 }
 
 func supportsLocalActionsHydrateTarget(target SSHTarget) bool {
@@ -475,7 +447,7 @@ func supportsLocalActionsHydrateTarget(target SSHTarget) bool {
 }
 
 func supportsGitHubActionsRunnerTarget(target SSHTarget) bool {
-	return target.TargetOS == "" || target.TargetOS == targetLinux || target.TargetOS == targetWindows || isWindowsWSL2Target(target)
+	return target.TargetOS == "" || target.TargetOS == targetLinux || target.TargetOS == targetWindows
 }
 
 func targetWithConfigDefaults(target SSHTarget, cfg Config) SSHTarget {
@@ -491,14 +463,14 @@ func targetWithConfigDefaults(target SSHTarget, cfg Config) SSHTarget {
 
 func (a App) resolveLeaseTargetForActions(ctx context.Context, cfg Config, id string, repo Repo, reclaim bool) (Server, SSHTarget, string, string, error) {
 	server, target, leaseID, err := a.resolveLeaseTargetForRepo(ctx, cfg, id, repo, reclaim)
-	return server, target, leaseID, serverSlug(server), err
+	return server, target, leaseID, ServerSlug(server), err
 }
 
 func shouldSkipBlacksmithActionsHydrate(identifier, provider string) (bool, string, error) {
 	if isBlacksmithProvider(provider) || strings.HasPrefix(identifier, "tbx_") {
 		return true, identifier, nil
 	}
-	claim, ok, err := resolveLeaseClaim(identifier)
+	claim, ok, err := ResolveLeaseClaim(identifier)
 	if err != nil || !ok {
 		return false, "", err
 	}
@@ -510,7 +482,7 @@ func shouldSkipBlacksmithActionsHydrate(identifier, provider string) (bool, stri
 
 func dispatchGitHubActionsWorkflow(ctx context.Context, dir string, repo GitHubRepo, workflow, ref string, fields, childEnvDenylist []string) error {
 	cmdArgs := []string{"workflow", "run", workflow, "--repo", repo.Slug(), "--ref", ref}
-	if err := validateWorkflowInputFields(fields); err != nil {
+	if _, err := fieldsMap(fields); err != nil {
 		return err
 	}
 	for _, field := range fields {
@@ -520,15 +492,23 @@ func dispatchGitHubActionsWorkflow(ctx context.Context, dir string, repo GitHubR
 }
 
 type localActionsHydrationPlan struct {
-	leaseID, workdir, jobName, expectedJob, script, warnings string
+	leaseID     string
+	workdir     string
+	jobName     string
+	expectedJob string
+	warnings    string
+	script      string
 }
 
-func prepareLocalActionsHydration(cfg Config, repo Repo, target SSHTarget, leaseID, expectedJob string, fields []string) (localActionsHydrationPlan, error) {
+func prepareLocalActionsHydration(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID, expectedJob string, fields []string) (localActionsHydrationPlan, error) {
+	if effectiveGitSeedSource(cfg) == "local" {
+		return localActionsHydrationPlan{}, Exit(2, "Actions hydration cannot use local-object Git seeding")
+	}
 	target = targetWithConfigDefaults(target, cfg)
 	if !supportsLocalActionsHydrateTarget(target) {
-		return localActionsHydrationPlan{}, exit(2, "local Actions hydration currently supports Linux and Windows WSL2 targets only")
+		return localActionsHydrationPlan{}, Exit(2, "local Actions hydration currently supports Linux and Windows WSL2 targets only")
 	}
-	if err := validateWorkflowInputFields(fields); err != nil {
+	if _, err := fieldsMap(fields); err != nil {
 		return localActionsHydrationPlan{}, err
 	}
 	workflowPath, err := localActionsWorkflowPath(repo.Root, cfg.Actions.Workflow)
@@ -545,7 +525,10 @@ func prepareLocalActionsHydration(cfg Config, repo Repo, target SSHTarget, lease
 	}
 	jobName, job, err := selectLocalHydrateJob(workflow, cfg.Actions.Job)
 	if err != nil {
-		return localActionsHydrationPlan{}, exit(2, "workflow %s %v", cfg.Actions.Workflow, err)
+		return localActionsHydrationPlan{}, Exit(2, "workflow %s %v", cfg.Actions.Workflow, err)
+	}
+	if err := validateLocalHydrateJob(job); err != nil {
+		return localActionsHydrationPlan{}, err
 	}
 	var warnings strings.Builder
 	if inputs, defaults, required, ok, err := parseWorkflowDispatchInputSpec(data); err != nil {
@@ -553,7 +536,7 @@ func prepareLocalActionsHydration(cfg Config, repo Repo, target SSHTarget, lease
 	} else if ok {
 		fields = applyWorkflowInputDefaults(fields, defaults)
 		if missing := missingRequiredWorkflowInputs(fields, required); len(missing) > 0 {
-			return localActionsHydrationPlan{}, exit(2, "workflow %s requires hydrate input(s) %s; pass them with -f key=value or define defaults", cfg.Actions.Workflow, strings.Join(missing, ","))
+			return localActionsHydrationPlan{}, Exit(2, "workflow %s requires hydrate input(s) %s; pass them with -f key=value or define defaults", cfg.Actions.Workflow, strings.Join(missing, ","))
 		}
 		filtered, dropped := filterWorkflowInputs(fields, inputs)
 		for _, field := range dropped {
@@ -565,20 +548,41 @@ func prepareLocalActionsHydration(cfg Config, repo Repo, target SSHTarget, lease
 		}
 		for _, required := range []string{"crabbox_id", "crabbox_runner_label", "crabbox_keep_alive_minutes"} {
 			if !inputs[required] {
-				return localActionsHydrationPlan{}, exit(2, "workflow %s does not declare required hydrate input %s", cfg.Actions.Workflow, required)
+				return localActionsHydrationPlan{}, Exit(2, "workflow %s does not declare required hydrate input %s", cfg.Actions.Workflow, required)
 			}
 		}
 	}
 	workdir := remoteJoin(cfg, leaseID, repo.Name)
+	fields = append([]string(nil), fields...)
+	prepareLocalActionsSources(repo.Root, &workflow, &job)
+	// Bind before branch selection and env exports, preserving cwd whitespace.
+	if workdir != "" && !strings.HasPrefix(workdir, "/") {
+		var cwd bytes.Buffer
+		if err := runActionsHydrationCommand(ctx, target, "pwd -P", &cwd); err != nil {
+			return localActionsHydrationPlan{}, Exit(7, "resolve local Actions workspace: %v", err)
+		}
+		root, ok := strings.CutSuffix(cwd.String(), "\n")
+		if !ok || !strings.HasPrefix(root, "/") {
+			return localActionsHydrationPlan{}, Exit(7, "resolve local Actions workspace: remote pwd did not return an absolute directory")
+		}
+		workdir = strings.TrimSuffix(root, "/") + "/" + workdir
+	}
 	script, err := localActionsHydrateScript(cfg, repo, workflow, job, jobName, leaseID, fields, workdir)
 	if err != nil {
 		return localActionsHydrationPlan{}, err
 	}
-	return localActionsHydrationPlan{leaseID: leaseID, workdir: workdir, jobName: jobName, expectedJob: expectedJob, script: script, warnings: warnings.String()}, nil
+	return localActionsHydrationPlan{
+		leaseID:     leaseID,
+		workdir:     workdir,
+		jobName:     jobName,
+		expectedJob: expectedJob,
+		warnings:    warnings.String(),
+		script:      script,
+	}, nil
 }
 
 func (a App) hydrateActionsLocally(ctx context.Context, cfg Config, repo Repo, target SSHTarget, leaseID, expectedJob string, fields []string, waitTimeout time.Duration, streamOutput bool, syncBefore bool, owner *workspaceOwner) (actionsHydrationState, error) {
-	plan, err := prepareLocalActionsHydration(cfg, repo, target, leaseID, expectedJob, fields)
+	plan, err := prepareLocalActionsHydration(ctx, cfg, repo, target, leaseID, expectedJob, fields)
 	if err != nil {
 		return actionsHydrationState{}, err
 	}
@@ -604,8 +608,9 @@ func (a App) executeLocalActionsHydration(ctx context.Context, cfg Config, repo 
 			return actionsHydrationState{}, err
 		}
 	}
+	// Sync may fall back to plain metadata; invalidate again using its final mode.
 	if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, plan.workdir, plainManifest), idempotentSSHRetryDelay); err != nil {
-		return actionsHydrationState{}, exit(7, "invalidate reusable sync fingerprint before Actions hydration: %v", err)
+		return actionsHydrationState{}, Exit(7, "invalidate reusable sync fingerprint before Actions hydration: %v", err)
 	}
 	stdout := io.Discard
 	stderr := io.Discard
@@ -614,12 +619,12 @@ func (a App) executeLocalActionsHydration(ctx context.Context, cfg Config, repo 
 		stderr = a.Stderr
 	}
 	if err := runSSHInput(ctx, target, remoteInstallLocalActionsHydrateScript(plan.leaseID), strings.NewReader(plan.script), stdout, stderr); err != nil {
-		return actionsHydrationState{}, exit(7, "install local Actions hydration script on %s: %v", target.Host, err)
+		return actionsHydrationState{}, Exit(7, "install local Actions hydration script on %s: %v", target.Host, err)
 	}
 	if isWindowsWSL2Target(target) {
 		remote := remoteRunLocalActionsHydrateScriptForeground(plan.leaseID, waitTimeout)
 		if err := runSSHInput(ctx, target, remote, nil, stdout, stderr); err != nil {
-			return actionsHydrationState{}, exit(7, "run local Actions hydration on %s: %v", target.Host, err)
+			return actionsHydrationState{}, Exit(7, "run local Actions hydration on %s: %v", target.Host, err)
 		}
 		stateCtx := ctx
 		if owner != nil {
@@ -628,12 +633,12 @@ func (a App) executeLocalActionsHydration(ctx context.Context, cfg Config, repo 
 		state, err := readActionsHydrationState(stateCtx, target, plan.leaseID)
 		if err != nil || state.Workspace == "" {
 			if err != nil {
-				return actionsHydrationState{}, exit(7, "read local Actions hydration marker for %s: %v", plan.leaseID, err)
+				return actionsHydrationState{}, Exit(7, "read local Actions hydration marker for %s: %v", plan.leaseID, err)
 			}
-			return actionsHydrationState{}, exit(7, "local Actions hydration completed without marker for %s", plan.leaseID)
+			return actionsHydrationState{}, Exit(7, "local Actions hydration completed without marker for %s", plan.leaseID)
 		}
 		if plan.expectedJob != "" && state.Job != "" && state.Job != plan.expectedJob {
-			return actionsHydrationState{}, exit(5, "local Actions hydration marker for %s came from job %q, expected %q", plan.leaseID, state.Job, plan.expectedJob)
+			return actionsHydrationState{}, Exit(5, "local Actions hydration marker for %s came from job %q, expected %q", plan.leaseID, state.Job, plan.expectedJob)
 		}
 		if err := ensureLocalActionsRunEnv(ctx, target, plan.leaseID, state); err != nil {
 			return actionsHydrationState{}, err
@@ -653,7 +658,7 @@ func (a App) executeLocalActionsHydration(ctx context.Context, cfg Config, repo 
 		pid, err = runSSHOutput(startCtx, target, startRemote)
 	}
 	if err != nil {
-		return actionsHydrationState{}, exit(7, "start local Actions hydration on %s: %v", target.Host, err)
+		return actionsHydrationState{}, Exit(7, "start local Actions hydration on %s: %v", target.Host, err)
 	}
 	waitCtx := ctx
 	if owner != nil {
@@ -673,14 +678,14 @@ func invalidateActionsHydrationWorkspaces(ctx context.Context, target SSHTarget,
 	workdirs := []string{workdir}
 	state, err := readActionsHydrationState(ctx, target, leaseID)
 	if err != nil {
-		return exit(7, "read Actions workspace before fingerprint invalidation: %v", err)
+		return Exit(7, "read Actions workspace before fingerprint invalidation: %v", err)
 	}
 	if strings.TrimSpace(state.Workspace) != "" {
 		workdirs = appendUniqueStrings(workdirs, state.Workspace)
 	}
 	for _, workdir := range workdirs {
 		if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteInvalidateSyncFingerprintForTarget(target, workdir, plainManifest), idempotentSSHRetryDelay); err != nil {
-			return exit(7, "invalidate reusable sync fingerprint before Actions hydration: %v", err)
+			return Exit(7, "invalidate reusable sync fingerprint before Actions hydration: %v", err)
 		}
 	}
 	return nil
@@ -696,13 +701,13 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 	}
 	manifest, err := syncManifestFilteredRules(repo.Root, excludes, syncIncludes(cfg))
 	if err != nil {
-		return plainManifest, exit(6, "build sync file list: %v", err)
+		return plainManifest, Exit(6, "build sync file list: %v", err)
 	}
 	if err := checkSyncPreflight(manifest, cfg, false, a.Stderr); err != nil {
 		return plainManifest, err
 	}
 	if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteMkdir(workdir), idempotentSSHRetryDelay); err != nil {
-		return plainManifest, exit(7, "create remote workdir: %v", err)
+		return plainManifest, Exit(7, "create remote workdir: %v", err)
 	}
 	coherence, credentialBlocked := syncGitCoherencePlan(cfg, repo)
 	if credentialBlocked {
@@ -713,13 +718,13 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 	}
 	if !plainManifest && coherence.seedEnabled() {
 		if out, err := runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
-			if reason, fallback := gitOriginRuntimeFallbackResult(coherence.RemoteURL, out, err); fallback {
+			if reason, fallback := gitSeedRuntimeFallbackResult(coherence, out, err); fallback {
 				plainManifest = true
 				coherence = gitCoherencePlan{}
 				fmt.Fprintf(a.Stderr, "git origin fallback reason=%s; using plain manifest sync\n", reason)
 			} else {
 				reportRemoteGitSeedFailure(a.Stderr, out, err, "aborting before file sync")
-				return plainManifest, exit(6, "remote git seed failed: %v", err)
+				return plainManifest, Exit(6, "remote git seed failed: %v", err)
 			}
 		}
 	}
@@ -727,41 +732,33 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 	deletedData := manifest.DeletedNUL()
 	finalizeToken, err := randomHex(16)
 	if err != nil {
-		return plainManifest, exit(6, "create sync finalize token: %v", err)
+		return plainManifest, Exit(6, "create sync finalize token: %v", err)
 	}
 	manifestInput := syncManifestInputForTarget(target, manifestData, deletedData)
 	if err := runSSHSyncScriptInput(ctx, target, remoteWriteSyncManifestsNewForTargetMode(target, workdir, finalizeToken, plainManifest), strings.NewReader(manifestInput), io.Discard, a.Stderr); err != nil {
-		return plainManifest, exit(7, "write sync manifests: %v", err)
+		return plainManifest, Exit(7, "write sync manifests: %v", err)
 	}
 	if shouldPruneRemoteSync(cfg.Sync.Delete, false) {
 		if !plainManifest {
 			if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remoteSeedSyncManifestFromGit(workdir), idempotentSSHRetryDelay); err != nil {
-				return plainManifest, exit(6, "remote sync seed manifest failed: %v", err)
+				return plainManifest, Exit(6, "remote sync seed manifest failed: %v", err)
 			}
 		}
 		if _, err := runIdempotentSSHSyncScriptCombinedOutput(ctx, target, remotePruneSyncManifestForTargetMode(target, workdir, finalizeToken, plainManifest, true), idempotentSSHRetryDelay); err != nil {
-			return plainManifest, exit(6, "remote sync prune failed: %v", err)
+			return plainManifest, Exit(6, "remote sync prune failed: %v", err)
 		}
 	}
 	fmt.Fprintf(a.Stderr, "syncing %s -> %s:%s for local actions hydrate\n", repo.Root, target.Host, workdir)
 	if err := rsync(ctx, target, repo.Root, workdir, excludes.patterns(), a.Stdout, a.Stderr, rsyncOptions{Checksum: cfg.Sync.Checksum, UseFilesFrom: true, FilesFrom: manifestData, NoTimes: localContainerDockerSocketConfig(cfg), Timeout: cfg.Sync.Timeout, HeartbeatInterval: 15 * time.Second}); err != nil {
-		return plainManifest, exit(6, "rsync failed: %v", err)
+		return plainManifest, Exit(6, "rsync failed: %v", err)
 	}
-	fingerprint := ""
-	if cfg.Sync.Fingerprint && !plainManifest {
-		if value, err := syncFingerprintForManifest(repo, cfg, manifest, excludes, coherence); err == nil {
-			fingerprint = value
-		} else {
-			fmt.Fprintf(a.Stderr, "warning: sync fingerprint failed: %v\n", err)
-		}
-	}
+	// Actions setup mutates this tree; finalize without certifying reusable content.
 	out, finalizeErr, reason, fallback := runRemoteFinalizeSync(ctx, target, workdir, remoteSyncFinalizeOptions{
 		AllowMassDeletions: true,
 		HydrateGit:         !plainManifest,
 		PlainManifest:      plainManifest,
 		BaseRef:            cfg.Sync.BaseRef,
 		BaseSHA:            gitHydrateBaseSHA(repo, cfg.Sync.BaseRef),
-		Fingerprint:        fingerprint,
 		Token:              finalizeToken,
 		Coherence:          coherence,
 	})
@@ -771,9 +768,9 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 	}
 	if finalizeErr != nil {
 		if out != "" {
-			return plainManifest, exit(6, "remote sync finalize failed: %s: %v", out, finalizeErr)
+			return plainManifest, Exit(6, "remote sync finalize failed: %s: %v", out, finalizeErr)
 		}
-		return plainManifest, exit(6, "remote sync finalize failed: %v", finalizeErr)
+		return plainManifest, Exit(6, "remote sync finalize failed: %v", finalizeErr)
 	}
 	return plainManifest, nil
 }
@@ -781,7 +778,7 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 func localActionsWorkflowPath(root, workflow string) (string, error) {
 	workflow = strings.TrimSpace(strings.TrimPrefix(workflow, "/"))
 	if workflow == "" {
-		return "", exit(2, "actions hydrate requires actions.workflow")
+		return "", Exit(2, "actions hydrate requires actions.workflow")
 	}
 	candidates := []string{workflow}
 	if !strings.Contains(workflow, "/") {
@@ -807,14 +804,14 @@ func localActionsWorkflowPath(root, workflow string) (string, error) {
 			continue
 		}
 		if info.IsDir() {
-			return "", exit(2, "local Actions hydration workflow %s is a directory", candidate)
+			return "", Exit(2, "local Actions hydration workflow %s is a directory", candidate)
 		}
 		return path, nil
 	}
 	if lastErr != nil {
-		return "", exit(2, "local Actions hydration workflow %s is not readable: %v", workflow, lastErr)
+		return "", Exit(2, "local Actions hydration workflow %s is not readable: %v", workflow, lastErr)
 	}
-	return "", exit(2, "local Actions hydration requires a repo-local workflow path under .github/workflows")
+	return "", Exit(2, "local Actions hydration requires a repo-local workflow path under .github/workflows")
 }
 
 type localHydrateWorkflow struct {
@@ -852,6 +849,7 @@ type localHydrateStep struct {
 	WorkingDirectory string            `yaml:"working-directory"`
 	Env              map[string]string `yaml:"env"`
 	With             map[string]string `yaml:"with"`
+	source           *localCompositeSource
 }
 
 type localCompositeAction struct {
@@ -859,6 +857,12 @@ type localCompositeAction struct {
 	Inputs  map[string]localCompositeInput  `yaml:"inputs"`
 	Outputs map[string]localCompositeOutput `yaml:"outputs"`
 	Runs    localCompositeRuns              `yaml:"runs"`
+	path    string
+}
+
+type localCompositeSource struct {
+	action localCompositeAction
+	err    error
 }
 
 type localCompositeInput struct {
@@ -883,7 +887,7 @@ func parseLocalHydrateWorkflow(data []byte, path string) (localHydrateWorkflow, 
 		return workflow, err
 	}
 	if len(workflow.Jobs) == 0 {
-		return workflow, exit(2, "workflow %s does not define jobs", path)
+		return workflow, Exit(2, "workflow %s does not define jobs", path)
 	}
 	return workflow, nil
 }
@@ -907,18 +911,80 @@ func selectLocalHydrateJob(workflow localHydrateWorkflow, legacyJob string) (str
 
 func validateLocalHydrateJob(job localHydrateJob) error {
 	if job.Container.Kind != 0 {
-		return exit(2, "local Actions hydration does not support job containers; rerun with --github-runner when the workflow needs full GitHub Actions semantics")
+		return Exit(2, "local Actions hydration does not support job containers; rerun with --github-runner when the workflow needs full GitHub Actions semantics")
 	}
 	if len(job.Services) > 0 {
-		return exit(2, "local Actions hydration does not support service containers; rerun with --github-runner when the workflow needs full GitHub Actions semantics")
+		return Exit(2, "local Actions hydration does not support service containers; rerun with --github-runner when the workflow needs full GitHub Actions semantics")
 	}
 	return nil
 }
 
-func localActionsHydrateScript(cfg Config, repo Repo, workflow localHydrateWorkflow, job localHydrateJob, jobName, leaseID string, fields []string, workdir string) (string, error) {
-	if err := validateLocalHydrateJob(job); err != nil {
-		return "", err
+const localActionsCompositeDepthLimit = 8
+
+func prepareLocalActionsSources(root string, workflow *localHydrateWorkflow, job *localHydrateJob) {
+	hashes := map[string]string{}
+	freeze := func(value string) string {
+		return localActionsExpressionPattern.ReplaceAllStringFunc(value, func(match string) string {
+			expr := strings.TrimSpace(localActionsExpressionPattern.FindStringSubmatch(match)[1])
+			if hash, ok := hashes[expr]; ok {
+				return hash
+			}
+			if hash, ok := localActionsHashFiles(expr, root); ok {
+				hashes[expr] = hash
+				return hash
+			}
+			return match
+		})
 	}
+	freezeEnv := func(values map[string]string) {
+		for key, value := range values {
+			values[key] = freeze(value)
+		}
+	}
+	freezeEnv(workflow.Env)
+	freezeEnv(job.Env)
+	workflow.Defaults.Run.WorkingDirectory = freeze(workflow.Defaults.Run.WorkingDirectory)
+	job.Defaults.Run.WorkingDirectory = freeze(job.Defaults.Run.WorkingDirectory)
+	var steps []*localHydrateStep
+	for i := range job.Steps {
+		steps = append(steps, &job.Steps[i])
+	}
+	sources := map[string]*localCompositeSource{}
+	// Workspace binding can select a skipped branch. Capture its files before sync;
+	// rendering must not reread mutable inputs. Breadth first keeps the depth bound.
+	for depth := 0; depth <= localActionsCompositeDepthLimit && len(steps) > 0; depth++ {
+		var next []*localHydrateStep
+		for _, step := range steps {
+			step.Run = freeze(step.Run)
+			step.WorkingDirectory = freeze(step.WorkingDirectory)
+			freezeEnv(step.Env)
+			freezeEnv(step.With)
+			if !isLocalCompositeActionUse(step.Uses) {
+				continue
+			}
+			if source, ok := sources[step.Uses]; ok {
+				step.source = source
+				continue
+			}
+			action, err := readLocalCompositeAction(root, step.Uses)
+			step.source = &localCompositeSource{action: action, err: err}
+			sources[step.Uses] = step.source
+			if err != nil || !strings.EqualFold(strings.TrimSpace(action.Runs.Using), "composite") {
+				continue
+			}
+			for name, output := range step.source.action.Outputs {
+				output.Value = freeze(output.Value)
+				step.source.action.Outputs[name] = output
+			}
+			for i := range step.source.action.Runs.Steps {
+				next = append(next, &step.source.action.Runs.Steps[i])
+			}
+		}
+		steps = next
+	}
+}
+
+func localActionsHydrateScript(cfg Config, repo Repo, workflow localHydrateWorkflow, job localHydrateJob, jobName, leaseID string, fields []string, workdir string) (string, error) {
 	inputs, err := fieldsMap(fields)
 	if err != nil {
 		return "", err
@@ -946,17 +1012,17 @@ func localActionsHydrateScript(cfg Config, repo Repo, workflow localHydrateWorkf
 		"RUNNER_TOOL_CACHE":     runnerToolCache,
 		"CRABBOX_LOCAL_ACTIONS": "1",
 	}
-	if err := mergeInterpolatedEnv(env, workflow.Env, inputs, workdir, repo.Root, nil); err != nil {
+	if err := mergeInterpolatedEnv(env, workflow.Env, inputs, workdir, nil); err != nil {
 		return "", err
 	}
-	if err := mergeInterpolatedEnv(env, job.Env, inputs, workdir, repo.Root, nil); err != nil {
+	if err := mergeInterpolatedEnv(env, job.Env, inputs, workdir, nil); err != nil {
 		return "", err
 	}
 
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString("rm -rf " + shellQuote(runnerRoot) + "\n")
-	b.WriteString("mkdir -p " + shellQuote(runnerRoot) + " " + shellQuote(workdir) + "\n")
+	b.WriteString("mkdir -p " + shellPathQuote(runnerRoot) + " " + shellPathQuote(workdir) + "\n")
 	b.WriteString("chmod 700 " + shellQuote(runnerRoot) + "\n")
 	b.WriteString("[ \"$(stat -c %u " + shellQuote(runnerRoot) + ")\" = \"$(id -u)\" ] || { echo 'crabbox local Actions runner root is not owned by the current user' >&2; exit 2; }\n")
 	b.WriteString("mkdir -p " + shellQuote(runnerTemp) + " " + shellQuote(runnerToolCache) + "\n")
@@ -967,7 +1033,7 @@ func localActionsHydrateScript(cfg Config, repo Repo, workflow localHydrateWorkf
 	b.WriteString("  *) export RUNNER_ARCH=\"$(uname -m)\" ;;\n")
 	b.WriteString("esac\n")
 	for _, key := range sortedKeys(env) {
-		value, err := interpolateLocalActionsValue(env[key], inputs, env, workdir, repo.Root, nil)
+		value, err := interpolateLocalActionsValue(env[key], inputs, env, workdir, nil)
 		if err != nil {
 			return "", err
 		}
@@ -981,7 +1047,6 @@ func localActionsHydrateScript(cfg Config, repo Repo, workflow localHydrateWorkf
 	}
 	b.WriteString(localActionsRuntimeShell())
 	ctx := localHydrateScriptContext{
-		RepoRoot:         repo.Root,
 		Workdir:          workdir,
 		Inputs:           inputs,
 		Env:              env,
@@ -996,7 +1061,7 @@ func localActionsHydrateScript(cfg Config, repo Repo, workflow localHydrateWorkf
 }
 
 func localActionsRunnerRootName(leaseID string) string {
-	slug := normalizeLeaseSlug(leaseID)
+	slug := NormalizeLeaseSlug(leaseID)
 	if slug == "" {
 		slug = "lease"
 	} else if len(slug) > 32 {
@@ -1010,7 +1075,6 @@ func localActionsRunnerRootName(leaseID string) string {
 }
 
 type localHydrateScriptContext struct {
-	RepoRoot         string
 	Workdir          string
 	Inputs           map[string]string
 	Env              map[string]string
@@ -1021,8 +1085,8 @@ type localHydrateScriptContext struct {
 }
 
 func appendLocalHydrateSteps(b *strings.Builder, steps []localHydrateStep, ctx localHydrateScriptContext) error {
-	if ctx.Depth > 8 {
-		return exit(2, "local Actions hydration composite action nesting is too deep")
+	if ctx.Depth > localActionsCompositeDepthLimit {
+		return Exit(2, "local Actions hydration composite action nesting is too deep")
 	}
 	for i, step := range steps {
 		skip, err := shouldSkipLocalHydrateStep(step.If, ctx.Inputs, ctx.Env, ctx.StepOutputs)
@@ -1038,14 +1102,14 @@ func appendLocalHydrateSteps(b *strings.Builder, steps []localHydrateStep, ctx l
 		}
 		fmt.Fprintf(b, "echo %s\n", shellQuote("local actions: "+label))
 		stepEnv := copyStringMap(ctx.Env)
-		if err := mergeInterpolatedEnv(stepEnv, step.Env, ctx.Inputs, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs); err != nil {
+		if err := mergeInterpolatedEnv(stepEnv, step.Env, ctx.Inputs, ctx.Workdir, ctx.StepOutputs); err != nil {
 			return err
 		}
 		for _, key := range sortedKeys(step.Env) {
-			if !validShellEnvName(key) {
-				return exit(2, "local Actions hydration does not support env name %q", key)
+			if !ValidShellEnvName(key) {
+				return Exit(2, "local Actions hydration does not support env name %q", key)
 			}
-			value, err := interpolateLocalActionsValue(stepEnv[key], ctx.Inputs, stepEnv, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+			value, err := interpolateLocalActionsValue(stepEnv[key], ctx.Inputs, stepEnv, ctx.Workdir, ctx.StepOutputs)
 			if err != nil {
 				return err
 			}
@@ -1066,7 +1130,7 @@ func appendLocalHydrateSteps(b *strings.Builder, steps []localHydrateStep, ctx l
 		if step.Run != "" {
 			shellName := firstNonBlank(step.Shell, ctx.JobDefaults.Run.Shell, ctx.WorkflowDefaults.Run.Shell, "bash")
 			wd := firstNonBlank(step.WorkingDirectory, ctx.JobDefaults.Run.WorkingDirectory, ctx.WorkflowDefaults.Run.WorkingDirectory)
-			wd, err = interpolateLocalActionsValue(wd, ctx.Inputs, stepEnv, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+			wd, err = interpolateLocalActionsValue(wd, ctx.Inputs, stepEnv, ctx.Workdir, ctx.StepOutputs)
 			if err != nil {
 				return err
 			}
@@ -1075,7 +1139,7 @@ func appendLocalHydrateSteps(b *strings.Builder, steps []localHydrateStep, ctx l
 			} else if !strings.HasPrefix(wd, "/") {
 				wd = path.Join(ctx.Workdir, wd)
 			}
-			run, err := interpolateLocalActionsValue(step.Run, ctx.Inputs, stepEnv, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+			run, err := interpolateLocalActionsValue(step.Run, ctx.Inputs, stepEnv, ctx.Workdir, ctx.StepOutputs)
 			if err != nil {
 				return err
 			}
@@ -1101,7 +1165,7 @@ func fieldsMap(fields []string) (map[string]string, error) {
 	for _, field := range fields {
 		key, value, ok := strings.Cut(field, "=")
 		if !ok || key == "" {
-			return nil, exit(2, "workflow input must be key=value: %s", field)
+			return nil, Exit(2, "workflow input must be key=value: %s", field)
 		}
 		out[key] = value
 	}
@@ -1119,9 +1183,9 @@ func repoSlugForActions(cfg Config, repo Repo) string {
 	return repo.Name + "/" + repo.Name
 }
 
-func mergeInterpolatedEnv(dst map[string]string, src map[string]string, inputs map[string]string, workdir, repoRoot string, stepOutputs map[string]map[string]string) error {
+func mergeInterpolatedEnv(dst map[string]string, src map[string]string, inputs map[string]string, workdir string, stepOutputs map[string]map[string]string) error {
 	for key, value := range src {
-		interpolated, err := interpolateLocalActionsValue(value, inputs, dst, workdir, repoRoot, stepOutputs)
+		interpolated, err := interpolateLocalActionsValue(value, inputs, dst, workdir, stepOutputs)
 		if err != nil {
 			return err
 		}
@@ -1130,7 +1194,7 @@ func mergeInterpolatedEnv(dst map[string]string, src map[string]string, inputs m
 	return nil
 }
 
-func interpolateLocalActionsValue(value string, inputs, env map[string]string, workdir, repoRoot string, stepOutputs map[string]map[string]string) (string, error) {
+func interpolateLocalActionsValue(value string, inputs, env map[string]string, workdir string, stepOutputs map[string]map[string]string) (string, error) {
 	replacements := map[string]string{
 		"github.workspace":  workdir,
 		"github.ref":        env["GITHUB_REF"],
@@ -1152,9 +1216,6 @@ func interpolateLocalActionsValue(value string, inputs, env map[string]string, w
 		expr := strings.TrimSpace(parts[1])
 		if replacement, ok := replacements[expr]; ok {
 			return replacement
-		}
-		if hash, ok := localActionsHashFiles(expr, repoRoot); ok {
-			return hash
 		}
 		if key, ok := strings.CutPrefix(expr, "inputs."); ok {
 			if input, ok := inputs[key]; ok {
@@ -1178,10 +1239,10 @@ func interpolateLocalActionsValue(value string, inputs, env map[string]string, w
 		return match
 	})
 	if unsupported != "" {
-		return "", exit(2, "local Actions hydration does not support expression %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", unsupported)
+		return "", Exit(2, "local Actions hydration does not support expression %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", unsupported)
 	}
 	if strings.Contains(out, "${{") {
-		return "", exit(2, "local Actions hydration does not support complex Actions expressions in %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", value)
+		return "", Exit(2, "local Actions hydration does not support complex Actions expressions in %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", value)
 	}
 	return out, nil
 }
@@ -1207,7 +1268,7 @@ func shouldSkipLocalHydrateStep(expr string, inputs, env map[string]string, step
 		if ok {
 			return !result, nil
 		}
-		return false, exit(2, "local Actions hydration does not support if expression %q", expr)
+		return false, Exit(2, "local Actions hydration does not support if expression %q", expr)
 	}
 }
 
@@ -1215,7 +1276,7 @@ func localHydrateUsesScript(step localHydrateStep, ctx localHydrateScriptContext
 	uses := strings.ToLower(strings.TrimSpace(step.Uses))
 	switch {
 	case strings.HasPrefix(uses, "actions/checkout@"):
-		if err := validateLocalCheckoutStep(step, ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot); err != nil {
+		if err := validateLocalCheckoutStep(step, ctx.Inputs, env, ctx.Workdir); err != nil {
 			return "", nil, err
 		}
 		return "# actions/checkout handled by Crabbox sync/git seed\n", nil, nil
@@ -1223,32 +1284,32 @@ func localHydrateUsesScript(step localHydrateStep, ctx localHydrateScriptContext
 		if err := validateLocalActionWithKeys("pnpm/action-setup", step.With, "version"); err != nil {
 			return "", nil, err
 		}
-		version, err := localHydrateWithInput(step, []string{"version"}, "", ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+		version, err := localHydrateWithInput(step, []string{"version"}, "", ctx.Inputs, env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return "", nil, err
 		}
 		if !localActionsPnpmVersionPattern.MatchString(version) {
-			return "", nil, exit(2, "local Actions hydration requires pnpm/action-setup to specify an explicit exact version (major.minor.patch); rerun with --github-runner for version ranges or package.json inference")
+			return "", nil, Exit(2, "local Actions hydration requires pnpm/action-setup to specify an explicit exact version (major.minor.patch); rerun with --github-runner for version ranges or package.json inference")
 		}
 		return "__crabbox_setup_pnpm " + shellQuote(version) + "\n", nil, nil
 	case strings.HasPrefix(uses, "actions/setup-node@"):
 		if err := validateLocalActionWithKeys("actions/setup-node", step.With, "node-version", "node-version-file", "check-latest", "cache"); err != nil {
 			return "", nil, err
 		}
-		cache, err := localHydrateWithInput(step, []string{"cache"}, "", ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+		cache, err := localHydrateWithInput(step, []string{"cache"}, "", ctx.Inputs, env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return "", nil, err
 		}
 		if cache != "" && cache != "pnpm" {
-			return "", nil, exit(2, "local Actions hydration does not support actions/setup-node cache %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", cache)
+			return "", nil, Exit(2, "local Actions hydration does not support actions/setup-node cache %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", cache)
 		}
-		version, err := localHydrateWithInput(step, []string{"node-version", "node-version-file"}, "", ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+		version, err := localHydrateWithInput(step, []string{"node-version", "node-version-file"}, "", ctx.Inputs, env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return "", nil, err
 		}
 		version = normalizeLocalNodeVersionSpec(version)
 		if strings.TrimSpace(step.With["node-version"]) != "" && !supportedLocalNodeVersionSpec(version) {
-			return "", nil, exit(2, "local Actions hydration does not support actions/setup-node version %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", version)
+			return "", nil, Exit(2, "local Actions hydration does not support actions/setup-node version %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", version)
 		}
 		script := "__crabbox_setup_node " + shellQuote(version) + "\n"
 		if cache == "pnpm" {
@@ -1259,7 +1320,7 @@ func localHydrateUsesScript(step localHydrateStep, ctx localHydrateScriptContext
 		if err := validateLocalActionWithKeys("actions/setup-go", step.With, "go-version", "go-version-file"); err != nil {
 			return "", nil, err
 		}
-		version, err := localHydrateWithInput(step, []string{"go-version", "go-version-file"}, "", ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+		version, err := localHydrateWithInput(step, []string{"go-version", "go-version-file"}, "", ctx.Inputs, env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return "", nil, err
 		}
@@ -1268,7 +1329,7 @@ func localHydrateUsesScript(step localHydrateStep, ctx localHydrateScriptContext
 		if err := validateLocalActionWithKeys("actions/setup-python", step.With, "python-version", "python-version-file"); err != nil {
 			return "", nil, err
 		}
-		version, err := localHydrateWithInput(step, []string{"python-version", "python-version-file"}, "", ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+		version, err := localHydrateWithInput(step, []string{"python-version", "python-version-file"}, "", ctx.Inputs, env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return "", nil, err
 		}
@@ -1280,7 +1341,7 @@ func localHydrateUsesScript(step localHydrateStep, ctx localHydrateScriptContext
 	case isLocalCompositeActionUse(step.Uses):
 		return localCompositeActionScript(step, ctx, env)
 	default:
-		return "", nil, exit(2, "local Actions hydration does not support uses step %q", step.Uses)
+		return "", nil, Exit(2, "local Actions hydration does not support uses step %q", step.Uses)
 	}
 }
 
@@ -1295,13 +1356,13 @@ func validateLocalActionWithKeys(action string, with map[string]string, allowed 
 	for key := range with {
 		normalized := strings.ToLower(strings.TrimSpace(key))
 		if !allowedSet[normalized] {
-			return exit(2, "local Actions hydration does not support %s option %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", action, key)
+			return Exit(2, "local Actions hydration does not support %s option %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", action, key)
 		}
 	}
 	return nil
 }
 
-func localHydrateWithInput(step localHydrateStep, names []string, fallback string, inputs, env map[string]string, workdir, repoRoot string, stepOutputs map[string]map[string]string) (string, error) {
+func localHydrateWithInput(step localHydrateStep, names []string, fallback string, inputs, env map[string]string, workdir string, stepOutputs map[string]map[string]string) (string, error) {
 	value := fallback
 	for _, name := range names {
 		if raw := strings.TrimSpace(step.With[name]); raw != "" {
@@ -1309,16 +1370,16 @@ func localHydrateWithInput(step localHydrateStep, names []string, fallback strin
 			break
 		}
 	}
-	return interpolateLocalActionsValue(value, inputs, env, workdir, repoRoot, stepOutputs)
+	return interpolateLocalActionsValue(value, inputs, env, workdir, stepOutputs)
 }
 
-func validateLocalCheckoutStep(step localHydrateStep, inputs, env map[string]string, workdir, repoRoot string) error {
+func validateLocalCheckoutStep(step localHydrateStep, inputs, env map[string]string, workdir string) error {
 	for key, value := range step.With {
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "ref", "fetch-depth", "persist-credentials", "set-safe-directory":
 			continue
 		case "path":
-			resolved, err := interpolateLocalActionsValue(value, inputs, env, workdir, repoRoot, nil)
+			resolved, err := interpolateLocalActionsValue(value, inputs, env, workdir, nil)
 			if err != nil {
 				return err
 			}
@@ -1326,7 +1387,7 @@ func validateLocalCheckoutStep(step localHydrateStep, inputs, env map[string]str
 				continue
 			}
 		case "submodules", "lfs":
-			resolved, err := interpolateLocalActionsValue(value, inputs, env, workdir, repoRoot, nil)
+			resolved, err := interpolateLocalActionsValue(value, inputs, env, workdir, nil)
 			if err != nil {
 				return err
 			}
@@ -1334,7 +1395,7 @@ func validateLocalCheckoutStep(step localHydrateStep, inputs, env map[string]str
 				continue
 			}
 		}
-		return exit(2, "local Actions hydration does not support actions/checkout option %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", key)
+		return Exit(2, "local Actions hydration does not support actions/checkout option %q; rerun with --github-runner when the workflow needs full GitHub Actions semantics", key)
 	}
 	return nil
 }
@@ -1345,23 +1406,19 @@ func isLocalCompositeActionUse(uses string) bool {
 }
 
 func localCompositeActionScript(step localHydrateStep, ctx localHydrateScriptContext, env map[string]string) (string, map[string]string, error) {
-	actionPath, err := localCompositeActionPath(ctx.RepoRoot, step.Uses)
-	if err != nil {
-		return "", nil, err
+	if step.source.err != nil {
+		return "", nil, step.source.err
 	}
-	action, err := readLocalCompositeAction(actionPath)
-	if err != nil {
-		return "", nil, err
-	}
+	action := step.source.action
 	if !strings.EqualFold(strings.TrimSpace(action.Runs.Using), "composite") {
-		return "", nil, exit(2, "local Actions hydration only supports repo-local composite actions; %s uses %q", step.Uses, action.Runs.Using)
+		return "", nil, Exit(2, "local Actions hydration only supports repo-local composite actions; %s uses %q", step.Uses, action.Runs.Using)
 	}
 	inputs := map[string]string{}
-	for _, name := range sortedCompositeInputKeys(action.Inputs) {
+	for _, name := range sortedKeys(action.Inputs) {
 		inputs[name] = action.Inputs[name].Default
 	}
 	for _, name := range sortedKeys(step.With) {
-		value, err := interpolateLocalActionsValue(step.With[name], ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+		value, err := interpolateLocalActionsValue(step.With[name], ctx.Inputs, env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return "", nil, err
 		}
@@ -1369,13 +1426,10 @@ func localCompositeActionScript(step localHydrateStep, ctx localHydrateScriptCon
 	}
 	for name, spec := range action.Inputs {
 		if spec.Required && strings.TrimSpace(inputs[name]) == "" {
-			return "", nil, exit(2, "local composite action %s requires input %s", step.Uses, name)
+			return "", nil, Exit(2, "local composite action %s requires input %s", step.Uses, name)
 		}
 	}
-	actionTargetPath, err := localCompositeActionTargetPath(ctx.Workdir, step.Uses)
-	if err != nil {
-		return "", nil, err
-	}
+	actionTargetPath := path.Join(ctx.Workdir, action.path)
 	next := ctx
 	next.Inputs = inputs
 	next.Env = copyStringMap(env)
@@ -1398,41 +1452,26 @@ func localCompositeActionScript(step localHydrateStep, ctx localHydrateScriptCon
 		fmt.Fprintf(&b, "__crabbox_restore_step_env %s\n", shellQuote("INPUT_"+actionInputEnvName(name)))
 	}
 	fmt.Fprintf(&b, "__crabbox_restore_step_env %s\n", shellQuote("GITHUB_ACTION_PATH"))
-	outputs, err := localCompositeActionOutputs(action.Outputs, next, actionTargetPath)
+	outputs, err := localCompositeActionOutputs(action.Outputs, next)
 	if err != nil {
 		return "", nil, err
 	}
 	return b.String(), outputs, nil
 }
 
-func localCompositeActionPath(repoRoot, uses string) (string, error) {
+func readLocalCompositeAction(repoRoot, uses string) (localCompositeAction, error) {
 	if repoRoot == "" {
-		return "", exit(2, "local Actions hydration cannot resolve repo-local action %q without a repository root", uses)
+		return localCompositeAction{}, Exit(2, "local Actions hydration cannot resolve repo-local action %q without a repository root", uses)
 	}
 	uses = strings.TrimSpace(uses)
 	if at := strings.IndexByte(uses, '@'); at >= 0 {
-		return "", exit(2, "local Actions hydration does not support versioned repo-local action %q", uses)
+		return localCompositeAction{}, Exit(2, "local Actions hydration does not support versioned repo-local action %q", uses)
 	}
 	clean := filepath.Clean(uses)
 	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", exit(2, "local Actions hydration repo-local action must stay inside the repository: %q", uses)
+		return localCompositeAction{}, Exit(2, "local Actions hydration repo-local action must stay inside the repository: %q", uses)
 	}
-	return filepath.Join(repoRoot, clean), nil
-}
-
-func localCompositeActionTargetPath(workdir, uses string) (string, error) {
-	uses = strings.TrimSpace(uses)
-	if at := strings.IndexByte(uses, '@'); at >= 0 {
-		return "", exit(2, "local Actions hydration does not support versioned repo-local action %q", uses)
-	}
-	clean := filepath.Clean(uses)
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", exit(2, "local Actions hydration repo-local action must stay inside the repository: %q", uses)
-	}
-	return path.Join(workdir, filepath.ToSlash(clean)), nil
-}
-
-func readLocalCompositeAction(dir string) (localCompositeAction, error) {
+	dir := filepath.Join(repoRoot, clean)
 	var lastErr error
 	for _, name := range []string{"action.yml", "action.yaml"} {
 		path := filepath.Join(dir, name)
@@ -1445,54 +1484,25 @@ func readLocalCompositeAction(dir string) (localCompositeAction, error) {
 		if err := yaml.Unmarshal(data, &action); err != nil {
 			return action, err
 		}
+		action.path = filepath.ToSlash(clean)
 		return action, nil
 	}
-	return localCompositeAction{}, exit(2, "local composite action %s is not readable: %v", dir, lastErr)
+	return localCompositeAction{}, Exit(2, "local composite action %s is not readable: %v", dir, lastErr)
 }
 
-func sortedCompositeInputKeys(values map[string]localCompositeInput) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func localCompositeActionOutputs(specs map[string]localCompositeOutput, ctx localHydrateScriptContext, actionTargetPath string) (map[string]string, error) {
+func localCompositeActionOutputs(specs map[string]localCompositeOutput, ctx localHydrateScriptContext) (map[string]string, error) {
 	if len(specs) == 0 {
 		return nil, nil
 	}
-	env := copyStringMap(ctx.Env)
-	env["GITHUB_ACTION_PATH"] = actionTargetPath
 	out := map[string]string{}
-	for _, name := range sortedCompositeOutputKeys(specs) {
-		value, err := interpolateLocalActionsValue(specs[name].Value, ctx.Inputs, env, ctx.Workdir, ctx.RepoRoot, ctx.StepOutputs)
+	for _, name := range sortedKeys(specs) {
+		value, err := interpolateLocalActionsValue(specs[name].Value, ctx.Inputs, ctx.Env, ctx.Workdir, ctx.StepOutputs)
 		if err != nil {
 			return nil, err
 		}
 		out[name] = value
 	}
 	return out, nil
-}
-
-func sortedCompositeOutputKeys(values map[string]localCompositeOutput) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func validateWorkflowInputFields(fields []string) error {
-	for _, field := range fields {
-		key, _, ok := strings.Cut(field, "=")
-		if !ok || key == "" {
-			return exit(2, "workflow input must be key=value: %s", field)
-		}
-	}
-	return nil
 }
 
 func applyWorkflowInputDefaults(fields []string, defaults map[string]string) []string {
@@ -1584,7 +1594,6 @@ func localActionsHashFiles(expr, repoRoot string) (string, bool) {
 	if err != nil || len(matches) == 0 {
 		return "", true
 	}
-	sort.Strings(matches)
 	h := sha256.New()
 	wrote := false
 	for _, match := range matches {
@@ -1825,11 +1834,11 @@ func appendLocalHydrateRunStep(b *strings.Builder, shellName, workdir, script st
 	delimiter := localHydrateHeredocDelimiter(script)
 	switch {
 	case shellName == "", shellName == "bash":
-		fmt.Fprintf(b, "__crabbox_run_bash %s <<'%s'\n%s\n%s\n", shellQuote(workdir), delimiter, script, delimiter)
+		fmt.Fprintf(b, "__crabbox_run_bash %s <<'%s'\n%s\n%s\n", shellPathQuote(workdir), delimiter, script, delimiter)
 	case shellName == "sh":
-		fmt.Fprintf(b, "__crabbox_run_sh %s <<'%s'\n%s\n%s\n", shellQuote(workdir), delimiter, script, delimiter)
+		fmt.Fprintf(b, "__crabbox_run_sh %s <<'%s'\n%s\n%s\n", shellPathQuote(workdir), delimiter, script, delimiter)
 	default:
-		return exit(2, "local Actions hydration does not support shell %q", shellName)
+		return Exit(2, "local Actions hydration does not support shell %q", shellName)
 	}
 	return nil
 }
@@ -1856,7 +1865,7 @@ func actionInputEnvName(name string) string {
 	return b.String()
 }
 
-func sortedKeys(values map[string]string) []string {
+func sortedKeys[T any](values map[string]T) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)
@@ -1871,23 +1880,6 @@ func copyStringMap(values map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
-}
-
-func validShellEnvName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i, r := range name {
-		switch {
-		case r == '_':
-		case r >= 'A' && r <= 'Z':
-		case r >= 'a' && r <= 'z':
-		case i > 0 && r >= '0' && r <= '9':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 func localActionsRuntimeShell() string {
@@ -2368,7 +2360,7 @@ func githubActionsRunnerLabels(cfg Config, leaseID, slug string, extra []string)
 		"crabbox-profile-" + sanitizeGitHubRunnerLabel(cfg.Profile),
 		"crabbox-class-" + sanitizeGitHubRunnerLabel(cfg.Class),
 	}
-	if slug = normalizeLeaseSlug(slug); slug != "" {
+	if slug = NormalizeLeaseSlug(slug); slug != "" {
 		labels = append(labels, "crabbox-"+sanitizeGitHubRunnerLabel(slug))
 	}
 	labels = append(labels, cfg.Actions.RunnerLabels...)
@@ -2396,7 +2388,7 @@ func waitForActionsHydration(ctx context.Context, target SSHTarget, leaseID, exp
 		state, err := readActionsHydrationState(ctx, target, leaseID)
 		if err == nil && state.Workspace != "" {
 			if expectedJob != "" && state.Job != "" && state.Job != expectedJob {
-				return actionsHydrationState{}, exit(5, "GitHub Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
+				return actionsHydrationState{}, Exit(5, "GitHub Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
 			}
 			return state, nil
 		}
@@ -2404,7 +2396,7 @@ func waitForActionsHydration(ctx context.Context, target SSHTarget, leaseID, exp
 			return actionsHydrationState{}, ctx.Err()
 		}
 		if time.Now().After(deadline) {
-			return actionsHydrationState{}, exit(5, "timed out waiting for GitHub Actions hydration marker for %s", leaseID)
+			return actionsHydrationState{}, Exit(5, "timed out waiting for GitHub Actions hydration marker for %s", leaseID)
 		}
 		fmt.Fprintf(stderr, "waiting for GitHub Actions hydration marker id=%s...\n", leaseID)
 		if err := sleepContext(ctx, 10*time.Second); err != nil {
@@ -2430,7 +2422,7 @@ func waitForLocalActionsHydration(ctx context.Context, target SSHTarget, leaseID
 		state, err := readActionsHydrationState(ctx, target, leaseID)
 		if err == nil && state.Workspace != "" {
 			if expectedJob != "" && state.Job != "" && state.Job != expectedJob {
-				return actionsHydrationState{}, exit(5, "local Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
+				return actionsHydrationState{}, Exit(5, "local Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
 			}
 			if err := ensureLocalActionsRunEnv(ctx, target, leaseID, state); err != nil {
 				return actionsHydrationState{}, err
@@ -2441,20 +2433,20 @@ func waitForLocalActionsHydration(ctx context.Context, target SSHTarget, leaseID
 		if statusErr == nil && strings.HasPrefix(status, "exit=") {
 			if state, err := readActionsHydrationState(ctx, target, leaseID); err == nil && state.Workspace != "" {
 				if expectedJob != "" && state.Job != "" && state.Job != expectedJob {
-					return actionsHydrationState{}, exit(5, "local Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
+					return actionsHydrationState{}, Exit(5, "local Actions hydration marker for %s came from job %q, expected %q", leaseID, state.Job, expectedJob)
 				}
 				if err := ensureLocalActionsRunEnv(ctx, target, leaseID, state); err != nil {
 					return actionsHydrationState{}, err
 				}
 				return state, nil
 			}
-			return actionsHydrationState{}, exit(7, "local Actions hydration exited before writing marker for %s: %s", leaseID, strings.TrimSpace(status))
+			return actionsHydrationState{}, Exit(7, "local Actions hydration exited before writing marker for %s: %s", leaseID, strings.TrimSpace(status))
 		}
 		if ctx.Err() != nil {
 			return actionsHydrationState{}, ctx.Err()
 		}
 		if time.Now().After(deadline) {
-			return actionsHydrationState{}, exit(5, "timed out waiting for local Actions hydration marker for %s", leaseID)
+			return actionsHydrationState{}, Exit(5, "timed out waiting for local Actions hydration marker for %s", leaseID)
 		}
 		fmt.Fprintf(stderr, "waiting for local Actions hydration marker id=%s...\n", leaseID)
 		if err := sleepContext(ctx, 5*time.Second); err != nil {
@@ -2464,28 +2456,24 @@ func waitForLocalActionsHydration(ctx context.Context, target SSHTarget, leaseID
 }
 
 func ensureLocalActionsRunEnv(ctx context.Context, target SSHTarget, leaseID string, state actionsHydrationState) error {
-	if err := runActionsHydrationQuiet(ctx, target, remoteEnsureLocalActionsRunEnv(leaseID, state.EnvFile)); err != nil {
-		return exit(7, "update local Actions env handoff on %s: %v", target.Host, err)
+	if err := runActionsHydrationCommand(ctx, target, remoteEnsureLocalActionsRunEnv(leaseID, state.EnvFile), io.Discard); err != nil {
+		return Exit(7, "update local Actions env handoff on %s: %v", target.Host, err)
 	}
 	return nil
 }
 
 func runActionsHydrationOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
-	commandCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	out, err := runSSHOutputWithRemoteWaitTimeout(commandCtx, target, remote, 15*time.Second, "2", "1")
-	if commandCtx.Err() == context.DeadlineExceeded {
-		return "", exit(7, "Actions hydration SSH probe timed out after 30s")
-	}
-	return out, err
+	var out bytes.Buffer
+	err := runActionsHydrationCommand(ctx, target, remote, &out)
+	return strings.TrimSpace(out.String()), err
 }
 
-func runActionsHydrationQuiet(ctx context.Context, target SSHTarget, remote string) error {
+func runActionsHydrationCommand(ctx context.Context, target SSHTarget, remote string, stdout io.Writer) error {
 	commandCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	err := runSSHQuietWithRemoteWaitTimeout(commandCtx, target, remote, 15*time.Second, "2", "1")
+	err := executeSSH(commandCtx, &target, remote, nil, 0, 15*time.Second, "2", "1", stdout, io.Discard)
 	if commandCtx.Err() == context.DeadlineExceeded {
-		return exit(7, "Actions hydration SSH probe timed out after 30s")
+		return Exit(7, "Actions hydration SSH probe timed out after 30s")
 	}
 	return err
 }
@@ -2501,9 +2489,9 @@ func clearActionsHydrationState(ctx context.Context, target SSHTarget, leaseID s
 		details = RedactDiagnosticSecrets(details, target.User)
 	}
 	if details != "" {
-		return exit(7, "clear GitHub Actions hydration marker on %s: %v: %s", target.Host, lastErr, details)
+		return Exit(7, "clear GitHub Actions hydration marker on %s: %v: %s", target.Host, lastErr, details)
 	}
-	return exit(7, "clear GitHub Actions hydration marker on %s: %v", target.Host, lastErr)
+	return Exit(7, "clear GitHub Actions hydration marker on %s: %v", target.Host, lastErr)
 }
 
 func invalidateActionsHydrationMarker(ctx context.Context, target SSHTarget, leaseID string) error {
@@ -2517,14 +2505,14 @@ func invalidateActionsHydrationMarker(ctx context.Context, target SSHTarget, lea
 		details = RedactDiagnosticSecrets(details, target.User)
 	}
 	if details != "" {
-		return exit(7, "invalidate GitHub Actions hydration marker on %s: %v: %s", target.Host, lastErr, details)
+		return Exit(7, "invalidate GitHub Actions hydration marker on %s: %v: %s", target.Host, lastErr, details)
 	}
-	return exit(7, "invalidate GitHub Actions hydration marker on %s: %v", target.Host, lastErr)
+	return Exit(7, "invalidate GitHub Actions hydration marker on %s: %v", target.Host, lastErr)
 }
 
 func writeActionsHydrationStop(ctx context.Context, target SSHTarget, leaseID string) error {
 	if err := runSSHQuiet(ctx, target, remoteWriteActionsHydrationStopForTarget(target, leaseID)); err != nil {
-		return exit(7, "write GitHub Actions hydration stop marker on %s: %v", target.Host, err)
+		return Exit(7, "write GitHub Actions hydration stop marker on %s: %v", target.Host, err)
 	}
 	return nil
 }
@@ -2583,7 +2571,7 @@ func remoteReadActionsHydrationState(leaseID string) string {
 
 func remoteReadActionsHydrationStateForTarget(target SSHTarget, leaseID string) string {
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$path = ` + psQuote(windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))) + `
+		return PowershellCommand(`$path = ` + psQuote(windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))) + `
 if (Test-Path -LiteralPath $path) { Get-Content -Raw -LiteralPath $path }
 exit 0
 `)
@@ -2597,7 +2585,7 @@ func remoteInvalidateActionsHydrationMarker(leaseID string) string {
 
 func remoteInvalidateActionsHydrationMarkerForTarget(target SSHTarget, leaseID string) string {
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$ErrorActionPreference = "Stop"
+		return PowershellCommand(`$ErrorActionPreference = "Stop"
 $path = ` + psQuote(windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))) + `
 if (Test-Path -LiteralPath $path) {
   Remove-Item -LiteralPath $path -Force -ErrorAction Stop
@@ -2639,7 +2627,7 @@ func remoteActionsHydrationMonitorForTarget(target SSHTarget, leaseID string, ti
 		path := windowsActionsHydrationPath(actionsHydrationStatePath(leaseID))
 		stop := windowsActionsHydrationPath(actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner)))
 		if owner != nil {
-			return powershellCommand(`$marker = ` + psQuote(path) + `
+			return PowershellCommand(`$marker = ` + psQuote(path) + `
 $stop = ` + psQuote(stop) + `
 $ownerState = Join-Path $HOME ` + psQuote(`.crabbox\workspace-owners\`+owner.key+`.owner`) + `
 $ownerToken = ` + psQuote(owner.token) + `
@@ -2666,7 +2654,7 @@ while ($true) {
 }
 `)
 		}
-		return powershellCommand(`$deadline = [DateTime]::UtcNow.AddSeconds(` + strconv.Itoa(seconds) + `)
+		return PowershellCommand(`$deadline = [DateTime]::UtcNow.AddSeconds(` + strconv.Itoa(seconds) + `)
 while ([DateTime]::UtcNow -lt $deadline) {
   if (Test-Path -LiteralPath ` + psQuote(path) + ` -PathType Leaf) { exit 0 }
   if (Test-Path -LiteralPath ` + psQuote(stop) + ` -PathType Leaf) { exit 125 }
@@ -2714,7 +2702,7 @@ done`
 func remotePrepareActionsHydrationMonitorForTarget(target SSHTarget, leaseID string, owner *workspaceOwner) string {
 	path := actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner))
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`Remove-Item -LiteralPath ` + psQuote(windowsActionsHydrationPath(path)) + ` -Force -ErrorAction SilentlyContinue
+		return PowershellCommand(`Remove-Item -LiteralPath ` + psQuote(windowsActionsHydrationPath(path)) + ` -Force -ErrorAction SilentlyContinue
 exit 0
 `)
 	}
@@ -2724,7 +2712,7 @@ exit 0
 func remoteCancelActionsHydrationMonitorForTarget(target SSHTarget, leaseID string, owner *workspaceOwner) string {
 	path := actionsHydrationOwnerMonitorStopPath(leaseID, ownerToken(owner))
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$path = ` + psQuote(windowsActionsHydrationPath(path)) + `
+		return PowershellCommand(`$path = ` + psQuote(windowsActionsHydrationPath(path)) + `
 New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($path)) | Out-Null
 New-Item -ItemType File -Force -Path $path | Out-Null
 exit 0
@@ -2759,7 +2747,7 @@ func waitWorkspaceOwnerNoChild(ctx context.Context, owner *workspaceOwner, timeo
 		case <-timer.C:
 		}
 	}
-	return exit(7, "confirm remote workspace owner child state failed closed: child")
+	return Exit(7, "confirm remote workspace owner child state failed closed: child")
 }
 
 func remoteRunLocalActionsHydrateScriptForeground(leaseID string, timeout time.Duration) string {
@@ -2851,7 +2839,7 @@ func remoteClearActionsHydrationStateForTarget(target SSHTarget, leaseID string)
 }
 exit 0
 `)
-		return powershellCommand(b.String())
+		return PowershellCommand(b.String())
 	}
 	return remoteClearActionsHydrationState(leaseID)
 }
@@ -2920,7 +2908,7 @@ func remoteWriteActionsHydrationStop(leaseID string) string {
 
 func remoteWriteActionsHydrationStopForTarget(target SSHTarget, leaseID string) string {
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$ErrorActionPreference = "Stop"
+		return PowershellCommand(`$ErrorActionPreference = "Stop"
 $dir = ` + psQuote(windowsActionsHydrationRoot()) + `
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 New-Item -ItemType File -Force -Path ` + psQuote(windowsActionsHydrationPath(actionsHydrationStopPath(leaseID))) + ` | Out-Null
@@ -3248,7 +3236,7 @@ func githubActionsRunnerInstallScriptForTarget(version string, ephemeral bool, t
 
 func githubActionsRunnerInstallRemoteCommand(target SSHTarget) string {
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$ErrorActionPreference = "Stop"
+		return PowershellCommand(`$ErrorActionPreference = "Stop"
 function Read-CrabboxRunnerValue {
   $line = [Console]::In.ReadLine()
   if ($null -eq $line) { throw "missing runner registration input" }
@@ -3391,13 +3379,13 @@ func githubActionsRegistrationToken(ctx context.Context, repo GitHubRepo, childE
 	out, err := ghOutputWithChildEnvironment(ctx, "", childEnvDenylist, "api", "-X", "POST", "repos/"+repo.Slug()+"/actions/runners/registration-token", "--jq", ".token")
 	if err != nil {
 		if isGitHubRunnerRegistrationPermissionError(err) {
-			return "", exit(3, "GitHub Actions runner registration for %s requires repository write access or fine-grained Self-hosted runners write permission. If this is a Blacksmith Testbox tbx_... id, skip actions hydrate and run with --provider blacksmith-testbox.", repo.Slug())
+			return "", Exit(3, "GitHub Actions runner registration for %s requires repository write access or fine-grained Self-hosted runners write permission. If this is a Blacksmith Testbox tbx_... id, skip actions hydrate and run with --provider blacksmith-testbox.", repo.Slug())
 		}
 		return "", err
 	}
 	token := strings.TrimSpace(out)
 	if token == "" {
-		return "", exit(3, "GitHub returned an empty runner registration token for %s", repo.Slug())
+		return "", Exit(3, "GitHub returned an empty runner registration token for %s", repo.Slug())
 	}
 	return token, nil
 }
@@ -3421,7 +3409,7 @@ var scpLikeGitHubRemote = regexp.MustCompile(`^[^@]+@github\.com:([^/]+)/(.+)$`)
 func parseGitHubRepo(value string) (GitHubRepo, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return GitHubRepo{}, exit(2, "GitHub repo is unknown; set actions.repo or pass --repo owner/name")
+		return GitHubRepo{}, Exit(2, "GitHub repo is unknown; set actions.repo or pass --repo owner/name")
 	}
 	if !strings.Contains(value, "://") {
 		if match := scpLikeGitHubRemote.FindStringSubmatch(value); match != nil {
@@ -3439,39 +3427,20 @@ func parseGitHubRepo(value string) (GitHubRepo, error) {
 			return cleanGitHubRepo(parts[0], parts[1])
 		}
 	}
-	return GitHubRepo{}, exit(2, "unsupported GitHub repo %q; expected owner/name or github.com remote", value)
+	return GitHubRepo{}, Exit(2, "unsupported GitHub repo %q; expected owner/name or github.com remote", value)
 }
 
 func cleanGitHubRepo(owner, name string) (GitHubRepo, error) {
 	owner = strings.TrimSpace(owner)
 	name = strings.TrimSuffix(strings.TrimSpace(name), ".git")
 	if owner == "" || name == "" {
-		return GitHubRepo{}, exit(2, "invalid GitHub repo owner/name")
+		return GitHubRepo{}, Exit(2, "invalid GitHub repo owner/name")
 	}
 	return GitHubRepo{Owner: owner, Name: name}, nil
 }
 
 func sanitizeGitHubRunnerLabel(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	var b strings.Builder
-	lastDash := false
-	for _, r := range value {
-		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
-		if ok {
-			b.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash {
-			b.WriteByte('-')
-			lastDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		return "unknown"
-	}
-	return out
+	return blank(NormalizeLeaseSlug(value), "unknown")
 }
 
 func ghOutputWithChildEnvironment(ctx context.Context, dir string, childEnvDenylist []string, args ...string) (string, error) {
@@ -3484,7 +3453,7 @@ func ghOutputWithChildEnvironment(ctx context.Context, dir string, childEnvDenyl
 	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", exit(3, "gh %s: %v\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", Exit(3, "gh %s: %v\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
 }

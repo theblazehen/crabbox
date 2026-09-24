@@ -99,10 +99,10 @@ func (w *runExitWitness) finish(ctx context.Context, transportCode int, transpor
 		return transportCode, transportErr, false
 	}
 	if w.invalid || !w.exited {
-		return 7, exit(7, "SSH completion did not include a valid owned workload exit marker; failure downloads skipped"), false
+		return 7, Exit(7, "SSH completion did not include a valid owned workload exit marker; failure downloads skipped"), false
 	}
 	if !w.started && w.code == 0 {
-		return 7, exit(7, "SSH setup did not reach the workload; failure downloads skipped"), false
+		return 7, Exit(7, "SSH setup did not reach the workload; failure downloads skipped"), false
 	}
 	return w.code, nil, w.started && w.code != 0
 }
@@ -123,7 +123,7 @@ func (w *runExitWitness) command(workdir string, env map[string]string, envFiles
 		body, args = `exec "$@"`, command
 	}
 	start := "printf " + shellQuote(string(w.prefix)+"start\x1f") + " >&2; "
-	inner := "bash -lc " + shellQuote(remoteBashLoginScript(workdir, "{ "+start+"\n"+body+"\n}")) + " bash"
+	inner := "bash -lc " + shellQuote(remoteBashLoginScript("{ "+start+"\n"+body+"\n}")) + " bash \"$1\""
 	for _, arg := range args {
 		inner += " " + shellQuote(arg)
 	}
@@ -133,12 +133,12 @@ func (w *runExitWitness) command(workdir string, env map[string]string, envFiles
 	// the inner login shell retains ordinary startup, exec, and errexit behavior.
 	outer := `"$@"; result=$?; printf ` + shellQuote(string(w.prefix)+"exit:%d\x1f") + ` "$result" >&2; exit 0`
 	b.WriteString("/bin/sh -c " + shellQuote(outer) + " sh " + inner)
-	return b.String()
+	return b.String() + ")"
 }
 
 func validateFailureDownloadTarget(target SSHTarget, downloads []string) error {
 	if len(downloads) > 0 && target.TargetOS != targetLinux {
-		return exit(2, "--download-on-failure requires an ordinary SSH-backed Linux target")
+		return Exit(2, "--download-on-failure requires an ordinary SSH-backed Linux target")
 	}
 	return nil
 }

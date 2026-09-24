@@ -70,6 +70,9 @@ func TestRunRecorderCapturesTelemetryOnlyWithRunHandle(t *testing.T) {
 				<-posted
 			}
 			rec.stopTelemetrySampler()
+			if rec.telemetryRequested != (test.runID != "") {
+				t.Fatalf("telemetry requested=%t run=%q", rec.telemetryRequested, test.runID)
+			}
 			calls, err := os.ReadFile(callsPath)
 			if test.runID == "" {
 				if !os.IsNotExist(err) || posts != 0 || rec.telemetryStart != nil || len(rec.telemetrySnapshot()) != 0 {
@@ -1138,6 +1141,54 @@ func TestRunRecorderFinishFailureDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRunRecorderFinishAndReceiptShareOriginalDeadlineBeyondReadAttempt(t *testing.T) {
+	receipt := runRecorderTestReceipt(t)
+	t.Setenv("CRABBOX_OWNER", "alice@example.com")
+	for _, slowPhase := range []string{"finish", "receipt"} {
+		t.Run(slowPhase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				var finishRequests, receiptRequests int
+				var progress bytes.Buffer
+				client := &CoordinatorClient{BaseURL: "https://example.test", readRetryWriter: &progress, Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					deadline, ok := req.Context().Deadline()
+					if !ok || !deadline.Equal(start.Add(runRecorderFinishTimeout)) {
+						t.Fatalf("%s %s deadline=%v, want original finish deadline", req.Method, req.URL.Path, deadline)
+					}
+					var phase, body string
+					var code int
+					switch {
+					case req.Method == http.MethodPost && req.URL.Path == "/v1/runs/run_123/finish":
+						finishRequests++
+						phase, code, body = "finish", http.StatusServiceUnavailable, "finish unavailable"
+					case req.Method == http.MethodGet && req.URL.Path == "/v1/runs/run_123/receipt":
+						receiptRequests++
+						phase, code = "receipt", http.StatusOK
+						encoded, err := json.Marshal(map[string]any{"receipt": receipt})
+						if err != nil {
+							t.Fatal(err)
+						}
+						body = string(encoded)
+					default:
+						t.Fatalf("unexpected request %s %s", req.Method, req.URL.Path)
+					}
+					if phase == slowPhase {
+						if err := sleepContext(req.Context(), 35*time.Second); err != nil {
+							return nil, err
+						}
+					}
+					return &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+				})}}
+				rec := &runRecorder{coord: client, runID: "run_123", stderr: io.Discard}
+				err := rec.Finish(t.Context(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt)
+				if err != nil || !rec.finished || !rec.terminalConfirmed || finishRequests != 1 || receiptRequests != 1 || time.Since(start) != 35*time.Second || progress.Len() != 0 {
+					t.Fatalf("err=%v finished=%v confirmed=%v finish=%d receipt=%d elapsed=%s retries=%q", err, rec.finished, rec.terminalConfirmed, finishRequests, receiptRequests, time.Since(start), progress.String())
+				}
+			})
+		})
+	}
+}
+
 func TestRunRecorderFinishRetriesIdenticalCommit(t *testing.T) {
 	var attempts int
 	var bodies [][]byte
@@ -1289,6 +1340,41 @@ func TestRunRecorderFinishRecoversCommittedReceiptAfterLostResponse(t *testing.T
 	}
 }
 
+func TestRunRecorderFreezesTelemetryBeforeGuestCleanup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	dir := t.TempDir()
+	callsPath := filepath.Join(dir, "calls")
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nprintf 'telemetry\\n' >> \"$CRABBOX_FAKE_TELEMETRY_CALLS\"\nprintf 'cpuCount=2\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_TELEMETRY_CALLS", callsPath)
+	finished := false
+	client := &CoordinatorClient{BaseURL: "https://example.test", Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/runs/run_123/finish" {
+			t.Fatalf("unexpected request %s %s", req.Method, req.URL.Path)
+		}
+		finished = true
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"run":{"id":"run_123"}}`)), Header: make(http.Header)}, nil
+	})}}
+	rec := &runRecorder{coord: client, runID: "run_123", stderr: io.Discard}
+	target := SSHTarget{User: "runner", Host: "example.test", Port: "22", FallbackPorts: []string{}}
+	rec.CaptureTelemetryEnd(t.Context(), target)
+	if rec.telemetryEnd == nil || !rec.telemetryEndFrozen {
+		t.Fatal("final sample not frozen")
+	}
+	rec.CaptureTelemetryEnd(t.Context(), target)
+	if err := rec.Finish(t.Context(), target, 0, 0, 0, "", false, nil, FailureClassification{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil || string(calls) != "telemetry\n" || !finished {
+		t.Fatalf("finish collected new guest telemetry: calls=%q finished=%t err=%v", calls, finished, err)
+	}
+}
+
 func TestRunRecorderResetTelemetryForLeaseReplacement(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -1297,15 +1383,18 @@ func TestRunRecorderResetTelemetryForLeaseReplacement(t *testing.T) {
 		close(done)
 	}()
 	rec := &runRecorder{
-		telemetryStart:   &LeaseTelemetry{CapturedAt: "2026-05-02T00:00:00Z"},
-		telemetrySamples: []*LeaseTelemetry{{CapturedAt: "2026-05-02T00:00:01Z"}},
-		telemetryCancel:  cancel,
-		telemetryDone:    done,
+		telemetryStart:     &LeaseTelemetry{CapturedAt: "2026-05-02T00:00:00Z"},
+		telemetryRequested: true,
+		telemetryEnd:       &LeaseTelemetry{CapturedAt: "2026-05-02T00:00:02Z"},
+		telemetryEndFrozen: true,
+		telemetrySamples:   []*LeaseTelemetry{{CapturedAt: "2026-05-02T00:00:01Z"}},
+		telemetryCancel:    cancel,
+		telemetryDone:      done,
 	}
 
 	rec.resetTelemetryForLeaseReplacement()
 
-	if rec.telemetryStart != nil || rec.telemetryCancel != nil || rec.telemetryDone != nil || len(rec.telemetrySamples) != 0 {
+	if rec.telemetryStart != nil || rec.telemetryRequested || rec.telemetryEnd != nil || rec.telemetryEndFrozen || rec.telemetryCancel != nil || rec.telemetryDone != nil || len(rec.telemetrySamples) != 0 {
 		t.Fatalf("telemetry not reset: %#v", rec)
 	}
 	select {

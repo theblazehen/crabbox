@@ -1,3 +1,4 @@
+import { base64URL, base64URLDecode, sha256Hex } from "./encoding";
 import {
   GitHubCredentialError,
   githubAccountID,
@@ -18,6 +19,7 @@ const accessJwtMaxChars = 32 * 1024;
 const accessKidMaxChars = 256;
 const accessKeySetTTLMS = 5 * 60 * 1000;
 const accessKeySetFailureTTLMS = 30 * 1000;
+const accessKeySetTimeoutMS = 15 * 1000;
 const accessKeySetCacheMaxEntries = 8;
 const githubAccessTokenMaxChars = 4096;
 const userTokenVersion = 3;
@@ -808,17 +810,33 @@ async function fetchAccessKeySet(
 ): Promise<AccessKeySetCacheEntry> {
   let keys: AccessPublicJwk[] = [];
   let ttl = accessKeySetFailureTTLMS;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error("Cloudflare Access key request timed out"));
+      controller.abort();
+    }, accessKeySetTimeoutMS);
+  });
   try {
-    const response = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`);
-    if (response.ok) {
-      const certs = (await response.json()) as AccessCerts;
-      if (Array.isArray(certs.keys)) {
-        keys = certs.keys;
-        ttl = accessKeySetTTLMS;
-      }
+    const certs = await Promise.race([
+      (async (): Promise<AccessCerts | undefined> => {
+        const response = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, {
+          signal: controller.signal,
+        });
+        return response.ok ? ((await response.json()) as AccessCerts) : undefined;
+      })(),
+      timeout,
+    ]);
+    // Only the winning result may populate the cache, even if fetch ignores abort.
+    if (Array.isArray(certs?.keys)) {
+      keys = certs.keys;
+      ttl = accessKeySetTTLMS;
     }
   } catch {
     // Cache fetch failures briefly so an upstream outage cannot amplify request load.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
   const entry: AccessKeySetCacheEntry = {
     expiresAt: Date.now() + ttl,
@@ -929,11 +947,6 @@ async function userTokenCredentialKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", material, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
-export async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 export async function adminGrantVersion(
   env: Pick<Env, "CRABBOX_ADMIN_TOKEN" | "CRABBOX_GITHUB_ADMIN_OWNERS">,
 ): Promise<string> {
@@ -944,25 +957,4 @@ export async function adminGrantVersion(
       owners: [...new Set(envList(env.CRABBOX_GITHUB_ADMIN_OWNERS))].toSorted(),
     }),
   );
-}
-
-export function base64URL(data: Uint8Array): string {
-  let binary = "";
-  for (const byte of data) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}
-
-function base64URLDecode(value: string): Uint8Array {
-  const padded = value
-    .replaceAll("-", "+")
-    .replaceAll("_", "/")
-    .padEnd(Math.ceil(value.length / 4) * 4, "=");
-  const binary = atob(padded);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
 }

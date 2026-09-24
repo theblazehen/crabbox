@@ -79,7 +79,7 @@ func runSSHSyncScriptInputTarget(ctx context.Context, target *SSHTarget, remote 
 		}
 		source, size = bytes.NewReader(data), int64(len(data))
 	}
-	transport, err := prepareSSHTransport(*target, "/bin/sh "+shellQuote(dir+"/script"), source, size, sshCommandLimit{})
+	transport, err := prepareSSHTransport(ctx, *target, "/bin/sh "+shellQuote(dir+"/script"), source, size, sshCommandLimit{})
 	if err != nil {
 		return sshPreparationError{err}
 	}

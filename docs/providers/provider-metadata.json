@@ -13,6 +13,20 @@
     "caveat": "Requires kubectl, Agent Sandbox v0.5.0rc1 v1beta1 CRDs, a warm pool, explicit context, and RBAC",
     "docs": "agent-sandbox.md"
   },
+  "agent-sandbox-ssh": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Kubernetes Agent Sandbox warm pool with private SSH transport",
+    "location": "self-hosted",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "unknown",
+    "lifecycle": "Agent Sandbox SandboxClaim",
+    "cleanup": "owned SandboxClaim delete",
+    "bestFit": "Retained Kubernetes-hosted Linux workspaces with SSH and rsync",
+    "caveat": "Requires kubectl port-forward RBAC, an SSH-compatible Linux amd64 warm pool, and explicit context",
+    "docs": "agent-sandbox.md"
+  },
   "anthropic-sandbox-runtime": {
     "status": "built-in",
     "category": "local-sandbox",
@@ -72,16 +86,16 @@
   "ascii-box": {
     "status": "built-in",
     "category": "direct-cloud",
-    "substrate": "ASCII Box managed Linux box",
+    "substrate": "Boat (formerly ASCII Box) managed Linux box",
     "location": "provider-managed",
     "ssh": "crabbox-managed",
     "sync": "crabbox-sync",
     "gpu": "unknown",
-    "lifecycle": "provider CLI",
+    "lifecycle": "provider CLI; keyed API fixed lease IDs",
     "cleanup": "provider delete",
-    "bestFit": "Managed Linux box over SSH",
-    "caveat": "Requires the ASCII Box CLI and account",
-    "auth": "API key via ASCII_BOX_API_KEY or CRABBOX_ASCII_BOX_API_KEY; Box CLI config; direct remote SSH lease",
+    "bestFit": "Managed Linux box over SSH, selectable as boat",
+    "caveat": "Requires Boat/Box CLI; fixed IDs allow one keyed recovery within 24h; no account attestation",
+    "auth": "API key via ASCII_BOX_API_KEY or CRABBOX_ASCII_BOX_API_KEY; Boat/Box CLI config; direct remote SSH lease",
     "docs": "ascii-box.md"
   },
   "aws": {
@@ -181,11 +195,11 @@
     "ssh": "crabbox-managed",
     "sync": "crabbox-sync",
     "gpu": "no",
-    "lifecycle": "HTTPS console API + WSS bootstrap",
+    "lifecycle": "TLS gRPC API + exec bootstrap",
     "cleanup": "machine destroy (claim-gated)",
     "bestFit": "Experimental isolated Linux microVM SSH leases",
-    "caveat": "2026-08-27: production ignores isolated=true; Crabbox rejects guest access and rolls back; guest execution unverified; guest port 8000 is public",
-    "auth": "BOXD_TOKEN or CRABBOX_BOXD_TOKEN interactive session from HTTPS device login; API-key sessions cannot mutate",
+    "caveat": "2026-09-01: isolated creation verified over the gRPC API; guest port 8000 is publicly proxied without authentication",
+    "auth": "CRABBOX_BOXD_API_KEY or BOXD_API_KEY bxd_ key, exchanged over HTTPS for short-lived JWTs",
     "docs": "boxd.md"
   },
   "cloud-run-sandbox": {
@@ -843,7 +857,7 @@
     "lifecycle": "Crabbox",
     "cleanup": "clone delete",
     "bestFit": "Local macOS, Linux, or Windows VM with snapshots",
-    "caveat": "Requires prepared Parallels source VMs and SSH",
+    "caveat": "Requires prepared source VMs and SSH; fixed lease IDs bind attested host and clone identity and remain single-use",
     "docs": "parallels.md"
   },
   "phala": {
@@ -872,7 +886,7 @@
     "lifecycle": "Crabbox",
     "cleanup": "VM delete",
     "bestFit": "Self-hosted Linux VM fleet",
-    "caveat": "Needs a prepared template, guest agent, and network",
+    "caveat": "Needs a prepared template, guest agent, and network; fixed lease IDs bind VMID and generation and retain uncertain attempts",
     "docs": "proxmox.md"
   },
   "railway": {

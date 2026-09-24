@@ -1,5 +1,20 @@
 import ssh2, { type Client as SSHClient, type ClientChannel } from "ssh2";
 
+import { AsyncMutex, KeyedAsyncMutex } from "./async-mutex";
+import { AWSPoolAccess } from "./aws-pool-access";
+import {
+  ReadyPoolAccess,
+  portablePoolPrefix,
+  portablePoolReservationKey,
+  portablePoolGrantKey,
+  poolTokenHash,
+  type PoolAccessBinding,
+  type PoolAccessReservation,
+  type PoolAccessGrant,
+  type ProviderPoolAccess,
+} from "./ready-pool-access";
+import { setPoolWake } from "./ready-pool-wake";
+type ReadyPoolMode = boolean | "portable";
 import { AzureResumableProvisioning } from "./azure-provisioning";
 import {
   clearHostReservations,
@@ -24,6 +39,7 @@ import {
   validateProvisioningRecord,
   type LeaseProvisioningOperation,
 } from "./lease-provisioning";
+import { isRegisteredLease, leaseIsLive } from "./lease-state";
 import type { ProviderResumableProvisioning } from "./provider-provisioning";
 import { ProvisioningAttemptHistory } from "./provisioning-attempts";
 import {
@@ -31,6 +47,8 @@ import {
   provisioningMaterialKey,
   sealProvisioningMaterial,
 } from "./provisioning-material";
+import { coordinatorStorageEntries } from "./storage-scan";
+import { WayVNCRetirement } from "./wayvnc-retirement";
 
 const { Client: SSHClientConstructor, utils: sshUtils } = ssh2;
 
@@ -42,7 +60,6 @@ import {
   githubUserIsAdmin,
   isAdminRequest,
   requestWithAuthContext,
-  sha256Hex,
   verifiedPortalTokenExpiresAtForRevocation,
   verifiedUserTokenExpiresAtForRevocation,
   type AuthContext,
@@ -51,6 +68,7 @@ import {
 } from "./auth";
 import {
   EC2SpotClient,
+  AWSLeaseAuthorityError,
   awsAutomaticProbesConfigured,
   awsCredentialsConfigured,
   awsConfiguredSecurityGroupID,
@@ -62,7 +80,6 @@ import {
   awsProvisioningErrorCategory,
   awsRegionCandidates,
   awsLeaseImageIdentity,
-  isAWSInstanceNotFoundError,
   isAWSRunInstancesOutcomeUncertain,
   isRetryableAWSProvisioningError,
   isAWSSecurityGroupRuleLimitError,
@@ -70,6 +87,14 @@ import {
   type AWSIngressConfig,
   type AWSPrivateWorkspaceConfig,
 } from "./aws";
+import {
+  awsCleanupAuditMatchesLease,
+  awsCleanupAuditView,
+  awsCleanupRecoveryAuditKey,
+  awsCleanupRecoveryFingerprint,
+  requireAWSLegacyCleanupLease,
+  type AWSLegacyCleanupAudit,
+} from "./aws-cleanup-recovery";
 import { InvalidAWSRegionError, sanitizeAWSRegion } from "./aws-region";
 import {
   AzureClient,
@@ -141,6 +166,7 @@ import {
   azureLocationFor,
   leaseConfig,
   normalizeArchitecture,
+  parseTarget,
   validCIDRs,
   validatedCIDRs,
   workspaceProviderKeyPrefix,
@@ -170,6 +196,7 @@ import {
   isDaytonaNotFound,
   type DaytonaSSHEndpoint,
 } from "./daytona";
+import { base64ToBytes, bytesToBase64, bytesToHex, sha256Hex } from "./encoding";
 import {
   GCPClient,
   gcpMachineImageNotFound,
@@ -405,6 +432,7 @@ import type {
   ReadyPoolReturnRequest,
   PromotedImageRecord,
   RunCreateRequest,
+  RunAdmissionFailureRequest,
   RunEventRecord,
   RunEventRequest,
   RunFinishRequest,
@@ -470,8 +498,7 @@ const leaseCleanupBatchSize = 16;
 const interruptedProvisioningDeploySettleMs = 5 * 60 * 1000;
 const interruptedProvisioningAbsenceConfirmationMs = 30 * 60 * 1000;
 const interruptedProvisioningRecoveryBatchSize = 16;
-const awsOrphanSweepInitialDelayMs = 60 * 1000;
-const azureOrphanSweepInitialDelayMs = 60 * 1000;
+const orphanSweepInitialDelayMs = 60 * 1000;
 const defaultAWSOrphanSweepIntervalSeconds = 60 * 60;
 const defaultAWSOrphanSweepGraceSeconds = 15 * 60;
 const defaultAzureOrphanSweepIntervalSeconds = 60 * 60;
@@ -870,16 +897,11 @@ interface LeaseCloudAudit {
   message?: string;
 }
 
-interface AWSOrphanSweepConfig {
-  enabled: boolean;
-  deleteEnabled: boolean;
+interface AWSOrphanSweepConfig extends CloudOrphanSweepConfig {
   macHostReleaseEnabled: boolean;
-  intervalSeconds: number;
-  graceSeconds: number;
-  regions: string[];
 }
 
-interface AzureOrphanSweepConfig {
+interface CloudOrphanSweepConfig {
   enabled: boolean;
   deleteEnabled: boolean;
   intervalSeconds: number;
@@ -963,24 +985,13 @@ interface AWSMacHostSweepCandidate {
   error?: string;
 }
 
-interface AWSOrphanSweepRecord {
-  startedAt: string;
-  finishedAt: string;
-  mode: "report" | "delete";
-  trigger: "alarm" | "admin";
-  enabled: boolean;
-  regions: string[];
-  scanned: number;
-  candidates: AWSOrphanSweepCandidate[];
-  terminated: number;
+interface AWSOrphanSweepRecord extends CloudOrphanSweepRecord {
   macHostsScanned?: number;
   macHostCandidates?: AWSMacHostSweepCandidate[];
   macHostsReleased?: number;
-  errors: Array<{ region: string; message: string }>;
-  nextRunAt?: string;
 }
 
-interface AzureOrphanSweepRecord {
+interface CloudOrphanSweepRecord {
   startedAt: string;
   finishedAt: string;
   mode: "report" | "delete";
@@ -1108,6 +1119,11 @@ export class FleetCoordinator {
   private readonly webVNCAgentCapabilities = new Map<string, Map<string, Set<string>>>();
   private readonly webVNCViewers = new Map<string, Map<string, WebVNCViewerSession>>();
   private readonly webVNCControllers = new Map<string, string>();
+  private readonly wayVNCRetirement = new WayVNCRetirement();
+  private readonly webVNCHandoffs = new Map<
+    string,
+    { viewerID: string; status: "pending" | "verified" | "manual" }
+  >();
   private readonly pendingWebVNCToViewer = new Map<string, WebVNCBuffer>();
   private readonly webVNCEvents = new Map<string, WebVNCEvent[]>();
   private readonly codeAgents = new Map<string, WebSocket>();
@@ -1126,8 +1142,9 @@ export class FleetCoordinator {
   private readonly egressSessionStateHydrations = new Map<string, Promise<void>>();
   private readonly runtimeAdapterAgents = new Map<string, WebSocket>();
   private readonly runtimeAdapterPending = new Map<string, RuntimeAdapterPendingRequest>();
-  private readonly runtimeAdapterDeleteQueues = new Map<string, Promise<void>>();
-  private readonly daytonaSnapshotBootstrapQueues = new Map<string, Promise<void>>();
+  private readonly runtimeAdapterDeleteLocks = new KeyedAsyncMutex<string>();
+  // Same-name bootstraps must not observe another request's active snapshot.
+  private readonly daytonaSnapshotBootstrapLocks = new KeyedAsyncMutex<string>();
   private readonly controlSockets = new Map<string, WebSocket>();
   private readonly failedControlSockets = new WeakSet<WebSocket>();
   private readonly workspaceTerminals = new Map<string, Set<WebSocket>>();
@@ -1138,11 +1155,12 @@ export class FleetCoordinator {
   private readonly deviceMembershipCache = new Map<string, DeviceMembershipCacheEntry>();
   private currentAdminGrantVersion: string | undefined;
   private bridgeRestoreReady: Promise<boolean> | undefined;
-  private readyPoolBorrowQueue: Promise<void> = Promise.resolve();
-  private bridgeTicketQueue: Promise<void> = Promise.resolve();
+  private readonly readyPoolBorrowLock = new AsyncMutex();
+  private readonly poolAccess: ReadyPoolAccess;
+  private readonly bridgeTicketLock = new AsyncMutex();
   private readonly bridgeTickets: BridgeTickets;
-  private awsIngressBarrier: Promise<void> = Promise.resolve();
-  private providerMaintenanceQueue: Promise<void> = Promise.resolve();
+  private readonly awsIngressOperationLock = new AsyncMutex();
+  private readonly providerMaintenanceLock = new AsyncMutex();
   private readonly webVNCCredentialHandoffs: WebVNCCredentialHandoffs;
   private readonly leaseProvisioning: LeaseProvisioningController;
   private maintenanceRun: Promise<void> | undefined;
@@ -1155,6 +1173,35 @@ export class FleetCoordinator {
     private readonly authContext: AuthRequestContext = {},
     private readonly coordinatorGeneration: string = crypto.randomUUID(),
   ) {
+    this.poolAccess = new ReadyPoolAccess(state, {
+      owner: requestOwner,
+      org: (request) => requestOrg(request, env),
+      authorized: (lease, request) =>
+        this.leaseManageableByRequest(lease, request, isAdminRequest(request)),
+      matches: readyPoolEntryMatches,
+      identityEqual: readyPoolIdentityEqual,
+      identityMatches: (entry, lease) =>
+        Boolean(entry.identity && this.readyPoolIdentityMatchesLease(entry.identity, lease)),
+      heartbeatDeadline: readyPoolBorrowDeadline,
+      withoutBorrow: withoutReadyPoolBorrow,
+      heartbeatMs: readyPoolBorrowTimeoutMs,
+      provider: (binding) =>
+        isCoordinatorProvider(binding.provider)
+          ? this.provider(binding.provider, binding.scope).poolAccess?.()
+          : undefined,
+      counters: (storage, entry, delta) =>
+        this.incrementReadyPoolCountersForScope(
+          entry.owner,
+          entry.org,
+          entry.key,
+          delta,
+          "portable",
+          storage,
+        ),
+      release: async (lease) => {
+        await this.releaseResolvedLease(lease, { deleteServer: true, keep: false });
+      },
+    });
     this.leaseProvisioning = new LeaseProvisioningController(
       state,
       env,
@@ -1192,9 +1239,12 @@ export class FleetCoordinator {
           });
       },
     );
-    state.provisioning?.registerProvisioningTick(() => this.leaseProvisioning.tick());
+    state.provisioning?.registerProvisioningTick(async () => {
+      await this.leaseProvisioning.tick();
+      await this.poolAccess.maintain();
+    });
     this.bridgeTickets = new BridgeTickets(state.storage, {
-      withLock: (operation) => this.withBridgeTicketLock(operation),
+      withLock: (operation) => this.bridgeTicketLock.run(operation),
       getLease: (id) => this.getLease(id),
       identifierMatchesLease,
       currentTicket: (ticket, lease) => this.currentLeaseBridgeTicket(ticket, lease),
@@ -1826,37 +1876,16 @@ export class FleetCoordinator {
     return await entry.load;
   }
 
-  private async activeOwnerDevices(owner: string, org: string): Promise<DeviceTokenRecord[]> {
-    const indexes = await this.state.storage.list<DeviceOwnerIndexRecord>({
+  private activeOwnerDevices(owner: string, org: string): Promise<DeviceTokenRecord[]> {
+    return this.activeOwnerIndexedRecords(owner, org, {
       prefix: deviceOwnerIndexPrefix(owner, org),
-      limit: maxDeviceTokensPerOwner + 1,
-      noCache: true,
+      max: maxDeviceTokensPerOwner,
+      id: (index: DeviceOwnerIndexRecord) => index.deviceID,
+      validIndex: validDeviceOwnerIndexRecord,
+      recordKey: deviceTokenKey,
+      validRecord: validStoredDeviceTokenRecord,
+      now: () => Date.now(),
     });
-    const records = await Promise.all(
-      [...indexes.entries()].map(async ([indexKey, index]) => {
-        if (!validDeviceOwnerIndexRecord(index, index.deviceID)) {
-          await this.state.storage.delete(indexKey);
-          return undefined;
-        }
-        const key = deviceTokenKey(index.deviceID);
-        const record = await this.state.storage.get<DeviceTokenRecord>(key, { noCache: true });
-        if (
-          !record ||
-          !validStoredDeviceTokenRecord(record, index.deviceID) ||
-          record.owner !== owner ||
-          record.org !== org
-        ) {
-          await this.state.storage.delete(indexKey);
-          return undefined;
-        }
-        if (Date.parse(record.expiresAt) <= Date.now()) {
-          await Promise.all([this.state.storage.delete(indexKey), this.state.storage.delete(key)]);
-          return undefined;
-        }
-        return record;
-      }),
-    );
-    return records.filter((record): record is DeviceTokenRecord => record !== undefined);
   }
 
   private async revokeDeviceRecord(record: DeviceTokenRecord): Promise<void> {
@@ -1865,41 +1894,69 @@ export class FleetCoordinator {
     await this.state.storage.delete(deviceOwnerIndexKey(record.owner, record.org, record.id));
   }
 
-  private async activeOwnerPairingGrants(
+  private activeOwnerPairingGrants(
     owner: string,
     org: string,
     now: number,
   ): Promise<PairingGrantRecord[]> {
-    const indexes = await this.state.storage.list<PairingGrantOwnerIndexRecord>({
+    return this.activeOwnerIndexedRecords(owner, org, {
       prefix: pairingGrantOwnerIndexPrefix(owner, org),
-      limit: maxPairingGrantsPerOwner + 1,
+      max: maxPairingGrantsPerOwner,
+      id: (index: PairingGrantOwnerIndexRecord) => index.grantHash,
+      validIndex: validPairingGrantOwnerIndexRecord,
+      recordKey: pairingGrantKey,
+      validRecord: validPairingGrantRecord,
+      now: () => now,
+    });
+  }
+
+  private async activeOwnerIndexedRecords<
+    I,
+    R extends { owner: string; org: string; expiresAt: string },
+  >(
+    owner: string,
+    org: string,
+    options: {
+      prefix: string;
+      max: number;
+      id: (index: I) => string;
+      validIndex: (index: I, id: string) => boolean;
+      recordKey: (id: string) => string;
+      validRecord: (record: R, id: string) => boolean;
+      now: () => number;
+    },
+  ): Promise<R[]> {
+    const indexes = await this.state.storage.list<I>({
+      prefix: options.prefix,
+      limit: options.max + 1,
       noCache: true,
     });
     const records = await Promise.all(
       [...indexes.entries()].map(async ([indexKey, index]) => {
-        if (!validPairingGrantOwnerIndexRecord(index, index.grantHash)) {
+        const id = options.id(index);
+        if (!options.validIndex(index, id)) {
           await this.state.storage.delete(indexKey);
           return undefined;
         }
-        const key = pairingGrantKey(index.grantHash);
-        const record = await this.state.storage.get<PairingGrantRecord>(key, { noCache: true });
+        const key = options.recordKey(id);
+        const record = await this.state.storage.get<R>(key, { noCache: true });
         if (
           !record ||
-          !validPairingGrantRecord(record, index.grantHash) ||
+          !options.validRecord(record, id) ||
           record.owner !== owner ||
           record.org !== org
         ) {
           await this.state.storage.delete(indexKey);
           return undefined;
         }
-        if (Date.parse(record.expiresAt) <= now) {
+        if (Date.parse(record.expiresAt) <= options.now()) {
           await Promise.all([this.state.storage.delete(indexKey), this.state.storage.delete(key)]);
           return undefined;
         }
         return record;
       }),
     );
-    return records.filter((record): record is PairingGrantRecord => record !== undefined);
+    return records.filter((record) => record !== undefined);
   }
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -2490,17 +2547,7 @@ export class FleetCoordinator {
           owner: attachment.owner,
           ...(attachment.org ? { org: attachment.org } : {}),
           ...(attachment.admin !== undefined ? { admin: attachment.admin } : {}),
-          ...(attachment.auth ? { auth: attachment.auth } : {}),
-          ...(attachment.login ? { login: attachment.login } : {}),
-          ...(attachment.sharedTokenHash ? { sharedTokenHash: attachment.sharedTokenHash } : {}),
-          ...(attachment.adminTokenHash ? { adminTokenHash: attachment.adminTokenHash } : {}),
-          ...(attachment.adminGrantVersion
-            ? { adminGrantVersion: attachment.adminGrantVersion }
-            : {}),
-          ...(attachment.portalSessionHash
-            ? { portalSessionHash: attachment.portalSessionHash }
-            : {}),
-          ...(attachment.githubGrant ? { githubGrant: attachment.githubGrant } : {}),
+          ...copyBridgeGrant(attachment),
           ...(attachment.viewerSessionID ? { viewerSessionID: attachment.viewerSessionID } : {}),
           ...(attachment.viewerSessionExpiresAt
             ? { viewerSessionExpiresAt: attachment.viewerSessionExpiresAt }
@@ -2834,6 +2881,7 @@ export class FleetCoordinator {
     }
     switch (attachment.kind) {
       case "webvnc-agent":
+        if (this.wayVNCRetirement.handle(socket, message)) break;
         await forwardOrBufferWebVNC(
           message,
           await this.currentBridgeRecipient(
@@ -3202,11 +3250,12 @@ export class FleetCoordinator {
       return candidates;
     });
     await this.reconcileInterruptedLeaseProvisioning(leaseIDs);
+    await this.poolAccess.maintain();
     await this.expireLeases(leaseIDs);
     await this.webVNCCredentialHandoffs.cleanupExpired();
     await this.cleanupExpiredWebVNCPortalViewerAuth();
     await this.reconcileRuntimeAdapterDeletes(leaseIDs);
-    await this.withReadyPoolBorrowLock(() =>
+    await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(() => this.maintainReadyPools(Date.now())),
     );
     await this.maintainWorkspacePrewarm();
@@ -3547,7 +3596,7 @@ export class FleetCoordinator {
         released.provisioningResourceMayExist = true;
         released.provisioningFailureRetryable = true;
       }
-      if (shouldDelete) {
+      if (shouldDelete && !canceledBeforeProviderIdentity) {
         const cleanupStarted = new Date();
         released.cleanupStartedAt = cleanupStarted.toISOString();
         released.cleanupClaimExpiresAt = new Date(
@@ -3555,6 +3604,8 @@ export class FleetCoordinator {
         ).toISOString();
         released.releaseDeletesServer = true;
         clearLeaseCleanupCompletion(released);
+      } else if (shouldDelete) {
+        released.cleanupRetryAt = now;
       } else if (leaseHasConfirmedNoProviderResource(released)) {
         completeLeaseProviderCleanup(released, released.updatedAt);
       }
@@ -4400,17 +4451,18 @@ export class FleetCoordinator {
                 : undefined;
               if (
                 !current ||
+                !sameLeaseReleaseIdentity(current, record) ||
                 current.state !== "provisioning" ||
-                (createAttempt && !currentAttempt)
+                (createAttempt &&
+                  (!currentAttempt || !createAttemptMatchesLease(currentAttempt, current)))
               ) {
-                return;
+                throw new ProviderDispatchFenceError(current);
               }
+              current.region = region;
+              current.updatedAt = new Date().toISOString();
+              await this.putLease(current);
               if (record.provider === "aws") {
-                await this.markAWSIngressReconcilePending({ ...current, region });
-              } else {
-                current.region = region;
-                current.updatedAt = new Date().toISOString();
-                await this.putLease(current);
+                await this.markAWSIngressReconcilePending(current);
               }
               await this.scheduleAlarm();
             });
@@ -4471,11 +4523,62 @@ export class FleetCoordinator {
     const provisioning: ProviderProvisioningContext = {
       ...targetProvisioning,
       ...(dispatched.providerScope ? { providerScope: dispatched.providerScope } : {}),
+      onProviderKeyCleanupPending: async (existingKey) => {
+        const active = await this.state.runExclusive(async () => {
+          const current = await this.getLease(dispatched.id);
+          const attempt = createAttempt
+            ? await this.pendingCreateAttempt(leaseID, createAttempt.token, owner, org)
+            : undefined;
+          const sameIncarnation =
+            current &&
+            sameLeaseReleaseIdentity(current, dispatched) &&
+            current.provisioningRequestStartedAt === dispatched.provisioningRequestStartedAt &&
+            current.provider === "aws" &&
+            current.providerKey === providerKeyForLease(current.id);
+          if (!sameIncarnation) {
+            return false;
+          }
+          const canContinue =
+            current.state === "provisioning" &&
+            Date.parse(current.expiresAt) > Date.now() &&
+            (!createAttempt || (attempt && createAttemptMatchesLease(attempt, current)));
+          if (!canContinue && !existingKey) {
+            return false;
+          }
+          current.providerKeyCleanupOwned = true;
+          current.providerKeyCleanupPending = true;
+          current.updatedAt = new Date().toISOString();
+          clearLeaseCleanupCompletion(current);
+          await this.putLease(current);
+          return Boolean(canContinue);
+        });
+        if (!active) {
+          throw new CreateAttemptCanceledError();
+        }
+      },
+      onProviderKeyCleanupComplete: async (target) => {
+        await this.state.runExclusive(async () => {
+          const current = await this.getLease(dispatched.id);
+          if (
+            !current ||
+            !sameLeaseReleaseIdentity(current, dispatched) ||
+            current.provisioningRequestStartedAt !== dispatched.provisioningRequestStartedAt ||
+            current.provider !== "aws" ||
+            current.region !== target.region
+          ) {
+            return;
+          }
+          delete current.providerKeyCleanupPending;
+          delete current.providerKeyCleanupID;
+          current.updatedAt = new Date().toISOString();
+          await this.putLease(current);
+        });
+      },
       onResourceCreated: (claim) => this.recordCreatedProviderResource(dispatched, claim),
       // Queued regional attempts must not restore access from their pre-provisioning snapshot.
       withLeaseAccess: (target, operation, observe) => {
         const ingressQueuedAt = Date.now();
-        return this.withAWSIngressOperationLock(async () => {
+        return this.awsIngressOperationLock.run(async () => {
           observe?.("ingress_wait", Date.now() - ingressQueuedAt);
           const lifecycleQueuedAt = Date.now();
           const access = await this.state.runExclusive(async () => {
@@ -4511,6 +4614,17 @@ export class FleetCoordinator {
     const provisioned = await provider
       .createServerWithFallback(config, leaseID, slug, owner, provisioning)
       .catch(async (error: unknown) => {
+        if (error instanceof ProviderDispatchFenceError) {
+          if (createAttempt && !fixedCreate) return createCanceledResponse();
+          return json(
+            {
+              error: "lease_state_changed",
+              message: error.message,
+              ...(error.current ? { lease: publicLeaseRecord(error.current) } : {}),
+            },
+            { status: 409 },
+          );
+        }
         const cleanupClaim = validatedProviderProvisioningCleanupClaim(error, config.provider);
         await this.state.runExclusive(async () => {
           if (prepared?.provisioning?.publishAccessBeforeProvisioning) {
@@ -4991,9 +5105,18 @@ export class FleetCoordinator {
       (attempt &&
         attempt.checkpointID === checkpointID &&
         createAttemptMatchesLease(attempt, existing));
-    if (!sameOwner || !sameIntent || !sameAttempt || !leaseIsLive(existing)) {
+    if (!sameOwner || !sameIntent || !sameAttempt) {
       return json(
         { error: "lease_id_conflict", message: "lease id is bound to another create intent" },
+        { status: 409 },
+      );
+    }
+    if (!leaseIsLive(existing)) {
+      return json(
+        {
+          error: "fixed_lease_terminal",
+          message: "lease id is bound to a terminal result for this create intent",
+        },
         { status: 409 },
       );
     }
@@ -5568,7 +5691,7 @@ export class FleetCoordinator {
       );
       return;
     }
-    if (lease?.providerKeyCleanupPending) {
+    if (lease && providerKeyCleanupBlocksProvisioningRecovery(lease)) {
       return;
     }
     if (!lease && workspaceProvisionDeadline(workspace) <= Date.now()) {
@@ -6969,7 +7092,7 @@ export class FleetCoordinator {
         currentWorkspace.leaseID !== workspace.leaseID ||
         currentWorkspace.releaseRequestedAt ||
         !currentLease ||
-        currentLease.providerKeyCleanupPending ||
+        providerKeyCleanupBlocksProvisioningRecovery(currentLease) ||
         !workspaceOwnsLease(currentWorkspace, currentLease) ||
         !(
           (currentLease.state === "provisioning" && !currentLease.provisioningRequestStartedAt) ||
@@ -7129,7 +7252,69 @@ export class FleetCoordinator {
       lease.createAttemptID,
       lease.createAttemptGeneration,
       lease.lifecycle,
+      lease.slug,
+      lease.providerOwner,
+      lease.providerKey,
+      lease.providerKeyCleanupOwned,
+      lease.hostId,
+      lease.hostID,
     ]);
+  }
+
+  private async commitRecoveredLeaseScope<T>(
+    request: Request,
+    leaseID: string,
+    expectedBinding: string,
+    observation: { providerScope: string; resourceAbsent: true },
+    prepareAudit: (transaction: CoordinatorStorageView) => Promise<() => Promise<T>>,
+  ): Promise<T> {
+    const runtime = this.state.provisioning;
+    if (!runtime)
+      throw new ProviderResourceUnresolvedError("Atomic cleanup recovery is unavailable");
+    return this.state.runExclusive(() =>
+      runtime.commitAndWake(async (transaction) => {
+        const current = await transaction.get<LeaseRecord>(leaseKey(leaseID));
+        if (
+          !isAdminRequest(request) ||
+          requestAuthType(request) === "device" ||
+          !current ||
+          this.cleanupRecoveryLeaseBinding(current) !== expectedBinding ||
+          !this.cleanupRecoveryLeaseEligible(current) ||
+          current.providerScope != null ||
+          current.provisioningRequestStartedAt ||
+          current.cleanupCompletedAt ||
+          !current.cleanupError ||
+          current.state !== "released" ||
+          current.releaseDeletesServer !== true ||
+          (await provisioningOwnsLease(transaction, leaseID))
+        ) {
+          throw new ProviderResourceUnresolvedError(
+            "Cleanup recovery lease or administrator authority changed before commit",
+          );
+        }
+        const writeAudit = await prepareAudit(transaction);
+        // Audit preparation can await storage; recheck authority before its first write.
+        const admittedGrantVersion = trustedAdminGrantVersion(request);
+        if (!admittedGrantVersion || admittedGrantVersion !== this.currentAdminGrantVersion) {
+          throw new ProviderResourceUnresolvedError(
+            "Cleanup recovery lease or administrator authority changed before commit",
+          );
+        }
+        const audit = await writeAudit();
+        const now = Date.now();
+        await transaction.put(leaseKey(leaseID), {
+          ...current,
+          providerScope: observation.providerScope,
+          provisioningResourceMayExist: false,
+          cleanupRetryAt: new Date(now).toISOString(),
+          updatedAt: new Date(now).toISOString(),
+        });
+        // This records the next cleanup wake, not provider cleanup completion.
+        const previousWake = await transaction.get<number | null>(legacyAlarmKey);
+        await setLegacyWake(transaction, Math.min(previousWake ?? now, now));
+        return audit;
+      }),
+    );
   }
 
   private async leaseRoute(request: Request, leaseID: string, action?: string): Promise<Response> {
@@ -7169,10 +7354,29 @@ export class FleetCoordinator {
           : undefined;
       if (!provider?.recoverCleanup)
         return json({ error: "cleanup_recovery_unsupported" }, { status: 501 });
-      if (!this.cleanupRecoveryLeaseEligible(lease)) {
+      if (provider.supportsCleanupScopeRecovery && !admin) {
+        return json(
+          { error: "forbidden", message: "administrator cleanup recovery required" },
+          { status: 403 },
+        );
+      }
+      if (
+        !this.cleanupRecoveryLeaseEligible(lease) ||
+        (await provisioningOwnsLease(this.state.storage, lease.id))
+      ) {
         return json({ error: "cleanup_recovery_requires_expired_blocked_lease" }, { status: 409 });
       }
       const expectedBinding = this.cleanupRecoveryLeaseBinding(lease);
+      const commitScopeRecovery: ProviderScopeRecoveryCommit = (observation, prepareAudit) =>
+        this.commitRecoveredLeaseScope(
+          request,
+          lease.id,
+          expectedBinding,
+          observation,
+          prepareAudit,
+        );
+      const scopeRecoveryArgs: [] | [ProviderScopeRecoveryCommit] =
+        provider.supportsCleanupScopeRecovery ? [commitScopeRecovery] : [];
       try {
         const recovery = await provider.recoverCleanup(
           lease,
@@ -7192,6 +7396,7 @@ export class FleetCoordinator {
               }
               return await commit();
             }),
+          ...scopeRecoveryArgs,
         );
         return json({ leaseID: lease.id, provider: providerID, recovery });
       } catch (error) {
@@ -7224,6 +7429,12 @@ export class FleetCoordinator {
           : undefined;
       if (!provider?.inspectCleanup) {
         return json({ error: "cleanup_inspection_unsupported" }, { status: 501 });
+      }
+      if (provider.supportsCleanupScopeRecovery && !admin) {
+        return json(
+          { error: "forbidden", message: "administrator cleanup inspection required" },
+          { status: 403 },
+        );
       }
       return json({
         leaseID: lease.id,
@@ -7618,7 +7829,23 @@ export class FleetCoordinator {
           { status: 409 },
         );
       }
-      return structuredClone(await this.applyLeaseHeartbeatState(lease, input));
+      const updated = await this.applyLeaseHeartbeatState(lease, input);
+      const providerID = managedLeaseProvider(updated);
+      if (
+        providerID &&
+        requestCIDRs.length > 0 &&
+        leaseOwnsAWSSSHAccess(updated) &&
+        this.provider(
+          providerID,
+          updated.region,
+          updated.providerProject,
+        ).leaseAccessRefreshUnchanged?.(updated, requestCIDRs)
+      ) {
+        await this.markAWSIngressReconcilePending(updated);
+        await this.armAlarmNoLaterThan(Date.now() + awsIngressReconcileMinDelayMs);
+        return json({ lease: this.leaseForRequest(updated, request, admin) });
+      }
+      return structuredClone(updated);
     });
     if (committed instanceof Response) {
       return committed;
@@ -7675,7 +7902,7 @@ export class FleetCoordinator {
     };
     const lease =
       managedProvider === "aws" && !committed.network?.awsPrivate
-        ? await this.withAWSIngressOperationLock(refresh)
+        ? await this.awsIngressOperationLock.run(refresh)
         : await refresh();
     return json({ lease: this.leaseForRequest(lease, request, isAdminRequest(request)) });
   }
@@ -8049,7 +8276,7 @@ export class FleetCoordinator {
         { status: 403 },
       );
     }
-    return await this.serializeRuntimeAdapterDelete(lease.id, async () => {
+    return await this.runtimeAdapterDeleteLocks.run(lease.id, async () => {
       const result = await this.finalizeRuntimeAdapterDeleteCompletion(
         lease,
         completion,
@@ -8110,7 +8337,7 @@ export class FleetCoordinator {
         { status: 403 },
       );
     }
-    return await this.serializeRuntimeAdapterDelete(lease.id, async () => {
+    return await this.runtimeAdapterDeleteLocks.run(lease.id, async () => {
       const result = await this.finalizeLegacyRuntimeAdapterDelete(
         lease,
         completion,
@@ -8185,7 +8412,7 @@ export class FleetCoordinator {
     lease: LeaseRecord,
     previousShare: NormalizedLeaseShare,
   ): Promise<void> {
-    await this.withBridgeTicketLock(async () => {
+    await this.bridgeTicketLock.run(async () => {
       await this.putLease(lease);
       if (leaseShareAccessShrank(previousShare, normalizedLeaseShare(lease.share))) {
         await this.revokeUnauthorizedLeaseBridges(lease);
@@ -9135,7 +9362,7 @@ export class FleetCoordinator {
         409,
       );
     }
-    return await this.serializeRuntimeAdapterDelete(lease.id, async () => {
+    return await this.runtimeAdapterDeleteLocks.run(lease.id, async () => {
       const current = await this.state.runExclusive(() => this.getLease(lease.id));
       if (!current || !leaseIsLive(current)) {
         return runtimeAdapterWorkspaceDeleteError(
@@ -9298,28 +9525,6 @@ export class FleetCoordinator {
         { status: 202 },
       );
     });
-  }
-
-  private async serializeRuntimeAdapterDelete<T>(
-    leaseID: string,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    const previous = this.runtimeAdapterDeleteQueues.get(leaseID) ?? Promise.resolve();
-    let release!: () => void;
-    const turn = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.then(() => turn);
-    this.runtimeAdapterDeleteQueues.set(leaseID, tail);
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-      if (this.runtimeAdapterDeleteQueues.get(leaseID) === tail) {
-        this.runtimeAdapterDeleteQueues.delete(leaseID);
-      }
-    }
   }
 
   private async markRuntimeAdapterDeletePending(
@@ -9925,7 +10130,7 @@ export class FleetCoordinator {
   }
 
   private async reconcileRuntimeAdapterDelete(lease: LeaseRecord): Promise<void> {
-    await this.serializeRuntimeAdapterDelete(lease.id, async () => {
+    await this.runtimeAdapterDeleteLocks.run(lease.id, async () => {
       const requestedAt = lease.runtimeAdapterDeleteRequestedAt;
       const adapterID = lease.runtimeAdapterID;
       const workspaceID = lease.runtimeAdapterWorkspaceID;
@@ -10770,7 +10975,7 @@ export class FleetCoordinator {
     if (!validWebVNCPortalViewerTicket(value)) {
       return undefined;
     }
-    return await this.withBridgeTicketLock(async () => {
+    return await this.bridgeTicketLock.run(async () => {
       const key = webVNCPortalViewerTicketKey(value);
       const ticket = await this.state.storage.get<WebVNCPortalViewerTicketRecord>(key);
       if (!ticket || ticket.ticket !== value) {
@@ -10895,7 +11100,7 @@ export class FleetCoordinator {
   private async consumeWebVNCPortalViewerCredentials(
     session: WebVNCPortalViewerSessionRecord,
   ): Promise<WebVNCCredentialHandoffResult> {
-    return await this.withBridgeTicketLock(async () => {
+    return await this.bridgeTicketLock.run(async () => {
       const key = webVNCPortalViewerSessionKey(session.session);
       const current = await this.state.storage.get<WebVNCPortalViewerSessionRecord>(key);
       const handoff = current?.credentialHandoffTicket;
@@ -11001,6 +11206,11 @@ export class FleetCoordinator {
       viewerCount: viewers.length,
       observerCount: Math.max(0, viewers.length - (controller ? 1 : 0)),
       availableViewerSlots: availableAgents.length,
+      remoteRetirementProtocol: 1,
+      wayvncHandoff:
+        this.webVNCHandoffs.get(lease.id)?.viewerID === controllerID
+          ? this.webVNCHandoffs.get(lease.id)?.status
+          : "manual",
       viewerID,
       viewerRole: currentViewer
         ? currentViewer.id === controllerID
@@ -11184,6 +11394,31 @@ export class FleetCoordinator {
     const previousID = this.activeWebVNCControllerID(lease.id);
     this.webVNCControllers.set(lease.id, viewerID);
     if (previousID !== viewerID) {
+      const previousHandoff = this.webVNCHandoffs.get(lease.id);
+      // A failed or overlapping handoff can leave an older observer owning layout.
+      const ownershipContinuous = !previousHandoff || previousHandoff.status === "verified";
+      const handoff = { viewerID, status: "pending" as "pending" | "verified" | "manual" };
+      this.webVNCHandoffs.set(lease.id, handoff);
+      const previous = this.webVNCViewers.get(lease.id)?.get(previousID);
+      const oldAgent = previous && this.webVNCAgents.get(lease.id)?.get(previous.agentID);
+      const newAgent = this.webVNCAgents.get(lease.id)?.get(viewer.agentID);
+      const retired =
+        ownershipContinuous && oldAgent && newAgent
+          ? await this.wayVNCRetirement.retire(
+              oldAgent,
+              newAgent,
+              this.openWebVNCAgents(lease.id).map(([, socket]) => socket),
+            )
+          : false;
+      // Reconnects and overlapping takeovers invalidate the pending generation.
+      if (this.webVNCHandoffs.get(lease.id) === handoff) {
+        handoff.status =
+          retired &&
+          this.activeWebVNCControllerID(lease.id) === viewerID &&
+          this.webVNCViewers.get(lease.id)?.get(viewerID) === viewer
+            ? "verified"
+            : "manual";
+      }
       this.recordWebVNCEvent(lease.id, "control_taken", `${viewer.label} took control`);
     }
     return await this.webVNCStatus(
@@ -11574,7 +11809,7 @@ export class FleetCoordinator {
     if (!validCodeViewerTicket(value)) {
       return undefined;
     }
-    return await this.withBridgeTicketLock(async () => {
+    return await this.bridgeTicketLock.run(async () => {
       const key = codeViewerTicketKey(value);
       const ticket = await this.state.storage.get<CodeViewerTicketRecord>(key);
       if (
@@ -11679,7 +11914,7 @@ export class FleetCoordinator {
         const expiresAt = Number.isFinite(tokenExpiresAt)
           ? Math.min(revocationExpiresAt, tokenExpiresAt)
           : revocationExpiresAt;
-        await this.withBridgeTicketLock(async () => {
+        await this.bridgeTicketLock.run(async () => {
           await this.state.storage.put<CodeViewerSessionRevocationRecord>(
             codeViewerSessionRevocationKey(portalSessionHash),
             {
@@ -11773,7 +12008,7 @@ export class FleetCoordinator {
     agent: WebSocket,
     bridgeGrant: CachedBridgeGrant,
   ): Promise<Response> {
-    return await this.withBridgeTicketLock(async () => {
+    return await this.bridgeTicketLock.run(async () => {
       const currentLease = await this.resolvePortalLease(lease.id, request);
       if (!currentLease) {
         return notFound();
@@ -12167,7 +12402,7 @@ export class FleetCoordinator {
         { status: 426 },
       );
     }
-    return await this.withBridgeTicketLock(async () => {
+    return await this.bridgeTicketLock.run(async () => {
       const lease = await this.resolvePortalLease(identifier, request);
       if (!lease) {
         return notFound();
@@ -12374,6 +12609,7 @@ export class FleetCoordinator {
     if (!viewers || viewers.size === 0) {
       this.webVNCViewers.delete(leaseID);
       this.webVNCControllers.delete(leaseID);
+      this.webVNCHandoffs.delete(leaseID);
       return;
     }
     if (this.webVNCControllers.get(leaseID) === viewerID) {
@@ -12392,6 +12628,7 @@ export class FleetCoordinator {
     }
     this.webVNCViewers.delete(leaseID);
     this.webVNCControllers.delete(leaseID);
+    this.webVNCHandoffs.delete(leaseID);
   }
 
   private async consumeRuntimeAdapterTicket(
@@ -12402,7 +12639,7 @@ export class FleetCoordinator {
     if (!validRuntimeAdapterTicket(value)) {
       return { status: "invalid" };
     }
-    return this.withBridgeTicketLock(async () => {
+    return this.bridgeTicketLock.run(async () => {
       const key = runtimeAdapterTicketKey(value);
       const ticket = await this.state.storage.get<RuntimeAdapterTicketRecord>(key);
       if (!ticket || ticket.ticket !== value || !isCurrentOrgKey(ticket.org)) {
@@ -12596,6 +12833,39 @@ export class FleetCoordinator {
     if (method === "GET" && !action) {
       return json({ pool: (await this.readyPoolStatus(key, request)).map(publicReadyPoolEntry) });
     }
+    if (action?.endsWith("-access")) {
+      if (!envFlagEnabled(this.env.CRABBOX_PORTABLE_POOLS_ENABLED) || !this.state.provisioning)
+        return json({ error: "portable_pools_disabled" }, { status: 409 });
+      if (request.method === "GET" && action === "capabilities-access")
+        return json({ schema: "crabbox-pool-access/v1", maxDurationSeconds: 1800, renewal: false });
+      if (request.method === "GET" && action === "metrics-access")
+        return this.readyPoolMetrics(request, key, "portable");
+      if (request.method === "GET" && action === "entries-access")
+        return json({
+          pool: (await this.readyPoolStatus(key, request, "portable")).map(publicReadyPoolEntry),
+        });
+      if (request.method === "POST") {
+        if (action === "register-access")
+          return this.registerReadyPoolLease(request, key, "portable");
+        if (action === "reconcile-access")
+          return this.reconcileReadyPoolCapacity(request, key, "portable");
+        if (action === "release-fill-claim-access")
+          return this.releaseReadyPoolFillClaim(request, key, "portable");
+        if (action === "borrow-access") {
+          const input = await readJson<ReadyPoolBorrowRequest>(request);
+          const error =
+            readyPoolIdentityRequestError(input.identity, true) ??
+            (await readyPoolSeedIdentityRequestError(input.identity, input)) ??
+            normalizeReadyPoolIdentityProvider(input);
+          if (error) return error;
+          return this.poolAccess.borrow(request, key, input);
+        }
+        const operation = action.slice(0, -7);
+        if (operation === "ack" || operation === "heartbeat" || operation === "return")
+          return this.poolAccess.act(request, key, operation, await readJson(request));
+      }
+      return notFound();
+    }
     if (method === "GET" && action === "identity") {
       return json({ schema: readyPoolIdentitySchemaV1 });
     }
@@ -12652,15 +12922,15 @@ export class FleetCoordinator {
   private async readyPoolStatus(
     key: string,
     request: Request,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<ReadyPoolEntry[]> {
-    return await this.withReadyPoolBorrowLock(() =>
+    return await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(() => this.readyPoolStatusSnapshot(request, key, typed)),
     );
   }
 
   private async allReadyPoolStatus(request: Request): Promise<ReadyPoolEntry[]> {
-    return await this.withReadyPoolBorrowLock(() =>
+    return await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(() => this.readyPoolStatusSnapshot(request)),
     );
   }
@@ -12668,7 +12938,7 @@ export class FleetCoordinator {
   private async readyPoolStatusSnapshot(
     request: Request,
     key?: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<ReadyPoolEntry[]> {
     const entries = await this.readyPoolEntries(typed);
     const leases = new Map((await this.leaseRecords()).map((lease) => [lease.id, lease]));
@@ -12747,13 +13017,22 @@ export class FleetCoordinator {
     ).readyPoolImageIdentity?.(lease);
   }
 
+  private readyPoolTransaction<T>(
+    mode: ReadyPoolMode,
+    callback: (storage: CoordinatorStorageView) => Promise<T>,
+  ): Promise<T> {
+    return mode === "portable"
+      ? this.poolAccess.transaction(callback)
+      : this.state.storage.transaction(callback);
+  }
+
   private async registerReadyPoolLease(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<Response> {
     const input = await readJson<ReadyPoolRegisterRequest>(request);
-    const identityError = readyPoolIdentityRequestError(input.identity, typed);
+    const identityError = readyPoolIdentityRequestError(input.identity, Boolean(typed));
     if (identityError) return identityError;
     const seedError = await readyPoolSeedIdentityRequestError(input.identity, input);
     if (seedError) return seedError;
@@ -12808,151 +13087,213 @@ export class FleetCoordinator {
         { status: 409 },
       );
     }
-    return await this.withReadyPoolBorrowLock(() =>
-      this.state.runExclusive(async () => {
-        const lease = await this.getLease(leaseID);
-        if (!lease) return notFound();
-        if (!this.leaseManageableByRequest(lease, request, isAdminRequest(request))) {
-          return json(
-            { error: "forbidden", message: "lease manage access required" },
-            { status: 403 },
-          );
-        }
-        if (lease.state !== "active" || Date.parse(lease.expiresAt) <= Date.now()) {
-          return json({ error: "lease_not_active" }, { status: 409 });
-        }
-        if (typed && !sameReadyPoolObservationLease(lease, checkedLease)) {
-          return json(
-            {
-              error: "ready_pool_image_observation_conflict",
-              message: "lease changed after immutable image evidence was observed",
-            },
-            { status: 409 },
-          );
-        }
-        if (typed && !this.readyPoolIdentityMatchesLease(input.identity!, lease)) {
-          return json({ error: "ready_pool_lease_identity_mismatch" }, { status: 409 });
-        }
-        const fillClaimToken = nonSecretString(input.fillClaimToken);
-        const fillClaim = fillClaimToken
-          ? await this.state.storage.get<ReadyPoolFillClaim>(
-              readyPoolFillClaimKey(fillClaimToken, typed),
-            )
-          : undefined;
-        if (fillClaimToken && !fillClaim) {
-          return json({ error: "fill_claim_not_found" }, { status: 409 });
-        }
-        if (
-          fillClaim &&
-          (fillClaim.key !== key ||
-            fillClaim.owner !== requestOwner(request) ||
-            fillClaim.org !== requestOrg(request, this.env))
-        ) {
-          return json({ error: "fill_claim_mismatch" }, { status: 409 });
-        }
-        if (fillClaim && Date.parse(fillClaim.expiresAt) <= Date.now()) {
-          await this.state.storage.delete(readyPoolFillClaimKey(fillClaim.token, typed));
-          return json({ error: "fill_claim_expired" }, { status: 409 });
-        }
-        if (
-          fillClaim?.compatibilityKey &&
-          compatibilityKey &&
-          fillClaim.compatibilityKey !== compatibilityKey
-        ) {
-          return json({ error: "fill_claim_compatibility_mismatch" }, { status: 409 });
-        }
-        const existingPoolEntries = [
-          ...(await this.readyPoolEntries()),
-          ...(await this.readyPoolEntries(true)),
-        ].filter((entry) => entry.leaseID === leaseID);
-        if (existingPoolEntries.some((entry) => entry.state === "busy")) {
-          return json(
-            {
-              error: "lease_pool_busy",
-              message: "lease is currently borrowed from a ready pool",
-            },
-            { status: 409 },
-          );
-        }
-        if (existingPoolEntries.some((entry) => entry.state === "quarantined")) {
-          return json(
-            { error: "pool_entry_quarantined", message: "quarantined leases must be drained" },
-            { status: 409 },
-          );
-        }
-        const now = new Date().toISOString();
-        const entry: ReadyPoolEntry = {
-          key,
-          leaseID,
-          state: "ready",
-          owner: lease.owner,
-          org: lease.org,
-          provider: lease.provider,
-          target: lease.target,
-          class: lease.class,
-          serverType: lease.serverType,
-          lastReadyAt: now,
-          createdAt: now,
-          updatedAt: now,
-          expiresAt: lease.expiresAt,
-        };
-        if (typed) {
-          for (const field of ["repo", "ref", "commit", "fingerprint"] as const) {
-            const value = input[field];
-            if (typeof value === "string" && value !== "") entry[field] = value;
+    let accessBinding: PoolAccessBinding | undefined;
+    if (typed === "portable") {
+      if (!isCoordinatorProvider(checkedLease.provider))
+        return json({ error: "unsupported_pool_access_provider" }, { status: 409 });
+      const capability = this.provider(
+        checkedLease.provider!,
+        checkedLease.region,
+        checkedLease.providerProject,
+      ).poolAccess?.();
+      if (!capability) return json({ error: "unsupported_pool_access_provider" }, { status: 409 });
+      if (!compatibilityKey) return json({ error: "compatibility_key_required" }, { status: 400 });
+      const existing = [...(await this.readyPoolEntries()), ...(await this.readyPoolEntries(true))];
+      if (existing.some((entry) => entry.leaseID === leaseID))
+        return json({ error: "lease_pool_protocol_conflict" }, { status: 409 });
+      accessBinding = await capability.enroll(checkedLease);
+    }
+    const claimHash =
+      typed === "portable" && input.fillClaimToken
+        ? await poolTokenHash("fill", input.fillClaimToken)
+        : input.fillClaimToken;
+    const response = await this.readyPoolBorrowLock.run(() =>
+      this.state.runExclusive(() =>
+        this.readyPoolTransaction(typed, async (storage) => {
+          const lease = await storage.get<LeaseRecord>(leaseKey(leaseID));
+          if (!lease) return notFound();
+          if (!this.leaseManageableByRequest(lease, request, isAdminRequest(request))) {
+            return json(
+              { error: "forbidden", message: "lease manage access required" },
+              { status: 403 },
+            );
           }
-        } else {
-          addReadyPoolEntryString(entry, "repo", input.repo);
-          addReadyPoolEntryString(entry, "ref", input.ref);
-          addReadyPoolEntryString(entry, "commit", input.commit);
-          addReadyPoolEntryString(entry, "fingerprint", input.fingerprint);
-        }
-        addReadyPoolEntryString(
-          entry,
-          "compatibilityKey",
-          fillClaim?.compatibilityKey ?? compatibilityKey,
-        );
-        addReadyPoolEntryString(entry, "image", input.image);
-        addReadyPoolEntryString(entry, "sshHost", readyPoolLeaseSSHHost(lease, input.sshHost));
-        addReadyPoolEntryString(entry, "sshUser", readyPoolLeaseSSHUser(lease, input.sshUser));
-        addReadyPoolEntryString(entry, "sshPort", readyPoolLeaseSSHPort(lease, input.sshPort));
-        addReadyPoolEntryString(entry, "workRoot", readyPoolLeaseWorkRoot(lease, input.workRoot));
-        if (typed) entry.identity = input.identity!;
-        if (lease.windowsMode) {
-          entry.windowsMode = lease.windowsMode;
-        }
-        if (fillClaim && !readyPoolEntryMatches(entry, fillClaim.criteria)) {
-          return json(
-            {
-              error: "fill_claim_criteria_mismatch",
-              message: "registered lease does not satisfy the claimed compatibility criteria",
-            },
-            { status: 409 },
+          if (lease.state !== "active" || Date.parse(lease.expiresAt) <= Date.now()) {
+            return json({ error: "lease_not_active" }, { status: 409 });
+          }
+          if (typed && !sameReadyPoolObservationLease(lease, checkedLease)) {
+            return json(
+              {
+                error: "ready_pool_image_observation_conflict",
+                message: "lease changed after immutable image evidence was observed",
+              },
+              { status: 409 },
+            );
+          }
+          if (typed && !this.readyPoolIdentityMatchesLease(input.identity!, lease)) {
+            return json({ error: "ready_pool_lease_identity_mismatch" }, { status: 409 });
+          }
+          const fillClaimToken = nonSecretString(claimHash);
+          const fillClaim = fillClaimToken
+            ? await storage.get<ReadyPoolFillClaim>(readyPoolFillClaimKey(fillClaimToken, typed))
+            : undefined;
+          if (fillClaimToken && !fillClaim) {
+            return json({ error: "fill_claim_not_found" }, { status: 409 });
+          }
+          if (
+            fillClaim &&
+            (fillClaim.key !== key ||
+              fillClaim.owner !== requestOwner(request) ||
+              fillClaim.org !== requestOrg(request, this.env))
+          ) {
+            return json({ error: "fill_claim_mismatch" }, { status: 409 });
+          }
+          if (fillClaim && Date.parse(fillClaim.expiresAt) <= Date.now()) {
+            await storage.delete(readyPoolFillClaimKey(fillClaim.token, typed));
+            if (typed === "portable") await setPoolWake(storage, `claim-${fillClaim.token}`);
+            return json({ error: "fill_claim_expired" }, { status: 409 });
+          }
+          if (
+            fillClaim?.compatibilityKey &&
+            compatibilityKey &&
+            fillClaim.compatibilityKey !== compatibilityKey
+          ) {
+            return json({ error: "fill_claim_compatibility_mismatch" }, { status: 409 });
+          }
+          const existingPoolEntries = [
+            ...(await this.readyPoolEntries(false, storage)),
+            ...(await this.readyPoolEntries(true, storage)),
+            ...(await this.readyPoolEntries("portable", storage)),
+          ].filter((entry) => entry.leaseID === leaseID);
+          const reservation = await storage.get<PoolAccessReservation>(
+            portablePoolReservationKey(leaseID),
           );
-        }
-        await Promise.all(
-          existingPoolEntries
-            .filter((existing) => existing.key !== key || Boolean(existing.identity) !== typed)
-            .map((existing) => this.deleteReadyPoolEntry(existing, Boolean(existing.identity))),
-        );
-        await this.putReadyPoolEntry(entry, typed);
-        if (fillClaim) {
-          await this.state.storage.delete(readyPoolFillClaimKey(fillClaim.token, typed));
-          await this.incrementReadyPoolCounters(request, key, { fillClaimsCompleted: 1 }, typed);
-        }
-        await this.scheduleAlarm();
-        return json({ entry: publicReadyPoolEntry(entry), lease: publicLeaseRecord(lease) });
-      }),
+          if (
+            (typed !== "portable" && reservation) ||
+            (typed === "portable" && existingPoolEntries.some((entry) => !entry.portableAccess))
+          )
+            return json({ error: "lease_pool_protocol_conflict" }, { status: 409 });
+          if (typed === "portable" && existingPoolEntries.some((entry) => entry.state !== "ready"))
+            return json({ error: "portable_pool_cleanup_pending" }, { status: 409 });
+          if (existingPoolEntries.some((entry) => entry.state === "busy")) {
+            return json(
+              {
+                error: "lease_pool_busy",
+                message: "lease is currently borrowed from a ready pool",
+              },
+              { status: 409 },
+            );
+          }
+          if (existingPoolEntries.some((entry) => entry.state === "quarantined")) {
+            return json(
+              { error: "pool_entry_quarantined", message: "quarantined leases must be drained" },
+              { status: 409 },
+            );
+          }
+          const now = new Date().toISOString();
+          const entry: ReadyPoolEntry = {
+            key,
+            leaseID,
+            state: "ready",
+            owner: lease.owner,
+            org: lease.org,
+            provider: lease.provider,
+            target: lease.target,
+            class: lease.class,
+            serverType: lease.serverType,
+            lastReadyAt: now,
+            createdAt: now,
+            updatedAt: now,
+            expiresAt: lease.expiresAt,
+          };
+          if (typed) {
+            for (const field of ["repo", "ref", "commit", "fingerprint"] as const) {
+              const value = input[field];
+              if (typeof value === "string" && value !== "") entry[field] = value;
+            }
+          } else {
+            addReadyPoolEntryString(entry, "repo", input.repo);
+            addReadyPoolEntryString(entry, "ref", input.ref);
+            addReadyPoolEntryString(entry, "commit", input.commit);
+            addReadyPoolEntryString(entry, "fingerprint", input.fingerprint);
+          }
+          addReadyPoolEntryString(
+            entry,
+            "compatibilityKey",
+            fillClaim?.compatibilityKey ?? compatibilityKey,
+          );
+          addReadyPoolEntryString(entry, "image", input.image);
+          addReadyPoolEntryString(entry, "sshHost", readyPoolLeaseSSHHost(lease, input.sshHost));
+          addReadyPoolEntryString(entry, "sshUser", readyPoolLeaseSSHUser(lease, input.sshUser));
+          addReadyPoolEntryString(entry, "sshPort", readyPoolLeaseSSHPort(lease, input.sshPort));
+          addReadyPoolEntryString(entry, "workRoot", readyPoolLeaseWorkRoot(lease, input.workRoot));
+          if (typed) entry.identity = input.identity!;
+          if (accessBinding) {
+            entry.portableAccess = true;
+          }
+          if (lease.windowsMode) {
+            entry.windowsMode = lease.windowsMode;
+          }
+          if (fillClaim && !readyPoolEntryMatches(entry, fillClaim.criteria)) {
+            return json(
+              {
+                error: "fill_claim_criteria_mismatch",
+                message: "registered lease does not satisfy the claimed compatibility criteria",
+              },
+              { status: 409 },
+            );
+          }
+          await Promise.all(
+            existingPoolEntries
+              .filter(
+                (existing) =>
+                  existing.key !== key ||
+                  (existing.portableAccess ? "portable" : Boolean(existing.identity)) !== typed,
+              )
+              .map((existing) =>
+                this.deleteReadyPoolEntry(
+                  existing,
+                  existing.portableAccess ? "portable" : Boolean(existing.identity),
+                  storage,
+                ),
+              ),
+          );
+          if (accessBinding) {
+            await storage.put(leaseKey(leaseID), { ...lease, portablePoolAccess: true });
+            await storage.put(portablePoolReservationKey(leaseID), {
+              key,
+              binding: accessBinding,
+              generation: reservation?.generation ?? 0,
+            });
+            await setPoolWake(storage, leaseID, Date.parse(lease.expiresAt) - 60_000);
+          }
+          await this.putReadyPoolEntry(entry, typed, storage);
+          if (fillClaim) {
+            await storage.delete(readyPoolFillClaimKey(fillClaim.token, typed));
+            if (typed === "portable") await setPoolWake(storage, `claim-${fillClaim.token}`);
+            await this.incrementReadyPoolCounters(
+              request,
+              key,
+              { fillClaimsCompleted: 1 },
+              typed,
+              storage,
+            );
+          }
+          return json({ entry: publicReadyPoolEntry(entry), lease: publicLeaseRecord(lease) });
+        }),
+      ),
     );
+    await this.state.runExclusive(() => this.scheduleAlarm());
+    return response;
   }
 
   private async borrowReadyPoolLease(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<Response> {
     const input = await readJson<ReadyPoolBorrowRequest>(request);
-    const identityError = readyPoolIdentityRequestError(input.identity, typed);
+    const identityError = readyPoolIdentityRequestError(input.identity, Boolean(typed));
     if (identityError) return identityError;
     const providerError = normalizeReadyPoolIdentityProvider(input);
     if (providerError) return providerError;
@@ -12967,7 +13308,7 @@ export class FleetCoordinator {
     } else {
       delete input.compatibilityKey;
     }
-    return await this.withReadyPoolBorrowLock(async () => {
+    return await this.readyPoolBorrowLock.run(async () => {
       return await this.state.runExclusive(async () => {
         await this.incrementReadyPoolCounters(request, key, { borrowRequests: 1 }, typed);
         const entries = (await this.readyPoolStatusSnapshot(request, key, typed)).filter((entry) =>
@@ -12993,6 +13334,8 @@ export class FleetCoordinator {
             lease.state === "active" &&
             Date.parse(lease.expiresAt) > nowMs
           ) {
+            // oxlint-disable-next-line eslint/no-await-in-loop -- check the reservation before selecting each candidate.
+            if (await this.state.storage.get(portablePoolReservationKey(lease.id))) continue;
             if (typed && !this.readyPoolIdentityMatchesLease(entry.identity!, lease)) {
               // oxlint-disable-next-line eslint/no-await-in-loop -- mismatch must be durably drained before another candidate can be borrowed.
               await this.drainMismatchedReadyPoolEntry(entry, typed);
@@ -13059,7 +13402,7 @@ export class FleetCoordinator {
   private async heartbeatReadyPoolBorrow(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<Response> {
     const input = await readJson<ReadyPoolBorrowHeartbeatRequest>(request);
     const leaseID = input.leaseID ?? "";
@@ -13070,7 +13413,7 @@ export class FleetCoordinator {
     if (!borrowToken) {
       return json({ error: "borrow_token_required" }, { status: 400 });
     }
-    return await this.withReadyPoolBorrowLock(() =>
+    return await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(async () => {
         const current = await this.getReadyPoolEntry(key, leaseID, typed);
         const lease = await this.getLease(leaseID);
@@ -13138,10 +13481,10 @@ export class FleetCoordinator {
   private async reconcileReadyPoolCapacity(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<Response> {
     const input = await readJson<ReadyPoolReconcileRequest>(request);
-    const identityError = readyPoolIdentityRequestError(input.identity, typed);
+    const identityError = readyPoolIdentityRequestError(input.identity, Boolean(typed));
     if (identityError) return identityError;
     const providerError = normalizeReadyPoolIdentityProvider(input);
     if (providerError) return providerError;
@@ -13184,161 +13527,193 @@ export class FleetCoordinator {
       ...input,
       ...(compatibilityKey ? { compatibilityKey } : {}),
     });
+    const rawClaimToken = crypto.randomUUID();
+    const storedClaimToken =
+      typed === "portable" ? await poolTokenHash("fill", rawClaimToken) : rawClaimToken;
     const nowMs = Date.now();
-    return await this.withReadyPoolBorrowLock(() =>
+    const response = await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(async () => {
         await this.maintainReadyPools(nowMs);
-        const owner = requestOwner(request);
-        const org = requestOrg(request, this.env);
-        let policyKey: string;
-        let previous: ReadyPoolDesiredCapacity | undefined;
-        let legacyPolicyKey: string | undefined;
-        if (input.identity) {
-          policyKey = await readyPoolDesiredCapacityKeyV2({
-            org,
-            owner,
-            key,
-            compatibilityKey,
-            identity: input.identity,
-          });
-          const current = await this.state.storage.get<ReadyPoolDesiredCapacity>(policyKey);
-          const candidateLegacyKey = readyPoolLegacyTypedDesiredKey(
-            owner,
-            org,
-            key,
-            compatibilityKey,
-            input.identity,
-          );
-          const legacy = storageKeyWithinLimit(candidateLegacyKey)
-            ? await this.state.storage.get<ReadyPoolDesiredCapacity>(candidateLegacyKey)
-            : undefined;
-          for (const [storedKey, stored] of [
-            [policyKey, current],
-            [candidateLegacyKey, legacy],
-          ] as const) {
-            if (!stored) continue;
-            const storedProvider = stored.criteria.provider;
-            if (
-              !readyPoolDesiredCapacityScopeMatches(stored, owner, org, key, compatibilityKey) ||
-              !readyPoolIdentityEqual(stored.criteria.identity, input.identity) ||
-              (storedProvider !== undefined && storedProvider !== input.identity.image.provider) ||
-              (storedKey === policyKey && !readyPoolIdentityEqual(stored.identity, input.identity))
-            ) {
-              return json(
-                {
-                  error: "typed_ready_pool_desired_identity_mismatch",
-                  message:
-                    "stored typed desired capacity does not match the requested provider identity",
-                },
-                { status: 409 },
+        return this.readyPoolTransaction(typed, async (storage) => {
+          const owner = requestOwner(request);
+          const org = requestOrg(request, this.env);
+          let policyKey: string;
+          let previous: ReadyPoolDesiredCapacity | undefined;
+          let legacyPolicyKey: string | undefined;
+          if (input.identity) {
+            policyKey = await readyPoolDesiredCapacityKeyV2({
+              org,
+              owner,
+              key,
+              compatibilityKey,
+              identity: input.identity,
+            });
+            if (typed === "portable")
+              policyKey = policyKey.replace(
+                "typed-ready-pool-v2-desired:",
+                "portable-ready-pool-v1-desired:",
               );
+            const current = await storage.get<ReadyPoolDesiredCapacity>(policyKey);
+            const candidateLegacyKey = readyPoolLegacyTypedDesiredKey(
+              owner,
+              org,
+              key,
+              compatibilityKey,
+              input.identity,
+            );
+            const legacy =
+              typed !== "portable" && storageKeyWithinLimit(candidateLegacyKey)
+                ? await storage.get<ReadyPoolDesiredCapacity>(candidateLegacyKey)
+                : undefined;
+            for (const [storedKey, stored] of [
+              [policyKey, current],
+              [candidateLegacyKey, legacy],
+            ] as const) {
+              if (!stored) continue;
+              const storedProvider = stored.criteria.provider;
+              if (
+                !readyPoolDesiredCapacityScopeMatches(stored, owner, org, key, compatibilityKey) ||
+                !readyPoolIdentityEqual(stored.criteria.identity, input.identity) ||
+                (storedProvider !== undefined &&
+                  storedProvider !== input.identity.image.provider) ||
+                (storedKey === policyKey &&
+                  !readyPoolIdentityEqual(stored.identity, input.identity))
+              ) {
+                return json(
+                  {
+                    error: "typed_ready_pool_desired_identity_mismatch",
+                    message:
+                      "stored typed desired capacity does not match the requested provider identity",
+                  },
+                  { status: 409 },
+                );
+              }
+              previous ??= stored;
+              if (storedKey !== policyKey) legacyPolicyKey = storedKey;
             }
-            previous ??= stored;
-            if (storedKey !== policyKey) legacyPolicyKey = storedKey;
+          } else {
+            policyKey = readyPoolLegacyDesiredKey(owner, org, key, compatibilityKey);
+            previous = await storage.get<ReadyPoolDesiredCapacity>(policyKey);
           }
-        } else {
-          policyKey = readyPoolLegacyDesiredKey(owner, org, key, compatibilityKey);
-          previous = await this.state.storage.get<ReadyPoolDesiredCapacity>(policyKey);
-        }
-        const now = new Date(nowMs).toISOString();
-        const desired: ReadyPoolDesiredCapacity = {
-          key,
-          owner,
-          org,
-          criteria,
-          ...(input.identity ? { identity: input.identity } : {}),
-          minReady,
-          maxReady,
-          createdAt: previous?.createdAt ?? now,
-          updatedAt: now,
-          ...(compatibilityKey ? { compatibilityKey } : {}),
-        };
-        await this.state.storage.put(policyKey, desired);
-        if (legacyPolicyKey) {
-          await this.state.storage.delete(legacyPolicyKey);
-        }
-
-        const leases = new Map((await this.leaseRecords()).map((lease) => [lease.id, lease]));
-        const entries = (await this.readyPoolEntries(typed)).filter((entry) => {
-          const lease = leases.get(entry.leaseID);
-          return (
-            entry.key === key &&
-            Boolean(
-              lease && this.leaseManageableByRequest(lease, request, isAdminRequest(request)),
-            ) &&
-            readyPoolEntryMatches(entry, criteria)
-          );
-        });
-        const claims = (await this.readyPoolFillClaims(typed)).filter(
-          (claim) =>
-            claim.key === key &&
-            claim.owner === owner &&
-            claim.org === org &&
-            claim.compatibilityKey === compatibilityKey &&
-            readyPoolCriteriaEqual(claim.criteria, criteria),
-        );
-        const counts = readyPoolCapacityCounts(entries, claims.length);
-        const activeCapacity = counts.ready + counts.busy + counts.inFlight;
-        let claim: ReadyPoolFillClaim | undefined;
-        if (input.claim === true && counts.ready < minReady && activeCapacity < maxReady) {
-          claim = {
-            token: crypto.randomUUID(),
+          const now = new Date(nowMs).toISOString();
+          const desired: ReadyPoolDesiredCapacity = {
             key,
             owner,
             org,
             criteria,
-            createdAt: now,
-            expiresAt: new Date(nowMs + readyPoolFillClaimTimeoutMs).toISOString(),
+            ...(input.identity ? { identity: input.identity } : {}),
+            minReady,
+            maxReady,
+            createdAt: previous?.createdAt ?? now,
+            updatedAt: now,
             ...(compatibilityKey ? { compatibilityKey } : {}),
           };
-          await this.state.storage.put(readyPoolFillClaimKey(claim.token, typed), claim);
-          counts.inFlight++;
-          await this.incrementReadyPoolCounters(request, key, { fillClaimsCreated: 1 }, typed);
-        }
-        await this.scheduleAlarm();
-        const counters = await this.readyPoolCounters(request, key, typed);
-        return json({
-          desired: {
-            key: desired.key,
-            criteria: desired.criteria,
-            minReady: desired.minReady,
-            maxReady: desired.maxReady,
-            createdAt: desired.createdAt,
-            updatedAt: desired.updatedAt,
-            ...(desired.compatibilityKey ? { compatibilityKey: desired.compatibilityKey } : {}),
-          },
-          counts,
-          satisfied: counts.ready >= minReady,
-          reconciling: counts.ready + counts.inFlight >= minReady,
-          capped:
-            counts.ready < minReady && counts.ready + counts.busy + counts.inFlight >= maxReady,
-          claim: claim
-            ? {
-                token: claim.token,
-                key: claim.key,
-                criteria: claim.criteria,
-                createdAt: claim.createdAt,
-                expiresAt: claim.expiresAt,
-                ...(claim.compatibilityKey ? { compatibilityKey: claim.compatibilityKey } : {}),
-              }
-            : undefined,
-          counters,
+          await storage.put(policyKey, desired);
+          if (legacyPolicyKey) {
+            await storage.delete(legacyPolicyKey);
+          }
+
+          const leases = new Map(
+            [...(await storage.list<LeaseRecord>({ prefix: "lease:" })).values()].map((lease) => [
+              lease.id,
+              lease,
+            ]),
+          );
+          const entries = (await this.readyPoolEntries(typed, storage)).filter((entry) => {
+            const lease = leases.get(entry.leaseID);
+            return (
+              entry.key === key &&
+              Boolean(
+                lease && this.leaseManageableByRequest(lease, request, isAdminRequest(request)),
+              ) &&
+              readyPoolEntryMatches(entry, criteria)
+            );
+          });
+          const claims = (await this.readyPoolFillClaims(typed, storage)).filter(
+            (claim) =>
+              claim.key === key &&
+              claim.owner === owner &&
+              claim.org === org &&
+              claim.compatibilityKey === compatibilityKey &&
+              readyPoolCriteriaEqual(claim.criteria, criteria),
+          );
+          const counts = readyPoolCapacityCounts(entries, claims.length);
+          const activeCapacity =
+            counts.ready +
+            counts.busy +
+            counts.inFlight +
+            (typed === "portable" ? counts.quarantined + counts.draining : 0);
+          let claim: ReadyPoolFillClaim | undefined;
+          if (input.claim === true && counts.ready < minReady && activeCapacity < maxReady) {
+            claim = {
+              token: storedClaimToken,
+              key,
+              owner,
+              org,
+              criteria,
+              createdAt: now,
+              expiresAt: new Date(nowMs + readyPoolFillClaimTimeoutMs).toISOString(),
+              ...(compatibilityKey ? { compatibilityKey } : {}),
+            };
+            await storage.put(readyPoolFillClaimKey(claim.token, typed), claim);
+            if (typed === "portable")
+              await setPoolWake(storage, `claim-${claim.token}`, Date.parse(claim.expiresAt));
+            counts.inFlight++;
+            await this.incrementReadyPoolCounters(
+              request,
+              key,
+              { fillClaimsCreated: 1 },
+              typed,
+              storage,
+            );
+          }
+
+          const counters = await this.readyPoolCounters(request, key, typed, storage);
+          return json({
+            desired: {
+              key: desired.key,
+              criteria: desired.criteria,
+              minReady: desired.minReady,
+              maxReady: desired.maxReady,
+              createdAt: desired.createdAt,
+              updatedAt: desired.updatedAt,
+              ...(desired.compatibilityKey ? { compatibilityKey: desired.compatibilityKey } : {}),
+            },
+            counts,
+            satisfied: counts.ready >= minReady,
+            reconciling: counts.ready + counts.inFlight >= minReady,
+            capped: counts.ready < minReady && activeCapacity >= maxReady,
+            claim: claim
+              ? {
+                  token: rawClaimToken,
+                  key: claim.key,
+                  criteria: claim.criteria,
+                  createdAt: claim.createdAt,
+                  expiresAt: claim.expiresAt,
+                  ...(claim.compatibilityKey ? { compatibilityKey: claim.compatibilityKey } : {}),
+                }
+              : undefined,
+            counters,
+          });
         });
       }),
     );
+    await this.state.runExclusive(() => this.scheduleAlarm());
+    return response;
   }
 
   private async releaseReadyPoolFillClaim(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<Response> {
     const input = await readJson<{ claimToken?: string }>(request);
-    const token = nonSecretString(input.claimToken);
+    const rawToken = nonSecretString(input.claimToken);
+    const token = typed === "portable" ? await poolTokenHash("fill", rawToken) : rawToken;
     if (!token) {
       return json({ error: "fill_claim_token_required" }, { status: 400 });
     }
-    return await this.withReadyPoolBorrowLock(() =>
+    return await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(async () => {
         const claim = await this.state.storage.get<ReadyPoolFillClaim>(
           readyPoolFillClaimKey(token, typed),
@@ -13351,23 +13726,30 @@ export class FleetCoordinator {
         ) {
           return notFound();
         }
-        await this.state.storage.delete(readyPoolFillClaimKey(token, typed));
+        await this.readyPoolTransaction(typed, async (storage) => {
+          await storage.delete(readyPoolFillClaimKey(token, typed));
+          if (typed === "portable") await setPoolWake(storage, `claim-${token}`);
+        });
         await this.scheduleAlarm();
         return json({ released: true });
       }),
     );
   }
 
-  private async readyPoolMetrics(request: Request, key: string): Promise<Response> {
-    return await this.withReadyPoolBorrowLock(() =>
+  private async readyPoolMetrics(
+    request: Request,
+    key: string,
+    typed: ReadyPoolMode = false,
+  ): Promise<Response> {
+    return await this.readyPoolBorrowLock.run(() =>
       this.state.runExclusive(async () => {
         await this.maintainReadyPools(Date.now());
         const leases = new Map((await this.leaseRecords()).map((lease) => [lease.id, lease]));
-        const entries = (await this.readyPoolEntries()).filter((entry) => {
+        const entries = (await this.readyPoolEntries(typed)).filter((entry) => {
           const lease = leases.get(entry.leaseID);
           return entry.key === key && this.readyPoolEntryVisibleToRequest(entry, request, lease);
         });
-        const claims = (await this.readyPoolFillClaims()).filter(
+        const claims = (await this.readyPoolFillClaims(typed)).filter(
           (claim) =>
             claim.key === key &&
             claim.owner === requestOwner(request) &&
@@ -13376,7 +13758,7 @@ export class FleetCoordinator {
         return json({
           key,
           counts: readyPoolCapacityCounts(entries, claims.length),
-          counters: await this.readyPoolCounters(request, key),
+          counters: await this.readyPoolCounters(request, key, typed),
         });
       }),
     );
@@ -13385,7 +13767,7 @@ export class FleetCoordinator {
   private async returnReadyPoolLease(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<Response> {
     const input = await readJson<ReadyPoolReturnRequest>(request);
     if (!typed && input.identity !== undefined) {
@@ -13395,7 +13777,7 @@ export class FleetCoordinator {
     if (!validLeaseID(leaseID)) {
       return json({ error: "invalid_lease_id" }, { status: 400 });
     }
-    return await this.withReadyPoolBorrowLock(async () => {
+    return await this.readyPoolBorrowLock.run(async () => {
       const current = await this.getReadyPoolEntry(key, leaseID, typed);
       if (!current) {
         return notFound();
@@ -13555,6 +13937,7 @@ export class FleetCoordinator {
   private async maintainReadyPools(nowMs: number): Promise<void> {
     const entries: ReadyPoolEntry[] = [];
     const typedEntries: ReadyPoolEntry[] = [];
+    const portableEntries = await this.readyPoolEntries("portable");
     const leases = new Map<string, LeaseRecord>();
     await Promise.all([
       this.visitStorageRecords<ReadyPoolEntry>(readyPoolPrefix, async (entry) => {
@@ -13564,13 +13947,27 @@ export class FleetCoordinator {
         typedEntries.push(entry);
       }),
     ]);
-    for (const leaseID of new Set([...entries, ...typedEntries].map((entry) => entry.leaseID))) {
+    for (const leaseID of new Set(
+      [...entries, ...typedEntries, ...portableEntries].map((entry) => entry.leaseID),
+    )) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- bound retained-pool hydration to one referenced lease at a time.
       const lease = await this.getLease(leaseID, { noCache: true });
       if (lease) leases.set(leaseID, lease);
     }
     await this.maintainReadyPoolEntries(entries, leases, nowMs);
     await this.maintainReadyPoolEntries(typedEntries, leases, nowMs, true);
+    await this.maintainReadyPoolEntries(portableEntries, leases, nowMs, "portable");
+    await this.visitStorageRecords<ReadyPoolFillClaim>(
+      "portable-ready-pool-v1-fill-claim:",
+      async (claim) => {
+        if (Date.parse(claim.expiresAt) <= nowMs) {
+          await this.poolAccess.transaction(async (storage) => {
+            await storage.delete(readyPoolFillClaimKey(claim.token, "portable"));
+            await setPoolWake(storage, `claim-${claim.token}`);
+          });
+        }
+      },
+    );
     await this.visitStorageRecords<ReadyPoolFillClaim>(readyPoolFillClaimPrefix, async (claim) => {
       if (Date.parse(claim.expiresAt) <= nowMs) {
         await this.state.storage.delete(readyPoolFillClaimKey(claim.token));
@@ -13590,10 +13987,19 @@ export class FleetCoordinator {
     entries: ReadyPoolEntry[],
     leases: Map<string, LeaseRecord>,
     nowMs: number,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<void> {
     for (const entry of entries) {
       const lease = leases.get(entry.leaseID);
+      if (typed === "portable") {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- pending cleanup retains its capacity and binding.
+        const grant = await this.state.storage.get<PoolAccessGrant>(
+          portablePoolGrantKey(entry.leaseID),
+        );
+        if (grant && grant.state !== "revoked") continue;
+        // Never prune the only resource binding while provider cleanup is outstanding.
+        if (entry.state !== "ready" && lease && !leaseProviderCleanupConfirmed(lease)) continue;
+      }
       const backingLeaseExpiresAt = Date.parse(lease?.expiresAt ?? "");
       const leaseStale =
         !lease ||
@@ -13645,6 +14051,31 @@ export class FleetCoordinator {
         (entry.state === "stale" || entry.state === "quarantined" || entry.state === "draining") &&
         Date.parse(entry.updatedAt) + readyPoolTerminalRetentionMs <= nowMs
       ) {
+        if (typed === "portable") {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- terminal metadata and counters retire atomically after provider proof.
+          await this.poolAccess.transaction(async (storage) => {
+            const grant = await storage.get<PoolAccessGrant>(portablePoolGrantKey(entry.leaseID));
+            const currentLease = await storage.get<LeaseRecord>(leaseKey(entry.leaseID));
+            if (
+              (grant && grant.state !== "revoked") ||
+              (currentLease && !leaseProviderCleanupConfirmed(currentLease))
+            )
+              return;
+            await this.deleteReadyPoolEntry(entry, typed, storage);
+            await storage.delete(portablePoolGrantKey(entry.leaseID));
+            await storage.delete(portablePoolReservationKey(entry.leaseID));
+            await setPoolWake(storage, entry.leaseID);
+            await this.incrementReadyPoolCountersForScope(
+              entry.owner,
+              entry.org,
+              entry.key,
+              { stalePruned: 1 },
+              typed,
+              storage,
+            );
+          });
+          continue;
+        }
         // oxlint-disable-next-line eslint/no-await-in-loop -- pruning is serialized with counter persistence for this entry.
         await this.deleteReadyPoolEntry(entry, typed);
         // oxlint-disable-next-line eslint/no-await-in-loop -- counters sharing a scope must not lose concurrent increments.
@@ -13665,7 +14096,7 @@ export class FleetCoordinator {
     entry: ReadyPoolEntry,
     reason: string,
     nowMs: number,
-    typed = false,
+    typed: ReadyPoolMode = false,
   ): Promise<void> {
     await this.putReadyPoolEntry(
       withoutReadyPoolBorrow({
@@ -13774,7 +14205,7 @@ export class FleetCoordinator {
 
   private async drainMismatchedReadyPoolEntry(
     entry: ReadyPoolEntry,
-    typed: boolean,
+    typed: ReadyPoolMode,
   ): Promise<void> {
     if (entry.state === "draining") return;
     await this.putReadyPoolEntry(
@@ -13941,7 +14372,7 @@ export class FleetCoordinator {
         { status: 400 },
       );
     }
-    return await this.withDaytonaSnapshotBootstrapLock(name, async () => {
+    return await this.daytonaSnapshotBootstrapLocks.run(name, async () => {
       const result = await new DaytonaClient(this.env).bootstrapSnapshot(
         name,
         cpu,
@@ -14293,7 +14724,7 @@ export class FleetCoordinator {
   private async adminAzureOrphanSweep(request: Request): Promise<Response> {
     const config = this.azureOrphanSweepConfig();
     const lastRun =
-      (await this.state.storage.get<AzureOrphanSweepRecord>(azureOrphanSweepRecordKey)) ?? null;
+      (await this.state.storage.get<CloudOrphanSweepRecord>(azureOrphanSweepRecordKey)) ?? null;
     if (request.method.toUpperCase() === "GET") {
       return json({ config, lastRun });
     }
@@ -14510,24 +14941,7 @@ export class FleetCoordinator {
     if (leaseID && !validLeaseID(leaseID)) {
       return json({ error: "invalid_lease_id" }, { status: 400 });
     }
-    const command = Array.isArray(input.command) ? input.command.map(String) : [];
-    const label = sanitizeRunLabel(input.label);
-    // Bind the original request, not mutable lease attribution or provider-resolved fields.
-    const createRequestSHA256 = requestedRunID
-      ? await sha256Hex(
-          JSON.stringify([
-            "run-create-v1",
-            leaseID,
-            input.provider ?? "hetzner",
-            input.target ?? "linux",
-            input.windowsMode ?? "",
-            input.class ?? "",
-            input.serverType ?? "",
-            command,
-            label ?? "",
-          ]),
-        )
-      : undefined;
+    const createRequestSHA256 = requestedRunID ? await runAdmissionFingerprint(input) : undefined;
     const id = requestedRunID ?? newRunID();
     const now = new Date().toISOString();
     const committed = await this.state.storage.transaction(async (storage) => {
@@ -14543,39 +14957,7 @@ export class FleetCoordinator {
       if (lease && !this.leaseVisibleToRequest(lease, request, false)) {
         return { kind: "missing" as const };
       }
-      const run: RunRecord = {
-        id,
-        leaseID,
-        leaseIDs: [],
-        owner,
-        org,
-        leaseOwners: [],
-        provider: lease?.provider ?? input.provider ?? "hetzner",
-        target: lease?.target ?? input.target ?? "linux",
-        class: lease?.class ?? input.class ?? "",
-        serverType: lease?.serverType ?? input.serverType ?? "",
-        command,
-        state: "running",
-        phase: "starting",
-        logBytes: 0,
-        logTruncated: false,
-        startedAt: now,
-        lastEventAt: now,
-        eventCount: 1,
-      };
-      if (lease) {
-        this.setRunLeaseAttribution(run, lease);
-      }
-      const windowsMode = lease?.windowsMode ?? input.windowsMode;
-      if (windowsMode) {
-        run.windowsMode = windowsMode;
-      }
-      if (lease?.slug) {
-        run.slug = lease.slug;
-      }
-      if (label) {
-        run.label = label;
-      }
+      const run = this.initialRunRecord(id, owner, org, input, now, lease);
       if (createRequestSHA256) run.createRequestSHA256 = createRequestSHA256;
       const event = boundedRunEvent(id, 1, now, { type: "run.started", phase: "starting" });
       await storage.put(runKey(id), run);
@@ -14593,6 +14975,53 @@ export class FleetCoordinator {
         status: committed.kind === "created" ? 201 : 200,
       },
     );
+  }
+
+  private initialRunRecord(
+    id: string,
+    owner: string,
+    org: string,
+    input: RunCreateRequest,
+    now: string,
+    lease?: LeaseRecord,
+  ): RunRecord {
+    const leaseID = input.leaseID ?? "";
+    const command = Array.isArray(input.command) ? input.command.map(String) : [];
+    const label = sanitizeRunLabel(input.label);
+    const run: RunRecord = {
+      id,
+      leaseID,
+      leaseIDs: [],
+      owner,
+      org,
+      leaseOwners: [],
+      provider: lease?.provider ?? input.provider ?? "hetzner",
+      target: lease?.target ?? input.target ?? "linux",
+      class: lease?.class ?? input.class ?? "",
+      serverType: lease?.serverType ?? input.serverType ?? "",
+      command,
+      state: "running",
+      phase: "starting",
+      logBytes: 0,
+      logTruncated: false,
+      startedAt: now,
+      lastEventAt: now,
+      eventCount: 1,
+    };
+    if (lease) {
+      this.setRunLeaseAttribution(run, lease);
+    }
+    const windowsMode = lease?.windowsMode ?? input.windowsMode;
+    if (windowsMode) {
+      run.windowsMode = windowsMode;
+    }
+    if (lease?.slug) {
+      run.slug = lease.slug;
+    }
+    if (label) {
+      run.label = label;
+    }
+    return run;
   }
 
   private async createArtifactUploads(request: Request): Promise<Response> {
@@ -14687,6 +15116,9 @@ export class FleetCoordinator {
     if (method === "POST" && action === "finish") {
       return this.finishRun(request, runID);
     }
+    if (method === "POST" && action === "admission-failure") {
+      return this.failRunAdmission(request, runID);
+    }
     return json({ error: "not_found" }, { status: 404 });
   }
 
@@ -14711,6 +15143,66 @@ export class FleetCoordinator {
       return notFound();
     }
     const input = await readJson<RunFinishRequest>(request);
+    return this.commitRunFinish(request, runID, run, input);
+  }
+
+  private async failRunAdmission(request: Request, runID: string): Promise<Response> {
+    if (!/^run_[a-f0-9]{32}$/.test(runID))
+      return json({ error: "invalid_run_id" }, { status: 400 });
+    const input = await readJson<RunAdmissionFailureRequest>(request);
+    if (
+      !input ||
+      !input.admission ||
+      typeof input.admission !== "object" ||
+      Array.isArray(input.admission) ||
+      !Number.isInteger(input.exitCode) ||
+      input.exitCode < 1 ||
+      input.exitCode > 255 ||
+      typeof input.message !== "string"
+    ) {
+      return json({ error: "invalid_admission_failure" }, { status: 400 });
+    }
+    const leaseID = input.admission.leaseID ?? "";
+    if (leaseID && !validLeaseID(leaseID))
+      return json({ error: "invalid_lease_id" }, { status: 400 });
+    const owner = requestOwner(request),
+      org = requestOrg(request, this.env);
+    const fingerprint = await runAdmissionFingerprint(input.admission);
+    const existing = await this.getRun(runID);
+    if (existing && (existing.owner !== owner || existing.org !== org)) return notFound();
+    if (
+      existing &&
+      (existing.createRequestSHA256 !== fingerprint ||
+        (existing.state === "running"
+          ? existing.phase !== "starting" || existing.eventCount !== 1
+          : !existing.admissionFailedBeforeWork))
+    ) {
+      return json({ error: "run_admission_failure_conflict" }, { status: 409 });
+    }
+    const run =
+      existing ??
+      this.initialRunRecord(runID, owner, org, input.admission, new Date().toISOString());
+    if (!existing) {
+      run.eventCount = 0;
+      run.createRequestSHA256 = fingerprint;
+    }
+    return this.commitRunFinish(
+      request,
+      runID,
+      run,
+      { exitCode: input.exitCode, syncMs: 0, commandMs: 0, log: input.message },
+      { fingerprint, input: input.admission },
+    );
+  }
+
+  private async commitRunFinish(
+    request: Request,
+    runID: string,
+    run: RunRecord,
+    input: RunFinishRequest,
+    admission?: { fingerprint: string; input: RunCreateRequest },
+  ): Promise<Response> {
+    const admissionFingerprint = admission?.fingerprint;
     const now = new Date();
     const exitCode = Number.isFinite(input.exitCode) ? input.exitCode : 1;
     const syncMs = finiteNumber(input.syncMs);
@@ -14773,17 +15265,48 @@ export class FleetCoordinator {
     try {
       await writeTerminalRunLog(this.state.storage, terminalLogPrefix, logInput.log);
       committed = await this.state.storage.transaction(async (storage) => {
-        const current = await storage.get<RunRecord>(runKey(runID));
+        let current = await storage.get<RunRecord>(runKey(runID));
+        if (admissionFingerprint) {
+          if (current && (current.owner !== run.owner || current.org !== run.org))
+            return { kind: "missing" as const };
+          if (
+            current &&
+            (current.createRequestSHA256 !== admissionFingerprint ||
+              (current.state === "running"
+                ? current.phase !== "starting" || current.eventCount !== 1
+                : !current.admissionFailedBeforeWork))
+          ) {
+            return { kind: "conflict" as const, run: current };
+          }
+          if (!current) {
+            const lease = run.leaseID
+              ? await storage.get<LeaseRecord>(leaseKey(run.leaseID))
+              : undefined;
+            if (lease && !this.leaseVisibleToRequest(lease, request, false))
+              return { kind: "missing" as const };
+            current = this.initialRunRecord(
+              runID,
+              run.owner,
+              run.org,
+              admission!.input,
+              run.startedAt,
+              lease,
+            );
+            current.eventCount = 0;
+            current.createRequestSHA256 = admissionFingerprint;
+          }
+        }
         if (!current) return { kind: "missing" as const };
         if (current.state !== "running") {
           return current.terminalFinishSHA256 === requestedFingerprint
             ? { kind: "duplicate" as const, run: current }
             : { kind: "conflict" as const, run: current };
         }
-        if (!sameTerminalRunBinding(current, run)) {
+        if (!admissionFingerprint && !sameTerminalRunBinding(current, run)) {
           return { kind: "conflict" as const, run: current };
         }
         const next = { ...current };
+        if (admissionFingerprint) next.admissionFailedBeforeWork = true;
         next.exitCode = exitCode;
         next.syncMs = normalizedSyncMs;
         next.commandMs = normalizedCommandMs;
@@ -14807,7 +15330,7 @@ export class FleetCoordinator {
         next.terminalLogPrefix = terminalLogPrefix;
         const seq = (next.eventCount ?? 0) + 1;
         const event = boundedRunEvent(next.id, seq, endedAt, {
-          type: "command.finished",
+          type: admissionFingerprint ? "run.failed" : "command.finished",
           phase: next.state,
           exitCode: next.exitCode,
         });
@@ -16693,6 +17216,17 @@ export class FleetCoordinator {
         // deletes belong to actual candidates, including persisted egress left by a restart.
         if (!needsCleanup && !closeBridges) return;
         if (await provisioningOwnsLease(this.state.storage, stored.id)) return;
+        if (
+          stored.provider === "aws" &&
+          leaseUsesCanonicalProviderKey(stored) &&
+          stored.providerKeyCleanupPending &&
+          !stored.cloudID &&
+          stored.provisioningRequestStartedAt &&
+          !stored.provisioningRequestSettledAt &&
+          !interruptedProvisioningVersionMismatch(stored, this.coordinatorGeneration)
+        ) {
+          return;
+        }
         if (closeBridges) {
           await this.closeLeaseBridges(stored.id, 1008, "lease ended");
         }
@@ -16956,9 +17490,15 @@ export class FleetCoordinator {
         if (Number.isFinite(expiresAt)) retainAlarm(Math.max(now + 1, expiresAt));
       },
     );
-    const orphanSweepAlarm = await this.nextAWSOrphanSweepAlarmTime();
+    const orphanSweepAlarm = await this.nextOrphanSweepAlarmTime(
+      "aws",
+      this.awsOrphanSweepConfig(),
+    );
     retainAlarm(orphanSweepAlarm);
-    const azureOrphanSweepAlarm = await this.nextAzureOrphanSweepAlarmTime();
+    const azureOrphanSweepAlarm = await this.nextOrphanSweepAlarmTime(
+      "azure",
+      this.azureOrphanSweepConfig(),
+    );
     retainAlarm(azureOrphanSweepAlarm);
     const azureCleanupAlarm = await this.nextAzureDeferredCleanupAlarmTime();
     retainAlarm(azureCleanupAlarm);
@@ -17060,7 +17600,7 @@ export class FleetCoordinator {
     }
     for (const target of work) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- one fence protects all shared AWS ingress mutations.
-      await this.withAWSIngressOperationLock(async () => {
+      await this.awsIngressOperationLock.run(async () => {
         const fresh = await this.state.runExclusive(async () => {
           const stored = await this.state.storage.get<StoredAWSIngressReconcileRecord>(
             awsIngressReconcileRecordKey,
@@ -17230,46 +17770,53 @@ export class FleetCoordinator {
     );
   }
 
-  private async nextAWSOrphanSweepAlarmTime(): Promise<number | undefined> {
-    const config = this.awsOrphanSweepConfig();
-    if (!config.enabled) {
-      return undefined;
-    }
-    const lastRun = await this.state.storage.get<AWSOrphanSweepRecord>(awsOrphanSweepRecordKey);
+  private async nextOrphanSweepAlarmTime(
+    provider: "aws" | "azure",
+    config: CloudOrphanSweepConfig,
+  ): Promise<number | undefined> {
+    if (!config.enabled) return undefined;
+    const lastRun = await this.state.storage.get<CloudOrphanSweepRecord>(
+      `${provider}-orphan-sweep:last`,
+    );
     const lastFinishedAt = Date.parse(lastRun?.finishedAt ?? "");
     const now = Date.now();
     if (!Number.isFinite(lastFinishedAt)) {
-      const stored = await this.state.storage.get<number>(awsOrphanSweepFirstAlarmKey);
+      const firstAlarmKey = `${provider}-orphan-sweep:first-alarm`;
+      const stored = await this.state.storage.get<number>(firstAlarmKey);
       if (typeof stored === "number" && Number.isFinite(stored)) {
         return Math.max(now + 1000, stored);
       }
-      const next = now + Math.min(config.intervalSeconds * 1000, awsOrphanSweepInitialDelayMs);
-      await this.state.storage.put(awsOrphanSweepFirstAlarmKey, next);
+      const next = now + Math.min(config.intervalSeconds * 1000, orphanSweepInitialDelayMs);
+      await this.state.storage.put(firstAlarmKey, next);
       return next;
     }
     return Math.max(now + 1000, lastFinishedAt + config.intervalSeconds * 1000);
+  }
+
+  private async orphanSweepDue(
+    key: string,
+    trigger: "alarm" | "admin",
+    config: CloudOrphanSweepConfig,
+  ): Promise<boolean> {
+    if (!config.enabled) return false;
+    const lastRun = await this.state.runExclusive(() =>
+      this.state.storage.get<CloudOrphanSweepRecord>(key),
+    );
+    const lastFinishedAt = Date.parse(lastRun?.finishedAt ?? "");
+    return !(
+      trigger !== "admin" &&
+      Number.isFinite(lastFinishedAt) &&
+      Date.now() < lastFinishedAt + config.intervalSeconds * 1000
+    );
   }
 
   private async runAWSOrphanSweepIfDue(
     trigger: "alarm" | "admin",
     requestedConfig?: AWSOrphanSweepConfig,
   ): Promise<AWSOrphanSweepRecord | undefined> {
-    return this.withProviderMaintenanceLock(async () => {
+    return this.providerMaintenanceLock.run(async () => {
       const config = requestedConfig ?? this.awsOrphanSweepConfig();
-      if (!config.enabled) {
-        return undefined;
-      }
-      const lastRun = await this.state.runExclusive(() =>
-        this.state.storage.get<AWSOrphanSweepRecord>(awsOrphanSweepRecordKey),
-      );
-      const lastFinishedAt = Date.parse(lastRun?.finishedAt ?? "");
-      if (
-        trigger !== "admin" &&
-        Number.isFinite(lastFinishedAt) &&
-        Date.now() < lastFinishedAt + config.intervalSeconds * 1000
-      ) {
-        return undefined;
-      }
+      if (!(await this.orphanSweepDue(awsOrphanSweepRecordKey, trigger, config))) return undefined;
       return await this.runAWSOrphanSweep(trigger, config);
     });
   }
@@ -17379,7 +17926,7 @@ export class FleetCoordinator {
     const activeLeases = new Map(activeAWSLeases.map((lease) => [lease.id, lease]));
     const activeCloudIDs = new Set(activeAWSLeases.map((lease) => lease.cloudID).filter(Boolean));
     for (const { machine, region } of inventory) {
-      const candidate = awsOrphanSweepCandidate(
+      const candidate = cloudOrphanSweepCandidate(
         machine,
         activeLeases,
         activeCloudIDs,
@@ -17395,49 +17942,22 @@ export class FleetCoordinator {
         ownershipLease && providerMachineOwnedByLease(machine, ownershipLease, "aws")
           ? ownershipLease
           : undefined;
-      recordCloudOrphanSweepOwnership(candidate, exactOwnershipLease);
-      const scopeObservedKeys = reconciliationObservedKeys.get(region);
-      const observation =
-        exactOwnershipLease && scopeObservedKeys
-          ? // oxlint-disable-next-line eslint/no-await-in-loop -- candidate state is read before its provider release decision.
-            await this.observeStoredProviderReconciliationCandidate({
-              provider: "aws",
-              scope: region,
-              resourceID: cloudID,
-              fingerprint: providerReconciliationFingerprint("aws", region, machine),
-              now,
-              quarantineSeconds: config.graceSeconds,
-            })
-          : undefined;
-      if (observation && scopeObservedKeys) {
-        scopeObservedKeys.add(observation.key);
-        candidate.action = "quarantined";
-      }
-      let released = false;
-      if (config.deleteEnabled && exactOwnershipLease && observation?.action === "release") {
-        try {
-          // AWS release re-reads canonical ownership and deletes the exact instance; success means absent or terminated.
-          // oxlint-disable-next-line eslint/no-await-in-loop -- release failures must stay attached to the candidate.
-          await this.provider("aws", region).releaseLease(exactOwnershipLease);
-          candidate.action = "terminated";
-          released = true;
-        } catch (error) {
-          candidate.action = "terminate_failed";
-          candidate.error = coordinatorErrorMessage(this.env, error);
+      // oxlint-disable-next-line eslint/no-await-in-loop -- persist each candidate before advancing.
+      await this.reconcileOrphanSweepCandidate(candidate, {
+        provider: "aws",
+        machine,
+        cloudID,
+        region,
+        now,
+        config,
+        lease: exactOwnershipLease,
+        observedKeys: reconciliationObservedKeys.get(region),
+        release: (lease) => this.provider("aws", region).releaseLease(lease),
+        reportError: (error) =>
           console.warn(
-            `aws orphan sweep terminate failed region=${region} cloud=${machine.cloudID}: ${candidate.error}`,
-          );
-        }
-      }
-      if (observation) {
-        if (released) {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- persist each candidate's final state before advancing.
-          await this.state.storage.delete(observation.key);
-        } else {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- persist each candidate's final state before advancing.
-          await this.state.storage.put(observation.key, observation.quarantine);
-        }
-      }
+            `aws orphan sweep terminate failed region=${region} cloud=${machine.cloudID}: ${error}`,
+          ),
+      });
       candidates.push(candidate);
     }
     for (const [region, observedKeys] of reconciliationObservedKeys) {
@@ -17504,6 +18024,50 @@ export class FleetCoordinator {
     return record;
   }
 
+  private async reconcileOrphanSweepCandidate(
+    candidate: CloudOrphanSweepCandidate,
+    input: {
+      provider: "aws" | "azure";
+      machine: ProviderMachine;
+      cloudID: string;
+      region: string;
+      now: number;
+      config: CloudOrphanSweepConfig;
+      lease: LeaseRecord | undefined;
+      observedKeys: Set<string> | undefined;
+      release: (lease: LeaseRecord) => Promise<void>;
+      reportError: (message: string) => void;
+    },
+  ): Promise<void> {
+    const { provider, machine, cloudID, region, now, config, lease, observedKeys } = input;
+    recordCloudOrphanSweepOwnership(candidate, lease);
+    if (!lease || !observedKeys) return;
+    const observation = await this.observeStoredProviderReconciliationCandidate({
+      provider,
+      scope: region,
+      resourceID: cloudID,
+      fingerprint: providerReconciliationFingerprint(provider, region, machine),
+      now,
+      quarantineSeconds: config.graceSeconds,
+    });
+    observedKeys.add(observation.key);
+    candidate.action = "quarantined";
+    let released = false;
+    if (config.deleteEnabled && observation.action === "release") {
+      try {
+        await input.release(lease);
+        candidate.action = "terminated";
+        released = true;
+      } catch (error) {
+        candidate.action = "terminate_failed";
+        candidate.error = coordinatorErrorMessage(this.env, error);
+        input.reportError(candidate.error);
+      }
+    }
+    if (released) await this.state.storage.delete(observation.key);
+    else await this.state.storage.put(observation.key, observation.quarantine);
+  }
+
   private awsOrphanSweepConfig(): AWSOrphanSweepConfig {
     const hasAWSCredentials = awsOrphanSweepCredentialsConfigured(this.env);
     const enabled =
@@ -17531,46 +18095,14 @@ export class FleetCoordinator {
     };
   }
 
-  private async nextAzureOrphanSweepAlarmTime(): Promise<number | undefined> {
-    const config = this.azureOrphanSweepConfig();
-    if (!config.enabled) {
-      return undefined;
-    }
-    const lastRun = await this.state.storage.get<AzureOrphanSweepRecord>(azureOrphanSweepRecordKey);
-    const lastFinishedAt = Date.parse(lastRun?.finishedAt ?? "");
-    const now = Date.now();
-    if (!Number.isFinite(lastFinishedAt)) {
-      const stored = await this.state.storage.get<number>(azureOrphanSweepFirstAlarmKey);
-      if (typeof stored === "number" && Number.isFinite(stored)) {
-        return Math.max(now + 1000, stored);
-      }
-      const next = now + Math.min(config.intervalSeconds * 1000, azureOrphanSweepInitialDelayMs);
-      await this.state.storage.put(azureOrphanSweepFirstAlarmKey, next);
-      return next;
-    }
-    return Math.max(now + 1000, lastFinishedAt + config.intervalSeconds * 1000);
-  }
-
   private async runAzureOrphanSweepIfDue(
     trigger: "alarm" | "admin",
-    requestedConfig?: AzureOrphanSweepConfig,
-  ): Promise<AzureOrphanSweepRecord | undefined> {
-    return this.withProviderMaintenanceLock(async () => {
+    requestedConfig?: CloudOrphanSweepConfig,
+  ): Promise<CloudOrphanSweepRecord | undefined> {
+    return this.providerMaintenanceLock.run(async () => {
       const config = requestedConfig ?? this.azureOrphanSweepConfig();
-      if (!config.enabled) {
+      if (!(await this.orphanSweepDue(azureOrphanSweepRecordKey, trigger, config)))
         return undefined;
-      }
-      const lastRun = await this.state.runExclusive(() =>
-        this.state.storage.get<AzureOrphanSweepRecord>(azureOrphanSweepRecordKey),
-      );
-      const lastFinishedAt = Date.parse(lastRun?.finishedAt ?? "");
-      if (
-        trigger !== "admin" &&
-        Number.isFinite(lastFinishedAt) &&
-        Date.now() < lastFinishedAt + config.intervalSeconds * 1000
-      ) {
-        return undefined;
-      }
       return await this.runAzureOrphanSweep(trigger, config);
     });
   }
@@ -17578,11 +18110,11 @@ export class FleetCoordinator {
   private async runAzureOrphanSweep(
     trigger: "alarm" | "admin",
     config = this.azureOrphanSweepConfig(),
-  ): Promise<AzureOrphanSweepRecord> {
+  ): Promise<CloudOrphanSweepRecord> {
     const startedAt = new Date().toISOString();
     const now = Date.now();
     const candidates: AzureOrphanSweepCandidate[] = [];
-    const errors: AzureOrphanSweepRecord["errors"] = [];
+    const errors: CloudOrphanSweepRecord["errors"] = [];
     const inventory: Array<{ machine: ProviderMachine; region: string }> = [];
     const reconciliationObservedKeys = new Set<string>();
     let inventorySucceeded = false;
@@ -17671,50 +18203,25 @@ export class FleetCoordinator {
         ownershipLease && providerMachineOwnedByLease(machine, ownershipLease, "azure")
           ? ownershipLease
           : undefined;
-      recordCloudOrphanSweepOwnership(candidate, exactOwnershipLease);
-      const observation =
-        exactOwnershipLease && inventorySucceeded
-          ? // oxlint-disable-next-line eslint/no-await-in-loop -- candidate state is read before its provider release decision.
-            await this.observeStoredProviderReconciliationCandidate({
-              provider: "azure",
-              scope: region,
-              resourceID: cloudID,
-              fingerprint: providerReconciliationFingerprint("azure", region, machine),
-              now,
-              quarantineSeconds: config.graceSeconds,
-            })
-          : undefined;
-      if (observation) {
-        reconciliationObservedKeys.add(observation.key);
-        candidate.action = "quarantined";
-      }
-      let released = false;
-      if (config.deleteEnabled && exactOwnershipLease && observation?.action === "release") {
-        try {
-          // Azure release uses the persisted provider scope and resumable owned-resource deletion.
-          // oxlint-disable-next-line eslint/no-await-in-loop -- release failures must stay attached to the candidate.
-          await this.withLegacyProviderMutation(exactOwnershipLease.id, () =>
-            this.provider("azure", region).releaseLease(exactOwnershipLease, {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- persist each candidate before advancing.
+      await this.reconcileOrphanSweepCandidate(candidate, {
+        provider: "azure",
+        machine,
+        cloudID,
+        region,
+        now,
+        config,
+        lease: exactOwnershipLease,
+        observedKeys: inventorySucceeded ? reconciliationObservedKeys : undefined,
+        release: (lease) =>
+          this.withLegacyProviderMutation(lease.id, () =>
+            this.provider("azure", region).releaseLease(lease, {
               resourceIdentity: machine.resourceIdentity ?? "",
             }),
-          );
-          candidate.action = "terminated";
-          released = true;
-        } catch (error) {
-          candidate.action = "terminate_failed";
-          candidate.error = coordinatorErrorMessage(this.env, error);
-          console.warn("azure orphan sweep terminate failed; inspect the sweep record for details");
-        }
-      }
-      if (observation) {
-        if (released) {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- persist each candidate's final state before advancing.
-          await this.state.storage.delete(observation.key);
-        } else {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- persist each candidate's final state before advancing.
-          await this.state.storage.put(observation.key, observation.quarantine);
-        }
-      }
+          ),
+        reportError: () =>
+          console.warn("azure orphan sweep terminate failed; inspect the sweep record for details"),
+      });
       candidates.push(candidate);
     }
     if (inventorySucceeded) {
@@ -17727,7 +18234,7 @@ export class FleetCoordinator {
       );
     }
     const finishedAt = new Date().toISOString();
-    const record: AzureOrphanSweepRecord = {
+    const record: CloudOrphanSweepRecord = {
       startedAt,
       finishedAt,
       mode: config.deleteEnabled ? "delete" : "report",
@@ -17752,7 +18259,7 @@ export class FleetCoordinator {
     return record;
   }
 
-  private azureOrphanSweepConfig(): AzureOrphanSweepConfig {
+  private azureOrphanSweepConfig(): CloudOrphanSweepConfig {
     const hasAzureCredentials = Boolean(
       this.env.AZURE_TENANT_ID &&
       this.env.AZURE_CLIENT_ID &&
@@ -18036,32 +18543,13 @@ export class FleetCoordinator {
     prefix: string,
     visitor: (record: T, key: string) => Promise<boolean | void> | boolean | void,
   ): Promise<void> {
-    let startAfter: string | undefined;
-    for (;;) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- each bounded page starts after the previous page.
-      const page = await this.state.storage.list<T>({
-        prefix,
-        limit: storageRecordScanBatchSize,
-        noCache: true,
-        ...(startAfter ? { startAfter } : {}),
-      });
-      if (page.size === 0) {
-        break;
-      }
-      for (const [key, record] of page) {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential visits bound legacy record hydration.
-        const shouldContinue = await visitor(record, key);
-        if (shouldContinue === false) {
-          return;
-        }
-      }
-      const nextStartAfter = [...page.keys()].at(-1);
-      if (!nextStartAfter || nextStartAfter === startAfter) {
-        throw new Error(`${prefix} record scan did not advance`);
-      }
-      startAfter = nextStartAfter;
-      if (page.size < storageRecordScanBatchSize) {
-        break;
+    for await (const [key, record] of coordinatorStorageEntries<T>(this.state.storage, {
+      prefix,
+      limit: storageRecordScanBatchSize,
+      noCache: true,
+    })) {
+      if ((await visitor(record, key)) === false) {
+        return;
       }
     }
   }
@@ -18087,16 +18575,28 @@ export class FleetCoordinator {
     return active;
   }
 
-  private async readyPoolEntries(typed = false): Promise<ReadyPoolEntry[]> {
-    const entries = await this.state.storage.list<ReadyPoolEntry>({
-      prefix: typed ? typedReadyPoolPrefix : readyPoolPrefix,
+  private async readyPoolEntries(
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
+  ): Promise<ReadyPoolEntry[]> {
+    const entries = await storage.list<ReadyPoolEntry>({
+      prefix:
+        typed === "portable" ? portablePoolPrefix : typed ? typedReadyPoolPrefix : readyPoolPrefix,
     });
     return [...entries.values()];
   }
 
-  private async readyPoolFillClaims(typed = false): Promise<ReadyPoolFillClaim[]> {
-    const claims = await this.state.storage.list<ReadyPoolFillClaim>({
-      prefix: typed ? typedReadyPoolFillClaimPrefix : readyPoolFillClaimPrefix,
+  private async readyPoolFillClaims(
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
+  ): Promise<ReadyPoolFillClaim[]> {
+    const claims = await storage.list<ReadyPoolFillClaim>({
+      prefix:
+        typed === "portable"
+          ? "portable-ready-pool-v1-fill-claim:"
+          : typed
+            ? typedReadyPoolFillClaimPrefix
+            : readyPoolFillClaimPrefix,
     });
     return [...claims.values()];
   }
@@ -18104,13 +18604,15 @@ export class FleetCoordinator {
   private async readyPoolCounters(
     request: Request,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
   ): Promise<ReadyPoolCounters> {
     return await this.readyPoolCountersForScope(
       requestOwner(request),
       requestOrg(request, this.env),
       key,
       typed,
+      storage,
     );
   }
 
@@ -18118,12 +18620,12 @@ export class FleetCoordinator {
     owner: string,
     org: string,
     key: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
   ): Promise<ReadyPoolCounters> {
     return (
-      (await this.state.storage.get<ReadyPoolCounters>(
-        readyPoolCountersKey(owner, org, key, typed),
-      )) ?? emptyReadyPoolCounters()
+      (await storage.get<ReadyPoolCounters>(readyPoolCountersKey(owner, org, key, typed))) ??
+      emptyReadyPoolCounters()
     );
   }
 
@@ -18131,7 +18633,8 @@ export class FleetCoordinator {
     request: Request,
     key: string,
     delta: Partial<Record<keyof Omit<ReadyPoolCounters, "updatedAt">, number>>,
-    typed = false,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
   ): Promise<void> {
     await this.incrementReadyPoolCountersForScope(
       requestOwner(request),
@@ -18139,6 +18642,7 @@ export class FleetCoordinator {
       key,
       delta,
       typed,
+      storage,
     );
   }
 
@@ -18147,117 +18651,42 @@ export class FleetCoordinator {
     org: string,
     key: string,
     delta: Partial<Record<keyof Omit<ReadyPoolCounters, "updatedAt">, number>>,
-    typed = false,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
   ): Promise<void> {
-    const counters = await this.readyPoolCountersForScope(owner, org, key, typed);
+    const counters = await this.readyPoolCountersForScope(owner, org, key, typed, storage);
     for (const [name, amount] of Object.entries(delta) as Array<
       [keyof Omit<ReadyPoolCounters, "updatedAt">, number]
     >) {
-      counters[name] += amount;
+      counters[name] = (counters[name] ?? 0) + amount;
     }
     counters.updatedAt = new Date().toISOString();
-    await this.state.storage.put(readyPoolCountersKey(owner, org, key, typed), counters);
+    await storage.put(readyPoolCountersKey(owner, org, key, typed), counters);
   }
 
   private async getReadyPoolEntry(
     key: string,
     leaseID: string,
-    typed = false,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
   ): Promise<ReadyPoolEntry | undefined> {
-    return this.state.storage.get<ReadyPoolEntry>(readyPoolKey(key, leaseID, typed));
+    return storage.get<ReadyPoolEntry>(readyPoolKey(key, leaseID, typed));
   }
 
-  private async putReadyPoolEntry(entry: ReadyPoolEntry, typed = false): Promise<void> {
-    await this.state.storage.put(readyPoolKey(entry.key, entry.leaseID, typed), entry);
+  private async putReadyPoolEntry(
+    entry: ReadyPoolEntry,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
+  ): Promise<void> {
+    await storage.put(readyPoolKey(entry.key, entry.leaseID, typed), entry);
   }
 
-  private async deleteReadyPoolEntry(entry: ReadyPoolEntry, typed = false): Promise<void> {
-    await this.state.storage.delete(readyPoolKey(entry.key, entry.leaseID, typed));
-  }
-
-  private async withReadyPoolBorrowLock<T>(operation: () => Promise<T>): Promise<T> {
-    let release!: () => void;
-    const previous = this.readyPoolBorrowQueue.catch(() => {});
-    const next = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.readyPoolBorrowQueue = previous.then(() => next);
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
-
-  private async withBridgeTicketLock<T>(operation: () => Promise<T>): Promise<T> {
-    let release!: () => void;
-    const previous = this.bridgeTicketQueue.catch(() => {});
-    const next = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.bridgeTicketQueue = previous.then(() => next);
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
-
-  private async withAWSIngressOperationLock<T>(operation: () => Promise<T>): Promise<T> {
-    let release!: () => void;
-    const previous = this.awsIngressBarrier.catch(() => {});
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.awsIngressBarrier = previous.then(() => gate);
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
-
-  private async withProviderMaintenanceLock<T>(operation: () => Promise<T>): Promise<T> {
-    let release!: () => void;
-    const previous = this.providerMaintenanceQueue.catch(() => {});
-    const next = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.providerMaintenanceQueue = previous.then(() => next);
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
-
-  private async withDaytonaSnapshotBootstrapLock<T>(
-    name: string,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    let release!: () => void;
-    const previous =
-      this.daytonaSnapshotBootstrapQueues.get(name)?.catch(() => {}) ?? Promise.resolve();
-    const next = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.then(() => next);
-    this.daytonaSnapshotBootstrapQueues.set(name, tail);
-    await previous;
-    try {
-      // Daytona exposes async snapshot completion by name, so same-name
-      // bootstraps must not overlap and observe another request's active row.
-      return await operation();
-    } finally {
-      release();
-      if (this.daytonaSnapshotBootstrapQueues.get(name) === tail) {
-        this.daytonaSnapshotBootstrapQueues.delete(name);
-      }
-    }
+  private async deleteReadyPoolEntry(
+    entry: ReadyPoolEntry,
+    typed: ReadyPoolMode = false,
+    storage: CoordinatorStorageView = this.state.storage,
+  ): Promise<void> {
+    await storage.delete(readyPoolKey(entry.key, entry.leaseID, typed));
   }
 
   private async recentRuns(
@@ -18871,6 +19300,8 @@ export class FleetCoordinator {
   }
 
   private async deleteLeaseServer(lease: LeaseRecord): Promise<void> {
+    if (lease.portablePoolAccess)
+      await this.poolAccess.invalidateLease(lease.id, "lease timeout or provider cleanup");
     const provider = managedLeaseProvider(lease);
     if (!provider) {
       return;
@@ -19225,6 +19656,8 @@ export class FleetCoordinator {
     ) {
       return current;
     }
+    if (current.portablePoolAccess)
+      await this.poolAccess.invalidateLease(current.id, "lease released");
     if (this.state.provisioning) {
       const released = await this.state.provisioning.commitAndWake(async (transaction) => {
         const latest = await transaction.get<LeaseRecord>(leaseKey(current.id));
@@ -19406,7 +19839,7 @@ export class FleetCoordinator {
   private withLeaseCleanupState<T>(lease: LeaseRecord, operation: () => Promise<T>): Promise<T> {
     const commit = () => this.state.runExclusive(operation);
     return managedLeaseProvider(lease) === "aws" && !lease.network?.awsPrivate
-      ? this.withAWSIngressOperationLock(commit)
+      ? this.awsIngressOperationLock.run(commit)
       : commit();
   }
 
@@ -19514,6 +19947,12 @@ const createAttemptCanceledMessage = "create attempt was canceled before complet
 class CreateAttemptCanceledError extends Error {
   constructor() {
     super(createAttemptCanceledMessage);
+  }
+}
+
+class ProviderDispatchFenceError extends Error {
+  constructor(readonly current: LeaseRecord | undefined) {
+    super("lease changed state before provider mutation");
   }
 }
 
@@ -19782,8 +20221,7 @@ async function readyPoolTaggedDigest(
     payload.set(field.encoded, offset);
     offset += field.encoded.byteLength;
   }
-  const digest = await crypto.subtle.digest("SHA-256", payload);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return sha256Hex(payload);
 }
 
 function validUnicodeScalarString(value: string): boolean {
@@ -19879,13 +20317,24 @@ function readyPoolEntryMatches(entry: ReadyPoolEntry, input: ReadyPoolBorrowRequ
     readyPoolFieldMatches(entry.fingerprint, input.fingerprint, false, exactSeed) &&
     readyPoolFieldMatches(entry.compatibilityKey, input.compatibilityKey) &&
     readyPoolFieldMatches(entry.provider, input.provider) &&
-    readyPoolFieldMatches(entry.target, input.target)
+    readyPoolFieldMatches(entry.target, input.target) &&
+    readyPoolFieldMatches(entry.class, input.class) &&
+    readyPoolFieldMatches(entry.serverType, input.serverType)
   );
 }
 
 function readyPoolCriteria(input: ReadyPoolBorrowRequest): ReadyPoolBorrowRequest {
   const criteria: ReadyPoolBorrowRequest = {};
-  for (const key of ["repo", "ref", "commit", "fingerprint", "provider", "target"] as const) {
+  for (const key of [
+    "repo",
+    "ref",
+    "commit",
+    "fingerprint",
+    "provider",
+    "target",
+    "class",
+    "serverType",
+  ] as const) {
     const value =
       input.identity && key !== "provider" && key !== "target"
         ? typeof input[key] === "string"
@@ -19929,6 +20378,8 @@ function readyPoolCriteriaEqual(
     "compatibilityKey",
     "provider",
     "target",
+    "class",
+    "serverType",
   ] as const) {
     if (normalizedLeft[key] !== normalizedRight[key]) return false;
   }
@@ -19975,6 +20426,7 @@ function withoutReadyPoolBorrow(entry: ReadyPoolEntry): ReadyPoolEntry {
     borrowHeartbeatRequired: _borrowHeartbeatRequired,
     borrowHeartbeatAt: _borrowHeartbeatAt,
     borrowExpiresAt: _borrowExpiresAt,
+    borrowHardDeadline: _borrowHardDeadline,
     borrowToken: _borrowToken,
     ...rest
   } = entry;
@@ -19983,6 +20435,7 @@ function withoutReadyPoolBorrow(entry: ReadyPoolEntry): ReadyPoolEntry {
   void _borrowHeartbeatRequired;
   void _borrowHeartbeatAt;
   void _borrowExpiresAt;
+  void _borrowHardDeadline;
   void _borrowToken;
   return rest;
 }
@@ -20065,8 +20518,8 @@ function readyPoolFieldMatches(
   return got === want || (allowMissing && got === "");
 }
 
-function readyPoolKey(key: string, leaseID: string, typed = false): string {
-  return `${typed ? typedReadyPoolPrefix : readyPoolPrefix}${key}:${leaseID}`;
+function readyPoolKey(key: string, leaseID: string, typed: ReadyPoolMode = false): string {
+  return `${typed === "portable" ? portablePoolPrefix : typed ? typedReadyPoolPrefix : readyPoolPrefix}${key}:${leaseID}`;
 }
 
 function readyPoolLegacyDesiredKey(
@@ -20149,12 +20602,21 @@ function storageKeyWithinLimit(key: string): boolean {
   return textEncoder.encode(key).byteLength <= durableObjectStorageKeyMaxBytes;
 }
 
-function readyPoolFillClaimKey(token: string, typed = false): string {
-  return `${typed ? typedReadyPoolFillClaimPrefix : readyPoolFillClaimPrefix}${token}`;
+function readyPoolFillClaimKey(token: string, typed: ReadyPoolMode = false): string {
+  return `${typed === "portable" ? "portable-ready-pool-v1-fill-claim:" : typed ? typedReadyPoolFillClaimPrefix : readyPoolFillClaimPrefix}${token}`;
 }
 
-function readyPoolCountersKey(owner: string, org: string, key: string, typed = false): string {
-  return `${typed ? typedReadyPoolCountersPrefix : readyPoolCountersPrefix}${[org, owner, key]
+function readyPoolCountersKey(
+  owner: string,
+  org: string,
+  key: string,
+  typed: ReadyPoolMode = false,
+): string {
+  return `${typed === "portable" ? "portable-ready-pool-v1-counters:" : typed ? typedReadyPoolCountersPrefix : readyPoolCountersPrefix}${[
+    org,
+    owner,
+    key,
+  ]
     .map((part) => encodeURIComponent(part))
     .join(":")}`;
 }
@@ -20806,7 +21268,7 @@ function mergeAWSImageMetadata(
   image: ProviderImage,
   metadata?: Partial<ProviderImage>,
 ): ProviderImage {
-  const target = normalizeAWSImageTarget(metadata?.target ?? image.target ?? "linux") ?? "linux";
+  const target = parseTarget(metadata?.target ?? image.target ?? "linux") ?? "linux";
   const serverType = metadata?.serverType ?? image.serverType ?? "";
   const result: ProviderImage = {
     ...metadata,
@@ -20866,7 +21328,12 @@ function azureLeaseImageIdentity(
   region: string,
 ): LeaseImageIdentity | undefined {
   if (config.selectedImage) {
-    return { ...config.selectedImage, region };
+    const { revision, ...selected } = config.selectedImage;
+    return {
+      ...selected,
+      region,
+      ...(selected.region === region && revision ? { revision } : {}),
+    };
   }
   if (config.azureSnapshot) {
     return {
@@ -20881,17 +21348,8 @@ function azureLeaseImageIdentity(
 }
 
 function normalizeAzureImageTarget(value: string | undefined): TargetOS | undefined {
-  switch ((value ?? "").trim().toLowerCase()) {
-    case "":
-    case "linux":
-    case "ubuntu":
-      return "linux";
-    case "windows":
-    case "win":
-      return "windows";
-    default:
-      return undefined;
-  }
+  const target = parseTarget(value ?? "");
+  return target === "macos" ? undefined : target;
 }
 
 function azureImageScopeMismatch(field: string, requested: string, recorded: string): Response {
@@ -20902,25 +21360,6 @@ function azureImageScopeMismatch(field: string, requested: string, recorded: str
     },
     { status: 409 },
   );
-}
-
-function normalizeAWSImageTarget(value: string | undefined): TargetOS | undefined {
-  switch ((value ?? "").trim().toLowerCase()) {
-    case "":
-    case "linux":
-    case "ubuntu":
-      return "linux";
-    case "mac":
-    case "macos":
-    case "darwin":
-    case "osx":
-      return "macos";
-    case "win":
-    case "windows":
-      return "windows";
-    default:
-      return undefined;
-  }
 }
 
 function awsImageArchitectureForTarget(target: TargetOS, serverType: string): string {
@@ -21167,7 +21606,7 @@ function runtimeAdapterLegacyDeleteCompletion(
 function newLeaseID(): string {
   const bytes = new Uint8Array(6);
   crypto.getRandomValues(bytes);
-  return `cbx_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `cbx_${bytesToHex(bytes)}`;
 }
 
 function newCreateAttemptGeneration(): string {
@@ -21341,6 +21780,7 @@ function sameLeaseImageIdentity(left: LeaseImageIdentity, right: LeaseImageIdent
     left.kind === right.kind &&
     left.region === right.region &&
     left.promotedAt === right.promotedAt &&
+    left.revision === right.revision &&
     left.sourceID === right.sourceID
   );
 }
@@ -21991,7 +22431,7 @@ function workspaceProvisioningNeedsRecovery(
   lease: LeaseRecord,
   now = Date.now(),
 ): boolean {
-  if (lease.providerKeyCleanupPending) {
+  if (providerKeyCleanupBlocksProvisioningRecovery(lease)) {
     return false;
   }
   if (lease.cloudID) {
@@ -22023,7 +22463,7 @@ function workspaceNextReconcileAt(
   if (lease?.state === "released" && lease.releaseDeletesServer === false) {
     return undefined;
   }
-  if (lease?.providerKeyCleanupPending) {
+  if (lease && providerKeyCleanupBlocksProvisioningRecovery(lease)) {
     const claimDeadline = cleanupClaimDeadline(lease);
     if (lease.cleanupStartedAt && Number.isFinite(claimDeadline)) {
       return claimDeadline;
@@ -22669,13 +23109,13 @@ async function workspaceResponseError(response: Response, fallback: string): Pro
 function newRunID(): string {
   const bytes = new Uint8Array(6);
   crypto.getRandomValues(bytes);
-  return `run_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `run_${bytesToHex(bytes)}`;
 }
 
 function newWebVNCSessionID(prefix: "agent" | "viewer"): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
-  return `${prefix}_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `${prefix}_${bytesToHex(bytes)}`;
 }
 
 function newWebVNCPortalViewerTicket(): string {
@@ -22689,7 +23129,7 @@ function newWebVNCPortalViewerSession(): string {
 function newRuntimeAdapterTicket(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
-  return `adapter_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `adapter_${bytesToHex(bytes)}`;
 }
 
 function newNativeVNCTicket(): string {
@@ -22711,13 +23151,13 @@ function newCodeViewerSession(): string {
 function randomHexToken(prefix: string): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
-  return `${prefix}${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `${prefix}${bytesToHex(bytes)}`;
 }
 
 function newEgressSessionID(): string {
   const bytes = new Uint8Array(6);
   crypto.getRandomValues(bytes);
-  return `egress_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `egress_${bytesToHex(bytes)}`;
 }
 
 function egressSocketKey(leaseID: string, sessionID: string): string {
@@ -22850,7 +23290,10 @@ function isReservedWebVNCControlFrame(message: unknown): boolean {
   }
   try {
     const parsed = JSON.parse(message) as { type?: unknown };
-    return parsed.type === "desktop_theme";
+    return (
+      parsed.type === "desktop_theme" ||
+      (typeof parsed.type === "string" && parsed.type.startsWith("wayvnc_"))
+    );
   } catch {
     return false;
   }
@@ -23514,6 +23957,13 @@ function leaseUsesCanonicalProviderKey(
     lease.providerKeyCleanupOwned === true &&
     validLeaseID(lease.id) &&
     lease.providerKey === providerKeyForLease(lease.id)
+  );
+}
+
+function providerKeyCleanupBlocksProvisioningRecovery(lease: LeaseRecord): boolean {
+  return Boolean(
+    lease.providerKeyCleanupPending &&
+    !(lease.provider === "aws" && leaseUsesCanonicalProviderKey(lease)),
   );
 }
 
@@ -24270,13 +24720,7 @@ function leaseBridgeTicketPrincipal(
     owner: ticket.owner,
     org: ticket.org,
     admin: ticket.admin === true,
-    ...(ticket.auth ? { auth: ticket.auth } : {}),
-    ...(ticket.login ? { login: ticket.login } : {}),
-    ...(ticket.sharedTokenHash ? { sharedTokenHash: ticket.sharedTokenHash } : {}),
-    ...(ticket.adminTokenHash ? { adminTokenHash: ticket.adminTokenHash } : {}),
-    ...(ticket.adminGrantVersion ? { adminGrantVersion: ticket.adminGrantVersion } : {}),
-    ...(ticket.portalSessionHash ? { portalSessionHash: ticket.portalSessionHash } : {}),
-    ...(ticket.githubGrant ? { githubGrant: ticket.githubGrant } : {}),
+    ...copyBridgeGrant(ticket),
   };
 }
 
@@ -24322,23 +24766,6 @@ function sendControl(socket: WebSocket, payload: unknown): void {
   } catch {
     closeSocket(socket, 1011, "control send failed");
   }
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
 }
 
 function identifierMatchesLease(identifier: string, lease: LeaseRecord): boolean {
@@ -24518,8 +24945,7 @@ async function workspaceSSHHostKeyFingerprint(publicKey: string): Promise<string
     throw new Error("workspace SSH host public key is invalid");
   }
   const raw = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
-  const digest = await crypto.subtle.digest("SHA-256", raw);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return sha256Hex(raw);
 }
 
 function requestSourceCIDRs(request: Request): string[] {
@@ -24780,6 +25206,22 @@ function applyRunEventSummary(run: RunRecord, event: RunEventRecord): void {
     run.phase = "failed";
     run.endedAt = event.createdAt;
   }
+}
+
+function runAdmissionFingerprint(input: RunCreateRequest): Promise<string> {
+  return sha256Hex(
+    JSON.stringify([
+      "run-create-v1",
+      input.leaseID ?? "",
+      input.provider ?? "hetzner",
+      input.target ?? "linux",
+      input.windowsMode ?? "",
+      input.class ?? "",
+      input.serverType ?? "",
+      Array.isArray(input.command) ? input.command.map(String) : [],
+      sanitizeRunLabel(input.label) ?? "",
+    ]),
+  );
 }
 
 function sanitizeRunLabel(value: unknown): string | undefined {
@@ -25196,10 +25638,6 @@ function pinnedHostConflict(config: LeaseConfig, leases: LeaseRecord[]): Respons
   );
 }
 
-function leaseIsLive(lease: LeaseRecord): boolean {
-  return lease.state === "active" || lease.state === "provisioning";
-}
-
 function leaseHeartbeatStateError(
   lease: LeaseRecord,
   now = Date.now(),
@@ -25212,10 +25650,6 @@ function leaseHeartbeatStateError(
     return "lease_expired";
   }
   return undefined;
-}
-
-function isRegisteredLease(lease: LeaseRecord): boolean {
-  return lease.lifecycle === "registered";
 }
 
 function managedLeaseProvider(lease: LeaseRecord): Provider | undefined {
@@ -25243,7 +25677,7 @@ function legacyCleanupIdentityCaptureEligible(lease: LeaseRecord): boolean {
     Number.isFinite(cleanupClaimExpiresAt) &&
     cleanupClaimExpiresAt >= cleanupStartedAt &&
     deletionIntended &&
-    !lease.providerKeyCleanupPending &&
+    !providerKeyCleanupBlocksProvisioningRecovery(lease) &&
     lease.state !== "provisioning" &&
     lease.provisioningResourceMayExist === undefined &&
     lease.provisioningFailureRetryable === undefined &&
@@ -25453,12 +25887,16 @@ function mergeProvisioningFailureMetadata(
     config.provider === "hetzner" ? hetznerProvisioningResourceID(error) : undefined;
   const providerKeyCleanupID =
     error instanceof HetznerProvisioningError ? error.providerKeyCleanupID : undefined;
+  const awsPreInstanceCancellation =
+    config.provider === "aws" && error instanceof CreateAttemptCanceledError && !lease.cloudID;
   const resourceMayExist = Boolean(
     cleanupClaim ||
     awsOutcomeUncertain ||
     providerOutcomeUncertain ||
     hetznerResourceMayExist ||
-    (lease.provisioningResourceMayExist && !hetznerDefiniteKeyOnlyFailure(lease, error)),
+    (lease.provisioningResourceMayExist &&
+      !hetznerDefiniteKeyOnlyFailure(lease, error) &&
+      !awsPreInstanceCancellation),
   );
 
   lease.updatedAt = failedAt;
@@ -25516,9 +25954,24 @@ function mergeProvisioningFailureMetadata(
     cleanupClaim ||
     failedHetznerServerID !== undefined ||
     providerKeyCleanupID !== undefined ||
+    lease.providerKeyCleanupPending ||
     (lease.cloudID && lease.releaseDeletesServer === true)
   ) {
-    lease.cleanupRetryAt = new Date(Date.parse(failedAt) + leaseCleanupRetryDelayMs).toISOString();
+    const retryDelay =
+      config.provider === "aws" &&
+      lease.providerKeyCleanupPending &&
+      leaseUsesCanonicalProviderKey(lease)
+        ? 0
+        : leaseCleanupRetryDelayMs;
+    lease.cleanupRetryAt = new Date(Date.parse(failedAt) + retryDelay).toISOString();
+  }
+  if (awsPreInstanceCancellation && !lease.providerKeyCleanupPending) {
+    clearLeaseCleanupMetadata(lease);
+    delete lease.cleanupStartedAt;
+    delete lease.cleanupClaimExpiresAt;
+    delete lease.failureError;
+    completeLeaseProviderCleanup(lease, failedAt);
+    return;
   }
   if (lease.provisioningResourceMayExist || lease.provisioningFailureRetryable) {
     delete lease.failureError;
@@ -25629,7 +26082,8 @@ function sameProvisioningAttempt(
     current.provisioningRequestSettledAt === expected.provisioningRequestSettledAt &&
     current.provisioningCoordinatorVersion === expected.provisioningCoordinatorVersion &&
     current.provisioningRecoveryObservedAt === expected.provisioningRecoveryObservedAt &&
-    current.provisioningRecoveryMissingSince === expected.provisioningRecoveryMissingSince,
+    current.provisioningRecoveryMissingSince === expected.provisioningRecoveryMissingSince &&
+    current.region === expected.region,
   );
 }
 
@@ -25672,7 +26126,7 @@ function unboundProvisioningRecoveryEligible(
     lease.host === "" &&
     !lease.cleanupStartedAt &&
     !lease.cleanupClaimExpiresAt &&
-    !lease.providerKeyCleanupPending &&
+    !providerKeyCleanupBlocksProvisioningRecovery(lease) &&
     validCreateAttemptID(lease.createAttemptID) &&
     Boolean(lease.createAttemptGeneration?.trim()) &&
     attempt &&
@@ -26160,6 +26614,7 @@ function leaseHasPublishedAWSAccess(lease: LeaseRecord): boolean {
 
 function awsIngressReconcileTargetKey(lease: LeaseRecord): string {
   return [
+    lease.providerScope ?? "",
     lease.region ?? "",
     lease.network?.awsSecurityGroupID ?? "",
     lease.network?.awsSecurityGroupName ?? "",
@@ -26174,6 +26629,7 @@ function awsIngressAccessTargetKey(
   region: string,
   ports: string[],
   env: Env,
+  providerScope = lease.providerScope,
 ): string {
   const workspaceManaged = lease.providerKey.startsWith(workspaceProviderKeyPrefix);
   const securityGroupID =
@@ -26186,7 +26642,7 @@ function awsIngressAccessTargetKey(
     : securityGroupName
       ? `managed:${subnetID}:${securityGroupName}`
       : `auto:${subnetID}:${awsManagedSecurityGroupName({ providerKey: lease.providerKey })}`;
-  return [region, group, ...ports.toSorted()].join("\u0000");
+  return [providerScope ?? "", region, group, ...ports.toSorted()].join("\u0000");
 }
 
 function awsIngressGroupMetadataUnknown(lease: LeaseRecord, env: Env): boolean {
@@ -26197,8 +26653,16 @@ function awsIngressGroupMetadataUnknown(lease: LeaseRecord, env: Env): boolean {
   );
 }
 
-function awsIngressPortScopeKey(region: string, port: string): string {
-  return [region, port].join("\u0000");
+function awsIngressPortScopeKey(
+  providerScope: string | undefined,
+  region: string,
+  port: string,
+): string {
+  return [providerScope ?? "", region, port].join("\u0000");
+}
+
+function awsIngressOperationScopeKey(providerScope: string | undefined, region: string): string {
+  return [providerScope ?? "", region].join("\u0000");
 }
 
 function awsLeaseSSHPorts(lease: LeaseRecord): string[] {
@@ -26242,16 +26706,6 @@ function hasUnknownActiveAWSSSHSource(leases: LeaseRecord[]): boolean {
       (lease.network?.sshSourceCIDRs?.length ?? 0) === 0 &&
       !lease.network?.sshSourceCIDRsComplete,
   );
-}
-
-function awsOrphanSweepCandidate(
-  machine: ProviderMachine,
-  activeLeases: Map<string, LeaseRecord>,
-  activeCloudIDs: Set<string>,
-  region: string,
-  graceSeconds: number,
-): AWSOrphanSweepCandidate | undefined {
-  return cloudOrphanSweepCandidate(machine, activeLeases, activeCloudIDs, region, graceSeconds);
 }
 
 function cloudOrphanSweepCandidate(
@@ -26434,6 +26888,7 @@ function parseProviderLabelTime(value: string | undefined): number {
 }
 
 interface CloudProvider {
+  poolAccess?(): ProviderPoolAccess;
   resumableProvisioning?(): ProviderResumableProvisioning;
   readyPoolImageIdentity?(lease: LeaseRecord): ReadyPoolImageIdentity | undefined;
   observeReadyPoolImageIdentity?(lease: LeaseRecord): Promise<LeaseImageIdentity | undefined>;
@@ -26474,6 +26929,7 @@ interface CloudProvider {
     lease: LeaseRecord,
     context: ProviderAccessContext,
   ): Promise<LeaseRecord | void>;
+  leaseAccessRefreshUnchanged?(lease: LeaseRecord, incomingCIDRs: string[]): boolean;
   refreshLeaseAccessForResolution?(lease: LeaseRecord): Promise<LeaseRecord | void>;
   reconcileLeaseAccess?(lease: LeaseRecord, context: ProviderAccessContext): Promise<void>;
   createServerWithFallback(
@@ -26500,12 +26956,15 @@ interface CloudProvider {
   deleteServer(id: string): Promise<void>;
   deleteOwnedServer?(lease: LeaseRecord): Promise<void>;
   inspectCleanup?(lease: LeaseRecord): Promise<unknown>;
+  // Scope repair requires admin authorization and its own lifecycle commit capability.
+  supportsCleanupScopeRecovery?: true;
   // Revalidate the lease after provider reads, before committing any recovery writes.
   recoverCleanup?(
     lease: LeaseRecord,
     expectedClaimFingerprint: string,
     actor: string,
     commitGuard: <T>(commit: () => Promise<T>) => Promise<T>,
+    commitScopeRecovery?: ProviderScopeRecoveryCommit,
   ): Promise<unknown>;
   supportsNativeImages(): boolean;
   nativeImagesUnsupportedMessage(): string;
@@ -26605,6 +27064,12 @@ interface ProviderWorkspaceCapability {
 type ProviderStateStorage = CoordinatorStorage;
 type ProviderStateStorageView = CoordinatorStorageView;
 
+// The lifecycle owner accepts a proved scope binding, never an arbitrary lease patch.
+type ProviderScopeRecoveryCommit = <T>(
+  observation: { providerScope: string; resourceAbsent: true },
+  prepareAudit: (transaction: CoordinatorStorageView) => Promise<() => Promise<T>>,
+) => Promise<T>;
+
 interface ProviderAccessContext {
   requestSourceCIDRs: string[];
   activeLeases: LeaseRecord[];
@@ -26633,6 +27098,8 @@ interface ProviderProvisioningContext {
   allowEmptySSHIngress?: boolean;
   publishAccessBeforeProvisioning?: boolean;
   onTargetAttempt?: (target: ProviderProvisioningTarget) => Promise<void>;
+  onProviderKeyCleanupPending?: (existingKey: boolean) => Promise<void>;
+  onProviderKeyCleanupComplete?: (target: ProviderProvisioningTarget) => Promise<void>;
   onResourceCreated?: (claim: ProviderProvisioningCleanupClaim) => Promise<boolean>;
   withLeaseAccess?: <T>(
     target: ProviderProvisioningTarget,
@@ -26900,6 +27367,7 @@ export class AzureProvider implements CloudProvider {
             kind: promoted.kind ?? "azure-os-disk-snapshot",
             region: promoted.region ?? located.azureLocation,
             promotedAt: promoted.promotedAt,
+            ...(promoted.revision ? { revision: promoted.revision } : {}),
             ...(snapshotID !== promoted.id ? { sourceID: snapshotID } : {}),
           },
         };
@@ -28125,6 +28593,24 @@ function awsCheckpointResourceAbsent(message: string, resourceID: string): boole
   );
 }
 
+function awsProviderScopeAccount(providerScope: string | undefined): string | undefined {
+  if (providerScope === undefined) return undefined;
+  const match = /^aws:account:(\d{12})$/.exec(providerScope);
+  if (!match) {
+    throw new Error("malformed AWS provider scope: expected aws:account:<12-digit-account-id>");
+  }
+  return match[1]!;
+}
+
+function authenticatedAWSAccount(account: string): string {
+  if (!/^\d{12}$/.test(account)) {
+    throw new Error("authenticated AWS identity did not return a 12-digit account ID");
+  }
+  return account;
+}
+
+type AWSLeaseOperationSession = Parameters<Parameters<EC2SpotClient["withLeaseOperation"]>[0]>[0];
+
 interface AWSMacHostAllocation {
   version: 1;
   hostID: string;
@@ -28154,6 +28640,9 @@ async function recordAWSMacHostAllocations(
 }
 
 export class AWSProvider implements CloudProvider {
+  readonly recoveryIsAuthoritative = true;
+  readonly supportsCleanupScopeRecovery = true;
+
   private clientValue?: EC2SpotClient;
   private readonly region: string;
 
@@ -28168,6 +28657,10 @@ export class AWSProvider implements CloudProvider {
   private get client(): EC2SpotClient {
     this.clientValue ??= new EC2SpotClient(this.env, this.region);
     return this.clientValue;
+  }
+
+  poolAccess(): ProviderPoolAccess {
+    return new AWSPoolAccess(this.client);
   }
 
   async authorizeHostPin(config: LeaseConfig, org: string): Promise<boolean> {
@@ -28268,18 +28761,211 @@ export class AWSProvider implements CloudProvider {
     return this.client.findServer(id);
   }
 
-  async recoverServer(lease: LeaseRecord): Promise<ProviderMachine | undefined> {
-    if (lease.network?.awsPrivate) {
-      if (lease.cloudID) {
-        const server = await this.findServer(lease.cloudID);
-        return server && providerMachineOwnedByLease(server, lease, "aws") ? server : undefined;
-      }
-      const server = await this.client.findWorkspaceServerByLease(lease.id);
-      return server && providerLabelsOwnedByLease(server.labels, lease, "aws") ? server : undefined;
+  private async recordedCleanupRecovery(
+    lease: LeaseRecord,
+  ): Promise<AWSLegacyCleanupAudit | undefined> {
+    const audit = await this.storage.get<AWSLegacyCleanupAudit>(
+      awsCleanupRecoveryAuditKey(lease.id),
+    );
+    if (audit && !(await awsCleanupAuditMatchesLease(audit, lease))) {
+      throw new ProviderResourceUnresolvedError(
+        "AWS cleanup recovery audit does not match the retained lease",
+      );
     }
-    if (!lease.cloudID) return undefined;
-    const server = await this.findServer(lease.cloudID);
-    return server && providerMachineOwnedByLease(server, lease, "aws") ? server : undefined;
+    return audit ? awsCleanupAuditView(audit) : undefined;
+  }
+
+  private async observeLegacyCleanupScope(lease: LeaseRecord) {
+    requireAWSLegacyCleanupLease(lease);
+    return this.withLeaseOperation(async (session) => {
+      if (session.region !== lease.region) {
+        throw new ProviderResourceUnresolvedError(
+          "AWS recovery Region does not match the retained lease",
+        );
+      }
+      const identity = await session.verifiedIdentity();
+      const evidence = await session.client.legacyAllocationEvidence(lease, identity.account);
+      if (await session.findServer(lease.cloudID)) {
+        throw new ProviderResourceUnresolvedError(
+          "AWS instance is still visible; use normal owned-resource cleanup instead of scope recovery",
+        );
+      }
+      return evidence;
+    });
+  }
+
+  async inspectCleanup(lease: LeaseRecord): Promise<unknown> {
+    const recoveryAudit = await this.recordedCleanupRecovery(lease);
+    if (recoveryAudit) return { recoveryAudit };
+    const claimFingerprint = await awsCleanupRecoveryFingerprint(lease);
+    const evidence = await this.observeLegacyCleanupScope(lease);
+    const current = await this.storage.get<LeaseRecord>(leaseKey(lease.id));
+    const claimUnchanged = Boolean(
+      current &&
+      current.providerScope == null &&
+      !current.cleanupStartedAt &&
+      !current.provisioningRequestStartedAt &&
+      (await awsCleanupRecoveryFingerprint(current)) === claimFingerprint,
+    );
+    return {
+      basis: "aws-cloudtrail-run-instances",
+      ...evidence,
+      resourceAbsent: true,
+      remainingCleanup: ["owned-key", "provider-access"],
+      claimUnchanged,
+      ...(claimUnchanged ? { claimFingerprint } : {}),
+    };
+  }
+
+  async recoverCleanup(
+    lease: LeaseRecord,
+    expectedClaimFingerprint: string,
+    actor: string,
+    commitGuard: <T>(commit: () => Promise<T>) => Promise<T>,
+    commitScopeRecovery?: ProviderScopeRecoveryCommit,
+  ): Promise<AWSLegacyCleanupAudit> {
+    const existing = await this.recordedCleanupRecovery(lease);
+    if (existing) {
+      if (existing.claimFingerprint !== expectedClaimFingerprint) {
+        throw new ProviderResourceUnresolvedError(
+          "AWS cleanup recovery was recorded for another binding",
+        );
+      }
+      return commitGuard(async () => existing);
+    }
+    if (
+      !commitScopeRecovery ||
+      !actor.trim() ||
+      actor.length > 256 ||
+      (await awsCleanupRecoveryFingerprint(lease)) !== expectedClaimFingerprint
+    ) {
+      throw new ProviderResourceUnresolvedError(
+        "AWS recovery binding changed; inspect cleanup again",
+      );
+    }
+    const evidence = await this.observeLegacyCleanupScope(lease);
+    const audit: AWSLegacyCleanupAudit = {
+      leaseID: lease.id,
+      region: evidence.region,
+      providerScope: evidence.providerScope,
+      cloudID: lease.cloudID,
+      eventID: evidence.eventID,
+      eventTime: evidence.eventTime,
+      actor,
+      recoveredAt: new Date().toISOString(),
+      claimFingerprint: expectedClaimFingerprint,
+    };
+    return commitScopeRecovery(
+      { providerScope: evidence.providerScope, resourceAbsent: true },
+      async (transaction) => {
+        const key = awsCleanupRecoveryAuditKey(lease.id);
+        if (await transaction.get(key)) {
+          throw new ProviderResourceUnresolvedError("AWS recovery evidence changed before commit");
+        }
+        return async () => {
+          await transaction.put(key, audit);
+          return audit;
+        };
+      },
+    );
+  }
+
+  private async verifyLeaseOperationAuthority(
+    lease: LeaseRecord,
+    session: AWSLeaseOperationSession,
+  ): Promise<string | undefined> {
+    const leaseRegion = lease.region?.trim();
+    if (!leaseRegion || leaseRegion !== session.region) {
+      throw new ProviderResourceUnresolvedError(
+        `AWS lease region does not match the cleanup session: recorded ${leaseRegion || "missing"}, session ${session.region}`,
+      );
+    }
+    let recordedAccount: string | undefined;
+    try {
+      recordedAccount = awsProviderScopeAccount(lease.providerScope);
+    } catch (error) {
+      throw new ProviderResourceUnresolvedError(
+        error instanceof Error ? error.message : "malformed AWS provider scope",
+        { cause: error },
+      );
+    }
+    const authenticatedAccount = authenticatedAWSAccount(
+      (await session.verifiedIdentity()).account,
+    );
+    if (recordedAccount && recordedAccount !== authenticatedAccount) {
+      throw new ProviderResourceUnresolvedError(
+        `AWS lease account scope does not match the authenticated account: recorded ${recordedAccount}, authenticated ${authenticatedAccount}`,
+      );
+    }
+    return recordedAccount;
+  }
+
+  private async observeLeaseServer(
+    lease: LeaseRecord,
+    session: AWSLeaseOperationSession,
+    observe: () => Promise<ProviderMachine | undefined>,
+    ownership?: "machine" | "labels",
+  ): Promise<ProviderMachine | undefined> {
+    const recordedAccount = await this.verifyLeaseOperationAuthority(lease, session);
+    let server: ProviderMachine | undefined;
+    try {
+      server = await observe();
+    } catch (error) {
+      if (!(error instanceof AWSLeaseAuthorityError)) {
+        throw error;
+      }
+      throw new ProviderResourceUnresolvedError(error.message, { cause: error });
+    }
+    if (!server && !recordedAccount) {
+      throw new ProviderResourceUnresolvedError(
+        "AWS lease account scope was not persisted; refusing to confirm instance absence",
+      );
+    }
+    if (
+      server &&
+      ((ownership === "machine" && !providerMachineOwnedByLease(server, lease, "aws")) ||
+        (ownership === "labels" && !providerLabelsOwnedByLease(server.labels, lease, "aws")))
+    ) {
+      throw new ProviderResourceUnresolvedError(
+        `AWS recovery resource ${server.cloudID} ownership does not match lease ${lease.id}`,
+      );
+    }
+    return server;
+  }
+
+  private async withLeaseOperation<T>(
+    operation: (session: AWSLeaseOperationSession) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await this.client.withLeaseOperation(operation);
+    } catch (error) {
+      if (!(error instanceof AWSLeaseAuthorityError)) {
+        throw error;
+      }
+      throw new ProviderResourceUnresolvedError(error.message, { cause: error });
+    }
+  }
+
+  async recoverServer(lease: LeaseRecord): Promise<ProviderMachine | undefined> {
+    return await this.withLeaseOperation(async (session) => {
+      if (!lease.cloudID) {
+        return await this.observeLeaseServer(
+          lease,
+          session,
+          () =>
+            lease.network?.awsPrivate
+              ? session.findWorkspaceServerByLease(lease.id)
+              : session.findCrabboxServerByLease(lease.id),
+          "labels",
+        );
+      }
+      return await this.observeLeaseServer(
+        lease,
+        session,
+        () => session.findServer(lease.cloudID),
+        "machine",
+      );
+    });
   }
 
   async resumeRecoveredServer(
@@ -28402,6 +29088,7 @@ export class AWSProvider implements CloudProvider {
               kind: promoted.kind ?? "aws-ami",
               region: promoted.region ?? config.awsRegion,
               promotedAt: promoted.promotedAt,
+              ...(promoted.revision ? { revision: promoted.revision } : {}),
             },
           }
         : {}),
@@ -28414,12 +29101,17 @@ export class AWSProvider implements CloudProvider {
     lease: LeaseRecord,
     context: ProviderAccessContext,
   ): Promise<ProviderLeaseCreatePreparation> {
-    if (config.target === "macos") {
-      const identity = await this.client.verifiedIdentity();
-      if (!/^\d{12}$/.test(identity.account)) {
-        throw new Error("AWS Mac host ownership requires an authenticated 12-digit account ID");
-      }
-      lease = { ...lease, providerScope: `aws:account:${identity.account}` };
+    const recordedAccount = awsProviderScopeAccount(lease.providerScope);
+    const authenticatedAccount = authenticatedAWSAccount(
+      (await this.client.verifiedIdentity()).account,
+    );
+    if (recordedAccount && recordedAccount !== authenticatedAccount) {
+      throw new Error(
+        `AWS provider scope conflicts with authenticated account: recorded ${recordedAccount}, authenticated ${authenticatedAccount}`,
+      );
+    }
+    if (!recordedAccount) {
+      lease = { ...lease, providerScope: `aws:account:${authenticatedAccount}` };
     }
     if (config.awsPrivate) {
       const policy = awsPrivateWorkspaceConfig(this.env);
@@ -28480,6 +29172,11 @@ export class AWSProvider implements CloudProvider {
     ).slice(0, 12)}`;
     const nextLease: LeaseRecord = {
       ...nextLeaseWithSources,
+      ...(lease.providerKey === providerKeyForLease(lease.id)
+        ? {
+            providerKeyCleanupOwned: true,
+          }
+        : {}),
       network: {
         ...nextLeaseWithSources.network,
         ...(config.awsSSHCIDRsPinned ? { sshPinnedSourceCIDRs: config.awsSSHCIDRs } : {}),
@@ -28502,6 +29199,13 @@ export class AWSProvider implements CloudProvider {
         publishAccessBeforeProvisioning: true,
       },
     };
+  }
+
+  leaseAccessRefreshUnchanged(lease: LeaseRecord, incomingCIDRs: string[]): boolean {
+    if (lease.network?.sshSourceCIDRsComplete !== true) return false;
+    const current = lease.network.sshSourceCIDRs ?? [];
+    const refreshed = refreshedAWSSSHSourceCIDRs(lease, validCIDRs(incomingCIDRs));
+    return JSON.stringify(current.toSorted()) === JSON.stringify(refreshed.toSorted());
   }
 
   async refreshLeaseAccess(
@@ -28530,8 +29234,75 @@ export class AWSProvider implements CloudProvider {
 
   async reconcileLeaseAccess(lease: LeaseRecord, context: ProviderAccessContext): Promise<void> {
     if (lease.network?.awsPrivate) return;
+    let recordedAccount: string | undefined;
+    try {
+      recordedAccount = awsProviderScopeAccount(lease.providerScope);
+    } catch (error) {
+      throw new AWSLeaseAuthorityError(
+        error instanceof Error ? error.message : "malformed AWS provider scope",
+        { cause: error },
+      );
+    }
+    const ingressLeases = [lease, ...context.activeLeases.filter(leaseOwnsAWSSSHAccess)];
+    if (!ingressLeases.some((candidate) => awsLeaseSSHPorts(candidate).length > 0)) return;
+    const clients = new Map<string, EC2SpotClient>();
+    let authorityScope = lease.providerScope;
+    const verifyRegion = async (region: string): Promise<void> => {
+      const regionalClient =
+        region === this.region ? this.client : new EC2SpotClient(this.env, region);
+      const operationClient = await regionalClient.withLeaseOperation(async (session) => {
+        const authenticatedAccount = authenticatedAWSAccount(
+          (await session.verifiedIdentity()).account,
+        );
+        if (recordedAccount && authenticatedAccount !== recordedAccount) {
+          throw new AWSLeaseAuthorityError(
+            `AWS provider scope conflicts with authenticated account: recorded ${recordedAccount}, authenticated ${authenticatedAccount}`,
+          );
+        }
+        const verifiedScope = `aws:account:${authenticatedAccount}`;
+        if (authorityScope && authorityScope !== verifiedScope) {
+          throw new AWSLeaseAuthorityError(
+            `AWS ingress reconciliation account changed between Regions: recorded ${authorityScope}, authenticated ${verifiedScope}`,
+          );
+        }
+        authorityScope = verifiedScope;
+        return session.client;
+      });
+      clients.set(awsIngressOperationScopeKey(authorityScope, region), operationClient);
+    };
+
+    await verifyRegion(lease.region || this.region);
+    const accessLeases = context.activeLeases.filter(
+      (candidate) =>
+        leaseOwnsAWSSSHAccess(candidate) &&
+        (!candidate.providerScope || candidate.providerScope === authorityScope),
+    );
+    const regions = uniqueNonEmpty(
+      [lease, ...accessLeases].flatMap((candidate) =>
+        awsLeaseSSHPorts(candidate).length > 0 ? [candidate.region || this.region] : [],
+      ),
+    );
+    for (const region of regions) {
+      if (clients.has(awsIngressOperationScopeKey(authorityScope, region))) continue;
+      // oxlint-disable-next-line eslint/no-await-in-loop -- all account scopes are verified before ingress mutates.
+      await verifyRegion(region);
+    }
+    await this.reconcileLeaseAccessWithClients(lease, context, clients, authorityScope);
+  }
+
+  private async reconcileLeaseAccessWithClients(
+    lease: LeaseRecord,
+    context: ProviderAccessContext,
+    clients = new Map<string, EC2SpotClient>(),
+    authorityScope = lease.providerScope,
+  ): Promise<void> {
+    if (lease.network?.awsPrivate) return;
     const globalCIDRs = awsGlobalSSHSourceCIDRs(this.env);
-    const accessLeases = context.activeLeases.filter(leaseOwnsAWSSSHAccess);
+    const accessLeases = context.activeLeases.filter(
+      (candidate) =>
+        leaseOwnsAWSSSHAccess(candidate) &&
+        (!candidate.providerScope || candidate.providerScope === authorityScope),
+    );
     const targets = new Map<
       string,
       { lease: LeaseRecord; port: string; region: string; leases: LeaseRecord[] }
@@ -28540,12 +29311,18 @@ export class AWSProvider implements CloudProvider {
     for (const [index, candidate] of [lease, ...accessLeases].entries()) {
       const region = candidate.region || this.region;
       for (const port of awsLeaseSSHPorts(candidate)) {
-        const key = awsIngressAccessTargetKey(candidate, region, [port], this.env);
+        const key = awsIngressAccessTargetKey(
+          candidate,
+          region,
+          [port],
+          this.env,
+          candidate.providerScope ?? authorityScope,
+        );
         const target = targets.get(key) ?? { lease: candidate, port, region, leases: [] };
         // The anchor identifies cleanup scope; only the access snapshot grants sources.
         if (index > 0) target.leases.push(candidate);
         targets.set(key, target);
-        const scopeKey = awsIngressPortScopeKey(region, port);
+        const scopeKey = awsIngressPortScopeKey(authorityScope, region, port);
         const scope = targetScopes.get(scopeKey) ?? {
           identities: new Set<string>(),
           hasUnknownGroup: false,
@@ -28568,14 +29345,24 @@ export class AWSProvider implements CloudProvider {
       const targetLease = target.lease;
       const cidrs = activeAWSSSHSourceCIDRs(target.leases, globalCIDRs);
       const reconcile =
-        ambiguousTargetScopes.has(awsIngressPortScopeKey(target.region, target.port)) ||
+        ambiguousTargetScopes.has(
+          awsIngressPortScopeKey(authorityScope, target.region, target.port),
+        ) ||
+        !targetLease.providerScope ||
+        target.leases.some((candidate) => !candidate.providerScope) ||
         hasUnknownActiveAWSSSHSource(target.leases)
           ? "additive"
           : "authoritative";
       // Sharing a read is safe only when every grouped port has the same policy.
       // Unioning distinct CIDRs or modes would widen access or prune retained rules.
       const key = JSON.stringify([
-        awsIngressAccessTargetKey(targetLease, target.region, [], this.env),
+        awsIngressAccessTargetKey(
+          targetLease,
+          target.region,
+          [],
+          this.env,
+          targetLease.providerScope ?? authorityScope,
+        ),
         reconcile,
         cidrs.toSorted(),
       ]);
@@ -28599,9 +29386,13 @@ export class AWSProvider implements CloudProvider {
     }
     for (const { config, reconcile } of refreshes.values()) {
       const region = config.awsRegion;
-      const client = region === this.region ? this.client : new EC2SpotClient(this.env, region);
+      const client = clients.get(awsIngressOperationScopeKey(authorityScope, region));
+      // A provisioning retry may only repair the region owned by its verified credential session.
+      if (clients.size > 0 && !client) continue;
+      const regionalClient =
+        client ?? (region === this.region ? this.client : new EC2SpotClient(this.env, region));
       // oxlint-disable-next-line eslint/no-await-in-loop -- distinct policies can share a group, so keep their mutation passes ordered.
-      await client.refreshSSHIngress(config, { reconcile, allowEmpty: true });
+      await regionalClient.refreshSSHIngress(config, { reconcile, allowEmpty: true });
     }
   }
 
@@ -28621,6 +29412,11 @@ export class AWSProvider implements CloudProvider {
   }> {
     const regions = awsRegionCandidates(config, this.env, this.region);
     const withLeaseAccess = provisioning?.withLeaseAccess;
+    const providerScope = provisioning?.providerScope;
+    const recordedAccount = awsProviderScopeAccount(providerScope);
+    if (!provisioning || !providerScope || !recordedAccount) {
+      throw new Error("AWS provisioning requires a persisted account scope");
+    }
     const totalStartedAt = Date.now();
     const history = new ProvisioningAttemptHistory();
     const ingressOptions =
@@ -28634,6 +29430,7 @@ export class AWSProvider implements CloudProvider {
           };
     for (const region of regions) {
       const client = region === this.region ? this.client : new EC2SpotClient(this.env, region);
+      let cleanupRegionalKey: (() => Promise<void>) | undefined;
       let allocated:
         | {
             serverType: string;
@@ -28642,194 +29439,239 @@ export class AWSProvider implements CloudProvider {
           }
         | undefined;
       try {
-        // Record only regions whose provisioning path is about to mutate provider state.
-        // oxlint-disable-next-line eslint/no-await-in-loop -- region fallback is intentionally ordered.
-        await provisioning?.onTargetAttempt?.({ region });
-        const requestStartedAt = Date.now();
-        const { server, serverType, market, attempts, imageID } =
-          // oxlint-disable-next-line eslint/no-await-in-loop -- region fallback must preserve ordered capacity preference.
-          await client.createServerWithFallback(
-            { ...config, awsRegion: region },
-            leaseID,
-            slug,
-            owner,
-            {
-              ...ingressOptions,
-              // Only ingress writes hold the fence; image, instance and address waits do not.
-              ...(!config.awsPrivate && withLeaseAccess
-                ? {
-                    withIngress: (
-                      apply: (cidrs: string[]) => Promise<string>,
-                      observe: ProviderAccessTimingObserver,
-                    ) =>
-                      withLeaseAccess(
-                        { region },
-                        async (lease, context) => {
-                          const cidrs = awsCreateSSHSourceCIDRs(
-                            { ...config, awsRegion: region },
-                            lease,
-                            context,
-                            this.env,
-                            this.region,
-                          );
-                          try {
-                            return await apply(cidrs);
-                          } catch (error) {
-                            if (
-                              !isAWSSecurityGroupRuleLimitError(
-                                coordinatorErrorMessage(this.env, error),
-                              )
-                            ) {
-                              throw error;
-                            }
-                            await this.reconcileLeaseAccess(lease, context);
-                            return apply(cidrs);
-                          }
-                        },
-                        observe,
-                      ),
-                  }
-                : {}),
-            },
+        // oxlint-disable-next-line eslint/no-await-in-loop -- each region gets a distinct authority snapshot.
+        const regionalResult = await client.withLeaseOperation(async (session) => {
+          const authenticatedAccount = authenticatedAWSAccount(
+            (await session.verifiedIdentity()).account,
           );
-        allocated = { serverType, market, attempts };
-        const requestMs = Date.now() - requestStartedAt;
-        const networkReadyStartedAt = Date.now();
-        let bootstrapMs = 0;
-        const claim: ProviderProvisioningCleanupClaim = {
-          provider: "aws",
-          cloudID: server.cloudID,
-          serverID: server.id,
-          region,
-          ...(provisioning?.providerScope ? { providerScope: provisioning.providerScope } : {}),
-        };
-        const onResourceCreated = provisioning?.onResourceCreated;
-        const publishResource = onResourceCreated
-          ? async (readinessError?: unknown) => {
-              try {
-                return await onResourceCreated(claim);
-              } catch (error) {
-                if (error instanceof ProviderResourceUnresolvedError) throw error;
-                const message = coordinatorErrorMessage(this.env, error);
-                const cause =
-                  readinessError === undefined
-                    ? error
-                    : new AggregateError([readinessError, error], message, {
-                        cause: readinessError,
-                      });
-                throw new ProviderProvisioningCleanupError(message, claim, cause);
-              }
-            }
-          : undefined;
-        const checkReadiness = publishResource
-          ? async () => {
-              if (!(await publishResource())) throw new CreateAttemptCanceledError();
-            }
-          : undefined;
-        let readyServer = server;
-        try {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- publish the allocation before readiness can perform provider I/O.
-          await checkReadiness?.();
-          // oxlint-disable-next-line eslint/no-await-in-loop -- wait on the region that created the instance.
-          readyServer = await client.waitForServerIP(
-            server.cloudID,
-            config.awsPrivate,
-            checkReadiness,
-          );
-          if (config.awsRequireSSM) {
-            // oxlint-disable-next-line eslint/no-await-in-loop -- private readiness belongs to the selected region.
-            await client.waitForSSMOnline(server.cloudID, checkReadiness);
-            const bootstrapStartedAt = Date.now();
-            // oxlint-disable-next-line eslint/no-await-in-loop -- bootstrap must finish before the lease becomes active.
-            const bootstrap = await client.runSSMBootstrap(
-              server.cloudID,
+          if (authenticatedAccount !== recordedAccount) {
+            throw new AWSLeaseAuthorityError(
+              `AWS provider scope conflicts with authenticated account: recorded ${recordedAccount}, authenticated ${authenticatedAccount}`,
+            );
+          }
+          // Persist the target only after its fixed credential snapshot proves the recorded account.
+          await provisioning?.onTargetAttempt?.({ region });
+          const operationClient = session.client;
+          let ownedKeyRequiresCleanup = false;
+          cleanupRegionalKey = async () => {
+            if (!ownedKeyRequiresCleanup) return;
+            await operationClient.deleteSSHKey(config.providerKey, leaseID);
+            await provisioning.onProviderKeyCleanupComplete?.({ region });
+            ownedKeyRequiresCleanup = false;
+          };
+          const requestStartedAt = Date.now();
+          const { server, serverType, market, attempts, imageID } =
+            await operationClient.createServerWithFallback(
+              { ...config, awsRegion: region },
               leaseID,
-              config.awsSSMBootstrapCommand,
-              config.awsSSMLogGroup,
+              slug,
+              owner,
+              {
+                ...ingressOptions,
+                onOwnedKeyCleanupRequired: async (existingKey: boolean) => {
+                  await provisioning.onProviderKeyCleanupPending?.(existingKey);
+                  ownedKeyRequiresCleanup = true;
+                },
+                // Only ingress writes hold the fence; image, instance and address waits do not.
+                ...(!config.awsPrivate && withLeaseAccess
+                  ? {
+                      withIngress: (
+                        apply: (cidrs: string[]) => Promise<string>,
+                        observe: ProviderAccessTimingObserver,
+                      ) =>
+                        withLeaseAccess(
+                          { region },
+                          async (lease, context) => {
+                            const cidrs = awsCreateSSHSourceCIDRs(
+                              { ...config, awsRegion: region },
+                              lease,
+                              context,
+                              this.env,
+                              this.region,
+                            );
+                            try {
+                              return await apply(cidrs);
+                            } catch (error) {
+                              if (
+                                !isAWSSecurityGroupRuleLimitError(
+                                  coordinatorErrorMessage(this.env, error),
+                                )
+                              ) {
+                                throw error;
+                              }
+                              await this.reconcileLeaseAccessWithClients(
+                                lease,
+                                context,
+                                new Map([
+                                  [
+                                    awsIngressOperationScopeKey(providerScope, region),
+                                    operationClient,
+                                  ],
+                                ]),
+                              );
+                              return apply(cidrs);
+                            }
+                          },
+                          observe,
+                        ),
+                    }
+                  : {}),
+              },
+            );
+          allocated = { serverType, market, attempts };
+          const requestMs = Date.now() - requestStartedAt;
+          const networkReadyStartedAt = Date.now();
+          let bootstrapMs = 0;
+          const claim: ProviderProvisioningCleanupClaim = {
+            provider: "aws",
+            cloudID: server.cloudID,
+            serverID: server.id,
+            region,
+            providerScope,
+          };
+          const onResourceCreated = provisioning.onResourceCreated;
+          const publishResource = onResourceCreated
+            ? async (readinessError?: unknown) => {
+                try {
+                  return await onResourceCreated(claim);
+                } catch (error) {
+                  if (error instanceof ProviderResourceUnresolvedError) throw error;
+                  const message = coordinatorErrorMessage(this.env, error);
+                  const cause =
+                    readinessError === undefined
+                      ? error
+                      : new AggregateError([readinessError, error], message, {
+                          cause: readinessError,
+                        });
+                  throw new ProviderProvisioningCleanupError(message, claim, cause);
+                }
+              }
+            : undefined;
+          const checkReadiness = publishResource
+            ? async () => {
+                if (!(await publishResource())) throw new CreateAttemptCanceledError();
+              }
+            : undefined;
+          let readyServer = server;
+          try {
+            await checkReadiness?.();
+            readyServer = await operationClient.waitForServerIP(
+              server.cloudID,
+              config.awsPrivate,
               checkReadiness,
             );
-            bootstrapMs = Date.now() - bootstrapStartedAt;
-            readyServer = {
-              ...readyServer,
-              host: "",
-              awsSSMCommandID: bootstrap.commandID,
-              awsSSMCommandStatus: bootstrap.status,
-            };
-          }
-        } catch (error) {
-          if (error instanceof ProviderResourceUnresolvedError) throw error;
-          // Publication failures already carry the allocation; retrying publication could lose that evidence.
-          if (providerProvisioningCleanupClaim(error)) throw error;
-          const waitMessage = error instanceof Error ? error.message : String(error);
-          if (publishResource) {
-            // The published owner decides current retain/delete intent; readiness never deletes behind it.
-            if (
-              !(error instanceof CreateAttemptCanceledError) &&
-              // oxlint-disable-next-line eslint/no-await-in-loop -- revalidate retain/delete intent after the failed provider read.
-              (await publishResource(error))
-            ) {
-              throw new ProviderProvisioningCleanupError(waitMessage, claim, error);
+            if (config.awsRequireSSM) {
+              await operationClient.waitForSSMOnline(server.cloudID, checkReadiness);
+              const bootstrapStartedAt = Date.now();
+              const bootstrap = await operationClient.runSSMBootstrap(
+                server.cloudID,
+                leaseID,
+                config.awsSSMBootstrapCommand,
+                config.awsSSMLogGroup,
+                checkReadiness,
+              );
+              bootstrapMs = Date.now() - bootstrapStartedAt;
+              readyServer = {
+                ...readyServer,
+                host: "",
+                awsSSMCommandID: bootstrap.commandID,
+                awsSSMCommandStatus: bootstrap.status,
+              };
             }
-            readyServer = server;
-          } else {
-            try {
-              if (config.awsPrivate) {
-                // oxlint-disable-next-line eslint/no-await-in-loop -- clean up the exact instance before any fallback.
-                await client.terminateServerAndWait(server.cloudID);
-              } else {
-                // oxlint-disable-next-line eslint/no-await-in-loop -- clean up the exact instance before any fallback.
-                await client.deleteServer(server.cloudID);
+          } catch (error) {
+            if (error instanceof ProviderResourceUnresolvedError) throw error;
+            // Publication failures already carry the allocation; retrying publication could lose that evidence.
+            if (providerProvisioningCleanupClaim(error)) throw error;
+            const waitMessage = error instanceof Error ? error.message : String(error);
+            if (publishResource) {
+              // The published owner decides current retain/delete intent; readiness never deletes behind it.
+              if (
+                !(error instanceof CreateAttemptCanceledError) &&
+                (await publishResource(error))
+              ) {
+                throw new ProviderProvisioningCleanupError(waitMessage, claim, error);
               }
-            } catch (deleteError) {
-              const deleteMessage =
-                deleteError instanceof Error ? deleteError.message : String(deleteError);
-              throw new ProviderProvisioningCleanupError(
-                `${waitMessage}; cleanup failed for AWS instance ${server.cloudID}: ${deleteMessage}`,
-                claim,
-                deleteError,
+              readyServer = server;
+            } else {
+              try {
+                if (config.awsPrivate) {
+                  await operationClient.terminateServerAndWait(server.cloudID);
+                } else {
+                  await operationClient.deleteServer(server.cloudID);
+                }
+              } catch (deleteError) {
+                const deleteMessage =
+                  deleteError instanceof Error ? deleteError.message : String(deleteError);
+                throw new ProviderProvisioningCleanupError(
+                  `${waitMessage}; cleanup failed for AWS instance ${server.cloudID}: ${deleteMessage}`,
+                  claim,
+                  deleteError,
+                );
+              }
+              throw new Error(
+                `${waitMessage}; crabbox_aws_stale_instance_cleaned; deleted AWS instance ${server.cloudID} after readiness failure`,
+                { cause: error },
               );
             }
-            throw new Error(
-              `${waitMessage}; crabbox_aws_stale_instance_cleaned; deleted AWS instance ${server.cloudID} after readiness failure`,
-              { cause: error },
-            );
           }
-        }
-        const result: {
-          server: ProviderMachine;
-          serverType: string;
-          market?: string;
-          attempts?: ProvisioningAttempt[];
-          image?: LeaseImageIdentity;
-          provisioningTiming?: LeaseProvisioningTiming;
-        } = {
-          server: { ...readyServer, region },
-          serverType,
-          image: awsLeaseImageIdentity(config, imageID, region),
-          provisioningTiming: withProvisioningPhases({
-            requestMs,
-            networkReadyMs: Date.now() - networkReadyStartedAt - bootstrapMs,
-            ...(bootstrapMs > 0 ? { bootstrapMs } : {}),
-            totalMs: Date.now() - totalStartedAt,
-          }),
-        };
-        if (market) {
-          result.market = market;
-        }
-        return { ...result, ...history.result(attempts) };
+          const result: {
+            server: ProviderMachine;
+            serverType: string;
+            market?: string;
+            attempts?: ProvisioningAttempt[];
+            image?: LeaseImageIdentity;
+            provisioningTiming?: LeaseProvisioningTiming;
+          } = {
+            server: { ...readyServer, region },
+            serverType,
+            image: awsLeaseImageIdentity(config, imageID, region),
+            provisioningTiming: withProvisioningPhases({
+              requestMs,
+              networkReadyMs: Date.now() - networkReadyStartedAt - bootstrapMs,
+              ...(bootstrapMs > 0 ? { bootstrapMs } : {}),
+              totalMs: Date.now() - totalStartedAt,
+            }),
+          };
+          if (market) {
+            result.market = market;
+          }
+          return { ...result, ...history.result(attempts) };
+        });
+        return regionalResult;
       } catch (error) {
-        // Keep cancellation typed so the create owner records cleanup debt before
-        // returning its terminal response, even after an earlier regional failure.
+        // Preserve owner fence types: cancellation after dispatch records cleanup
+        // debt, while a pre-mutation fence bypasses failure bookkeeping entirely.
         if (
           error instanceof CreateAttemptCanceledError ||
+          error instanceof ProviderDispatchFenceError ||
+          error instanceof AWSLeaseAuthorityError ||
           providerProvisioningCleanupClaim(error) ||
           error instanceof ProviderResourceUnresolvedError
         ) {
           throw error;
         }
-        const message = error instanceof Error ? error.message : String(error);
+        let regionError = error;
+        let message = error instanceof Error ? error.message : String(error);
+        const retryableRegionFailure = isRetryableAWSRegionProvisioningError(message);
+        if (retryableRegionFailure && cleanupRegionalKey) {
+          try {
+            // Region-scoped key pairs must not survive a failed attempt when fallback advances.
+            // oxlint-disable-next-line eslint/no-await-in-loop -- cleanup must finish before the next Region owns the lease.
+            await cleanupRegionalKey();
+          } catch (cleanupError) {
+            if (cleanupError instanceof AWSLeaseAuthorityError) {
+              throw new ProviderResourceUnresolvedError(cleanupError.message, {
+                cause: cleanupError,
+              });
+            }
+            const cleanupMessage =
+              cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+            message = `${message}; failed to clean AWS SSH key in ${region}: ${cleanupMessage}`;
+            regionError = new AggregateError([error, cleanupError], message, { cause: error });
+          }
+        }
         history.recordFailure(
-          error,
+          regionError,
           {
             region,
             serverType: allocated?.serverType ?? config.serverType,
@@ -28840,7 +29682,7 @@ export class AWSProvider implements CloudProvider {
           `${region}: ${message}`,
           allocated?.attempts,
         );
-        if (!isRetryableAWSRegionProvisioningError(message)) {
+        if (!retryableRegionFailure || regionError !== error) {
           break;
         }
       }
@@ -28867,6 +29709,8 @@ export class AWSProvider implements CloudProvider {
       ...(server.awsSSMCommandStatus ? { awsSSMCommandStatus: server.awsSSMCommandStatus } : {}),
       ...(config.awsPrivate ? { awsSSMLogGroup: config.awsSSMLogGroup } : {}),
     };
+    delete nextLease.providerKeyCleanupPending;
+    delete nextLease.providerKeyCleanupID;
     const hints = capacityHints(this.env, nextConfig, nextLease, attempts);
     if (hints.length > 0) {
       nextLease.capacityHints = hints;
@@ -28875,36 +29719,42 @@ export class AWSProvider implements CloudProvider {
   }
 
   async releaseLease(lease: LeaseRecord): Promise<void> {
-    const unsettledAllocation = Boolean(
-      lease.provisioningRequestStartedAt || lease.provisioningResourceMayExist,
-    );
-    // A new EC2 allocation can be absent from reads before its ID propagates.
-    const server = await ownedProviderMachineForRelease("aws", lease, (id) =>
-      unsettledAllocation ? this.client.waitForServerVisibility(id) : this.findServer(id),
-    );
-    try {
-      if (server) {
-        await this.client.terminateServerAndWait(lease.cloudID);
-      }
-    } catch (error) {
-      const message = coordinatorErrorMessage(this.env, error);
-      if (unsettledAllocation || !isAWSInstanceNotFoundError(message)) {
-        throw error;
-      }
-      console.warn(
-        `AWS lease cleanup found missing instance lease=${lease.id} cloud=${lease.cloudID}: ${message}`,
+    await this.withLeaseOperation(async (session) => {
+      const recordedAccount = await this.verifyLeaseOperationAuthority(lease, session);
+      const unsettledAllocation = Boolean(
+        lease.provisioningRequestStartedAt || lease.provisioningResourceMayExist,
       );
-    }
-    if (lease.network?.awsPrivate) {
-      privateAWSWorkspaceLifecycleLog("terminated", {
-        lease_id: lease.id,
-        cloud_id: lease.cloudID,
-        region: lease.region,
-      });
-    }
-    if (leaseUsesCanonicalProviderKey(lease)) {
-      await this.deleteSSHKey(lease.providerKey, lease.id);
-    }
+      // A new EC2 allocation can be absent from reads before its ID propagates.
+      const server = lease.cloudID
+        ? await ownedProviderMachineForRelease("aws", lease, (id) =>
+            this.observeLeaseServer(
+              lease,
+              session,
+              () =>
+                unsettledAllocation ? session.waitForServerVisibility(id) : session.findServer(id),
+              "machine",
+            ),
+          )
+        : undefined;
+      if (server) {
+        await session.terminateServerAndWait(lease.cloudID);
+      }
+      if (lease.network?.awsPrivate) {
+        privateAWSWorkspaceLifecycleLog("terminated", {
+          lease_id: lease.id,
+          cloud_id: lease.cloudID,
+          region: lease.region,
+        });
+      }
+      if (leaseUsesCanonicalProviderKey(lease)) {
+        if (!lease.cloudID && !recordedAccount) {
+          throw new ProviderResourceUnresolvedError(
+            "AWS lease account scope was not persisted; refusing key-only cleanup",
+          );
+        }
+        await session.deleteSSHKey(lease.providerKey, lease.id);
+      }
+    });
   }
 
   supportsNativeImages(): boolean {
@@ -29571,7 +30421,7 @@ export class AWSProvider implements CloudProvider {
       : known?.region === historyRegion
         ? known
         : undefined;
-    const target = normalizeAWSImageTarget(
+    const target = parseTarget(
       input.target ?? url.searchParams.get("target") ?? prior?.target ?? "linux",
     );
     if (!target) {

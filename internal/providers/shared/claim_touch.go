@@ -2,6 +2,8 @@ package shared
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -14,6 +16,46 @@ type ClaimTouchPolicy struct {
 	Provider  string
 	Authorize func(context.Context, core.LeaseTarget, core.LeaseClaim) error
 	Prepare   func(core.LeaseClaim) (map[string]string, time.Time)
+}
+
+// ClaimActivityHoldState identifies logical holds that native runtime status
+// cannot clear. Adapters must retain them in observations and reject activity.
+func ClaimActivityHoldState(claim core.LeaseClaim) string {
+	state := strings.ToLower(strings.TrimSpace(claim.Labels["state"]))
+	switch state {
+	case "cleanup", "deleting", "expired", "released":
+		return state
+	default:
+		return ""
+	}
+}
+
+// ObservedClaimActivityState preserves logical holds and precise activity while
+// replacing obsolete runtime state. Adapters classify running/obsolete states;
+// recorded and observed strings retain their provider-specific normalization.
+func ObservedClaimActivityState(claim core.LeaseClaim, recorded, observed string, observedRunning, recordedObsolete bool) string {
+	if hold := ClaimActivityHoldState(claim); hold != "" {
+		return hold
+	}
+	if observedRunning {
+		if recordedObsolete {
+			return observed
+		}
+		return recorded
+	}
+	if observed != "" && observed != "unknown" {
+		return observed
+	}
+	return recorded
+}
+
+// AuthorizeClaimActivity checks lifecycle holds and checkpoint exclusion;
+// resource ownership and exact-snapshot checks remain the adapter's responsibility.
+func AuthorizeClaimActivity(claim core.LeaseClaim) error {
+	if hold := ClaimActivityHoldState(claim); hold != "" {
+		return core.Exit(4, "%s lease=%s activity is held in state %s", claim.Provider, claim.LeaseID, hold)
+	}
+	return core.AuthorizeCheckpointRelease(claim, "")
 }
 
 // CommitClaimTouch publishes one prepared touch through the existing claim CAS.
@@ -32,4 +74,52 @@ func CommitClaimTouch(ctx context.Context, req core.TouchRequest, policy ClaimTo
 	}
 	labels, now := policy.Prepare(expected)
 	return core.UpdateLeaseClaimTouchIfUnchanged(ctx, req.Lease.LeaseID, expected, labels, now, req.IdleTimeoutOverride)
+}
+
+// ClaimLifecycleLabels restores persisted lifecycle policy without renewing it.
+// It retains all internal provider metadata; it is not a public-label filter.
+func ClaimLifecycleLabels(claim core.LeaseClaim) map[string]string {
+	labels := CloneLabels(claim.Labels)
+	if claim.IdleTimeoutSeconds > 0 {
+		labels["idle_timeout"] = strconv.Itoa(claim.IdleTimeoutSeconds)
+		labels["idle_timeout_secs"] = labels["idle_timeout"]
+	}
+	for key, value := range map[string]string{"created_at": claim.ClaimedAt, "last_touched_at": claim.LastUsedAt} {
+		if labels[key] == "" {
+			if stamp, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
+				labels[key] = core.LeaseLabelTime(stamp)
+			}
+		}
+	}
+	return labels
+}
+
+// LegacyLabelIdleTimeout is opt-in for adapters whose released heartbeat writer
+// updated labels without updating the structured timeout. Reconcile it only in
+// the next authorized transaction, using the original claim as the CAS snapshot.
+func LegacyLabelIdleTimeout(claim core.LeaseClaim) *time.Duration {
+	for _, key := range []string{"idle_timeout_secs", "idle_timeout"} {
+		idle, ok := core.LeaseLabelDuration(claim.Labels[key])
+		if !ok || idle <= 0 {
+			continue
+		}
+		idle = idle.Round(time.Second)
+		if idle < time.Second {
+			continue
+		}
+		if int(idle/time.Second) != claim.IdleTimeoutSeconds {
+			return &idle
+		}
+		return nil
+	}
+	return nil
+}
+
+// LegacyLabelLifecycleLabels preserves policy recorded by label-only writers
+// without changing the persisted claim or renewing its activity and expiry.
+func LegacyLabelLifecycleLabels(claim core.LeaseClaim) map[string]string {
+	if legacy := LegacyLabelIdleTimeout(claim); legacy != nil {
+		claim.IdleTimeoutSeconds = int(*legacy / time.Second)
+	}
+	return ClaimLifecycleLabels(claim)
 }

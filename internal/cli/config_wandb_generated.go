@@ -16,27 +16,21 @@ func defaultWandbConfig() WandbConfig {
 	return WandbConfig{}
 }
 
-func (cfg *WandbConfig) applyFile(file *fileWandbConfig) error {
-	if file == nil {
-		return nil
-	}
-	if file.APIKey != "" {
-		cfg.APIKey = file.APIKey
-	}
-	if file.DefaultImage != "" {
-		cfg.DefaultImage = file.DefaultImage
-	}
-	if file.MaxLifetimeSeconds > 0 {
-		cfg.MaxLifetimeSeconds = file.MaxLifetimeSeconds
-	}
-	return nil
+// WandbConfigApplied records accepted assignments during one application.
+type WandbConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *WandbConfig) applyEnv() error {
-	cfg.APIKey = getenv("CRABBOX_WANDB_API_KEY", cfg.APIKey)
-	cfg.DefaultImage = getenv("CRABBOX_WANDB_DEFAULT_IMAGE", getenv("WANDB_DEFAULT_IMAGE", cfg.DefaultImage))
-	cfg.MaxLifetimeSeconds = getenvInt("CRABBOX_WANDB_MAX_LIFETIME_SECONDS", getenvInt("WANDB_MAX_LIFETIME_SECONDS", cfg.MaxLifetimeSeconds))
-	return nil
+func (cfg *WandbConfig) applyFile(file *fileWandbConfig) (WandbConfigApplied, error) {
+	var applied WandbConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "wandb")
+	return applied, err
+}
+
+func (cfg *WandbConfig) applyEnv() (WandbConfigApplied, error) {
+	var applied WandbConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 3)
+	return applied, err
 }
 
 // WandbConfigFlagValues holds parsed values; only visited flags are applied.
@@ -47,18 +41,14 @@ type WandbConfigFlagValues struct {
 
 // RegisterWandbConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterWandbConfigFlags(fs *flag.FlagSet, defaults WandbConfig) WandbConfigFlagValues {
-	return WandbConfigFlagValues{
-		DefaultImage:       fs.String("wandb-image", defaults.DefaultImage, "Container image used when acquiring a new W&B sandbox"),
-		MaxLifetimeSeconds: fs.Int("wandb-max-lifetime", defaults.MaxLifetimeSeconds, "Maximum sandbox lifetime in seconds before W&B reclaims it"),
-	}
+	var values WandbConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values WandbConfigFlagValues) Apply(cfg *WandbConfig, fs *flag.FlagSet) {
-	if flagWasSet(fs, "wandb-image") {
-		cfg.DefaultImage = *values.DefaultImage
-	}
-	if flagWasSet(fs, "wandb-max-lifetime") {
-		cfg.MaxLifetimeSeconds = *values.MaxLifetimeSeconds
-	}
+func (values WandbConfigFlagValues) Apply(cfg *WandbConfig, fs *flag.FlagSet) (WandbConfigApplied, error) {
+	var applied WandbConfigApplied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

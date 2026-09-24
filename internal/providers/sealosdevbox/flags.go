@@ -19,7 +19,8 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if !ok {
 		return nil
 	}
-	applied := v.Apply(&cfg.SealosDevbox, fs)
+	applied, err := v.Apply(&cfg.SealosDevbox, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
 	cfg.SealosDevbox.ExpandAppliedLocalPaths(applied)
 	if applied.WorkRoot {
 		cfg.WorkRoot = cfg.SealosDevbox.WorkRoot
@@ -27,6 +28,9 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	}
 	if applied.DeleteOnRelease {
 		core.MarkDeleteOnReleaseExplicit(cfg, providerName)
+	}
+	if err != nil {
+		return err
 	}
 	return validateBaseConfig(*cfg)
 }
@@ -55,7 +59,7 @@ func validateBaseConfig(cfg core.Config) error {
 			return core.Exit(2, "sealos-devbox SSH gateway port must be between 1 and 65535")
 		}
 	}
-	clean := path.Clean(sealosWorkRoot(cfg))
+	clean := path.Clean(core.EffectiveSealosDevboxWorkRoot(cfg))
 	if !strings.HasPrefix(clean, "/") {
 		return core.Exit(2, "sealosDevbox.workRoot %q must resolve to an absolute path", values.WorkRoot)
 	}
@@ -98,8 +102,4 @@ func normalizeNetwork(value string) string {
 	default:
 		return strings.TrimSpace(value)
 	}
-}
-
-func sealosWorkRoot(cfg core.Config) string {
-	return core.EffectiveSealosDevboxWorkRoot(cfg)
 }

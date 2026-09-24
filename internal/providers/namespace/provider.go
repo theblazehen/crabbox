@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
-	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 func init() {
@@ -18,12 +17,10 @@ var _ core.ProviderClassProfileProvider = Provider{}
 
 var classProfiles = buildClassProfiles()
 
-func (Provider) Name() string { return namespaceProvider }
-func (Provider) Aliases() []string {
-	return []string{"namespace", "namespace-devboxes"}
-}
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Aliases:          []string{"namespace", "namespace-devboxes"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationCLI),
 		Name:             namespaceProvider,
 		Family:           "namespace",
 		Kind:             core.ProviderKindSSHLease,
@@ -58,26 +55,12 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.ServerTypeExplicit && strings.TrimSpace(cfg.ServerType) != "" {
 		return strings.ToUpper(strings.TrimSpace(cfg.ServerType))
 	}
-	if candidates, matched := core.ProviderClassCandidatesForProfiles(classProfiles, cfg); matched {
-		return candidates[0]
-	}
-	if core.IsCanonicalProviderClass(cfg.Class) {
-		return ""
-	}
-	return namespaceSizeForClass(cfg.Class)
+	return core.ProviderClassPrimaryTypeForProfiles(classProfiles, cfg, namespaceSizeForClass(cfg.Class))
 }
 
 func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
 	size := strings.TrimSpace(cfg.Namespace.Size)
 	return strings.ToUpper(size), size != ""
-}
-
-func (Provider) ServerTypeForClass(class string) string {
-	cfg := core.Config{Provider: namespaceProvider, TargetOS: core.TargetLinux, Architecture: core.ArchitectureAMD64, Class: class}
-	if candidates, matched := core.ProviderClassCandidatesForProfiles(classProfiles, cfg); matched {
-		return candidates[0]
-	}
-	return namespaceSizeForClass(class)
 }
 
 func namespaceSizeForClass(class string) string {
@@ -101,8 +84,4 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 }
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewNamespaceLeaseBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return shared.ConfigureDoctor("namespace-devbox", func() (core.Backend, error) { return p.Configure(cfg, rt) })
 }

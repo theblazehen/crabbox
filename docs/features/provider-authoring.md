@@ -86,9 +86,12 @@ import _ "github.com/openclaw/crabbox/internal/providers/example"
 `cmd/crabbox/main.go` already imports `internal/providers/all`, so nothing else
 needs to change for the binary to see the new provider.
 
-Tests inside `internal/cli` cannot import `internal/providers/all` because that
-creates an import cycle. If you need a test provider for core dispatch, register
-it from a same-package test file.
+Same-package tests in `internal/cli` cannot import provider adapters because that
+creates an import cycle. Register a synthetic provider there only to test core
+dispatch. To test actual provider policy, use an external `cli_test` package,
+which can import and register the real adapter without an import cycle. Use
+scoped backend injection when needed to keep execution local; do not reproduce
+the adapter's policy in a fake provider.
 
 ## Step 3. Register The Provider
 
@@ -108,9 +111,6 @@ func init() {
 }
 
 type Provider struct{}
-
-func (Provider) Name() string      { return "example" }
-func (Provider) Aliases() []string { return nil }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
@@ -140,14 +140,15 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 }
 ```
 
-`Name()` is the canonical name used in docs, config (`provider: example`), and
-the `--provider` flag. `RegisterProvider` registers the canonical name plus
-every alias and panics on a duplicate, so keep names unique. Aliases are for
+`ProviderSpec.Name` is the canonical name used in docs, config (`provider: example`),
+and the `--provider` flag. `RegisterProvider` registers it plus every entry in
+`ProviderSpec.Aliases` and panics on a duplicate, so keep names unique. Aliases are for
 compatibility — Blacksmith uses `blacksmith` as an alias for
 `blacksmith-testbox`. Do not invent aliases for new providers; pick one
 canonical name.
 
-`Spec()` is the source of truth for what the provider can do. Read on.
+`Spec()` owns identity and capabilities. Return stable metadata without side
+effects: core reads it during registration and selection before configuration.
 
 ## Step 4. Be Honest In `Spec`
 
@@ -214,9 +215,11 @@ Rules:
   provider runs direct from the CLI unless a broker URL is configured (see
   [Coordinator](coordinator.md)).
 
-Actions runner hydration is not a feature flag. Core checks for an SSH lease
-backend on a `linux` or `windows` target (`localcontainer` is explicitly
-rejected). Set `target=linux` only on a backend that can actually satisfy it.
+`--actions-runner` requires an SSH lease backend on a `linux` or `windows` target.
+Set `ProviderSpec.ActionsRunnerUnsupported` when the provider cannot host the
+native GitHub Actions runner, as local-container, apple-container, and multipass
+do. This restriction does not disable ordinary Actions hydration. Set
+`target=linux` only on a backend that can actually satisfy it.
 
 Versioned workspace features describe provider depth, not the presence of
 Crabbox checkpoint commands. Core can always record a generic checkpoint from
@@ -325,6 +328,31 @@ Never accept secrets as flag arguments. Pull them from environment variables,
 SDK config, the broker, or the operator's credential store. Flags are visible in
 shell history, process listings, and recorded run logs.
 
+Provider-native configuration defaults belong in `ProviderConfigDefaulter`'s
+`ApplyConfigDefaults` hook. Core calls it after input parsing and portable-OS
+preprocessing, then normally normalizes and validates the target. Providers whose
+existing command boundary retains native defaults after target normalization
+implement `ProviderConfigDefaultsPhase` and return
+`ProviderConfigDefaultsCallerFinalizes`. This leaves finalization with the caller:
+config loading normalizes afterward, while command paths may already have
+normalized before defaults. The zero/default phase retains dispatcher
+normalization and validation. Both phases are config-only; neither may acquire
+runners or inspect native runtime state. Use core provenance
+accessors to preserve explicit inputs; `ApplyLinuxConnectionDefaults` restores
+explicit connection settings when applying Linux defaults across provider changes.
+Keep acquisition-only validation deferred: DigitalOcean and Linode preserve an
+unresolved explicit portable image until backend construction captures the error,
+before filling runtime fallbacks. Passive config-display hooks must not invoke
+configuration-default phases. Implement `ProviderConfigShowNormalizer` for narrow,
+selected-provider display projections; use `ApplyConfigShowSSHDefaults` when
+projecting conventional SSH defaults without changing explicit connection inputs
+or provider-native configuration. Provider-owned config-show sections may derive
+pure effective display values from the supplied Config, including inactive
+providers' displayed work roots. They must not call ApplyConfigDefaults, load
+configuration, read environment or native state, resolve credentials, or mutate
+the supplied configuration. Selected top-level projections still belong in
+ProviderConfigShowNormalizer and require actionable provider selection.
+
 ## Step 6. Implement The Backend
 
 Pick the interface that matches the kind you declared. Both embed `Backend`,
@@ -370,14 +398,50 @@ required labels, and carry the returned full claim as the exact snapshot for
 later fenced updates. Recovery phases, account or key authorization, live
 resource validation, and every deletion decision remain adapter-owned.
 
+Optional `core.AbsenceVerifier` observes the exact claim-bound resource without
+mutating it. Return zero evidence for a present resource, an error for uncertain
+absence, or `AbsenceEvidence` containing the unchanged claim and both proof
+flags after verifying scope, exact structured not-found, and complete unfiltered
+inventory where available. Core owns local forgetting through
+`ForgetAbsentLeaseClaim`, including the exclusive claim fence and exclusions for
+fixed, checkpoint, coordinator, and adapter owners. Targeted `stop --force`
+uses this capability; `OrdinaryStopAbsenceRecovery` additionally opts in an
+existing ordinary-stop contract. Report `ReleaseLeaseOutcome.ForgottenLocally`
+when an adapter's release entry point delegates to this transaction, so core
+skips release cleanup and reports local forgetting distinctly.
+
+Use `shared.RemoveExactClaimAfterContext` for exact-claim terminal cleanup and
+pass the same lifecycle context that its provider action uses. There is no
+implicit background-context variant: waiting for the claim fence must honor the
+operation's cancellation policy. An acquisition rollback that intentionally
+outlives the acquisition must choose its independent context explicitly, without
+silently changing the provider's existing cleanup budget. A successful action
+still completes durable claim retirement after cancellation; do not add a
+post-action cancellation check that strands already-confirmed cleanup.
+
 `List` returns `[]LeaseView` (a type alias for `Server`). Do not print from
 `List` — core renders the table.
+
+Claim-publication helpers initialize a missing idle policy, but preserve an
+already-recorded positive idle duration during ordinary direct-lease preparation,
+repository reclaim, and endpoint publication. Their duration argument is not
+implicit replacement intent. Explicit idle changes belong to the run/Touch
+policy path; managed coordinator projections use the resolved server's
+`idle_timeout_secs` label rather than the command's configured default. This also
+keeps acquisition finalization from reinitializing a policy already published
+by the provider's first acquisition step.
 
 `Touch` updates idle/state metadata on the provider when possible. Use the
 `internal/cli/provider_labels.go` helpers for safe label encoding. The optional
 `TouchRequest.IdleTimeoutOverride` carries replacement intent: `nil` preserves
 the current lease timeout, while a non-nil value replaces it. Do not infer
 replacement intent from the effective `IdleTimeout` fallback.
+
+The adapter owns the metadata-write client and resource identifier; do not
+infer a different provider from an identifier's shape. For existing best-effort
+touch paths, `shared.DirectSSHBackend.Touch` accepts the complete touch request,
+preserves its explicit idle-timeout replacement intent, and shares label updates
+and warning output while its callback performs the provider-specific write.
 
 Static providers must commit touched lifecycle labels and any explicit timeout
 replacement to their durable local claim. `Resolve` must reconstruct lifecycle
@@ -420,8 +484,16 @@ reads, and invokes adapter checks and progress. Keep state strings,
 retryability, normalization, ownership checks, provider actions, claim updates,
 cleanup, and error wording in the adapter.
 
+For bounded acquisition reads that stop at the first fetch error and return no
+partial value on failure, use `shared.PollReady`. It owns the child timeout and
+distinguishes that deadline from caller cancellation and immediate client
+deadlines. Supply the provider's readiness predicate and nonnil timeout error;
+the interval, request construction, state interpretation, and diagnostic remain
+adapter-owned. Use `Poll` directly when retryability, progress, last-observation
+retention, or detached-context policy differs.
+
 Vanilla provider HTTP redirect guards should use `shared.SecureHTTPClient` and
-`shared.SameOrigin`. The shared policy compares scheme and hostname
+`core.SameHTTPOrigin`. The shared policy compares scheme and hostname
 case-insensitively, normalizes the default HTTP and HTTPS ports, preserves an
 injected redirect hook, and otherwise retains the standard 10-redirect cap.
 The adapter still builds its exact provider-specific refusal error. Keep a
@@ -437,10 +509,37 @@ type CleanupBackend interface {
 }
 ```
 
+Adapters using the common `crabbox.provider`, `crabbox.scope` and `crabbox.claim`
+sandbox metadata can use `shared.ValidateSandboxOwnershipMetadata`. It preserves
+exact marker comparisons and the existing missing-ID and mismatch errors.
+Endpoint admission, requested-resource ID binding and different provider marker
+schemes remain adapter-owned; this check is not a replacement for those policies.
+
+Delegated adapters can use `shared.RefreshRetainedLeaseActivity` in their
+`Retained` callback to refresh an existing claim while still holding the
+provider operation lock. It preserves the stored scope, pond and repository,
+treats a missing claim as a no-op, and delegates idle-timeout policy to core.
+It does not perform admission or reclaim; provider-specific warnings and
+activation conditions stay in the adapter.
+
+Delegated adapters that expire local claims by last activity should use
+`shared.ClaimIdleCleanupDue`. It preserves the shared idle-deadline decision
+and skip reasons, including disabled timeouts and invalid timestamps. Absolute
+TTL rules, recovery deadlines, ownership validation, and deletion authorization
+remain adapter-owned; an idle deadline alone does not authorize cleanup.
+
 Cleanup must honor `CleanupRequest.DryRun`, log every skip/delete decision to
 `rt.Stderr`, and filter by Crabbox labels so it never touches unrelated
 machines. When a broker is configured, core refuses to call provider cleanup at
 all — brokered cleanup belongs to the coordinator scheduler.
+
+Adapters with explicit cleanup decisions can use `shared.DirectCleanupDecision`
+to apply a server deletion, recovery continuation, or confirmed-missing claim
+retirement behind one dry-run boundary. Discover and validate candidates before
+applying the decision; put mutating provider preparation, recovery writes, and
+key removal inside its mutation callback. Missing-resource policy and recovery
+eligibility remain adapter-owned. Azure and GCP use this boundary without
+changing the ordinary `DirectSSHBackend.CleanupServers` contract.
 
 For claim-authorized providers built on `shared.DirectSSHBackend`, use its
 opt-in `PrepareCleanup` hook after the shared expiration/keep gate. Preparation
@@ -497,6 +596,20 @@ summary.
    `SyncDelegated: true`;
 6. stop temporary resources when `Keep` is false.
 
+Archive-based providers configure a `core.ArchiveWorkspace` using
+`core.NewArchiveWorkspace(cfg, rt, req, providerName, workdir)`. Core owns
+preparation, guardrails, transfer
+timing, workspace replacement, and temporary-archive cleanup, using `/tmp` as
+the default remote archive directory. Adapters supply upload and execution
+callbacks and any provider-specific cleanup context or replacement behavior.
+Return this workspace from `DelegatedSandboxLifecycle.Workspace`; the run owner
+prepares the local archive before acquisition and calls `Sync` or `Ensure` after
+admission. Bind the upload and execution callbacks to the current resource inside
+the workspace factory, without contacting the provider during construction.
+Use `CleanWorkdir` for an adapter's path rules and `Replace` for mounted workspace
+replacement. Keep native synchronization or operation-wide claim fencing in
+`shared.WorkspaceOperations` when those contracts need a different sequence.
+
 `Status` returns a normalized `StatusView`. If the provider only emits a table,
 parse it inside the backend and return structured fields — do not print the
 native table.
@@ -510,18 +623,22 @@ boundary intact across those flows.
 
 ### Optional Backends
 
-- `DoctorProvider` / `DoctorBackend` — add `ConfigureDoctor` plus a `Doctor`
-  method so `crabbox doctor --provider <name>` returns structured
-  `DoctorCheck` items instead of a generic message. When `ConfigureDoctor`
-  configures the standard backend and requires that capability, delegate the
-  assertion to `shared.ConfigureDoctor`; keep direct doctor-backend construction
-  and provider-specific validation local.
+- `DoctorBackend` — add a `Doctor` method to the ordinary backend so
+  `crabbox doctor --provider <name>` returns structured `DoctorCheck` items.
+  Core discovers this capability automatically on the selected provider.
+  Add a `DoctorProvider.ConfigureDoctor` override only when diagnostics must
+  bypass acquisition-only validation or use a different backend.
 - `JSONListBackend` — add `ListJSON` only when a script-facing JSON shape
   already exists and callers depend on it. This is a compatibility escape hatch;
   new providers should return normalized `[]LeaseView` from `List` and let core
   render JSON.
 
 ## Step 7. Use The Runtime
+
+Use `core.ValidShellEnvName` for the portable ASCII environment-name grammar
+and `core.IsShellEnvAssignment` to recognize a leading `NAME=value` argument.
+These helpers do not trim names or validate values. Keep the adapter's policy
+for invalid names, value restrictions, allowlists, quoting, and transport local.
 
 Backends receive a narrow runtime instead of touching package-level state:
 
@@ -548,6 +665,9 @@ Rules:
   tests can pass a fake clock for deterministic timing assertions.
 - Use `rt.Stdout` and `rt.Stderr` for streaming and warnings. Do not write
   directly to `os.Stdout` / `os.Stderr`.
+- Use `shared.LocalCommandError` when a failed tool keeps its nonzero exit code
+  (zero becomes one) and reports trimmed stderr before stdout. Providers with
+  different exit, redaction, or cause-wrapping contracts retain their own policy.
 - Use `rt.HTTP` for outbound HTTP when the provider has a JSON API. Tests can
   inject a stubbed transport.
 
@@ -684,3 +804,20 @@ to the rest of Crabbox.
 - [Source map](../source-map.md): files behind documented behavior.
 - [Architecture](../architecture.md): system overview and lease flow.
 - [Coordinator](coordinator.md): brokered lease contract.
+
+### Bounded ready-pool access
+
+`CloudProvider.poolAccess()` is an optional capability separate from typed image
+identity. Core journals grants, generations, receipt hashes, immutable deadlines,
+and cleanup intent in transactions; adapters perform external mutations after
+those transactions commit. Implement `enroll`, `install`, and `revoke` from
+`worker/src/ready-pool-access.ts`. Bind every operation to the immutable resource
+and lease. A replay or delayed install must not restore a revoked generation.
+
+`revoke` must prove both exact key removal and active-session fencing, or
+confirmed resource destruction. An accepted API request is insufficient.
+Enrollment must establish guest expiry enforcement that survives coordinator
+outages and guest reboot. AWS uses SSM, root-owned generation tombstones,
+persistent expiry timers, and observed boot-ID changes. Whole-instance reboot
+cannot preserve a replacement grant's sessions, so v1 has no in-place renewal.
+Unsupported adapters must leave this capability absent.

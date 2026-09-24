@@ -8,37 +8,35 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-func RegisterSmolvmProviderFlags(fs *flag.FlagSet, defaults Config) any {
+func RegisterSmolvmProviderFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return core.RegisterSmolvmConfigFlags(fs, defaults.Smolvm)
 }
 
-func ApplySmolvmProviderFlags(cfg *Config, fs *flag.FlagSet, values any) error {
+func ApplySmolvmProviderFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if core.ProviderNameMatchesExact(cfg.Provider, Provider{}) {
 		if err := shared.RejectExplicitMachineSizingFlags(fs, providerName, "use --smolvm-cpus/--smolvm-memory-mb", "use --smolvm-image"); err != nil {
 			return err
 		}
 	}
-	v, ok := values.(core.SmolvmConfigFlagValues)
-	if !ok {
-		return nil
+	if ok, err := core.ApplyProviderConfigFlags[core.SmolvmConfigFlagValues](cfg, fs, values, &cfg.Smolvm, providerName); !ok || err != nil {
+		return err
 	}
-	v.Apply(&cfg.Smolvm, fs)
 	return validateConfig(*cfg)
 }
 
-func validateConfig(cfg Config) error {
+func validateConfig(cfg core.Config) error {
 	if network := strings.TrimSpace(cfg.Smolvm.Network); network != "" {
 		switch strings.ToLower(network) {
 		case "open", "blocked", "public", "private":
 		default:
-			return exit(2, "invalid smolvm network %q (use open or blocked)", network)
+			return core.Exit(2, "invalid smolvm network %q (use open or blocked)", network)
 		}
 	}
 	if cpus := cfg.Smolvm.CPUs; cpus < 0 {
-		return exit(2, "smolvm cpus must be >= 0")
+		return core.Exit(2, "smolvm cpus must be >= 0")
 	}
 	if mem := cfg.Smolvm.MemoryMB; mem < 0 {
-		return exit(2, "smolvm memory-mb must be >= 0")
+		return core.Exit(2, "smolvm memory-mb must be >= 0")
 	}
 	_, err := cleanWorkdir(workdir(cfg))
 	return err

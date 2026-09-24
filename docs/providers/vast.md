@@ -177,6 +177,11 @@ URLs.
 10. Wait for Crabbox SSH bootstrap readiness and write a local lease claim.
 11. Run normal Crabbox SSH sync, command execution, status, list, and cleanup.
 
+The initial native SSH-endpoint wait has a ten-minute elapsed-time budget that
+bounds both API requests and the gaps between observations. Caller cancellation
+stops the wait without extending that budget; lifecycle timestamps do not control
+it. A completed ready response or terminal provider error retains precedence.
+
 The provider requires Linux. It does not advertise desktop, browser, code-server,
 Tailscale, coordinator, or provider-managed sync support in this release.
 Actions hydration works only as normal command execution on the resulting Linux
@@ -250,6 +255,27 @@ the provider stop or destroy request, and the resulting claim update or removal.
 Runtime state updates preserve that exact non-secret routing metadata. Generated
 stop commands include the credential-free API endpoint and never include the API
 key.
+
+The local claim also owns idle timeout, creation time, TTL, keep policy, and
+heartbeat activity. Fresh status/list reads preserve those values without writing
+the claim; a stopped or failed native instance still reports its physical state.
+After a native restart, a saved runtime stop/failure no longer masks the running
+instance. Logical deletion and expiry holds remain intact.
+Plain `status` includes the available native SSH host, port, user, and stored
+lease key for core's readiness probe, just like `status --wait`; it does not
+prepare access or renew the claim. A missing or incomplete native SSH endpoint
+still permits a metadata-only status observation.
+An ordinary heartbeat preserves the recorded idle timeout, while an explicit
+`--idle-timeout` replaces it atomically with activity timestamps. Expiry remains
+capped by the recorded creation-based TTL. A stale or missing claim snapshot is
+an error, not a successful heartbeat.
+
+Upgrades preserve valid policy labels written by older releases, including a
+timeout stored only in labels. The next authorized heartbeat or repository reuse
+reconciles the structured timeout in the same claim transaction. Earlier releases
+could already have reset creation, TTL, or keep labels during resolution; those
+lost historical values cannot be reconstructed. Unclaimed observations do not
+invent lifecycle history; explicit `--reclaim` initializes a new policy.
 
 ## Guarded Live Smoke
 

@@ -161,10 +161,16 @@ func TestDelegatedSandboxSecondaryDiagnosticsKeepSafeMessages(t *testing.T) {
 	result, err := RunDelegatedSandbox(t.Context(), core.RunRequest{NoSync: true, Keep: true}, DelegatedSandboxLifecycle{
 		Provider: "test",
 		Acquire:  func(context.Context) (DelegatedSandbox, error) { return DelegatedSandbox{LeaseID: "lease"}, nil },
-		NoSync:   func(context.Context) error { return nil },
+		Workspace: func() SandboxWorkspace {
+			return WorkspaceOperations{
+				EnsureFunc: func(context.Context) error { return nil },
+			}
+		},
 		Command: func(context.Context) (DelegatedSandboxCommand, error) {
 			return DelegatedSandboxCommand{
-				Run:   func(context.Context) (int, error) { return 1, ExitErrorWithCause(1, "safe execution", primary) },
+				Run: func(context.Context, io.Writer, io.Writer) (int, error) {
+					return 1, ExitErrorWithCause(1, "safe execution", primary)
+				},
 				Close: func(context.Context) error { return ExitErrorWithCause(5, "safe cleanup", secondary) },
 			}, nil
 		},
@@ -289,29 +295,34 @@ func TestDelegatedSandboxLifecycle(t *testing.T) {
 			lifecycle := DelegatedSandboxLifecycle{
 				Provider: "test", Runtime: core.Runtime{Stdout: &stdout, Stderr: &stderr, Clock: clock}, Workdir: "/workspace/repo", CleanupTimeout: 2 * time.Second,
 				Preflight: func(context.Context) error { return step("preflight") },
-				PrepareArchive: func(context.Context) (*core.PreparedArchive, error) {
-					if err := step("archive"); err != nil {
-						return nil, err
+				Workspace: func() SandboxWorkspace {
+					return WorkspaceOperations{
+						PrepareArchiveFunc: func(context.Context) (*core.PreparedArchive, error) {
+							if err := step("archive"); err != nil {
+								return nil, err
+							}
+							file, err := os.CreateTemp(t.TempDir(), "archive-")
+							if err != nil {
+								t.Fatal(err)
+							}
+							archivePath = file.Name()
+							return &core.PreparedArchive{File: file}, nil
+						},
+						SyncFunc: func(_ context.Context, archive *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
+							if (archive == nil) != tc.reuse {
+								t.Fatalf("prepared archive=%v reused=%t", archive, tc.reuse)
+							}
+							return []core.TimingPhase{{Name: "test_sync", Ms: 1}}, time.Millisecond, step("sync")
+						},
+						EnsureFunc: func(context.Context) error { return step("workspace") },
 					}
-					file, err := os.CreateTemp(t.TempDir(), "archive-")
-					if err != nil {
-						t.Fatal(err)
-					}
-					archivePath = file.Name()
-					return &core.PreparedArchive{File: file}, nil
 				},
 				Acquire: func(context.Context) (DelegatedSandbox, error) { return sandbox("acquire") },
 				Resolve: func(context.Context) (DelegatedSandbox, error) { return sandbox("resolve") },
 				Setup:   func(context.Context) error { return step("setup") },
-				Sync: func(_ context.Context, archive *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
-					if (archive == nil) != tc.reuse {
-						t.Fatalf("prepared archive=%v reused=%t", archive, tc.reuse)
-					}
-					return []core.TimingPhase{{Name: "test_sync", Ms: 1}}, time.Millisecond, step("sync")
-				},
-				NoSync: func(context.Context) error { return step("workspace") },
+
 				Command: func(context.Context) (DelegatedSandboxCommand, error) {
-					return DelegatedSandboxCommand{Text: "true", Run: func(context.Context) (int, error) {
+					return DelegatedSandboxCommand{Text: "true", Run: func(context.Context, io.Writer, io.Writer) (int, error) {
 						if !locked {
 							t.Fatal("command without lock")
 						}
@@ -444,20 +455,25 @@ func TestDelegatedSandboxSequence(t *testing.T) {
 	add := func(name string) { calls = append(calls, name) }
 	lifecycle := DelegatedSandboxLifecycle{
 		Provider: "test", Runtime: core.Runtime{}, Workdir: "/repo",
-		Preflight:      func(context.Context) error { add("preflight"); return nil },
-		PrepareArchive: func(context.Context) (*core.PreparedArchive, error) { add("archive"); return nil, nil },
+		Preflight: func(context.Context) error { add("preflight"); return nil },
+		Workspace: func() SandboxWorkspace {
+			return WorkspaceOperations{
+				PrepareArchiveFunc: func(context.Context) (*core.PreparedArchive, error) { add("archive"); return nil, nil },
+				SyncFunc: func(context.Context, *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
+					add("sync")
+					return nil, 0, nil
+				},
+			}
+		},
 		Acquire: func(context.Context) (DelegatedSandbox, error) {
 			add("acquire")
 			return DelegatedSandbox{Unlock: func() { add("unlock") }}, nil
 		},
 		Setup: func(context.Context) error { add("setup"); return nil },
-		Sync: func(context.Context, *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
-			add("sync")
-			return nil, 0, nil
-		},
+
 		Command: func(context.Context) (DelegatedSandboxCommand, error) {
 			add("command")
-			return DelegatedSandboxCommand{Run: func(context.Context) (int, error) { add("exec"); return 0, nil }, Close: func(context.Context) error { add("close-command"); return nil }}, nil
+			return DelegatedSandboxCommand{Run: func(context.Context, io.Writer, io.Writer) (int, error) { add("exec"); return 0, nil }, Close: func(context.Context) error { add("close-command"); return nil }}, nil
 		},
 		Cleanup: func(context.Context) error { add("cleanup"); return nil },
 	}
@@ -482,7 +498,11 @@ func TestDelegatedSandboxCleanupDeadline(t *testing.T) {
 	result, err := RunDelegatedSandbox(t.Context(), core.RunRequest{NoSync: true, SyncOnly: true}, DelegatedSandboxLifecycle{
 		Provider: "test", CleanupTimeout: time.Millisecond,
 		Acquire: func(context.Context) (DelegatedSandbox, error) { return DelegatedSandbox{LeaseID: "lease"}, nil },
-		NoSync:  func(context.Context) error { return nil },
+		Workspace: func() SandboxWorkspace {
+			return WorkspaceOperations{
+				EnsureFunc: func(context.Context) error { return nil },
+			}
+		},
 		Cleanup: func(ctx context.Context) error { calls++; <-ctx.Done(); return ctx.Err() },
 	})
 	if calls != 1 || !errors.Is(err, context.DeadlineExceeded) || result.ExitCode != 1 || result.ErrorKind != core.RunErrorProvider || !result.Session.Kept {
@@ -491,6 +511,139 @@ func TestDelegatedSandboxCleanupDeadline(t *testing.T) {
 }
 
 type sandboxFailingTimingWriter struct{}
+
+func TestDelegatedSandboxAcquisitionRecovery(t *testing.T) {
+	failure := errors.New("acquisition unresolved")
+	for _, tc := range []struct {
+		name                                                string
+		err                                                 error
+		keep, keepOnFailure, reuse, noCarrier, emptyCarrier bool
+		wantCode                                            int
+		wantStatus                                          core.RunStatus
+		wantKind                                            core.RunErrorKind
+	}{
+		{name: "default", err: failure, wantCode: 1, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "keep", err: failure, keep: true, wantCode: 1, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "keep on failure", err: failure, keepOnFailure: true, wantCode: 1, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "typed primary", err: core.ExitError{Code: 4, Message: "pending claim"}, wantCode: 4, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "canceled", err: context.Canceled, wantCode: 1, wantStatus: core.RunStatusCanceled, wantKind: core.RunErrorCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, wantCode: 1, wantStatus: core.RunStatusTimedOut, wantKind: core.RunErrorTimeout},
+		{name: "ID alone", err: failure, noCarrier: true, wantCode: 1, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "empty carrier", err: failure, emptyCarrier: true, wantCode: 1, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "resolve ignores carrier", err: failure, reuse: true, wantCode: 1, wantStatus: core.RunStatusFailed, wantKind: core.RunErrorProvider},
+		{name: "success ignores carrier", wantStatus: core.RunStatusSucceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			var calls []string
+			clock := &sandboxTestClock{current: time.Unix(0, 0)}
+			acquire := func(context.Context) (DelegatedSandbox, error) {
+				calls = append(calls, "acquire")
+				clock.Sleep(3 * time.Millisecond)
+				s := DelegatedSandbox{LeaseID: "ordinary", Slug: "ordinary-slug", CleanupCommand: "stop ordinary", Unlock: func() { calls = append(calls, "unlock") }}
+				if !tc.noCarrier {
+					s.Recovery = &DelegatedSandboxRecovery{LeaseID: "pending", Slug: "pending-slug", CleanupCommand: "stop pending"}
+					if tc.emptyCarrier {
+						s.Recovery.LeaseID = ""
+					}
+				}
+				return s, tc.err
+			}
+			step := func(name string) func(context.Context) error {
+				return func(context.Context) error { calls = append(calls, name); return nil }
+			}
+			req := core.RunRequest{NoSync: true, TimingJSON: true, Keep: tc.keep, KeepOnFailure: tc.keepOnFailure}
+			if tc.reuse {
+				req.ID = "ordinary"
+			}
+			result, err := RunDelegatedSandbox(t.Context(), req, DelegatedSandboxLifecycle{
+				Provider: "fixture", Runtime: core.Runtime{Stderr: &stderr, Clock: clock},
+				Acquire: acquire, Resolve: acquire, Setup: step("setup"), Workspace: func() SandboxWorkspace {
+					return WorkspaceOperations{
+						EnsureFunc: step("workspace"),
+					}
+				},
+				Command: func(context.Context) (DelegatedSandboxCommand, error) {
+					calls = append(calls, "command")
+					return DelegatedSandboxCommand{Run: func(context.Context, io.Writer, io.Writer) (int, error) { calls = append(calls, "run"); return 0, nil }}, nil
+				},
+				Cleanup: step("cleanup"), Retained: step("retained"),
+			})
+			if result.ExitCode != tc.wantCode || result.Status != tc.wantStatus || result.ErrorKind != tc.wantKind || !errors.Is(err, tc.err) {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+			wantCalls := []string{"acquire", "unlock"}
+			wantLease := ""
+			wantRecovery := tc.err != nil && !tc.reuse && !tc.noCarrier && !tc.emptyCarrier
+			if wantRecovery {
+				wantLease = "pending"
+				want := &core.RunSessionHandle{Provider: "fixture", LeaseID: "pending", Slug: "pending-slug", CleanupCommand: "stop pending", Kept: true}
+				if !reflect.DeepEqual(result.Session, want) || result.Slug != "pending-slug" {
+					t.Fatalf("recovery session=%#v result=%#v", result.Session, result)
+				}
+			} else if tc.err == nil {
+				wantLease = "ordinary"
+				wantCalls = []string{"acquire", "setup", "workspace", "command", "run", "cleanup", "unlock"}
+				if result.Session == nil || result.Session.LeaseID != "ordinary" || result.Session.Kept {
+					t.Fatalf("success session=%#v", result.Session)
+				}
+			} else if result.Session != nil {
+				t.Fatalf("unadmitted session=%#v", result.Session)
+			}
+			if !reflect.DeepEqual(calls, wantCalls) || result.LeaseID != wantLease {
+				t.Fatalf("calls=%v result=%#v", calls, result)
+			}
+			var report core.TimingReport
+			reports := 0
+			for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
+				if strings.HasPrefix(line, "{") {
+					reports++
+					if err := json.Unmarshal([]byte(line), &report); err != nil {
+						t.Fatal(err)
+					}
+				} else if tc.err != nil {
+					t.Fatalf("acquisition error ran normal reporting policy: %q", line)
+				}
+			}
+			if reports != 1 || report.LeaseID != wantLease || report.ExitCode != tc.wantCode || report.RunStatus != tc.wantStatus || report.ErrorKind != tc.wantKind || report.TotalMs != 3 || report.CommandMs != 0 {
+				t.Fatalf("timing=%#v", report)
+			}
+		})
+	}
+}
+
+func TestDelegatedSandboxAcquisitionRecoveryTimingFailureReleasesResources(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "prepared-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := core.ExitError{Code: 4, Message: "registration unresolved"}
+	unlocks := 0
+	result, err := RunDelegatedSandbox(t.Context(), core.RunRequest{TimingJSON: true, Keep: true}, DelegatedSandboxLifecycle{
+		Provider: "fixture", Runtime: core.Runtime{Stderr: sandboxFailingTimingWriter{}},
+		Workspace: func() SandboxWorkspace {
+			return WorkspaceOperations{
+				PrepareArchiveFunc: func(context.Context) (*core.PreparedArchive, error) { return &core.PreparedArchive{File: file}, nil },
+			}
+		},
+		Acquire: func(context.Context) (DelegatedSandbox, error) {
+			return DelegatedSandbox{Recovery: &DelegatedSandboxRecovery{LeaseID: "pending"}, Unlock: func() {
+				unlocks++
+				if _, err := os.Stat(file.Name()); !os.IsNotExist(err) {
+					t.Errorf("archive not closed before unlock: %v", err)
+				}
+			}}, primary
+		},
+		Cleanup:  func(context.Context) error { t.Fatal("shared acquisition cleanup"); return nil },
+		Retained: func(context.Context) error { t.Fatal("shared acquisition retention"); return nil },
+	})
+	if !errors.Is(err, primary) || !errors.Is(err, io.ErrClosedPipe) || result.ExitCode != 4 || unlocks != 1 || result.Session == nil || !result.Session.Kept {
+		t.Fatalf("result=%#v err=%v unlocks=%d", result, err, unlocks)
+	}
+	if _, err := file.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("archive descriptor remains open: %v", err)
+	}
+}
 
 func (sandboxFailingTimingWriter) Write(p []byte) (int, error)               { return len(p), nil }
 func (sandboxFailingTimingWriter) WriteTimingReport(core.TimingReport) error { return io.ErrClosedPipe }
@@ -502,9 +655,13 @@ func TestDelegatedSandboxTimingWriterFailureDoesNotSkipCleanupOrMaskExit(t *test
 			result, err := RunDelegatedSandbox(t.Context(), core.RunRequest{NoSync: true, TimingJSON: true, KeepOnFailure: true}, DelegatedSandboxLifecycle{
 				Provider: "test", Runtime: core.Runtime{Stderr: sandboxFailingTimingWriter{}},
 				Acquire: func(context.Context) (DelegatedSandbox, error) { return DelegatedSandbox{LeaseID: "lease"}, nil },
-				NoSync:  func(context.Context) error { return nil },
+				Workspace: func() SandboxWorkspace {
+					return WorkspaceOperations{
+						EnsureFunc: func(context.Context) error { return nil },
+					}
+				},
 				Command: func(context.Context) (DelegatedSandboxCommand, error) {
-					return DelegatedSandboxCommand{Run: func(context.Context) (int, error) { return code, nil }}, nil
+					return DelegatedSandboxCommand{Run: func(context.Context, io.Writer, io.Writer) (int, error) { return code, nil }}, nil
 				},
 				Cleanup: func(context.Context) error { calls++; return nil },
 			})
@@ -540,21 +697,29 @@ func TestDelegatedSandboxCancellationBetweenPhases(t *testing.T) {
 			}
 			cleanups := 0
 			result, err := RunDelegatedSandbox(ctx, core.RunRequest{}, DelegatedSandboxLifecycle{
-				Provider:       "test",
-				Preflight:      func(context.Context) error { step("preflight"); return nil },
-				PrepareArchive: func(context.Context) (*core.PreparedArchive, error) { step("archive"); return nil, nil },
+				Provider:  "test",
+				Preflight: func(context.Context) error { step("preflight"); return nil },
+				Workspace: func() SandboxWorkspace {
+					return WorkspaceOperations{
+						PrepareArchiveFunc: func(context.Context) (*core.PreparedArchive, error) { step("archive"); return nil, nil },
+						SyncFunc: func(context.Context, *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
+							step("sync")
+							return nil, 0, nil
+						},
+					}
+				},
 				Acquire: func(context.Context) (DelegatedSandbox, error) {
 					step("acquire")
 					return DelegatedSandbox{LeaseID: "lease"}, nil
 				},
 				Setup: func(context.Context) error { step("setup"); return nil },
-				Sync: func(context.Context, *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
-					step("sync")
-					return nil, 0, nil
-				},
+
 				Command: func(context.Context) (DelegatedSandboxCommand, error) {
 					step("command")
-					return DelegatedSandboxCommand{Run: func(context.Context) (int, error) { t.Fatal("command ran after cancellation"); return 0, nil }}, nil
+					return DelegatedSandboxCommand{Run: func(context.Context, io.Writer, io.Writer) (int, error) {
+						t.Fatal("command ran after cancellation")
+						return 0, nil
+					}}, nil
 				},
 				Cleanup: func(ctx context.Context) error {
 					if ctx.Err() != nil {
@@ -667,5 +832,28 @@ func TestRejectExplicitMachineSizingFlagsContract(t *testing.T) {
 				t.Fatalf("error=%v exit=%#v want=%q", err, exitErr, tc.want)
 			}
 		})
+	}
+}
+
+func TestMessageWrapperPreservesDelegatedExitOwnerAndPrimaryClassification(t *testing.T) {
+	for _, code := range []int{0, -1, 23} {
+		raw := core.ExitError{Code: 7, Message: "raw inner diagnostic"}
+		owned := ExitErrorWithCause(code, "selected public message", errors.Join(raw, context.Canceled))
+		wrapped := ErrorWithMessage("outer presentation", owned)
+		var selected core.ExitError
+		if !core.AsExitError(wrapped, &selected) || selected.Code != code || selected.Message != "selected public message" {
+			t.Fatalf("public owner lost: %+v", selected)
+		}
+		if core.PrimaryRunClassificationCause(wrapped) != core.PrimaryRunClassificationCause(owned) {
+			t.Fatal("primary classification owner changed")
+		}
+		originalResult, originalErr := PinDelegatedRunFailure(core.RunResult{}, owned)
+		result, err := PinDelegatedRunFailure(core.RunResult{}, wrapped)
+		if result.ExitCode != originalResult.ExitCode || result.Status != originalResult.Status || result.ErrorKind != originalResult.ErrorKind {
+			t.Fatalf("pinning changed: %+v %+v", result, originalResult)
+		}
+		if !core.AsExitError(err, &selected) || selected.Message != "outer presentation" || selected.Code != core.ExitCodeForError(originalErr, 1) || !errors.Is(err, raw) {
+			t.Fatalf("finalization presentation/cause changed: %v", err)
+		}
 	}
 }

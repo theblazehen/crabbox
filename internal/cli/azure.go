@@ -22,9 +22,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v12"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources/v4"
 )
 
 const (
@@ -88,49 +88,49 @@ type AzureClient struct {
 type azureImageRef struct{ Publisher, Offer, SKU, Version string }
 
 func NewAzureClient(ctx context.Context, cfg Config) (*AzureClient, error) {
-	if cfg.AzureSubscription == "" {
+	if cfg.Azure.Subscription == "" {
 		info, err := azAccountShow(ctx, "")
 		if err != nil {
-			return nil, exit(3, "AZURE_SUBSCRIPTION_ID is required for direct azure provider (or run 'az login' and 'crabbox azure login'): %v", err)
+			return nil, Exit(3, "AZURE_SUBSCRIPTION_ID is required for direct azure provider (or run 'az login' and 'crabbox azure login'): %v", err)
 		}
-		cfg.AzureSubscription = info.ID
-		if cfg.AzureTenant == "" {
-			cfg.AzureTenant = info.TenantID
+		cfg.Azure.Subscription = info.ID
+		if cfg.Azure.Tenant == "" {
+			cfg.Azure.Tenant = info.TenantID
 		}
 		fmt.Fprintf(os.Stderr, "using azure subscription from az cli: %s (%s)\n", info.Name, info.ID)
 	}
-	if cfg.AzureLocation == "" {
-		return nil, exit(3, "azure location is required (set azure.location or CRABBOX_AZURE_LOCATION)")
+	if cfg.Azure.Location == "" {
+		return nil, Exit(3, "azure location is required (set azure.location or CRABBOX_AZURE_LOCATION)")
 	}
 	cred, err := azureCredentialForConfig(cfg)
 	if err != nil {
-		return nil, exit(3, "azure credential: %v", err)
+		return nil, Exit(3, "azure credential: %v", err)
 	}
 	img, err := parseAzureImageRef(azureImageForConfig(cfg))
 	if err != nil {
 		return nil, err
 	}
-	rgFactory, err := armresources.NewClientFactory(cfg.AzureSubscription, cred, nil)
+	rgFactory, err := armresources.NewClientFactory(cfg.Azure.Subscription, cred, nil)
 	if err != nil {
 		return nil, fmt.Errorf("armresources factory: %w", err)
 	}
-	netFactory, err := armnetwork.NewClientFactory(cfg.AzureSubscription, cred, nil)
+	netFactory, err := armnetwork.NewClientFactory(cfg.Azure.Subscription, cred, nil)
 	if err != nil {
 		return nil, fmt.Errorf("armnetwork factory: %w", err)
 	}
-	cmpFactory, err := armcompute.NewClientFactory(cfg.AzureSubscription, cred, nil)
+	cmpFactory, err := armcompute.NewClientFactory(cfg.Azure.Subscription, cred, nil)
 	if err != nil {
 		return nil, fmt.Errorf("armcompute factory: %w", err)
 	}
 	return &AzureClient{
-		SubscriptionID: cfg.AzureSubscription,
-		Location:       cfg.AzureLocation,
-		ResourceGroup:  cfg.AzureResourceGroup,
-		VNet:           cfg.AzureVNet,
-		Subnet:         cfg.AzureSubnet,
-		NSG:            cfg.AzureNSG,
-		SSHCIDRs:       cfg.AzureSSHCIDRs,
-		Network:        cfg.AzureNetwork,
+		SubscriptionID: cfg.Azure.Subscription,
+		Location:       cfg.Azure.Location,
+		ResourceGroup:  cfg.Azure.ResourceGroup,
+		VNet:           cfg.Azure.VNet,
+		Subnet:         cfg.Azure.Subnet,
+		NSG:            cfg.Azure.NSG,
+		SSHCIDRs:       cfg.Azure.SSHCIDRs,
+		Network:        cfg.Azure.Network,
 		Image:          img,
 		SSHPort:        cfg.SSHPort,
 		FallbackPorts:  cfg.SSHFallbackPorts,
@@ -149,25 +149,25 @@ func NewAzureClient(ctx context.Context, cfg Config) (*AzureClient, error) {
 }
 
 func azureSSHCIDRsForConfig(ctx context.Context, cfg Config) ([]string, error) {
-	if len(cfg.AzureSSHCIDRs) > 0 {
-		return cfg.AzureSSHCIDRs, nil
+	if len(cfg.Azure.SSHCIDRs) > 0 {
+		return cfg.Azure.SSHCIDRs, nil
 	}
 	cidr, err := detectOutboundIPv4CIDRFunc(ctx)
 	if err == nil && cidr != "" {
 		return []string{cidr}, nil
 	}
 	if err != nil {
-		return nil, exit(3, "azure ssh CIDRs are not configured and outbound IPv4 detection failed: %v; set CRABBOX_AZURE_SSH_CIDRS explicitly (use 0.0.0.0/0 only if world-open SSH is intentional)", err)
+		return nil, Exit(3, "azure ssh CIDRs are not configured and outbound IPv4 detection failed: %v; set CRABBOX_AZURE_SSH_CIDRS explicitly (use 0.0.0.0/0 only if world-open SSH is intentional)", err)
 	}
-	return nil, exit(3, "azure ssh CIDRs are not configured and outbound IPv4 detection returned no IPv4 address; set CRABBOX_AZURE_SSH_CIDRS explicitly (use 0.0.0.0/0 only if world-open SSH is intentional)")
+	return nil, Exit(3, "azure ssh CIDRs are not configured and outbound IPv4 detection returned no IPv4 address; set CRABBOX_AZURE_SSH_CIDRS explicitly (use 0.0.0.0/0 only if world-open SSH is intentional)")
 }
 
 func azureSSHCIDRsForRules(ctx context.Context, cfg Config, existingRules []*armnetwork.SecurityRule) ([]string, error) {
-	if len(cfg.AzureSSHCIDRs) > 0 {
-		return cfg.AzureSSHCIDRs, nil
+	if len(cfg.Azure.SSHCIDRs) > 0 {
+		return cfg.Azure.SSHCIDRs, nil
 	}
-	if strings.EqualFold(strings.TrimSpace(cfg.AzureNetwork), "private") {
-		return nil, exit(3, "azure private network SSH CIDRs are not configured; set CRABBOX_AZURE_SSH_CIDRS to the VPN/VNet source CIDR explicitly")
+	if strings.EqualFold(strings.TrimSpace(cfg.Azure.Network), "private") {
+		return nil, Exit(3, "azure private network SSH CIDRs are not configured; set CRABBOX_AZURE_SSH_CIDRS to the VPN/VNet source CIDR explicitly")
 	}
 	detected, err := azureSSHCIDRsForConfig(ctx, Config{})
 	if err != nil {
@@ -182,7 +182,7 @@ func azureSSHCIDRsForRules(ctx context.Context, cfg Config, existingRules []*arm
 			return existing, nil
 		}
 	}
-	return nil, exit(3, "azure ssh CIDRs are not configured and this shared NSG already has managed SSH CIDRs %s; set CRABBOX_AZURE_SSH_CIDRS explicitly to replace or extend them", strings.Join(existing, ","))
+	return nil, Exit(3, "azure ssh CIDRs are not configured and this shared NSG already has managed SSH CIDRs %s; set CRABBOX_AZURE_SSH_CIDRS explicitly to replace or extend them", strings.Join(existing, ","))
 }
 
 func azureExistingCrabboxSSHCIDRs(rules []*armnetwork.SecurityRule) []string {
@@ -201,9 +201,9 @@ func azureExistingCrabboxSSHCIDRs(rules []*armnetwork.SecurityRule) []string {
 }
 
 func azureCredentialForConfig(cfg Config) (azcore.TokenCredential, error) {
-	if cfg.AzureTenant != "" && cfg.AzureClientID != "" {
+	if cfg.Azure.Tenant != "" && cfg.Azure.ClientID != "" {
 		if secret := os.Getenv("AZURE_CLIENT_SECRET"); secret != "" {
-			return azidentity.NewClientSecretCredential(cfg.AzureTenant, cfg.AzureClientID, secret, nil)
+			return azidentity.NewClientSecretCredential(cfg.Azure.Tenant, cfg.Azure.ClientID, secret, nil)
 		}
 	}
 	return azidentity.NewDefaultAzureCredential(nil)
@@ -212,25 +212,25 @@ func azureCredentialForConfig(cfg Config) (azcore.TokenCredential, error) {
 func parseAzureImageRef(s string) (azureImageRef, error) {
 	parts := strings.Split(s, ":")
 	if len(parts) != 4 {
-		return azureImageRef{}, exit(2, "azure image must be Publisher:Offer:SKU:Version, got %q", s)
+		return azureImageRef{}, Exit(2, "azure image must be Publisher:Offer:SKU:Version, got %q", s)
 	}
 	return azureImageRef{Publisher: parts[0], Offer: parts[1], SKU: parts[2], Version: parts[3]}, nil
 }
 
 func azureImageForConfig(cfg Config) string {
-	if cfg.TargetOS == targetWindows && (cfg.AzureImage == "" || isAzureDefaultLinuxImage(cfg.AzureImage)) {
+	if cfg.TargetOS == targetWindows && (cfg.Azure.Image == "" || isAzureDefaultLinuxImage(cfg.Azure.Image)) {
 		return defaultAzureWindowsImage
 	}
-	if cfg.TargetOS == targetLinux && effectiveArchitectureForConfig(cfg) == ArchitectureARM64 && (cfg.AzureImage == "" || isAzureDefaultLinuxImage(cfg.AzureImage)) {
+	if cfg.TargetOS == targetLinux && effectiveArchitectureForConfig(cfg) == ArchitectureARM64 && (cfg.Azure.Image == "" || isAzureDefaultLinuxImage(cfg.Azure.Image)) {
 		if cfg.OSImage == "ubuntu:24.04" {
 			return azureNobleLinuxARM64Image
 		}
 		return defaultAzureLinuxARM64Image
 	}
-	if cfg.AzureImage == "" {
+	if cfg.Azure.Image == "" {
 		return defaultAzureLinuxImage
 	}
-	return cfg.AzureImage
+	return cfg.Azure.Image
 }
 
 func isAzureDefaultLinuxImage(image string) bool {
@@ -243,7 +243,7 @@ func isAzureDefaultLinuxImage(image string) bool {
 }
 
 func azureWindowsARM64HasExplicitImage(cfg Config) bool {
-	image := strings.TrimSpace(cfg.AzureImage)
+	image := strings.TrimSpace(cfg.Azure.Image)
 	return image != "" && image != defaultAzureWindowsImage && !isAzureDefaultLinuxImage(image)
 }
 
@@ -251,7 +251,7 @@ func azureVMSizeCandidatesForClass(class string) []string {
 	return azureVMSizeCandidatesForTargetModeArchitectureClass(targetLinux, windowsModeNormal, ArchitectureAMD64, class)
 }
 
-func azureVMSizeCandidatesForConfig(cfg Config) []string {
+func AzureVMSizeCandidatesForConfig(cfg Config) []string {
 	provider, err := ProviderFor(cfg.Provider)
 	if err != nil {
 		return nil
@@ -277,8 +277,8 @@ func AzureVMSizeCandidatesForProfiles(cfg Config, profiles []ProviderClassProfil
 			candidates = []string{cfg.Class}
 		}
 	}
-	mode, err := NormalizeAzureOSDiskMode(cfg.AzureOSDisk)
-	if cfg.AzureSnapshot != "" {
+	mode, err := NormalizeAzureOSDiskMode(cfg.Azure.OSDisk)
+	if cfg.Azure.Snapshot != "" {
 		mode = AzureOSDiskManaged
 	}
 	if err != nil || !azureOSDiskUsesFullCaching(mode) {
@@ -352,14 +352,14 @@ func azureSupportsEphemeralFullCaching(vmSize string) bool {
 	if !azureSupportsEphemeralOS(vmSize) {
 		return false
 	}
-	cores, ok := azureVMSizeVCPUCount(vmSize)
+	cores, ok := AzureVMSizeVCPUCount(vmSize)
 	if !ok {
 		return false
 	}
 	return cores > 4
 }
 
-func azureVMSizeVCPUCount(vmSize string) (int, bool) {
+func AzureVMSizeVCPUCount(vmSize string) (int, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(vmSize))
 	if !strings.HasPrefix(normalized, "standard_") {
 		return 0, false
@@ -391,7 +391,7 @@ func NormalizeAzureOSDiskMode(value string) (string, error) {
 	case AzureOSDiskManaged:
 		return AzureOSDiskManaged, nil
 	default:
-		return "", exit(2, "azure.osDisk must be auto, managed, ephemeral, or ephemeral-preview")
+		return "", Exit(2, "azure.osDisk must be auto, managed, ephemeral, or ephemeral-preview")
 	}
 }
 
@@ -406,7 +406,7 @@ func NormalizeAzureSnapshotSKU(value string) (string, error) {
 	case "standard_zrs":
 		return string(armcompute.SnapshotStorageAccountTypesStandardZRS), nil
 	default:
-		return "", exit(2, "azure.snapshotSKU must be Premium_LRS, Standard_LRS, or Standard_ZRS")
+		return "", Exit(2, "azure.snapshotSKU must be Premium_LRS, Standard_LRS, or Standard_ZRS")
 	}
 }
 
@@ -417,7 +417,7 @@ func NormalizeAzureDiskSKU(value string) (string, error) {
 			return string(sku), nil
 		}
 	}
-	return "", exit(2, "azure.osDiskSKU is not a supported managed disk storage SKU")
+	return "", Exit(2, "azure.osDiskSKU is not a supported managed disk storage SKU")
 }
 
 func azureOSDiskIsEphemeral(mode string) bool {
@@ -437,7 +437,7 @@ func (c *AzureClient) useEphemeralOSDisk(ctx context.Context, cfg Config) (bool,
 }
 
 func (c *AzureClient) validatedAzureOSDiskMode(ctx context.Context, cfg Config) (string, error) {
-	mode, err := NormalizeAzureOSDiskMode(cfg.AzureOSDisk)
+	mode, err := NormalizeAzureOSDiskMode(cfg.Azure.OSDisk)
 	if err != nil {
 		return "", err
 	}
@@ -446,10 +446,10 @@ func (c *AzureClient) validatedAzureOSDiskMode(ctx context.Context, cfg Config) 
 	}
 	supported := c.supportsEphemeralOS(ctx, cfg.ServerType)
 	if !supported {
-		return "", exit(2, "azure.osDisk=%s requires an Azure VM size with ephemeral OS disk support; %s is not supported", mode, cfg.ServerType)
+		return "", Exit(2, "azure.osDisk=%s requires an Azure VM size with ephemeral OS disk support; %s is not supported", mode, cfg.ServerType)
 	}
 	if azureOSDiskUsesFullCaching(mode) && !azureSupportsEphemeralFullCaching(cfg.ServerType) {
-		return "", exit(2, "azure.osDisk=ephemeral-preview requires a full-caching preview Azure VM size; %s is not supported because preview full caching requires more than 4 vCPUs and local storage larger than 2x the OS disk plus 1 GiB", cfg.ServerType)
+		return "", Exit(2, "azure.osDisk=ephemeral-preview requires a full-caching preview Azure VM size; %s is not supported because preview full caching requires more than 4 vCPUs and local storage larger than 2x the OS disk plus 1 GiB", cfg.ServerType)
 	}
 	return mode, nil
 }
@@ -681,7 +681,7 @@ func (c *AzureClient) ensureNSG(ctx context.Context) error {
 	}
 	rules := preserveNonCrabboxRules(existingRules)
 	usedPriorities := azureNSGUsedPriorities(rules)
-	cidrs, err := azureSSHCIDRsForRules(ctx, Config{AzureSSHCIDRs: c.SSHCIDRs, AzureNetwork: c.Network}, existingRules)
+	cidrs, err := azureSSHCIDRsForRules(ctx, Config{Azure: AzureConfig{SSHCIDRs: c.SSHCIDRs, Network: c.Network}}, existingRules)
 	if err != nil {
 		return err
 	}
@@ -746,8 +746,8 @@ func nextAzureNSGPriority(used map[int32]bool) (int32, error) {
 func (c *AzureClient) CreateServerWithFallback(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any)) (Server, Config, error) {
 	// Return the resolved account scope so the provider can persist an exact
 	// claim even when authentication was discovered through `az login`.
-	cfg.AzureSubscription = c.SubscriptionID
-	cfg.AzureResourceGroup = c.ResourceGroup
+	cfg.Azure.Subscription = c.SubscriptionID
+	cfg.Azure.ResourceGroup = c.ResourceGroup
 	regions := azureRegionCandidates(cfg, c.Location)
 	var errs []error
 	for _, region := range regions {
@@ -781,82 +781,62 @@ func (c *AzureClient) LeaseClaimScope() string {
 }
 
 func (c *AzureClient) createServerWithFallbackInLocation(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any)) (Server, Config, error) {
-	candidates := azureProvisioningCandidatesForConfig(cfg)
-	if len(candidates) == 0 {
-		provider, _ := ProviderFor(cfg.Provider)
-		if provider == nil {
-			return Server{}, cfg, exit(2, "provider=%s has no class profile for class=%s", cfg.Provider, cfg.Class)
-		}
-		if err := validateProviderClassSelector(provider, cfg); err != nil {
-			return Server{}, cfg, err
-		}
-		return Server{}, cfg, exit(2, "provider=%s has no usable provisioning candidates for class=%s", cfg.Provider, cfg.Class)
+	attempts, err := azureProvisioningPlan(cfg)
+	if err != nil {
+		return Server{}, cfg, err
 	}
-	var errs []error
 	sharedInfraReady := false
-	for i, vmSize := range candidates {
-		next := cfg
-		next.ServerType = vmSize
-		if i > 0 && logf != nil {
-			logf("fallback provisioning type=%s after quota/capacity rejection\n", vmSize)
-		}
-		if next.AzureSnapshot == "" {
-			if _, err := c.validatedAzureOSDiskMode(ctx, next); err != nil {
-				return Server{}, next, err
-			}
-		}
-		if !sharedInfraReady {
-			if err := c.EnsureSharedInfra(ctx); err != nil {
-				return Server{}, next, err
-			}
-			sharedInfraReady = true
-		}
-		server, err := c.createServer(ctx, next, publicKey, leaseID, slug, keep)
-		if err == nil {
-			return server, next, nil
-		}
-		errs = append(errs, fmt.Errorf("%s: %w", vmSize, err))
-		if !isAzureRetryableProvisioningError(err) {
-			return Server{}, next, joinErrors(errs)
-		}
-	}
-	if strings.EqualFold(cfg.Capacity.Market, "spot") && strings.HasPrefix(cfg.Capacity.Fallback, "on-demand") {
-		for _, vmSize := range candidates {
-			next := cfg
-			next.ServerType = vmSize
-			next.Capacity.Market = "on-demand"
-			if logf != nil {
-				logf("fallback provisioning type=%s market=on-demand after spot rejection\n", vmSize)
-			}
-			if next.AzureSnapshot == "" {
+	return ProvisionServerCandidates(ctx, cfg, attempts, ServerProvisioner{
+		Prepare: func(ctx context.Context, next Config) error {
+			if next.Azure.Snapshot == "" {
 				if _, err := c.validatedAzureOSDiskMode(ctx, next); err != nil {
-					return Server{}, next, err
+					return err
 				}
 			}
 			if !sharedInfraReady {
 				if err := c.EnsureSharedInfra(ctx); err != nil {
-					return Server{}, next, err
+					return err
 				}
 				sharedInfraReady = true
 			}
-			server, err := c.createServer(ctx, next, publicKey, leaseID, slug, keep)
-			if err == nil {
-				return server, next, nil
+			return nil
+		},
+		Create: func(ctx context.Context, next Config) (Server, error) {
+			return c.createServer(ctx, next, publicKey, leaseID, slug, keep)
+		},
+		CanRetry: isAzureRetryableProvisioningError,
+	}, logf)
+}
+
+func azureProvisioningPlan(cfg Config) ([]ProvisioningCandidate, error) {
+	candidates := azureProvisioningCandidatesForConfig(cfg)
+	if err := validateProvisioningCandidates(cfg, candidates); err != nil {
+		return nil, err
+	}
+	var attempts []ProvisioningCandidate
+	for marketIndex, market := range provisioningMarkets(cfg) {
+		for i, vmSize := range candidates {
+			next := cfg
+			next.ServerType = vmSize
+			next.Capacity.Market = market
+			attempt := ProvisioningCandidate{Config: next, FailureLabel: vmSize}
+			if marketIndex > 0 {
+				attempt.FailureLabel = "on-demand " + vmSize
+				attempt.FallbackMessage = fmt.Sprintf("fallback provisioning type=%s market=on-demand after spot rejection\n", vmSize)
+			} else if i > 0 {
+				attempt.FallbackMessage = fmt.Sprintf("fallback provisioning type=%s after quota/capacity rejection\n", vmSize)
 			}
-			errs = append(errs, fmt.Errorf("on-demand %s: %w", vmSize, err))
-			if !isAzureRetryableProvisioningError(err) {
-				return Server{}, next, joinErrors(errs)
-			}
+			attempts = append(attempts, attempt)
 		}
 	}
-	return Server{}, cfg, joinErrors(errs)
+	return attempts, nil
 }
 
 func azureProvisioningCandidatesForConfig(cfg Config) []string {
 	if cfg.ServerTypeExplicit && cfg.ServerType != "" {
 		return []string{cfg.ServerType}
 	}
-	candidates := azureVMSizeCandidatesForConfig(cfg)
+	candidates := AzureVMSizeCandidatesForConfig(cfg)
 	storedType := concreteStoredServerType(cfg)
 	if storedType == "" || len(candidates) == 0 || storedType == candidates[0] {
 		return candidates
@@ -869,10 +849,10 @@ func azureProvisioningCandidatesForConfig(cfg Config) []string {
 }
 
 func azureCanPrependNonExplicitServerType(cfg Config) bool {
-	if cfg.AzureSnapshot != "" {
+	if cfg.Azure.Snapshot != "" {
 		return true
 	}
-	mode, err := NormalizeAzureOSDiskMode(cfg.AzureOSDisk)
+	mode, err := NormalizeAzureOSDiskMode(cfg.Azure.OSDisk)
 	if err != nil {
 		return true
 	}
@@ -883,14 +863,14 @@ func azureCanPrependNonExplicitServerType(cfg Config) bool {
 }
 
 func azureRegionCandidates(cfg Config, preferredLocation string) []string {
-	return appendUniqueStrings([]string{cfg.AzureLocation, preferredLocation}, cfg.Capacity.Regions...)
+	return appendUniqueStrings([]string{cfg.Azure.Location, preferredLocation}, cfg.Capacity.Regions...)
 }
 
 func azureConfigForLocation(cfg Config, location string, multiRegion bool) Config {
-	cfg.AzureLocation = location
+	cfg.Azure.Location = location
 	if multiRegion {
-		cfg.AzureVNet = azureRegionalName(cfg.AzureVNet, location)
-		cfg.AzureNSG = azureRegionalName(cfg.AzureNSG, location)
+		cfg.Azure.VNet = azureRegionalName(cfg.Azure.VNet, location)
+		cfg.Azure.NSG = azureRegionalName(cfg.Azure.NSG, location)
 	}
 	return cfg
 }
@@ -915,7 +895,7 @@ func azureRegionalName(base, location string) string {
 }
 
 func (c *AzureClient) createServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool) (server Server, err error) {
-	name := leaseProviderName(leaseID, slug)
+	name := LeaseProviderName(leaseID, slug)
 	defer func() {
 		if err == nil {
 			return
@@ -926,25 +906,45 @@ func (c *AzureClient) createServer(ctx context.Context, cfg Config, publicKey, l
 }
 
 func (c *AzureClient) createServerSteps(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, name string) (Server, error) {
+	return c.createServerStepsWithLabels(ctx, cfg, publicKey, leaseID, slug, name, keep, nil)
+}
+
+// CreateFixedServer submits one candidate. Its adapter persists the attempt
+// first and owns reconciliation; ambiguous failures must not trigger rollback.
+func (c *AzureClient) CreateFixedServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, labels map[string]string) (Server, error) {
+	if cfg.Azure.OSDisk == AzureOSDiskEphemeralPreview {
+		return Server{}, Exit(2, "direct Azure fixed leases do not support ephemeral-preview OS disks")
+	}
+	if _, err := c.validatedAzureOSDiskMode(ctx, cfg); err != nil {
+		return Server{}, err
+	}
+	if err := c.EnsureSharedInfra(ctx); err != nil {
+		return Server{}, err
+	}
+	return c.createServerStepsWithLabels(ctx, cfg, publicKey, leaseID, slug, LeaseProviderName(leaseID, slug), false, labels)
+}
+
+func (c *AzureClient) createServerStepsWithLabels(ctx context.Context, cfg Config, publicKey, leaseID, slug, name string, keep bool, labels map[string]string) (Server, error) {
 	pipName := name + "-pip"
 	nicName := name + "-nic"
 	diskName := name + "-osdisk"
 	quarantineNSGName := name + azureSnapshotQuarantineNSGSuffix
 
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
-		cfg.Tailscale.Hostname = renderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
+		cfg.Tailscale.Hostname = RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
-	now := time.Now().UTC()
-	labels := directLeaseLabels(cfg, leaseID, slug, "azure", mapMarket(strings.EqualFold(cfg.Capacity.Market, "spot")), keep, now)
+	if labels == nil {
+		labels = DirectLeaseLabels(cfg, leaseID, slug, "azure", mapMarket(strings.EqualFold(cfg.Capacity.Market, "spot")), keep, time.Now().UTC())
+	}
 	tags := azureLabelsToTags(labels)
 	sharedNSGID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/networkSecurityGroups/%s",
 		c.SubscriptionID, c.ResourceGroup, c.NSG)
-	quarantinedSnapshot := cfg.AzureSnapshot != "" && cfg.TargetOS == targetWindows
+	quarantinedSnapshot := cfg.Azure.Snapshot != "" && cfg.TargetOS == targetWindows
 
 	var network azureLeaseNetwork
 	var snapshotDiskID string
 	var err error
-	if cfg.AzureSnapshot != "" {
+	if cfg.Azure.Snapshot != "" {
 		network, snapshotDiskID, err = runAzureSnapshotPrerequisites(
 			ctx,
 			func(workCtx context.Context) (azureLeaseNetwork, error) {
@@ -962,8 +962,8 @@ func (c *AzureClient) createServerSteps(ctx context.Context, cfg Config, publicK
 				return c.createManagedDiskFromSnapshot(
 					workCtx,
 					diskName,
-					cfg.AzureSnapshot,
-					cfg.AzureOSDiskSKU,
+					cfg.Azure.Snapshot,
+					cfg.Azure.OSDiskSKU,
 					tags,
 				)
 			},
@@ -979,7 +979,7 @@ func (c *AzureClient) createServerSteps(ctx context.Context, cfg Config, publicK
 	var osDiskMode string
 	var imageReference *armcompute.ImageReference
 	osDisk := &armcompute.OSDisk{Name: to.Ptr(diskName)}
-	if cfg.AzureSnapshot != "" {
+	if cfg.Azure.Snapshot != "" {
 		osDisk.CreateOption = to.Ptr(armcompute.DiskCreateOptionTypesAttach)
 		osDisk.OSType = to.Ptr(azureOSDiskType(cfg.TargetOS))
 		osDisk.Caching = to.Ptr(armcompute.CachingTypesReadWrite)
@@ -1019,7 +1019,7 @@ func (c *AzureClient) createServerSteps(ctx context.Context, cfg Config, publicK
 		}
 	}
 	networkInterface := &armcompute.NetworkInterfaceReference{ID: to.Ptr(network.id)}
-	if cfg.AzureSnapshot != "" {
+	if cfg.Azure.Snapshot != "" {
 		networkInterface.Properties = &armcompute.NetworkInterfaceReferenceProperties{
 			DeleteOption: to.Ptr(armcompute.DeleteOptionsDelete),
 		}
@@ -1052,7 +1052,11 @@ func (c *AzureClient) createServerSteps(ctx context.Context, cfg Config, publicK
 			return Server{}, err
 		}
 	} else {
-		vmPoller, err := c.vmc.BeginCreateOrUpdate(ctx, c.ResourceGroup, name, vm, nil)
+		var options *armcompute.VirtualMachinesClientBeginCreateOrUpdateOptions
+		if labels["fixed_attempt"] != "" {
+			options = &armcompute.VirtualMachinesClientBeginCreateOrUpdateOptions{IfNoneMatch: to.Ptr("*")}
+		}
+		vmPoller, err := c.vmc.BeginCreateOrUpdate(ctx, c.ResourceGroup, name, vm, options)
 		if err != nil {
 			return Server{}, fmt.Errorf("begin vm: %w", err)
 		}
@@ -1064,7 +1068,7 @@ func (c *AzureClient) createServerSteps(ctx context.Context, cfg Config, publicK
 	}
 	if cfg.TargetOS == targetWindows {
 		commands := []string{azureWindowsBootstrapCommand()}
-		if cfg.AzureSnapshot != "" {
+		if cfg.Azure.Snapshot != "" {
 			commands, err = azureWindowsSnapshotRehydrateCommands(cfg, publicKey)
 			if err != nil {
 				return Server{}, err
@@ -2187,7 +2191,7 @@ func ValidateAzureOwnedVM(expected, live Server) error {
 	}
 	labels := live.Labels
 	if labels == nil || labels["crabbox"] != "true" || labels["created_by"] != "crabbox" || labels["provider"] != "azure" ||
-		!isCanonicalLeaseID(labels["lease"]) || strings.TrimSpace(labels["slug"]) == "" {
+		!IsCanonicalLeaseID(labels["lease"]) || strings.TrimSpace(labels["slug"]) == "" {
 		return fmt.Errorf("live Azure VM %s no longer has canonical Crabbox ownership tags", expectedID)
 	}
 	if liveLeaseID, expectedLeaseID := strings.TrimSpace(labels["lease"]), strings.TrimSpace(expected.Labels["lease"]); liveLeaseID != expectedLeaseID {
@@ -2212,7 +2216,7 @@ func validateAzureCleanupResourceTags(kind, name string, tags map[string]*string
 	if labels["crabbox"] != "true" || labels["created_by"] != "crabbox" || labels["provider"] != "azure" {
 		return fmt.Errorf("Azure cleanup %s %s lacks canonical Crabbox ownership tags", kind, name)
 	}
-	if leaseID := strings.TrimSpace(labels["lease"]); !isCanonicalLeaseID(leaseID) || leaseID != strings.TrimSpace(expected["lease"]) {
+	if leaseID := strings.TrimSpace(labels["lease"]); !IsCanonicalLeaseID(leaseID) || leaseID != strings.TrimSpace(expected["lease"]) {
 		return fmt.Errorf("Azure cleanup %s %s lease %q does not match VM lease %q", kind, name, leaseID, expected["lease"])
 	}
 	if slug := strings.TrimSpace(labels["slug"]); slug == "" || slug != strings.TrimSpace(expected["slug"]) {
@@ -2752,4 +2756,9 @@ func azureLeaseClaimScope(subscriptionID, resourceGroup string) string {
 		return ""
 	}
 	return "subscription:" + subscriptionID + "|resource-group:" + resourceGroup
+}
+
+func ValidateAzureSSHCIDRsForAcquire(ctx context.Context, cfg Config) error {
+	_, err := azureSSHCIDRsForRules(ctx, cfg, nil)
+	return err
 }

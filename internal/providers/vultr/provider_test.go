@@ -13,10 +13,10 @@ import (
 
 func TestProviderSpec(t *testing.T) {
 	provider := Provider{}
-	if provider.Name() != providerName {
-		t.Fatalf("Name=%q", provider.Name())
+	if provider.Spec().Name != providerName {
+		t.Fatalf("Name=%q", provider.Spec().Name)
 	}
-	if aliases := provider.Aliases(); len(aliases) != 0 {
+	if aliases := provider.Spec().Aliases; len(aliases) != 0 {
 		t.Fatalf("Aliases=%v want none", aliases)
 	}
 	spec := provider.Spec()
@@ -41,11 +41,11 @@ func TestProviderForResolvesCanonicalOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if provider.Name() != providerName {
-		t.Fatalf("provider=%s", provider.Name())
+	if provider.Spec().Name != providerName {
+		t.Fatalf("provider=%s", provider.Spec().Name)
 	}
 	for _, alias := range []string{"vlt", "vultr-cloud"} {
-		if got, err := core.ProviderFor(alias); err == nil && got.Name() == providerName {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == providerName {
 			t.Fatalf("%q alias unexpectedly resolves to vultr", alias)
 		}
 	}
@@ -60,9 +60,29 @@ func TestProviderServerTypeDefaults(t *testing.T) {
 		t.Fatalf("explicit ServerTypeForConfig=%q", got)
 	}
 	for _, class := range []string{"tiny", "small", "standard", "fast", "large", "beast", "unknown"} {
-		if got := provider.ServerTypeForClass(class); got != "vc2-1c-1gb" {
-			t.Fatalf("ServerTypeForClass(%q)=%q", class, got)
+		if got := provider.ServerTypeForConfig(core.Config{Class: class}); got != "vc2-1c-1gb" {
+			t.Fatalf("ServerTypeForConfig(%q)=%q", class, got)
 		}
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  core.Config
+		want string
+	}{
+		{"unsupported target", core.Config{Class: "standard", TargetOS: core.TargetWindows}, ""},
+		{"unsupported architecture", core.Config{Class: "standard", TargetOS: core.TargetLinux, Architecture: core.ArchitectureARM64}, ""},
+		{"legacy fallback", core.Config{Class: "custom", TargetOS: core.TargetWindows}, "vc2-1c-1gb"},
+		{"untrimmed class", core.Config{Class: " standard ", TargetOS: core.TargetWindows}, "vc2-1c-1gb"},
+		{"raw explicit override", core.Config{Class: "standard", TargetOS: core.TargetWindows, ServerType: " custom ", ServerTypeExplicit: true}, " custom "},
+		{"whitespace explicit override", core.Config{Class: "standard", ServerType: " ", ServerTypeExplicit: true}, " "},
+		{"empty explicit override", core.Config{Class: "standard", TargetOS: core.TargetWindows, ServerTypeExplicit: true}, ""},
+		{"inherited type", core.Config{Class: "standard", ServerType: "custom"}, "vc2-1c-1gb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := provider.ServerTypeForConfig(tc.cfg); got != tc.want {
+				t.Fatalf("ServerTypeForConfig=%q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

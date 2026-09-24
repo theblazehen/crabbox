@@ -20,6 +20,44 @@ type fixedAcquisitionTestBackend struct {
 	pause bool
 }
 
+func TestFixedAcquisitionImageEvidenceIdentity(t *testing.T) {
+	isolateTestUserDirs(t)
+	opts := FixedAcquireOptions{Kind: FixedLeaseKind{ClaimProvider: FixedAWSClaimProvider, IntentVersion: 1}, LeaseID: "cbx_image_identity", RepoRoot: t.TempDir()}
+	prepare := func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error) {
+		return FixedLeaseBinding{ProviderScope: "fixture", Fingerprint: "fixed-intent", Slug: "image-identity"}, nil
+	}
+	for _, tc := range []struct {
+		id, reference          string
+		observed, wantEvidence bool
+	}{
+		{"resource-a", "old:tag", true, true},
+		{"resource-a", "old:tag", false, true},
+		{"resource-b", "", false, false},
+		{"resource-c", "new:tag", true, true},
+	} {
+		server := Server{CloudID: tc.id}
+		if tc.observed {
+			server.ImageEvidence = &ImageEvidence{ConfiguredReference: tc.reference, RuntimeImageID: "same-image", RepositoryDigests: []string{"reported-digest"}}
+		}
+		_, err := AcquireFixedLease(opts, prepare, func(context.Context, *LeaseClaim, *FixedCreateIntent, func() error) (LeaseTarget, error) {
+			return LeaseTarget{Server: server, LeaseID: opts.LeaseID}, nil
+		}, t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if server.ImageEvidence != nil {
+			server.ImageEvidence.RepositoryDigests[0] = "changed-after-publication"
+		}
+		claim, err := ReadLeaseClaim(opts.LeaseID)
+		if err != nil || claim.CloudID != tc.id || (claim.ImageEvidence != nil) != tc.wantEvidence {
+			t.Fatalf("claim=%+v err=%v", claim, err)
+		}
+		if tc.wantEvidence && (claim.ImageEvidence.ConfiguredReference != tc.reference || claim.ImageEvidence.RepositoryDigests[0] == "changed-after-publication") {
+			t.Fatal("stored snapshot changed identity or shares observation storage")
+		}
+	}
+}
+
 func (b *fixedAcquisitionTestBackend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
 	lease, err := AcquireFixedLease(FixedAcquireOptions{
 		Kind:    FixedLeaseKind{ClaimProvider: FixedAWSClaimProvider, IntentVersion: 1},
@@ -141,6 +179,81 @@ func TestFixedAcquisitionSerializesCLIReplayAcrossProcesses(t *testing.T) {
 	}
 }
 
+func TestFixedAcquisitionCancellationDoesNotWaitForClaimLock(t *testing.T) {
+	for _, beforeWait := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cancel-before-wait=%t", beforeWait), func(t *testing.T) {
+			testFixedAcquisitionClaimLockCancellation(t, beforeWait)
+		})
+	}
+}
+
+func testFixedAcquisitionClaimLockCancellation(t *testing.T, beforeWait bool) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_123456abcdef"
+	locked, release := make(chan struct{}), make(chan struct{})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- WithDurableLeaseClaimLock(leaseID, func(*LeaseClaim, bool, func() error) error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-locked:
+	case err := <-holderDone:
+		t.Fatalf("hold claim lock: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if beforeWait {
+		cancel()
+	}
+	acquireDone := make(chan error, 1)
+	go func() {
+		_, err := AcquireFixedLease(FixedAcquireOptions{
+			Kind: FixedLeaseKind{ClaimProvider: "test", IntentVersion: 1}, LeaseID: leaseID,
+		}, func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error) {
+			return FixedLeaseBinding{}, errors.New("canceled acquisition reached prepare")
+		}, func(context.Context, *LeaseClaim, *FixedCreateIntent, func() error) (LeaseTarget, error) {
+			return LeaseTarget{}, errors.New("canceled acquisition reached provider")
+		}, ctx)
+		acquireDone <- err
+	}()
+	finished := false
+	defer func() {
+		close(release)
+		if err := <-holderDone; err != nil {
+			t.Errorf("release claim lock: %v", err)
+		}
+		if !finished {
+			<-acquireDone
+		}
+	}()
+	if !beforeWait {
+		select {
+		case err := <-acquireDone:
+			finished = true
+			t.Fatalf("acquisition bypassed the held claim lock: %v", err)
+		case <-time.After(30 * time.Millisecond):
+		}
+		cancel()
+	}
+	select {
+	case err := <-acquireDone:
+		finished = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("acquisition error=%v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled fixed acquisition waited for the held claim lock")
+	}
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
+		t.Fatalf("canceled acquisition published a claim: exists=%t err=%v", exists, err)
+	}
+}
+
 func TestWarmupFailedFixedReplayPreservesLease(t *testing.T) {
 	clearConfigEnv(t)
 	isolateRunTestUserDirs(t, t.TempDir())
@@ -160,7 +273,7 @@ func TestWarmupFailedFixedReplayPreservesLease(t *testing.T) {
 	if backend.creates != 1 || backend.releaseCount != 0 {
 		t.Fatalf("fixed replay created=%d released=%d, want 1/0", backend.creates, backend.releaseCount)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || !exists {
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || !exists {
 		t.Fatalf("fixed replay lost its claim: exists=%t err=%v", exists, err)
 	}
 }

@@ -11,8 +11,33 @@ to the local `brev` CLI to create, list, refresh, stop, and delete Brev
 workspaces. After Brev writes its SSH config, Crabbox uses the normal SSH
 transport for sync, `run`, `ssh`, `status`, `list`, and `stop`.
 
-Crabbox does not store or accept Brev secrets. Authentication stays in the Brev
-CLI's own credential store.
+Crabbox does not store Brev credentials or accept them as flags. Authentication
+stays with the Brev CLI.
+
+For headless use, Brev also accepts `BREV_API_KEY` in the environment. This
+overrides saved Brev credentials. Crabbox asks `brev org ls` for that key's
+effective organization before lifecycle operations; the key never becomes a
+Crabbox flag or config value. Verify the account with `brev org ls` before
+creating a workspace.
+
+## Existing claims after an authentication upgrade
+
+Older Crabbox versions could record the saved credentials' organization while
+Brev used `BREV_API_KEY` for a different organization. These mismatched claims
+remain blocked and unchanged after upgrade. Crabbox does not automatically
+rewrite their ownership.
+
+Run `brev org ls` and `brev ls --json --all` with the credentials you used to
+create the workspace. Verify the workspace ID and organization in the Brev
+console against the retained claim before taking action. Manage that exact
+workspace directly through Brev until the claim has been reconciled; use Brev's
+stop or delete operation when you intend to stop or remove it. Preserve
+the local claim for diagnosis rather than changing its organization to bypass
+the check. New Crabbox leases record the effective key's organization correctly.
+
+If the claim belongs to another valid account, use that account's credentials.
+`brev set` cannot override `BREV_API_KEY`; unset or replace the environment key
+first. Automatic repair of misbound claims is outside this fix.
 
 ## Prerequisites
 
@@ -127,8 +152,9 @@ CRABBOX_NVIDIA_BREV_WORK_ROOT
 
 `nvidiaBrev.org` scopes read-only inventory through `brev ls --org`. Brev's
 mutating commands and `brev refresh` do not accept that selector, so Crabbox
-rejects lifecycle and SSH resolution when `org` is configured. Use `brev set`
-to select the active organization before running mutating Crabbox commands.
+rejects lifecycle and SSH resolution when `org` is configured. Use credentials
+for the desired organization before running mutating Crabbox commands. OAuth
+users select it with `brev set`; an environment `BREV_API_KEY` takes precedence.
 
 ## Lifecycle
 
@@ -181,9 +207,21 @@ grace period.
 - `container` (default) selects the workspace host alias.
 - `host` selects the `<workspace-name>-host` alias.
 
+A retained lease remembers this choice across new Crabbox processes and stop/start.
+An explicit `nvidiaBrev.target` setting, environment override, or flag changes it;
+omitting the setting preserves the stored target.
+
 Brev may emit either a direct `HostName`/`Port` target or a `ProxyCommand`.
-Crabbox supports both forms as long as the SSH config entry includes a user and
-identity file.
+Crabbox uses native OpenSSH to interpret the generated config, including
+certificate-only `Match exec` entries and optional certificate/static-key fallback.
+Crabbox captures the config when it validates the workspace. Run, sync, forwarding,
+and interactive connections reuse those bytes, so a later Brev refresh cannot
+redirect an already resolved operation. Each new transport still reevaluates the
+captured certificate hook. These transports retain Crabbox's session policy instead
+of inheriting remote commands or forwards.
+
+Printed native SSH commands use Brev's current config file. Regenerate them after
+changing organizations.
 
 ### Release and cleanup
 
@@ -197,6 +235,11 @@ crabbox stop --provider nvidia-brev gpu-smoke
 `brev delete`, and keeps polling until Brev inventory confirms that the
 workspace is absent. The local claim remains available for a later `stop` or
 `cleanup` retry if polling is interrupted.
+
+Blank, whitespace-only, or malformed inventory output is an error, even when
+the Brev process exits successfully. Crabbox retains the deleting claim until
+a retry receives valid inventory confirming absence; that reconciliation does
+not repeat the delete request.
 
 Crabbox stores the active Brev organization ID in each claim. Because Brev
 mutations do not accept an organization selector, lifecycle commands reject an

@@ -25,53 +25,21 @@ func defaultSemaphoreConfig() SemaphoreConfig {
 
 // SemaphoreConfigApplied records accepted assignments during one application.
 type SemaphoreConfigApplied struct {
-	Host  bool
-	Token bool
+	InputAccepted bool
+	Host          bool
+	Token         bool
 }
 
 func (cfg *SemaphoreConfig) applyFile(file *fileSemaphoreConfig) (SemaphoreConfigApplied, error) {
 	var applied SemaphoreConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.Host != "" {
-		cfg.Host = file.Host
-		applied.Host = true
-	}
-	if file.Token != "" {
-		cfg.Token = file.Token
-		applied.Token = true
-	}
-	if file.Project != "" {
-		cfg.Project = file.Project
-	}
-	if file.Machine != "" {
-		cfg.Machine = file.Machine
-	}
-	if file.OSImage != "" {
-		cfg.OSImage = file.OSImage
-	}
-	if file.IdleTimeout != "" {
-		cfg.IdleTimeout = file.IdleTimeout
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "semaphore")
+	return applied, err
 }
 
 func (cfg *SemaphoreConfig) applyEnv() (SemaphoreConfigApplied, error) {
 	var applied SemaphoreConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_SEMAPHORE_HOST", "SEMAPHORE_HOST"); ok {
-		cfg.Host = value
-		applied.Host = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_SEMAPHORE_TOKEN", "SEMAPHORE_API_TOKEN"); ok {
-		cfg.Token = value
-		applied.Token = true
-	}
-	cfg.Project = getenv("CRABBOX_SEMAPHORE_PROJECT", getenv("SEMAPHORE_PROJECT", cfg.Project))
-	cfg.Machine = getenv("CRABBOX_SEMAPHORE_MACHINE", cfg.Machine)
-	cfg.OSImage = getenv("CRABBOX_SEMAPHORE_OS_IMAGE", cfg.OSImage)
-	cfg.IdleTimeout = getenv("CRABBOX_SEMAPHORE_IDLE_TIMEOUT", cfg.IdleTimeout)
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 6)
+	return applied, err
 }
 
 // SemaphoreConfigFlagValues holds parsed values; only visited flags are applied.
@@ -85,13 +53,9 @@ type SemaphoreConfigFlagValues struct {
 
 // RegisterSemaphoreConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterSemaphoreConfigFlags(fs *flag.FlagSet, defaults SemaphoreConfig) SemaphoreConfigFlagValues {
-	return SemaphoreConfigFlagValues{
-		Host:        fs.String("semaphore-host", defaults.Host, "Semaphore host (e.g. myorg.semaphoreci.com)"),
-		Project:     fs.String("semaphore-project", defaults.Project, "Semaphore project name"),
-		Machine:     fs.String("semaphore-machine", blank(defaults.Machine, SemaphoreConfigFlagFallbackMachine), "Machine type"),
-		OSImage:     fs.String("semaphore-os-image", blank(defaults.OSImage, SemaphoreConfigFlagFallbackOSImage), "OS image"),
-		IdleTimeout: fs.String("semaphore-idle-timeout", blank(defaults.IdleTimeout, SemaphoreConfigFlagFallbackIdleTimeout), "Idle timeout"),
-	}
+	var values SemaphoreConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // SemaphoreConfigVisitedFlags records raw flag visits, independently of application.
@@ -101,30 +65,14 @@ type SemaphoreConfigVisitedFlags struct {
 
 // SemaphoreConfigFlagPresence reports visits for tracked flag bindings.
 func SemaphoreConfigFlagPresence(fs *flag.FlagSet) SemaphoreConfigVisitedFlags {
-	return SemaphoreConfigVisitedFlags{
-		Host: flagWasSet(fs, "semaphore-host"),
-	}
+	var visited SemaphoreConfigVisitedFlags
+	recordConfigFlagVisits[SemaphoreConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values SemaphoreConfigFlagValues) Apply(cfg *SemaphoreConfig, fs *flag.FlagSet) SemaphoreConfigApplied {
+func (values SemaphoreConfigFlagValues) Apply(cfg *SemaphoreConfig, fs *flag.FlagSet) (SemaphoreConfigApplied, error) {
 	var applied SemaphoreConfigApplied
-	visited := SemaphoreConfigFlagPresence(fs)
-	if visited.Host {
-		cfg.Host = *values.Host
-		applied.Host = true
-	}
-	if flagWasSet(fs, "semaphore-project") {
-		cfg.Project = *values.Project
-	}
-	if flagWasSet(fs, "semaphore-machine") {
-		cfg.Machine = *values.Machine
-	}
-	if flagWasSet(fs, "semaphore-os-image") {
-		cfg.OSImage = *values.OSImage
-	}
-	if flagWasSet(fs, "semaphore-idle-timeout") {
-		cfg.IdleTimeout = *values.IdleTimeout
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

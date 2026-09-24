@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -134,7 +135,7 @@ func newLifecycleTestBackend(t *testing.T, cfg core.Config) lifecycleTestBackend
 	oldEnsureKey := ensureTestboxKey
 	oldRemoveKey := removeTestboxKey
 	firecrackerHostGOOS = "linux"
-	ensureTestboxKey = func(_ Config, leaseID string) (string, string, error) {
+	ensureTestboxKey = func(_ core.Config, leaseID string) (string, string, error) {
 		path, err := core.TestboxKeyPath(leaseID)
 		if err != nil {
 			return "", "", err
@@ -342,19 +343,21 @@ func TestAcquireLeavesSuccessfulMachineContextAlive(t *testing.T) {
 }
 
 func TestAcquireCancelsMachineWhenLaunchTimeoutExpires(t *testing.T) {
-	cfg := lifecycleConfig(t)
-	cfg.Firecracker.LaunchTimeout = time.Nanosecond
-	test := newLifecycleTestBackend(t, cfg)
-	test.factory.machine.block = true
-	test.factory.machine.cancelCh = make(chan struct{})
+	synctest.Test(t, func(t *testing.T) {
+		cfg := lifecycleConfig(t)
+		cfg.Firecracker.LaunchTimeout = time.Nanosecond
+		test := newLifecycleTestBackend(t, cfg)
+		test.factory.machine.block = true
+		test.factory.machine.cancelCh = make(chan struct{})
 
-	_, err := test.backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: test.repoRoot}})
-	if err == nil || !strings.Contains(err.Error(), "firecracker launch timed out") {
-		t.Fatalf("Acquire err=%v want launch timeout", err)
-	}
-	if test.factory.machine.canceled.Load() == 0 {
-		t.Fatal("machine was not canceled after launch timeout")
-	}
+		_, err := test.backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: test.repoRoot}})
+		if err == nil || !strings.Contains(err.Error(), "firecracker launch timed out") {
+			t.Fatalf("Acquire err=%v want launch timeout", err)
+		}
+		if test.factory.machine.canceled.Load() == 0 {
+			t.Fatal("machine was not canceled after launch timeout")
+		}
+	})
 }
 
 func TestAcquireRecordsEffectiveTopLevelSSHUser(t *testing.T) {
@@ -468,7 +471,7 @@ func TestCleanupDryRunReportsStateAndClaimWithoutMutating(t *testing.T) {
 	}
 	test.processes.alive[4242] = false
 
-	orphanServer := Server{
+	orphanServer := core.Server{
 		CloudID:  "orphan-vmid",
 		Provider: providerName,
 		Name:     "orphan-vmid",
@@ -478,7 +481,7 @@ func TestCleanupDryRunReportsStateAndClaimWithoutMutating(t *testing.T) {
 			"state": "ready",
 		},
 	}
-	if err := core.ClaimLeaseTargetForConfig(lease.LeaseID+"-orphan", "orphan-slug", lifecycleConfig(t), orphanServer, SSHTarget{}, time.Minute); err != nil {
+	if err := core.ClaimLeaseTargetForConfig(lease.LeaseID+"-orphan", "orphan-slug", lifecycleConfig(t), orphanServer, core.SSHTarget{}, time.Minute); err != nil {
 		t.Fatalf("ClaimLeaseTargetForConfig: %v", err)
 	}
 

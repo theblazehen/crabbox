@@ -17,6 +17,30 @@ crabbox stop --provider ssh --static-host mac-studio.local mac-studio.local
 
 `crabbox release` is a compatibility alias for `crabbox stop`.
 
+## Repository-scoped cleanup
+
+Ordinary `stop` is an administrative lease operation: changing the current
+directory does not restrict it to that repository's claims. Integrations that
+must not clean up a lease after another checkout reclaims it use:
+
+```sh
+crabbox stop --current-repo --id cbx_0a1b2c3d4e5f
+```
+
+This mode requires a canonical fixed-ID lease and a supported provider. The
+release owner validates the current repository under the same exclusive claim
+fence used for deletion, before provider or connection cleanup. A transfer that
+finishes first makes the previous repository's cleanup fail. A running
+[`exec`](exec.md) keeps this release waiting until its transport has finished.
+Validated terminal tombstones are safe, side-effect-free successes even when a
+compact tombstone no longer retains a repository path.
+
+Direct Daytona fixed-ID leases initially support this mode. Other providers,
+ordinary non-fixed claims, coordinator routes, and recovery/controller identity
+flag combinations are rejected. Query `crabbox exec --check` before allocation
+and require `currentRepoStop: true` when integrating fixed-ID lifecycle cleanup.
+Ordinary administrative `stop` remains unchanged.
+
 For coordinator-backed leases, the preliminary lookup has a ten-second budget.
 If it stalls, ordinary stop warns and proceeds through the existing
 provider-scoped release request. Provider identity mismatches still block
@@ -97,7 +121,10 @@ Crabbox lease ID and local slug:
   fresh matching session ownership metadata before terminating the sandbox.
   Failed termination keeps the claim; claimless sessions require explicit
   `--reclaim` reuse.
-- `daytona` — deletes the Daytona sandbox.
+- `daytona` — deletes the Daytona sandbox and waits for confirmed deletion under
+  the caller's cancellation and deadline. The CLI remains signal-cancelable;
+  the automatic-cleanup timeout does not shorten that lifetime. Non-cancelable
+  callers, including detached job cleanup, retain the 30-second fallback.
 - `coder` — stops the Coder workspace by default and removes the local claim.
   Set `coder.deleteOnRelease` or pass `--coder-delete-on-release` to delete the
   workspace instead.
@@ -236,6 +263,7 @@ for marker paths, Linux egress process-matching scope, and Tailscale limits.
 ```text
 --provider <name>          provider to act against (see crabbox providers)
 --id <lease-or-slug>        lease ID or slug (equivalent to the positional arg)
+--current-repo              restrict fixed-ID cleanup to its current repository owner
 --reclaim                   explicitly adopt a provider resource when that provider supports safe stop adoption
 --force                     recover one exact resource through verified provider adoption or an inspected coordinator lease
 --target linux|macos|windows
@@ -257,6 +285,33 @@ the exact coordinator lease and verify its provider before release; inspection
 failures never fall back to releasing an unverified ID. Providers without a
 verified recovery contract reject `--force` and direct the operator to their
 native provider CLI. `cleanup` does not support `--force`.
+
+For direct Azure fixed-ID VMs, use `stop --force --provider azure --id
+<canonical-cbx-id>` when a restart or redeployment has lost the local claim.
+Recovery validates the VM's lease, provider key, create-intent fingerprint,
+attempt nonce, deterministic name, immutable VM ID, and account scope before
+durably restoring the claim and entering normal guarded deletion. Incomplete
+or conflicting identity is rejected; ordinary `stop` does not adopt an unclaimed
+fixed-ID VM. If cleanup is interrupted after the VM is deleted, retry the same
+command: the retained claim supplies the companion-resource identities. A
+completed recovery retains the single-use terminal receipt, and retries are
+idempotent.
+
+For direct Daytona and ASCII Box/Boat claims, `stop --force --provider <provider>
+--id <canonical-cbx-id>` can also forget a resource that the provider has already
+removed. Core requires an exact native not-found and complete, unfiltered
+inventory absence in the claim's original provider scope, then removes only the
+unchanged local claim under its lock. It reports `forgotten locally (resource
+absent)`, sends no deletion or guest cleanup, and leaves keys and registrations
+alone. Failed or partial inventory, authentication failures, identity mismatch,
+and cancellation retain the claim. Fixed-ID replay records, checkpoint-held
+claims, and coordinator/runtime-adapter registrations cannot use this path.
+
+ASCII Box opts into the same recovery for ordinary `stop`, preserving its
+existing behavior. Ordinary Daytona `stop` still fails closed on initial
+absence; forced recovery requires a claim created with account binding. See
+[Daytona recovery](../providers/daytona.md#recovering-pre-binding-claims) and the
+[ASCII Box account limitation](../providers/ascii-box.md#absence-recovery-scope).
 
 `--reclaim` remains the existing provider-specific adoption interface where
 supported. `--force` is the consistent cross-provider recovery interface for

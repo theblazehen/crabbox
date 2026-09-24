@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -68,7 +69,7 @@ func TestFastAPICloudFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.fastAPICloudAPIURL }}
 		fs := newFlagSet("test", io.Discard)
@@ -101,7 +102,7 @@ func TestRailwayFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.railwayAPIURL }}
 		fs := newFlagSet("test", io.Discard)
@@ -134,7 +135,7 @@ func TestUpstashBoxFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.upstashBoxBaseURL }}
 		fs := newFlagSet("test", io.Discard)
@@ -167,7 +168,7 @@ func TestCloudflareFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.cloudflareAPIURL }}
 		fs := newFlagSet("test", io.Discard)
@@ -200,7 +201,7 @@ func TestAzureDynamicSessionsFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.azSessionsEndpoint }}
 		fs := newFlagSet("test", io.Discard)
@@ -233,7 +234,7 @@ func TestSmolvmFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.smolvmBaseURL }}
 		fs := newFlagSet("test", io.Discard)
@@ -266,7 +267,7 @@ func TestSemaphoreFlagSourceCentralPhase(t *testing.T) {
 		seen := credentialSourceUnknown
 		var applyErr error
 		if fail {
-			applyErr = exit(2, "synthetic invalid configuration")
+			applyErr = Exit(2, "synthetic invalid configuration")
 		}
 		providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(cfg Config) { seen = cfg.credentialProvenance.semaphoreHost }}
 		fs := newFlagSet("test", io.Discard)
@@ -300,7 +301,7 @@ func TestE2BFlagSourcesCentralPhase(t *testing.T) {
 			seenURL, seenDomain := credentialSourceUnknown, credentialSourceUnknown
 			var applyErr error
 			if fail {
-				applyErr = exit(2, "synthetic invalid configuration")
+				applyErr = Exit(2, "synthetic invalid configuration")
 			}
 			providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(c Config) {
 				seenURL, seenDomain = c.credentialProvenance.e2bAPIURL, c.credentialProvenance.e2bDomain
@@ -672,8 +673,8 @@ func TestProviderRegistryCanonicalAndAliases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", tc.name, err)
 		}
-		if provider.Name() != tc.canonical {
-			t.Fatalf("ProviderFor(%q).Name() = %q, want %q", tc.name, provider.Name(), tc.canonical)
+		if provider.Spec().Name != tc.canonical {
+			t.Fatalf("ProviderFor(%q).Spec().Name = %q, want %q", tc.name, provider.Spec().Name, tc.canonical)
 		}
 	}
 	if _, err := ProviderFor("missing"); err == nil {
@@ -684,7 +685,7 @@ func TestProviderRegistryCanonicalAndAliases(t *testing.T) {
 func TestLeaseOptionsFromConfigCanonicalizesProviderScope(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Provider = "google-cloud"
-	cfg.GCPProject = "project-a"
+	cfg.GCP.Project = "project-a"
 	if scope := leaseOptionsFromConfig(cfg).ProviderScope; scope != "project:project-a" {
 		t.Fatalf("provider scope=%q", scope)
 	}
@@ -719,8 +720,8 @@ func TestAzureBackendFlagRoutesToDynamicSessions(t *testing.T) {
 	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider != "azure-dynamic-sessions" || cfg.AzureBackend != AzureBackendDynamicSessions || cfg.ServerType != "" {
-		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.AzureBackend, cfg.ServerType)
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.Azure.Backend != AzureBackendDynamicSessions || cfg.ServerType != "" {
+		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.Azure.Backend, cfg.ServerType)
 	}
 }
 
@@ -737,15 +738,15 @@ func TestProviderFlagsRouteAzureBackendWithoutLeaseCreate(t *testing.T) {
 	if err := applyProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider != "azure-dynamic-sessions" || cfg.AzureBackend != AzureBackendDynamicSessions {
-		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.AzureBackend)
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.Azure.Backend != AzureBackendDynamicSessions {
+		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.Azure.Backend)
 	}
 }
 
 func TestAzureBackendFlagOverridesDynamicSessionsConfig(t *testing.T) {
 	defaults := baseConfig()
 	defaults.Provider = "azure-dynamic-sessions"
-	defaults.AzureBackend = AzureBackendDynamicSessions
+	defaults.Azure.Backend = AzureBackendDynamicSessions
 	fs := newFlagSet("test", io.Discard)
 	values := registerLeaseCreateFlags(fs, defaults)
 	if err := parseFlags(fs, []string{"--azure-backend", "vm"}); err != nil {
@@ -755,15 +756,15 @@ func TestAzureBackendFlagOverridesDynamicSessionsConfig(t *testing.T) {
 	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider != "azure" || cfg.AzureBackend != AzureBackendVM || cfg.ServerType == "" {
-		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.AzureBackend, cfg.ServerType)
+	if cfg.Provider != "azure" || cfg.Azure.Backend != AzureBackendVM || cfg.ServerType == "" {
+		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.Azure.Backend, cfg.ServerType)
 	}
 }
 
 func TestProviderFlagsOverrideDynamicSessionsConfigWithoutLeaseCreate(t *testing.T) {
 	defaults := baseConfig()
 	defaults.Provider = "azure-dynamic-sessions"
-	defaults.AzureBackend = AzureBackendDynamicSessions
+	defaults.Azure.Backend = AzureBackendDynamicSessions
 	fs := newFlagSet("test", io.Discard)
 	providerFlag := fs.String("provider", defaults.Provider, "")
 	values := registerProviderFlags(fs, defaults)
@@ -775,8 +776,8 @@ func TestProviderFlagsOverrideDynamicSessionsConfigWithoutLeaseCreate(t *testing
 	if err := applyProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider != "azure" || cfg.AzureBackend != AzureBackendVM {
-		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.AzureBackend)
+	if cfg.Provider != "azure" || cfg.Azure.Backend != AzureBackendVM {
+		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.Azure.Backend)
 	}
 }
 
@@ -785,7 +786,7 @@ func TestRouteConfiguredProviderPreservesAuthoritativeProviderFamilyRoute(t *tes
 		t.Run(string(source), func(t *testing.T) {
 			defaults := baseConfig()
 			defaults.Provider = "azure"
-			defaults.AzureBackend = AzureBackendDynamicSessions
+			defaults.Azure.Backend = AzureBackendDynamicSessions
 			fs := newFlagSet("authoritative Azure flags", io.Discard)
 			values := registerProviderFlags(fs, defaults)
 			if err := parseFlags(fs, []string{"--azure-snapshot-sku", "premium_lrs"}); err != nil {
@@ -805,8 +806,8 @@ func TestRouteConfiguredProviderPreservesAuthoritativeProviderFamilyRoute(t *tes
 			if cfg.Provider != "azure" || cfg.providerSelectionSource != source {
 				t.Fatalf("provider=%q source=%q, want authoritative azure/%s", cfg.Provider, cfg.providerSelectionSource, source)
 			}
-			if cfg.AzureSnapshotSKU != "Premium_LRS" {
-				t.Fatalf("snapshot SKU=%q, want non-routing flag applied", cfg.AzureSnapshotSKU)
+			if cfg.Azure.SnapshotSKU != "Premium_LRS" {
+				t.Fatalf("snapshot SKU=%q, want non-routing flag applied", cfg.Azure.SnapshotSKU)
 			}
 		})
 	}
@@ -815,7 +816,7 @@ func TestRouteConfiguredProviderPreservesAuthoritativeProviderFamilyRoute(t *tes
 		t.Run("routed_"+string(source), func(t *testing.T) {
 			cfg := baseConfig()
 			setProviderSelection(&cfg, "azure", source)
-			cfg.AzureBackend = AzureBackendDynamicSessions
+			cfg.Azure.Backend = AzureBackendDynamicSessions
 			if err := routeConfiguredProvider(&cfg); err != nil {
 				t.Fatal(err)
 			}
@@ -847,7 +848,7 @@ func TestRouteConfiguredProviderPreservesAuthoritativeProviderFamilyRoute(t *tes
 func TestApplyProviderRoutingFlagsPreservesAuthoritativeAzureRoute(t *testing.T) {
 	defaults := baseConfig()
 	defaults.Provider = "azure"
-	defaults.AzureBackend = AzureBackendDynamicSessions
+	defaults.Azure.Backend = AzureBackendDynamicSessions
 
 	fs := newFlagSet("authoritative Azure route", io.Discard)
 	values := registerProviderFlags(fs, defaults)
@@ -1336,10 +1337,10 @@ func TestConfiguredCacheVolumeAllowsExistingLeaseReuse(t *testing.T) {
 		Path:     "/var/cache/crabbox/pnpm",
 		Required: true,
 	}}
-	if err := claimLeaseForRepoProvider("tbx_existing", "existing", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("tbx_existing", "existing", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := updateLeaseClaimCacheVolumes("tbx_existing", CacheVolumeStickyDiskSpecs(cfg.Cache.Volumes)); err != nil {
+	if err := UpdateLeaseClaimCacheVolumes("tbx_existing", CacheVolumeStickyDiskSpecs(cfg.Cache.Volumes)); err != nil {
 		t.Fatal(err)
 	}
 	if err := applyLeaseCreateFlagsForLease(&cfg, fs, values, "tbx_existing"); err != nil {
@@ -1362,7 +1363,7 @@ func TestConfiguredCacheVolumeRejectsExistingLeaseWithoutClaimedVolume(t *testin
 		Path:     "/var/cache/crabbox/pnpm",
 		Required: true,
 	}}
-	if err := claimLeaseForRepoProvider("tbx_existing", "existing", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("tbx_existing", "existing", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	err := applyLeaseCreateFlagsForLease(&cfg, fs, values, "tbx_existing")
@@ -1978,13 +1979,41 @@ func TestServerLeaseClaimSnapshotIsExplicitAndCloned(t *testing.T) {
 // The nil embedded provider makes any non-metadata method call fail this test.
 type nameMetadataOnlyTestProvider struct {
 	Provider
-	nameCalls, aliasCalls *int
+	specCalls *int
 }
 
-func (p nameMetadataOnlyTestProvider) Name() string { *p.nameCalls++; return " Metadata-Only " }
-func (p nameMetadataOnlyTestProvider) Aliases() []string {
-	*p.aliasCalls++
-	return []string{" Alias-One ", "SECOND"}
+func (p nameMetadataOnlyTestProvider) Spec() ProviderSpec {
+	*p.specCalls++
+	return ProviderSpec{Name: " Metadata-Only ", Aliases: []string{" Alias-One ", "SECOND"}}
+}
+
+func TestProviderRegistrationUsesSpecIdentity(t *testing.T) {
+	specCalls := 0
+	p := nameMetadataOnlyTestProvider{specCalls: &specCalls}
+	RegisterProvider(p)
+	t.Cleanup(func() {
+		for _, name := range []string{"metadata-only", "alias-one", "second"} {
+			delete(providerRegistry, name)
+		}
+	})
+	if specCalls != 1 {
+		t.Fatalf("registration read metadata %d times, want once", specCalls)
+	}
+	for _, name := range []string{"metadata-only", " METADATA-ONLY ", "alias-one", " ALIAS-ONE ", "second", "SECOND"} {
+		got, err := ProviderFor(name)
+		if err != nil || got != p {
+			t.Fatalf("ProviderFor(%q) = %v, %v; want the registered adapter", name, got, err)
+		}
+	}
+	count := 0
+	for _, name := range RegisteredProviderNames() {
+		if name == " Metadata-Only " {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("canonical metadata name appeared %d times, want once", count)
+	}
 }
 
 func TestProviderNameMatchesMetadataOnly(t *testing.T) {
@@ -1992,8 +2021,8 @@ func TestProviderNameMatchesMetadataOnly(t *testing.T) {
 		t.Fatal("fixture must not be registered")
 	}
 	registrySize := len(providerRegistry)
-	nameCalls, aliasCalls := 0, 0
-	p := nameMetadataOnlyTestProvider{nameCalls: &nameCalls, aliasCalls: &aliasCalls}
+	specCalls := 0
+	p := nameMetadataOnlyTestProvider{specCalls: &specCalls}
 	for _, tc := range []struct {
 		name string
 		want bool
@@ -2002,7 +2031,7 @@ func TestProviderNameMatchesMetadataOnly(t *testing.T) {
 			t.Fatalf("name=%q got=%t want=%t", tc.name, got, tc.want)
 		}
 	}
-	if nameCalls == 0 || aliasCalls == 0 || len(providerRegistry) != registrySize {
+	if specCalls == 0 || len(providerRegistry) != registrySize {
 		t.Fatal("metadata consultation or registry boundary changed")
 	}
 }
@@ -2012,8 +2041,8 @@ func TestProviderNameMatchesExactMetadataOnly(t *testing.T) {
 		t.Fatal("fixture must not be registered")
 	}
 	registrySize := len(providerRegistry)
-	nameCalls, aliasCalls := 0, 0
-	p := nameMetadataOnlyTestProvider{nameCalls: &nameCalls, aliasCalls: &aliasCalls}
+	specCalls := 0
+	p := nameMetadataOnlyTestProvider{specCalls: &specCalls}
 	for _, tc := range []struct {
 		name string
 		want bool
@@ -2022,7 +2051,357 @@ func TestProviderNameMatchesExactMetadataOnly(t *testing.T) {
 			t.Fatalf("exact name=%q got=%t want=%t", tc.name, got, tc.want)
 		}
 	}
-	if nameCalls == 0 || aliasCalls == 0 || len(providerRegistry) != registrySize {
+	if specCalls == 0 || len(providerRegistry) != registrySize {
 		t.Fatal("metadata consultation or registry boundary changed")
+	}
+}
+
+func TestProviderOwnedConfigShowConnectionProjection(t *testing.T) {
+	for _, provider := range []struct {
+		name string
+		user string
+	}{
+		{"digitalocean", "root"},
+		{"linode", "root"},
+		{"vultr", "root"},
+		{"lambda", "ubuntu"},
+		{"scaleway", "root"},
+		{"tencentcloud", "ubuntu"},
+	} {
+		t.Run(provider.name, func(t *testing.T) {
+			for _, mode := range []string{"compiled_defaults", "empty", "custom", "explicit_defaults"} {
+				t.Run(mode, func(t *testing.T) {
+					cfg := baseConfig()
+					setProviderSelection(&cfg, provider.name, providerSelectionFlag)
+					// These unresolved and provider-specific settings must remain passive.
+					cfg.DigitalOcean.Image = ""
+					cfg.Linode.Image = ""
+					cfg.Vultr.UserScheme = "limited"
+					cfg.SSHFallbackPorts = []string{"2200", "2201"}
+					wantUser, wantPort := provider.user, "22"
+					switch mode {
+					case "empty":
+						cfg.SSHUser, cfg.SSHPort = "", ""
+					case "custom":
+						cfg.SSHUser, cfg.SSHPort = "operator", "2202"
+						wantUser, wantPort = cfg.SSHUser, cfg.SSHPort
+					case "explicit_defaults":
+						cfg.explicitSSHUser, cfg.explicitSSHPort = cfg.SSHUser, cfg.SSHPort
+						wantUser, wantPort = cfg.SSHUser, cfg.SSHPort
+					}
+					adapter, err := ProviderFor(cfg.Provider)
+					if err != nil {
+						t.Fatal(err)
+					}
+					normalizer, ok := adapter.(ProviderConfigShowNormalizer)
+					if !ok {
+						t.Fatal("registered provider does not own config-show normalization")
+					}
+					want := cfg
+					want.SSHUser, want.SSHPort, want.SSHFallbackPorts = wantUser, wantPort, nil
+					if got := normalizer.NormalizeConfigForShow(cfg); !reflect.DeepEqual(got, want) {
+						t.Fatal("display projection changed fields beyond the expected connection defaults")
+					}
+					if got := effectiveConfigForShow(cfg); got.SSHUser != wantUser || got.SSHPort != wantPort || got.SSHFallbackPorts != nil {
+						t.Fatalf("display connection = %q:%q fallbacks=%v", got.SSHUser, got.SSHPort, got.SSHFallbackPorts)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestConfigBindingCentralFlagSourcePhase(t *testing.T) {
+	cases := []struct {
+		name       string
+		flags      [2]string
+		secondBool bool
+		sources    func(*Config) [2]*credentialValueSource
+	}{
+		{
+			name: "tenki", flags: [2]string{"tenki-endpoint", "tenki-gateway"},
+			sources: func(cfg *Config) [2]*credentialValueSource {
+				return [2]*credentialValueSource{&cfg.credentialProvenance.tenkiEndpoint, &cfg.credentialProvenance.tenkiGateway}
+			},
+		},
+		{
+			name: "daytona", flags: [2]string{"daytona-api-url", "daytona-ssh-gateway-host"},
+			sources: func(cfg *Config) [2]*credentialValueSource {
+				return [2]*credentialValueSource{&cfg.credentialProvenance.daytonaAPIURL, &cfg.credentialProvenance.daytonaSSHGateway}
+			},
+		},
+		{
+			name: "proxmox", flags: [2]string{"proxmox-api-url", "proxmox-insecure-tls"}, secondBool: true,
+			sources: func(cfg *Config) [2]*credentialValueSource {
+				return [2]*credentialValueSource{&cfg.credentialProvenance.proxmoxAPIURL, &cfg.credentialProvenance.proxmoxInsecureTLS}
+			},
+		},
+		{
+			name: "sprites-unikraft", flags: [2]string{"sprites-api-url", "unikraft-cloud-url"},
+			sources: func(cfg *Config) [2]*credentialValueSource {
+				return [2]*credentialValueSource{&cfg.credentialProvenance.spritesAPIURL, &cfg.credentialProvenance.unikraftCloudAPIURL}
+			},
+		},
+		{
+			name: "islo-tenki", flags: [2]string{"islo-base-url", "tenki-endpoint"},
+			sources: func(cfg *Config) [2]*credentialValueSource {
+				return [2]*credentialValueSource{&cfg.credentialProvenance.isloBaseURL, &cfg.credentialProvenance.tenkiEndpoint}
+			},
+		},
+		{
+			name: "static-tenki", flags: [2]string{"static-host", "tenki-endpoint"},
+			sources: func(cfg *Config) [2]*credentialValueSource {
+				return [2]*credentialValueSource{&cfg.credentialProvenance.staticHost, &cfg.credentialProvenance.tenkiEndpoint}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			original := providerRegistry["aws"]
+			t.Cleanup(func() { providerRegistry["aws"] = original })
+			for _, fail := range []bool{false, true} {
+				for _, visited := range [][2]bool{{false, false}, {true, false}, {false, true}, {true, true}} {
+					cfg := baseConfig()
+					cfg.Provider = "aws"
+					for _, source := range tc.sources(&cfg) {
+						*source = credentialSourceTrustedFile
+					}
+					var seen [2]credentialValueSource
+					var applyErr error
+					if fail {
+						applyErr = Exit(2, "synthetic flag rejection")
+					}
+					providerRegistry["aws"] = credentialFlagPhaseTestProvider{Provider: original, applyErr: applyErr, observe: func(observed Config) {
+						for i, source := range tc.sources(&observed) {
+							seen[i] = *source
+						}
+					}}
+					fs := newFlagSet("test", io.Discard)
+					fs.String(tc.flags[0], "", "")
+					values := [2]string{"", ""}
+					if tc.secondBool {
+						fs.Bool(tc.flags[1], true, "")
+						values[1] = "false"
+					} else {
+						fs.String(tc.flags[1], "", "")
+					}
+					var args []string
+					for i, visit := range visited {
+						if visit {
+							args = append(args, "--"+tc.flags[i]+"="+values[i])
+						}
+					}
+					if err := fs.Parse(args); err != nil {
+						t.Fatal(err)
+					}
+					err := applyProviderFlags(&cfg, fs, providerFlagValues{})
+					if (err != nil) != fail {
+						t.Fatalf("fail=%t visited=%v central flag error=%v", fail, visited, err)
+					}
+					for i, source := range tc.sources(&cfg) {
+						want := credentialSourceTrustedFile
+						if visited[i] && !fail {
+							want = credentialSourceFlag
+						}
+						if seen[i] != credentialSourceTrustedFile || *source != want {
+							t.Fatalf("fail=%t visited=%v flag=%s central marking moved from its post-success phase", fail, visited, tc.flags[i])
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCallerFinalizedDefaultsPreserveLeaseFlagRoots(t *testing.T) {
+	for _, tc := range []struct{ provider, flag string }{
+		{"hyperv", "hyperv-work-root"}, {"windows-sandbox", "windows-sandbox-workdir"},
+		{"wsb", "windows-sandbox-workdir"}, {"windows-sandbox-provider", "windows-sandbox-workdir"},
+		{"exe-dev", "exe-dev-work-root"}, {"exe", "exe-dev-work-root"}, {"exedev", "exe-dev-work-root"},
+	} {
+		for _, root := range []string{"/work/crabbox", `C:\crabbox`, "/Users/ec2-user/crabbox", "  ", "/custom/work"} {
+			t.Run(tc.provider+"/"+root, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := baseConfig()
+				fs := flag.NewFlagSet("lease", flag.ContinueOnError)
+				fs.SetOutput(io.Discard)
+				values := registerLeaseCreateFlags(fs, cfg)
+				if err := fs.Parse([]string{"--provider", tc.provider, "--" + tc.flag, root}); err != nil {
+					t.Fatal(err)
+				}
+				if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+					t.Fatal(err)
+				}
+				if cfg.WorkRoot != root {
+					t.Fatalf("root=%q want %q", cfg.WorkRoot, root)
+				}
+			})
+		}
+	}
+}
+
+func TestCallerFinalizedDefaultsLoadConfig(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, target, root, err string }{
+		{"hyperv", "provider: hyperv\nhyperv:\n  workRoot: /work/crabbox\n", "windows", `C:\crabbox`, ""},
+		{"sandbox alias", "provider: wsb\nwindowsSandbox:\n  workdir: /work/crabbox\n", "windows", `C:\crabbox`, ""},
+		{"sandbox target alias", "provider: windows-sandbox\ntarget: win\nwindows:\n  mode: powershell\n", "windows", `C:\crabbox-work`, ""},
+		{"sandbox errors retain priority", "provider: windows-sandbox\ntarget: bogus\nwindows:\n  mode: bogus\n", "", "", "provider=windows-sandbox supports target=windows only"},
+		{"sandbox mode error", "provider: windows-sandbox\nwindows:\n  mode: wsl\n", "", "", "provider=windows-sandbox supports windows.mode=normal only"},
+		{"hyperv invalid target", "provider: hyperv\ntarget: bogus\n", "", "", "target must be"},
+		{"exe target alias", "provider: exe\ntarget: ubuntu\n", "linux", "/tmp/crabbox", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_CONFIG", path)
+			cfg, err := loadConfig()
+			if tc.err != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.err) {
+					t.Fatalf("error=%v want %q", err, tc.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.TargetOS != tc.target || cfg.WorkRoot != tc.root {
+				t.Fatalf("target/root=%q/%q want %q/%q", cfg.TargetOS, cfg.WorkRoot, tc.target, tc.root)
+			}
+		})
+	}
+}
+
+func TestCallerFinalizedDefaultsExeDevUser(t *testing.T) {
+	for _, user := range []string{"", "alice", "  alice  "} {
+		t.Run(user, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("USER", user)
+			cfg := baseConfig()
+			cfg.Provider = "exe-dev"
+			cfg.ExeDev.User = ""
+			want := cfg.SSHUser
+			if user != "" {
+				want = user
+			}
+			if err := applyProviderConfigDefaults(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SSHUser != want {
+				t.Fatalf("user=%q want %q", cfg.SSHUser, want)
+			}
+		})
+	}
+}
+
+type defaultPhaseTestProvider struct{ Provider }
+
+func (defaultPhaseTestProvider) ApplyConfigDefaults(cfg *Config) error {
+	cfg.TargetOS = "win"
+	cfg.WorkRoot = "/work/crabbox"
+	return nil
+}
+
+type explicitDefaultPhaseTestProvider struct {
+	defaultPhaseTestProvider
+	phase ProviderConfigDefaultsTargetFinalization
+}
+
+func (p explicitDefaultPhaseTestProvider) ConfigDefaultsTargetFinalization() ProviderConfigDefaultsTargetFinalization {
+	return p.phase
+}
+
+func TestProviderConfigDefaultsFinalizationContract(t *testing.T) {
+	original := providerRegistry["hyperv"]
+	t.Cleanup(func() { providerRegistry["hyperv"] = original })
+	for _, tc := range []struct {
+		name         string
+		provider     Provider
+		target, root string
+	}{
+		{"implicit dispatcher", defaultPhaseTestProvider{original}, "windows", `C:\crabbox`},
+		{"explicit dispatcher", explicitDefaultPhaseTestProvider{defaultPhaseTestProvider{original}, ProviderConfigDefaultsDispatcherFinalizes}, "windows", `C:\crabbox`},
+		{"caller", explicitDefaultPhaseTestProvider{defaultPhaseTestProvider{original}, ProviderConfigDefaultsCallerFinalizes}, "win", "/work/crabbox"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			providerRegistry["hyperv"] = tc.provider
+			cfg := baseConfig()
+			cfg.Provider = "hyperv"
+			if err := applyProviderConfigDefaults(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.TargetOS != tc.target || cfg.WorkRoot != tc.root {
+				t.Fatalf("target/root=%q/%q want %q/%q", cfg.TargetOS, cfg.WorkRoot, tc.target, tc.root)
+			}
+		})
+	}
+}
+
+func TestWindowsSandboxSavedModeProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name, saved string
+		marker      bool
+		wantErr     string
+	}{
+		{"flag marker alone", "", true, ""},
+		{"saved alias", "powershell", false, ""},
+		{"saved unsupported", "wsl", false, "provider=windows-sandbox supports windows.mode=normal only"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Provider = "windows-sandbox"
+			cfg.WindowsMode = "wsl2"
+			cfg.explicitWindowsMode = tc.saved
+			cfg.windowsModeFlagExplicit = tc.marker
+			err := applyProviderConfigDefaults(&cfg)
+			if tc.wantErr != "" {
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("error=%v want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.WindowsMode != windowsModeNormal {
+				t.Fatalf("mode=%q", cfg.WindowsMode)
+			}
+		})
+	}
+}
+
+func TestCallerFinalizedDefaultsResolvedConfig(t *testing.T) {
+	for _, tc := range []struct{ provider, yaml string }{
+		{"hyperv", "hyperv:\n  workRoot: /work/crabbox\n"},
+		{"windows-sandbox", "windowsSandbox:\n  workdir: /work/crabbox\n"},
+		{"exe-dev", "exeDev:\n  workRoot: /work/crabbox\n"},
+	} {
+		for _, id := range []string{"", "synthetic-existing-id"} {
+			t.Run(tc.provider+"/"+id, func(t *testing.T) {
+				clearConfigEnv(t)
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				if err := os.WriteFile(path, []byte("provider: "+tc.provider+"\n"+tc.yaml), 0600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CRABBOX_CONFIG", path)
+				defaults := baseConfig()
+				fs := newFlagSet("test", io.Discard)
+				fs.String("provider", "", "")
+				target := registerTargetFlags(fs, defaults)
+				network := registerNetworkModeFlag(fs, defaults)
+				if err := fs.Parse([]string{"--provider", tc.provider}); err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := loadLeaseTargetConfig(fs, tc.provider, target, network, leaseTargetConfigOptions{LeaseID: id, ProviderResourceID: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cfg.WorkRoot != "/work/crabbox" {
+					t.Fatalf("root=%q", cfg.WorkRoot)
+				}
+			})
+		}
 	}
 }

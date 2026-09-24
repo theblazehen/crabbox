@@ -2,10 +2,6 @@
 
 package cli
 
-import (
-	"os"
-)
-
 type fileLinodeConfig struct {
 	Region     string   `yaml:"region,omitempty"`
 	Image      string   `yaml:"image,omitempty"`
@@ -20,49 +16,19 @@ func defaultLinodeConfig() LinodeConfig {
 
 // LinodeConfigApplied records accepted assignments during one application.
 type LinodeConfigApplied struct {
-	Image bool
-	Type  bool
+	InputAccepted bool
+	Image         bool
+	Type          bool
 }
 
 func (cfg *LinodeConfig) applyFile(file *fileLinodeConfig) (LinodeConfigApplied, error) {
 	var applied LinodeConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.Region != "" {
-		cfg.Region = file.Region
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-		applied.Image = true
-	}
-	if file.Type != "" {
-		cfg.Type = file.Type
-		applied.Type = true
-	}
-	if file.FirewallID != "" {
-		cfg.FirewallID = file.FirewallID
-	}
-	if len(file.SSHCIDRs) > 0 {
-		cfg.SSHCIDRs = file.SSHCIDRs
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "linode")
+	return applied, err
 }
 
 func (cfg *LinodeConfig) applyEnv() (LinodeConfigApplied, error) {
 	var applied LinodeConfigApplied
-	cfg.Region = getenv("CRABBOX_LINODE_REGION", cfg.Region)
-	if value, ok := firstNonEmptyEnv("CRABBOX_LINODE_IMAGE"); ok {
-		cfg.Image = value
-		applied.Image = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_LINODE_TYPE"); ok {
-		cfg.Type = value
-		applied.Type = true
-	}
-	cfg.FirewallID = getenv("CRABBOX_LINODE_FIREWALL", cfg.FirewallID)
-	if value := os.Getenv("CRABBOX_LINODE_SSH_CIDRS"); value != "" {
-		cfg.SSHCIDRs = splitCommaList(value)
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 5)
+	return applied, err
 }

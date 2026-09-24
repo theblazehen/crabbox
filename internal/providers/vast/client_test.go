@@ -4,10 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 func TestClientSendsBearerAuthAndRefusesCrossOriginRedirect(t *testing.T) {
@@ -21,7 +27,7 @@ func TestClientSendsBearerAuthAndRefusesCrossOriginRedirect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newVastClient(VastConfig{APIKey: "vast-secret", APIURL: server.URL}, Runtime{HTTP: server.Client()})
+	client, err := newVastClient(core.VastConfig{APIKey: "vast-secret", APIURL: server.URL}, core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +82,75 @@ func TestRedactVastAPIErrorSecrets(t *testing.T) {
 	}
 }
 
+func TestVastAPIErrorDiagnosticRedaction(t *testing.T) {
+	const token = "fixture-vast-secret-token"
+	c := &vastClient{apiKey: token}
+	readErr := errors.New("read interrupted with " + token)
+	for _, tc := range []struct {
+		name, body string
+		readErr    error
+	}{
+		{name: "credential across cutoff", body: strings.Repeat("x", 1590) + token},
+		{name: "read diagnostic", body: "partial response", readErr: readErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.decodeAPIError("GET /instances/100/", http.StatusForbidden, "403 Forbidden", []byte(tc.body), tc.readErr)
+			var apiErr *vastAPIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden || apiErr.Status != "403 Forbidden" {
+				t.Fatalf("typed status changed: %v", err)
+			}
+			if strings.Contains(apiErr.Body, token[:10]) || !strings.Contains(apiErr.Body, "<redacted>") {
+				t.Fatalf("unsafe API diagnostic: %q", apiErr.Body)
+			}
+			if errors.Is(err, readErr) {
+				t.Fatal("read failure overrode API error classification")
+			}
+		})
+	}
+}
+
+func TestTransportErrorPreservesCauseWithoutDisplayingSecrets(t *testing.T) {
+	cause := fmt.Errorf("failed with vast-secret: %w", context.DeadlineExceeded)
+	client, err := newVastClient(core.VastConfig{APIKey: "vast-secret", APIURL: "https://example.test"}, core.Runtime{HTTP: &http.Client{Transport: testutil.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, cause
+	})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetInstance(t.Context(), 100)
+	if !errors.Is(err, cause) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want original transport cause", err)
+	}
+	if strings.Contains(err.Error(), "vast-secret") || !strings.Contains(err.Error(), "<redacted>") {
+		t.Fatalf("transport diagnostic not redacted: %v", err)
+	}
+}
+
+func TestReadinessDeadlineCancelsNativeHTTPClient(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-t.Context().Done():
+			}
+		}))
+		defer server.Close()
+		client, err := newVastClient(core.VastConfig{APIKey: "fixture-key", APIURL: server.URL}, core.Runtime{HTTP: server.Client()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := newTestBackend(t, client)
+		b.pollTimeout = 50 * time.Millisecond
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		_, err = b.waitForInstanceReady(ctx, client, 100)
+		var exit core.ExitError
+		if !core.AsExitError(err, &exit) || exit.Code != 5 || !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			t.Fatalf("err=%v parent=%v, want own readiness deadline from real HTTP request", err, ctx.Err())
+		}
+	})
+}
+
 func TestOfferSearchPayloadAndDecode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v0/bundles/" {
@@ -110,7 +185,7 @@ func TestOfferSearchPayloadAndDecode(t *testing.T) {
 	defer server.Close()
 
 	client := newTestVastClient(t, server)
-	offers, err := client.SearchOffers(context.Background(), vastOfferSearchInput{Config: VastConfig{
+	offers, err := client.SearchOffers(context.Background(), vastOfferSearchInput{Config: core.VastConfig{
 		InstanceType:   "on-demand",
 		GPUName:        "H100",
 		GPUCount:       4,
@@ -127,7 +202,7 @@ func TestOfferSearchPayloadAndDecode(t *testing.T) {
 }
 
 func TestOfferSearchPayloadMapsInterruptibleToBid(t *testing.T) {
-	body := buildVastOfferSearchPayload(VastConfig{InstanceType: "interruptible"})
+	body := buildVastOfferSearchPayload(core.VastConfig{InstanceType: "interruptible"})
 	if body["type"] != "bid" {
 		t.Fatalf("type=%#v want bid", body["type"])
 	}
@@ -162,7 +237,7 @@ func TestCreateInstancePayloadAndDecodeNewContract(t *testing.T) {
 
 	client := newTestVastClient(t, server)
 	resp, err := client.CreateInstance(context.Background(), 42, vastCreateInstanceInput{
-		Config:      VastConfig{Image: "nvidia/cuda:12", TemplateID: "tpl-123", Runtype: "ssh_direct", DiskGB: 80},
+		Config:      core.VastConfig{Image: "nvidia/cuda:12", TemplateID: "tpl-123", Runtype: "ssh_direct", DiskGB: 80},
 		Label:       "cbx1|lease|slug|active",
 		SSHKey:      "ssh-ed25519 AAAA...",
 		Environment: map[string]string{"CRABBOX": "1", "MESSAGE": "space ' value"},
@@ -319,17 +394,17 @@ func TestManageInstanceAllowsSuccessOnlyMutationResponse(t *testing.T) {
 }
 
 func TestClientRejectsNonHTTPSExceptLoopback(t *testing.T) {
-	if _, err := newVastClient(VastConfig{APIKey: "secret", APIURL: "http://vast.example.test"}, Runtime{}); err == nil {
+	if _, err := newVastClient(core.VastConfig{APIKey: "secret", APIURL: "http://vast.example.test"}, core.Runtime{}); err == nil {
 		t.Fatal("expected non-https non-loopback rejection")
 	}
-	if _, err := newVastClient(VastConfig{APIKey: "secret", APIURL: "http://127.0.0.1:8080/api/v0"}, Runtime{}); err != nil {
+	if _, err := newVastClient(core.VastConfig{APIKey: "secret", APIURL: "http://127.0.0.1:8080/api/v0"}, core.Runtime{}); err != nil {
 		t.Fatalf("loopback rejected: %v", err)
 	}
 }
 
 func newTestVastClient(t *testing.T, server *httptest.Server) *vastClient {
 	t.Helper()
-	api, err := newVastClient(VastConfig{APIKey: "vast-secret", APIURL: server.URL + "/api/v0"}, Runtime{HTTP: server.Client()})
+	api, err := newVastClient(core.VastConfig{APIKey: "vast-secret", APIURL: server.URL + "/api/v0"}, core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,5 +420,47 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCompactJSONRequestEnvelope(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "ctx")
+	const base = "https://api.example.test/base"
+	var ptr *string
+	var slice []string
+	for _, tc := range []struct {
+		name     string
+		body     any
+		want     string
+		absolute bool
+	}{
+		{name: "nil"}, {name: "typed nil pointer", body: ptr, want: "null"}, {name: "typed nil slice", body: slice, want: "null"}, {name: "compact escaped JSON", body: map[string]string{"message": "<&>"}, want: "{\"message\":\"\\u003c\\u0026\\u003e\"}"}, {name: "absolute URL", absolute: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			path := "/records"
+			endpoint := base + path
+			if tc.absolute {
+				path = "https://api.example.test/absolute?limit=2"
+				endpoint = path
+			}
+			headers := http.Header{}
+			headers.Set("Authorization", "Bearer synthetic-token")
+			headers.Set("Accept", "application/json")
+			if tc.body != nil {
+				headers.Set("Content-Type", "application/json")
+			}
+			httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				testutil.RequireRequestEnvelope(t, req, ctx, http.MethodPost, endpoint, tc.want, headers)
+				return nil, errors.New("synthetic-transport-stop")
+			})}
+			c := &vastClient{apiURL: base, apiKey: "synthetic-token", httpClient: httpClient}
+			err := c.do(ctx, http.MethodPost, path, tc.body, nil)
+			if err == nil || !strings.Contains(err.Error(), "synthetic-transport-stop") || calls != 1 {
+				t.Fatalf("error=%v calls=%d", err, calls)
+			}
+		})
 	}
 }

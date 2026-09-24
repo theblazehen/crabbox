@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,26 +15,11 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-type Config = core.Config
-type Runtime = core.Runtime
-type ProviderSpec = core.ProviderSpec
-type Backend = core.Backend
-type AcquireRequest = core.AcquireRequest
-type ResolveRequest = core.ResolveRequest
-type ListRequest = core.ListRequest
-type LeaseView = core.LeaseView
-type ReleaseLeaseRequest = core.ReleaseLeaseRequest
-type TouchRequest = core.TouchRequest
-type CleanupRequest = core.CleanupRequest
-type LeaseTarget = core.LeaseTarget
-type Server = core.Server
-type SSHTarget = core.SSHTarget
-
 type leaseBackend struct {
 	shared.DirectSSHBackend
 }
 
-func NewBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func NewBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	cfg.Provider = "parallels"
 	if cfg.Parallels.User != "" {
 		cfg.SSHUser = cfg.Parallels.User
@@ -49,36 +36,55 @@ func NewBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
 	return &leaseBackend{DirectSSHBackend: shared.DirectSSHBackend{SpecValue: spec, Cfg: cfg, RT: rt, StoredLeaseKeys: true}}
 }
 
-func (b *leaseBackend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
-	return shared.AcquireAttemptsRetry(b.RT, req.Keep, func() (LeaseTarget, error) {
+func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	// A caller-supplied lease ID is a single create identity. Retrying it with a
+	// fresh lease would defeat the replay contract, so it never enters the
+	// generated-ID bootstrap retry loop.
+	if strings.TrimSpace(req.RequestedLeaseID) != "" {
+		return b.acquireFixed(ctx, req)
+	}
+	return shared.AcquireAttemptsRetry(b.RT, req.Keep, func() (core.LeaseTarget, error) {
 		return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
 	})
 }
 
-func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug string) (LeaseTarget, error) {
+func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug string) (core.LeaseTarget, error) {
 	cfg := b.Cfg
-	source := strings.TrimSpace(firstNonEmpty(cfg.Parallels.SourceID, cfg.Parallels.Source))
+	source := strings.TrimSpace(shared.FirstNonBlankTrimmed(cfg.Parallels.SourceID, cfg.Parallels.Source))
 	if source == "" {
-		return LeaseTarget{}, core.Exit(2, "provider=parallels requires --parallels-source, --parallels-template, or parallels.source")
+		return core.LeaseTarget{}, core.Exit(2, "provider=parallels requires --parallels-source, --parallels-template, or parallels.source")
 	}
-	selected, err := core.SelectParallelsFleetConfig(ctx, cfg, b.RT.Exec, source)
+	// Hold the host's capacity reservation from the maxVMs count through the clone,
+	// so concurrent forks cannot all pass the gate on the same pre-clone count.
+	selected, releaseCapacity, err := core.ReserveParallelsFleetCapacity(ctx, cfg, b.RT.Exec, source)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
+	capacityHeld := true
+	releaseCapacityOnce := func() {
+		if capacityHeld {
+			capacityHeld = false
+			releaseCapacity()
+		}
+	}
+	defer releaseCapacityOnce()
 	cfg = selected
 	client := core.NewParallelsClient(cfg, b.RT.Exec)
+	if err := client.ValidateMacOSBootstrapKey(ctx); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	servers, err := client.ListCrabboxServers(ctx)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	leaseID := core.NewLeaseID()
 	slug, err := core.AllocateDirectLeaseSlug(leaseID, requestedSlug, servers)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(cfg, leaseID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	keepKey := false
 	defer func() {
@@ -93,74 +99,118 @@ func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug
 	}
 	cfg.SSHKey = keyPath
 	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
-	snapshotID := strings.TrimSpace(firstNonEmpty(cfg.Parallels.SourceSnapshotID, cfg.Parallels.SourceSnapshot))
+	snapshotID := strings.TrimSpace(shared.FirstNonBlankTrimmed(cfg.Parallels.SourceSnapshotID, cfg.Parallels.SourceSnapshot))
 	if snapshotID != "" && cfg.Parallels.SourceSnapshotID == "" {
 		resolved, err := client.SnapshotID(ctx, source, snapshotID)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		snapshotID = resolved
 	}
 	fmt.Fprintf(b.RT.Stderr, "provisioning provider=parallels lease=%s slug=%s host=%s source=%s snapshot=%s clone_mode=%s keep=%v\n",
 		leaseID, slug, parallelsHostName(cfg), source, blank(snapshotID, "-"), blank(cfg.Parallels.CloneMode, "linked"), keep)
 	server, err := client.Clone(ctx, source, snapshotID, leaseID, slug, keep)
+	// The clone now counts against maxVMs for every later reservation, so the rest of
+	// bootstrap does not need to keep other forks waiting.
+	releaseCapacityOnce()
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if err := client.Start(ctx, server.CloudID); err != nil {
 		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	vm, err := client.WaitForIP(ctx, server.CloudID, cfg.Parallels.StartupTimeout)
+	vm, err := client.WaitForIP(ctx, server.CloudID, cfg.Parallels.StartupTimeout, core.ParallelsIPWaitAcquisition)
 	if err != nil {
 		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	if err := client.WaitForGuestExec(ctx, server.CloudID, cfg, cfg.Parallels.StartupTimeout); err != nil {
+	if err := b.prepareGuest(ctx, client, server.CloudID, vm, cfg, publicKey); err != nil {
 		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
-	}
-	if err := client.InstallSSHKey(ctx, server.CloudID, cfg, publicKey); err != nil {
-		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
-	}
-	if err := client.EnsureGuestReady(ctx, server.CloudID, cfg); err != nil {
-		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	server.PublicNet.IPv4.IP = vm.IP
-	target := core.SSHTargetFromConfig(cfg, vm.IP)
+	if vm.IPSource != "" {
+		server.Labels["ip_source"] = vm.IPSource
+	}
+	target := parallelsLeaseSSHTarget(cfg, vm.IP)
 	if cfg.TargetOS == core.TargetWindows && cfg.WindowsMode == core.WindowsModeNormal {
 		target.ReadyCheck = core.PowershellCommand(`$PSVersionTable.PSVersion | Out-Null`)
 	}
-	if cfg.Parallels.Host != "" {
-		target.ProxyCommand = parallelsProxyCommand(cfg, vm.IP)
-		target.SSHConfigProxy = true
-	}
-	if err := core.WaitForSSHReady(ctx, &target, b.RT.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+	if err := waitForSSHReady(ctx, &target, b.RT.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
 		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	server.Status = "ready"
 	server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, "ready", time.Now().UTC())
 	if err := core.ClaimLeaseTargetForConfig(leaseID, slug, cfg, server, target, cfg.IdleTimeout); err != nil {
 		cleanupVM(server.CloudID)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	fmt.Fprintf(b.RT.Stderr, "provisioned lease=%s vm=%s ip=%s\n", leaseID, server.DisplayID(), vm.IP)
 	keepKey = true
-	return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 }
 
-func (b *leaseBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error) {
+func (b *leaseBackend) prepareGuest(ctx context.Context, client *core.ParallelsClient, vmID string, vm core.ParallelsVM, cfg core.Config, publicKey string) error {
+	if vm.IPSource == "dhcp-mac" {
+		fmt.Fprintf(b.RT.Stderr, "parallels macOS fallback vm=%s ip=%s discovery=dhcp-mac bootstrap=ssh\n", vmID, vm.IP)
+		return client.BootstrapMacOSOverSSH(ctx, vm.IP, cfg, publicKey)
+	}
+	if err := client.WaitForGuestExec(ctx, vmID, cfg, cfg.Parallels.StartupTimeout); err != nil {
+		if parallelsMacOSBootstrapFallbackAllowed(cfg, err) {
+			fmt.Fprintf(b.RT.Stderr, "parallels macOS fallback vm=%s ip=%s discovery=tools bootstrap=ssh\n", vmID, vm.IP)
+			return client.BootstrapMacOSOverSSH(ctx, vm.IP, cfg, publicKey)
+		}
+		return err
+	}
+	if err := client.InstallSSHKey(ctx, vmID, cfg, publicKey); err != nil {
+		if parallelsMacOSBootstrapFallbackAllowed(cfg, err) {
+			fmt.Fprintf(b.RT.Stderr, "parallels macOS fallback vm=%s ip=%s discovery=tools bootstrap=ssh\n", vmID, vm.IP)
+			return client.BootstrapMacOSOverSSH(ctx, vm.IP, cfg, publicKey)
+		}
+		return err
+	}
+	if err := client.EnsureGuestReady(ctx, vmID, cfg); err != nil {
+		if parallelsMacOSBootstrapFallbackAllowed(cfg, err) {
+			fmt.Fprintf(b.RT.Stderr, "parallels macOS fallback vm=%s ip=%s discovery=tools bootstrap=ssh\n", vmID, vm.IP)
+			return client.BootstrapMacOSOverSSH(ctx, vm.IP, cfg, publicKey)
+		}
+		return err
+	}
+	return nil
+}
+
+func parallelsMacOSBootstrapFallbackAllowed(cfg core.Config, err error) bool {
+	return cfg.TargetOS == core.TargetMacOS && strings.TrimSpace(cfg.Parallels.BootstrapKey) != "" && core.ParallelsGuestToolsUnavailable(err)
+}
+
+func (b *leaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
 	id := strings.TrimSpace(req.ID)
 	if id == "" {
-		return LeaseTarget{}, core.Exit(2, "parallels resolve requires lease id or slug")
+		return core.LeaseTarget{}, core.Exit(2, "parallels resolve requires lease id or slug")
 	}
-	if claim, ok, err := core.ResolveLeaseClaimForProvider(id, "parallels"); err != nil {
-		return LeaseTarget{}, err
-	} else if ok {
-		id = claim.LeaseID
+	fixedClaim, fixedClaimFound, err := core.ResolveLeaseClaimForProvider(id, "parallels")
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if fixedClaimFound {
+		id = fixedClaim.LeaseID
+	}
+	// A fixed lease's durable claim is its own release route, and it is the only
+	// one. Resolution answers with a claim-only target before the inventory
+	// sweep, so nothing here inspects a guest, discovers an SSH user, or hands
+	// App.stop a usable SSH target for remote cleanup: all of that would reach a
+	// VM occupying the recorded name before its incarnation had been attested.
+	// releaseFixed re-attests the host and the VM and performs every ownership
+	// check. It also makes stop on a terminal tombstone, or on an acquired VM
+	// that is already gone, an idempotent no-op rather than an error, even when
+	// the fleet is unreachable.
+	if req.ReleaseOnly && fixedClaimFound && parallelsFixedLeaseKind.IsFixedClaim(fixedClaim) {
+		return parallelsFixedReleaseTarget(fixedClaim), nil
+	}
+	if fixedClaimFound && parallelsFixedLeaseKind.IsFixedClaim(fixedClaim) {
+		return b.resolveFixed(ctx, req, fixedClaim)
 	}
 	var hostErrs []error
 	for _, candidate := range core.ParallelsCandidateConfigs(b.Cfg) {
@@ -174,21 +224,45 @@ func (b *leaseBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTa
 			leaseID, slug := parallelsLeaseFromVMName(vm.Name)
 			labels := core.ParallelsLabelsFromName(vm.Name)
 			if labels["lease"] == "" {
-				labels = core.DirectLeaseLabels(candidate, firstNonEmpty(leaseID, vm.ID), slug, "parallels", "", true, time.Now().UTC())
+				labels = core.DirectLeaseLabels(candidate, shared.FirstNonBlankTrimmed(leaseID, vm.ID), slug, "parallels", "", true, time.Now().UTC())
 			}
 			labels["host"] = parallelsHostName(candidate)
 			server := core.Server{CloudID: vm.ID, Provider: "parallels", Name: vm.Name, Status: strings.ToLower(vm.State), Labels: labels}
-			server.PublicNet.IPv4.IP = vm.IP
 			server.ServerType.Name = core.ServerTypeForProviderClass("parallels", candidate.Class)
 			normalizedID := strings.ReplaceAll(id, "_", "-")
 			if vm.ID == id || vm.Name == id || leaseID == id || strings.ReplaceAll(leaseID, "_", "-") == normalizedID || core.NormalizeLeaseSlug(slug) == core.NormalizeLeaseSlug(id) {
-				leaseID = firstNonEmpty(leaseID, vm.ID)
+				leaseID = shared.FirstNonBlankTrimmed(leaseID, vm.ID)
+				claim, claimOK, claimExact, claimErr := core.ResolveLeaseClaimForProviderWithExact(leaseID, "parallels")
+				if claimErr != nil {
+					return core.LeaseTarget{}, claimErr
+				}
+				// Native VM handles must use the same attestation as lease IDs.
+				if claimOK && claimExact && parallelsFixedLeaseKind.IsFixedClaim(claim) {
+					if req.ReleaseOnly {
+						return parallelsFixedReleaseTarget(claim), nil
+					}
+					return b.resolveFixed(ctx, req, claim)
+				}
 				adopt, err := authorizeParallelsResolve(req, leaseID, vm.ID, parallelsHostName(candidate))
 				if err != nil {
-					return LeaseTarget{}, err
+					return core.LeaseTarget{}, err
+				}
+				if claimOK && claimExact && applyParallelsClaimSSHPortToConfig(&candidate, claim, leaseID, vm.ID, parallelsHostName(candidate)) {
+					client = core.NewParallelsClient(candidate, b.RT.Exec)
 				}
 				if vm.IP == "" && strings.EqualFold(vm.State, "running") {
-					vm, _ = client.WaitForIP(ctx, vm.ID, 30*time.Second)
+					discovered, err := client.WaitForIP(ctx, vm.ID, 30*time.Second, core.ParallelsIPWaitExisting)
+					if err != nil {
+						if !req.ReleaseOnly && !req.StatusOnly {
+							return core.LeaseTarget{}, err
+						}
+					} else {
+						vm = discovered
+					}
+				}
+				server.PublicNet.IPv4.IP = vm.IP
+				if vm.IPSource != "" {
+					server.Labels["ip_source"] = vm.IPSource
 				}
 				if strings.TrimSpace(candidate.SSHUser) == core.BaseConfig().SSHUser {
 					var user string
@@ -202,28 +276,97 @@ func (b *leaseBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTa
 						candidate.SSHUser = strings.TrimSpace(user)
 					}
 				}
-				target := core.SSHTargetFromConfig(candidate, vm.IP)
-				useStoredTestboxKey(&target, leaseID)
-				if candidate.Parallels.Host != "" {
-					target.ProxyCommand = parallelsProxyCommand(candidate, vm.IP)
-					target.SSHConfigProxy = true
+				target := parallelsLeaseSSHTarget(candidate, vm.IP)
+				if !req.ReleaseOnly {
+					if err := core.UseStoredTestboxKey(&target, leaseID); err != nil {
+						return core.LeaseTarget{}, err
+					}
+				}
+				if claimOK && claimExact {
+					applyParallelsClaimSSHPort(&target, claim, leaseID, vm.ID, parallelsHostName(candidate))
 				}
 				if adopt {
 					if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, candidate, server, target, req.Repo.Root, candidate.IdleTimeout, true); err != nil {
-						return LeaseTarget{}, err
+						return core.LeaseTarget{}, err
 					}
 				}
-				return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+				return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 			}
 		}
 	}
 	if len(hostErrs) > 0 {
-		return LeaseTarget{}, fmt.Errorf("parallels fleet inventory incomplete while resolving %s: %w", req.ID, errors.Join(hostErrs...))
+		return core.LeaseTarget{}, fmt.Errorf("parallels fleet inventory incomplete while resolving %s: %w", req.ID, errors.Join(hostErrs...))
 	}
-	return LeaseTarget{}, core.Exit(4, "parallels lease not found: %s", req.ID)
+	return core.LeaseTarget{}, core.Exit(4, "parallels lease not found: %s", req.ID)
 }
 
-func authorizeParallelsResolve(req ResolveRequest, leaseID, vmID, host string) (bool, error) {
+// parallelsFixedReleaseTarget carries only the identity the durable release
+// path needs. It grants no SSH access and asserts no live resource: releaseFixed
+// reads the claim itself and performs every ownership and attestation check.
+func parallelsFixedReleaseTarget(claim core.LeaseClaim) core.LeaseTarget {
+	server := core.Server{
+		CloudID:  claim.CloudID,
+		Provider: parallelsProviderName,
+		Name:     strings.TrimSpace(claim.FixedCreateIntent.Attempt["name"]),
+		Status:   "unknown",
+		Labels:   maps.Clone(claim.Labels),
+	}
+	server.ImmutableID = claim.CloudImmutableID
+	return core.LeaseTarget{Server: server, LeaseID: claim.LeaseID}
+}
+
+func parallelsSSHTarget(cfg core.Config, host string) core.SSHTarget {
+	target := core.SSHTargetFromConfig(cfg, host)
+	// The account credential is consumed only by Crabbox's local ARD client.
+	// Never inherit it into ssh, scp, rsync, ProxyCommand, or viewer children.
+	target.ChildEnvDenylist = append(target.ChildEnvDenylist, "CRABBOX_PARALLELS_PASSWORD")
+	return target
+}
+
+func parallelsLeaseSSHTarget(cfg core.Config, host string) core.SSHTarget {
+	target := parallelsSSHTarget(cfg, host)
+	if cfg.Parallels.Host != "" {
+		target.ProxyCommand = parallelsProxyCommand(cfg, host)
+		target.SSHConfigProxy = true
+	}
+	return target
+}
+
+func parallelsClaimSSHPort(claim core.LeaseClaim, leaseID, vmID, host string) (string, bool) {
+	if claim.LeaseID != strings.TrimSpace(leaseID) ||
+		claim.CloudID != strings.TrimSpace(vmID) ||
+		strings.TrimSpace(claim.Labels["host"]) != strings.TrimSpace(host) ||
+		claim.SSHPort <= 0 || claim.SSHPort > 65535 {
+		return "", false
+	}
+	return strconv.Itoa(claim.SSHPort), true
+}
+
+func applyParallelsClaimSSHPortToConfig(cfg *core.Config, claim core.LeaseClaim, leaseID, vmID, host string) bool {
+	port, ok := parallelsClaimSSHPort(claim, leaseID, vmID, host)
+	if !ok || cfg == nil {
+		return false
+	}
+	cfg.SSHPort = port
+	cfg.SSHFallbackPorts = []string{}
+	return true
+}
+
+func applyParallelsClaimSSHPort(target *core.SSHTarget, claim core.LeaseClaim, leaseID, vmID, host string) bool {
+	// Resolve already ownership-fences the exact lease/VM/host binding before
+	// this point. Reuse the transport endpoint that acquisition actually proved
+	// instead of replacing it with the command's generic SSH default. The same
+	// port is applied to the client config before DHCP/IP discovery.
+	port, ok := parallelsClaimSSHPort(claim, leaseID, vmID, host)
+	if !ok || target == nil {
+		return false
+	}
+	target.Port = port
+	target.FallbackPorts = []string{}
+	return true
+}
+
+func authorizeParallelsResolve(req core.ResolveRequest, leaseID, vmID, host string) (bool, error) {
 	owned, err := exactParallelsClaimOwned(leaseID, vmID, host)
 	if err != nil {
 		return false, err
@@ -232,8 +375,21 @@ func authorizeParallelsResolve(req ResolveRequest, leaseID, vmID, host string) (
 	if owned || readOnlyStatus {
 		return false, nil
 	}
+	// Fixed leases never reach here on a release: resolution answered them from
+	// their durable claim before touching the inventory, so this gate keeps its
+	// original strictness for ordinary leases.
 	if req.ReleaseOnly || !req.Reclaim {
 		return false, parallelsOwnershipError(leaseID, vmID, host)
+	}
+	// A fixed lease ID is a single create identity. Adoption would rewrite its
+	// claim and discard the durable create intent, so the replay and tombstone
+	// guarantees must outrank an explicit --reclaim.
+	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		return false, err
+	}
+	if exists && parallelsFixedLeaseKind.IsFixedClaim(claim) {
+		return false, core.Exit(4, "lease_id_conflict: Parallels lease %q has a durable fixed create intent; --reclaim cannot re-bind it to VM %q on host %q", strings.TrimSpace(leaseID), strings.TrimSpace(vmID), strings.TrimSpace(host))
 	}
 	if strings.TrimSpace(req.Repo.Root) == "" {
 		return false, core.Exit(2, "parallels --reclaim requires repository context before binding VM %q on host %q", strings.TrimSpace(vmID), strings.TrimSpace(host))
@@ -241,9 +397,9 @@ func authorizeParallelsResolve(req ResolveRequest, leaseID, vmID, host string) (
 	return true, nil
 }
 
-func (b *leaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseView, error) {
+func (b *leaseBackend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
 	_ = req
-	var out []LeaseView
+	var out []core.LeaseView
 	var hostErrs []error
 	for _, cfg := range core.ParallelsCandidateConfigs(b.Cfg) {
 		leases, err := core.NewParallelsClient(cfg, b.RT.Exec).ListCrabboxServers(ctx)
@@ -265,12 +421,12 @@ func (b *leaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseView, 
 	return out, nil
 }
 
-func parallelsHostError(cfg Config, action string, err error) error {
+func parallelsHostError(cfg core.Config, action string, err error) error {
 	return fmt.Errorf("host %s %s: %w", parallelsHostName(cfg), action, err)
 }
 
 func (b *leaseBackend) Doctor(ctx context.Context, req core.DoctorRequest) (core.DoctorResult, error) {
-	servers, err := b.List(ctx, ListRequest{})
+	servers, err := b.List(ctx, core.ListRequest{})
 	if err != nil {
 		return core.DoctorResult{}, err
 	}
@@ -287,11 +443,7 @@ func (b *leaseBackend) Doctor(ctx context.Context, req core.DoctorRequest) (core
 			return core.DoctorResult{}, err
 		}
 		if vm.IP != "" {
-			target := core.SSHTargetFromConfig(selected, vm.IP)
-			if selected.Parallels.Host != "" {
-				target.ProxyCommand = parallelsProxyCommand(selected, vm.IP)
-				target.SSHConfigProxy = true
-			}
+			target := parallelsLeaseSSHTarget(selected, vm.IP)
 			if err := core.WaitForSSHReady(ctx, &target, io.Discard, "doctor", 10*time.Second); err != nil {
 				return core.DoctorResult{}, err
 			}
@@ -304,11 +456,31 @@ func (b *leaseBackend) Doctor(ctx context.Context, req core.DoctorRequest) (core
 	}, nil
 }
 
-func (b *leaseBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error {
+func (b *leaseBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	_, err := b.ReleaseLeaseWithOutcome(ctx, req)
+	return err
+}
+
+func (b *leaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.ReleaseLeaseRequest) (core.ReleaseLeaseOutcome, error) {
+	var outcome core.ReleaseLeaseOutcome
+	err := b.releaseLease(ctx, req, &outcome)
+	return outcome, err
+}
+
+func (b *leaseBackend) releaseLease(ctx context.Context, req core.ReleaseLeaseRequest, outcome *core.ReleaseLeaseOutcome) error {
+	if leaseID := strings.TrimSpace(req.Lease.LeaseID); leaseID != "" {
+		claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+		if err != nil {
+			return err
+		}
+		if exists && parallelsFixedLeaseKind.IsFixedClaim(claim) {
+			return b.releaseFixed(ctx, claim, outcome)
+		}
+	}
 	if req.Lease.Server.Name != "" && !strings.HasPrefix(req.Lease.Server.Name, "crabbox-") {
 		return core.Exit(2, "refusing to release non-Crabbox Parallels VM %q", req.Lease.Server.Name)
 	}
-	id := firstNonEmpty(req.Lease.Server.CloudID, req.Lease.LeaseID)
+	id := shared.FirstNonBlankTrimmed(req.Lease.Server.CloudID, req.Lease.LeaseID)
 	cfg := b.configForLease(ctx, req.Lease)
 	if err := requireExactParallelsClaim(req.Lease.LeaseID, id, parallelsHostName(cfg)); err != nil {
 		return err
@@ -316,20 +488,22 @@ func (b *leaseBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest
 	if err := core.NewParallelsClient(cfg, b.RT.Exec).Delete(ctx, id); err != nil {
 		return err
 	}
+	outcome.Terminal = true
 	core.RemoveLeaseClaim(req.Lease.LeaseID)
 	core.RemoveStoredTestboxKey(req.Lease.LeaseID)
 	return nil
 }
 
-func (b *leaseBackend) Touch(ctx context.Context, req TouchRequest) (Server, error) {
+func (b *leaseBackend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
 	server := req.Lease.Server
-	server.Labels = core.TouchDirectLeaseLabels(server.Labels, b.Cfg, req.State, time.Now().UTC())
-	core.NewParallelsClient(b.configForLease(ctx, req.Lease), b.RT.Exec).SetLeaseLabels(firstNonEmpty(req.Lease.LeaseID, server.Labels["lease"]), server.Labels)
+	// Preserve stored policy only when the caller omitted an override.
+	server.Labels = core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(server.Labels, b.Cfg, req.State, time.Now().UTC(), req.IdleTimeoutOverride)
+	core.NewParallelsClient(b.configForLease(ctx, req.Lease), b.RT.Exec).SetLeaseLabels(shared.FirstNonBlankTrimmed(req.Lease.LeaseID, server.Labels["lease"]), server.Labels)
 	return server, nil
 }
 
-func (b *leaseBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
-	servers, err := b.List(ctx, ListRequest{Options: req.Options})
+func (b *leaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
+	servers, err := b.List(ctx, core.ListRequest{Options: req.Options})
 	if err != nil {
 		return err
 	}
@@ -340,7 +514,7 @@ func (b *leaseBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
 			continue
 		}
 		leaseID := server.Labels["lease"]
-		cfg := b.configForLease(ctx, LeaseTarget{
+		cfg := b.configForLease(ctx, core.LeaseTarget{
 			Server:  server,
 			LeaseID: leaseID,
 		})
@@ -354,6 +528,19 @@ func (b *leaseBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
 		}
 		fmt.Fprintf(b.RT.Stderr, "delete vm id=%s name=%s\n", server.DisplayID(), server.Name)
 		if req.DryRun {
+			continue
+		}
+		claim, claimExists, err := core.ReadLeaseClaimWithPresence(leaseID)
+		if err != nil {
+			return err
+		}
+		if claimExists && parallelsFixedLeaseKind.IsFixedClaim(claim) {
+			// A fixed ID is a single-use operation identity: sweep the VM
+			// through the durable release path so its terminal tombstone
+			// survives and the ID can never be replayed into a second VM.
+			if err := b.releaseFixed(ctx, claim, &core.ReleaseLeaseOutcome{}); err != nil {
+				return err
+			}
 			continue
 		}
 		client := core.NewParallelsClient(cfg, b.RT.Exec)
@@ -392,7 +579,7 @@ func exactParallelsClaimOwned(leaseID, vmID, host string) (bool, error) {
 	return ok && exact && claim.LeaseID == leaseID && claim.CloudID == vmID && strings.TrimSpace(claim.Labels["host"]) == host, nil
 }
 
-func parallelsProxyCommand(cfg Config, guestIP string) string {
+func parallelsProxyCommand(cfg core.Config, guestIP string) string {
 	host := cfg.Parallels.Host
 	if cfg.Parallels.HostUser != "" {
 		host = cfg.Parallels.HostUser + "@" + host
@@ -406,7 +593,7 @@ func parallelsProxyCommand(cfg Config, guestIP string) string {
 	return strings.Join(core.ShellWords(args), " ")
 }
 
-func (b *leaseBackend) configForLease(ctx context.Context, lease LeaseTarget) Config {
+func (b *leaseBackend) configForLease(ctx context.Context, lease core.LeaseTarget) core.Config {
 	host := strings.TrimSpace(lease.Server.Labels["host"])
 	if host != "" {
 		for _, candidate := range core.ParallelsCandidateConfigs(b.Cfg) {
@@ -415,7 +602,7 @@ func (b *leaseBackend) configForLease(ctx context.Context, lease LeaseTarget) Co
 			}
 		}
 	}
-	id := firstNonEmpty(lease.Server.CloudID, lease.LeaseID)
+	id := shared.FirstNonBlankTrimmed(lease.Server.CloudID, lease.LeaseID)
 	if id != "" {
 		for _, candidate := range core.ParallelsCandidateConfigs(b.Cfg) {
 			client := core.NewParallelsClient(candidate, b.RT.Exec)
@@ -427,17 +614,8 @@ func (b *leaseBackend) configForLease(ctx context.Context, lease LeaseTarget) Co
 	return b.Cfg
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-func parallelsHostName(cfg Config) string {
-	return firstNonEmpty(cfg.Parallels.SelectedHost, cfg.Parallels.Host, "local")
+func parallelsHostName(cfg core.Config) string {
+	return core.ParallelsHostRefForConfig(cfg)
 }
 
 func blank(value, fallback string) string {
@@ -445,10 +623,6 @@ func blank(value, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func useStoredTestboxKey(target *SSHTarget, leaseID string) {
-	shared.UseStoredTestboxKey(target, leaseID)
 }
 
 func parallelsLeaseFromVMName(name string) (string, string) {

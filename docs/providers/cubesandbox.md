@@ -23,6 +23,11 @@ Use an SSH-lease provider such as `aws`, `hetzner`, or `ssh` when the workflow
 requires `crabbox ssh`, VNC, code-server, GitHub Actions runner hydration, or
 host-managed SSH access.
 
+Multipart archive uploads finish using their borrowed source before returning.
+HTTP failures remain primary; source failures after an early success response are
+reported with token redaction. Cancellation stops HTTP/pipe work but may wait for
+an in-flight source read; the upload does not close the caller-owned source.
+
 ## Prerequisites
 
 - A reachable Cube API endpoint, usually `http://<cubeapi-host>:3000`.
@@ -97,6 +102,14 @@ from repository-local config because the Cube API selects the envd route, which
 receives the sandbox access token, workspace archive, command, and forwarded
 environment.
 
+All nine configuration bindings share one typed declaration. The API key stays
+environment-only. File strings ignore empty values, and file proxy ports apply
+only when positive. Environment proxy ports retain signed-integer parsing and
+first-nonempty alias precedence; malformed values fail without applying later
+fields. Explicit flags retain their existing empty-string and signed-port
+behavior. Endpoint provenance and repository destination rejection remain core
+policy, separate from these bindings.
+
 Provider flags:
 
 ```text
@@ -165,6 +178,10 @@ that a later stream trailer or sandbox deletion succeeded.
 
 The envd Connect wire codec is shared with E2B; this abnormal-end policy and
 CubeProxy routing remain CubeSandbox-owned.
+
+The compatible control plane also shares sandbox record types, returned-ID
+validation, and cursor pagination with E2B. Authentication, creation payloads,
+response-error decoding, and envd endpoint routing stay in each adapter.
 
 ## Gotchas
 

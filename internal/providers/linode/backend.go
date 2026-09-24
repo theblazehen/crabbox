@@ -142,28 +142,28 @@ func (b *linodeLeaseBackend) acquireOnce(ctx context.Context, req core.AcquireRe
 			core.RemoveStoredTestboxKey(leaseID)
 			return
 		}
-		claimErr := b.persistAcquireCleanupClaim(leaseID, slug, cfg, created, req.Repo.Root, accountID, req.Keep, now)
-		claimPersisted := claimErr == nil
-		if cleanupErr := rollbackLinodeAcquire(client, created.ID); cleanupErr != nil {
-			err = fmt.Errorf("%v; linode cleanup failed: %w", err, errors.Join(claimErr, cleanupErr))
-			return
+		claim, claimErr := b.persistAcquireCleanupClaim(leaseID, slug, cfg, created, req.Repo.Root, accountID, req.Keep, now)
+		var cleanupErr error
+		if claimErr != nil {
+			// This attempt owns the new instance, but not a competing claim or its SSH files.
+			cleanupErr = errors.Join(claimErr, rollbackLinodeAcquire(client, created.ID))
+		} else {
+			// Rollback outlives acquisition; its provider timeout starts after admission.
+			cleanupErr = shared.RemoveSSHLeaseClaimAfter(context.Background(), claim, func() error {
+				return rollbackLinodeAcquire(client, created.ID)
+			})
 		}
-		if claimPersisted {
-			core.RemoveLeaseClaim(leaseID)
-		}
-		core.RemoveStoredTestboxKey(leaseID)
+		err = shared.JoinAcquireCleanupError(err, cleanupErr)
 	}()
 	cfg.SSHKey = keyPath
 	cfg.ProviderKey = providerKeyForLease(leaseID)
-	if !cfg.ServerTypeExplicit || cfg.ServerType == "" {
-		cfg.ServerType = linodeServerTypeForConfig(cfg)
-	}
+	cfg.ServerType = linodeServerTypeForConfig(cfg)
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
 		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
 	createReq := createLinodeRequest{
 		Region:         linodeRegionForConfig(cfg),
-		Type:           linodeServerTypeForConfig(cfg),
+		Type:           cfg.ServerType,
 		Image:          linodeImageForConfig(cfg),
 		Label:          core.LeaseProviderName(leaseID, slug),
 		Tags:           leaseTags(cfg, leaseID, slug, "provisioning", req.Keep, now),
@@ -246,7 +246,7 @@ func (b *linodeLeaseBackend) persistAcquireRecoveryClaim(leaseID, slug string, c
 	return core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, repoRoot, cfg.IdleTimeout, false)
 }
 
-func (b *linodeLeaseBackend) persistAcquireCleanupClaim(leaseID, slug string, cfg core.Config, created linodeInstance, repoRoot, accountID string, keep bool, now time.Time) error {
+func (b *linodeLeaseBackend) persistAcquireCleanupClaim(leaseID, slug string, cfg core.Config, created linodeInstance, repoRoot, accountID string, keep bool, now time.Time) (core.LeaseClaim, error) {
 	server := core.Server{Provider: providerName, Name: core.LeaseProviderName(leaseID, slug)}
 	if created.ID != 0 {
 		server = serverFromLinode(created, cfg)
@@ -261,13 +261,14 @@ func (b *linodeLeaseBackend) persistAcquireCleanupClaim(leaseID, slug string, cf
 		var err error
 		repoRoot, err = os.Getwd()
 		if err != nil {
-			return fmt.Errorf("resolve rollback cleanup working directory: %w", err)
+			return core.LeaseClaim{}, fmt.Errorf("resolve rollback cleanup working directory: %w", err)
 		}
 	}
-	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, repoRoot, cfg.IdleTimeout, false); err != nil {
-		return fmt.Errorf("persist linode rollback cleanup claim: %w", err)
+	claim, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, slug, cfg, server, core.SSHTarget{}, repoRoot, cfg.IdleTimeout, false, core.LeaseClaim{}, false)
+	if err != nil {
+		return core.LeaseClaim{}, fmt.Errorf("persist linode rollback cleanup claim: %w", err)
 	}
-	return nil
+	return claim, nil
 }
 
 func (b *linodeLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
@@ -469,7 +470,7 @@ func (b *linodeLeaseBackend) targetFromLinode(item linodeInstance, req core.Reso
 		if expectedAccountID != accountID {
 			return core.LeaseTarget{}, core.Exit(3, "linode account mismatch: current account %s does not match lease account %s", accountID, expectedAccountID)
 		}
-		liveCloudID := firstNonBlank(server.CloudID, strconv.FormatInt(server.ID, 10))
+		liveCloudID := shared.FirstNonBlank(server.CloudID, strconv.FormatInt(server.ID, 10))
 		if claim.CloudID != "" && claim.CloudID != liveCloudID {
 			return core.LeaseTarget{}, core.Exit(2, "refusing to resolve Linode instance %d from stale local claim", server.ID)
 		}
@@ -496,10 +497,8 @@ func (b *linodeLeaseBackend) targetFromLinode(item linodeInstance, req core.Reso
 		return target, nil
 	}
 	ssh := core.SSHTargetFromConfig(b.Cfg, server.PublicNet.IPv4.IP)
-	if keyPath, err := core.TestboxKeyPath(leaseID); err == nil {
-		if _, statErr := os.Stat(keyPath); statErr == nil {
-			ssh.Key = keyPath
-		}
+	if err := core.UseStoredTestboxKey(&ssh, leaseID); err != nil {
+		return core.LeaseTarget{}, err
 	}
 	if req.Repo.Root != "" && !req.NoLocalStateMutations {
 		updatedClaim, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, server.Labels["slug"], b.Cfg, server, ssh, req.Repo.Root, b.Cfg.IdleTimeout, req.Reclaim, claim, claimExists)
@@ -553,7 +552,7 @@ func (b *linodeLeaseBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (
 		}
 	}
 	result := core.InventoryDoctorResult(providerName, count)
-	result.Message += fmt.Sprintf(" default_type=%s region=%s image=%s", b.Cfg.ServerType, linodeRegionForConfig(b.Cfg), linodeImageForConfig(b.Cfg))
+	result.Message += fmt.Sprintf(" default_type=%s region=%s image=%s", linodeServerTypeForConfig(b.Cfg), linodeRegionForConfig(b.Cfg), linodeImageForConfig(b.Cfg))
 	return result, nil
 }
 
@@ -649,7 +648,7 @@ func (b *linodeLeaseBackend) updateFencedLinodeMetadata(ctx context.Context, lea
 				labels[key] = value
 			}
 		} else {
-			applyTailscaleMetadata(labels, *meta)
+			shared.ApplyTailscaleMetadata(labels, *meta)
 		}
 		labels[linodeAccountLabel] = accountID
 		if err := client.UpdateLinodeTags(providerCtx, server.ID, replaceCrabboxTags(item.Tags, tagsFromLabels(labels))); err != nil {
@@ -809,10 +808,9 @@ func (b *linodeLeaseBackend) deleteServer(ctx context.Context, _ core.Config, se
 		}
 		return client.DeleteLinode(ctx, item.ID)
 	}
-	if err := core.RemoveLeaseClaimIfUnchangedAfter(leaseID, expectedClaim, action); err != nil {
+	if err := shared.RemoveSSHLeaseClaimAfter(ctx, expectedClaim, action); err != nil {
 		return fmt.Errorf("finalize linode cleanup claim: %w", err)
 	}
-	core.RemoveStoredTestboxKey(leaseID)
 	return nil
 }
 
@@ -821,7 +819,7 @@ func validateCleanupClaim(server core.Server, claim core.LeaseClaim, liveLinodeV
 	if claim.LeaseID != leaseID || claim.Provider == "" {
 		return core.Exit(2, "linode lease claim is incomplete for lease=%s", leaseID)
 	}
-	cloudID := firstNonBlank(server.CloudID, strconv.FormatInt(server.ID, 10))
+	cloudID := shared.FirstNonBlank(server.CloudID, strconv.FormatInt(server.ID, 10))
 	if claim.Provider == providerName && claim.CloudID != "" && claim.CloudID != cloudID {
 		return core.Exit(2, "refusing to release Linode instance %d from stale local claim", server.ID)
 	}
@@ -929,25 +927,11 @@ func appendLinodeIfMissing(linodes []linodeInstance, item linodeInstance) []lino
 	return append(linodes, item)
 }
 
-func applyTailscaleMetadata(labels map[string]string, meta core.TailscaleMetadata) {
-	shared.ApplyTailscaleMetadata(labels, meta)
-}
-
 func (b *linodeLeaseBackend) waitForLinodeIP(ctx context.Context, client linodeAPI, id int64, timeout time.Duration) (linodeInstance, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	result, err := shared.Poll(waitCtx, 0, 3*time.Second, shared.SleepContext,
+	return shared.PollReady(ctx, timeout, 3*time.Second,
 		func(ctx context.Context) (linodeInstance, error) { return client.GetLinode(ctx, id) },
-		func(_ context.Context, item linodeInstance, fetchErr error) (bool, error) {
-			return publicIPv4(item) != "", fetchErr
-		}, nil)
-	if err != nil {
-		if context.Cause(ctx) == nil && errors.Is(context.Cause(waitCtx), context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded) {
-			return linodeInstance{}, core.Exit(5, "timed out waiting for Linode instance IP")
-		}
-		result.Value = linodeInstance{}
-	}
-	return result.Value, err
+		func(item linodeInstance) bool { return publicIPv4(item) != "" },
+		core.Exit(5, "timed out waiting for Linode instance IP"))
 }
 
 func rollbackLinodeAcquire(client linodeAPI, linodeID int64) error {
@@ -989,7 +973,7 @@ func serverFromLinode(item linodeInstance, cfg core.Config) core.Server {
 		Labels:   labels,
 	}
 	server.PublicNet.IPv4.IP = publicIPv4(item)
-	server.ServerType.Name = firstNonBlank(item.Type, cfg.ServerType)
+	server.ServerType.Name = shared.FirstNonBlank(item.Type, cfg.ServerType)
 	return server
 }
 
@@ -1076,12 +1060,7 @@ func applyLinodeDefaults(cfg *core.Config) {
 	if cfg.TargetOS == "" {
 		cfg.TargetOS = core.TargetLinux
 	}
-	if cfg.Linode.Region == "" {
-		cfg.Linode.Region = core.LinodeConfiguredRegionDefault
-	}
-	if cfg.Linode.Image == "" {
-		cfg.Linode.Image = core.LinodeImageFallback
-	}
+	applyNativeDefaults(&cfg.Linode)
 	if cfg.Linode.Type == "" {
 		cfg.Linode.Type = linodeServerTypeForClass(cfg.Class)
 	}
@@ -1095,10 +1074,6 @@ func applyLinodeDefaults(cfg *core.Config) {
 		cfg.SSHPort = "22"
 	}
 	cfg.SSHFallbackPorts = nil
-}
-
-func firstNonBlank(values ...string) string {
-	return shared.FirstNonBlank(values...)
 }
 
 func isLinodeNotFound(err error) bool {

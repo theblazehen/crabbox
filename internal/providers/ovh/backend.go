@@ -165,7 +165,7 @@ func (b *Backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 		return core.LeaseTarget{}, err
 	}
 	cfg.SSHKey = keyPath
-	cfg.ProviderKey = providerKeyForLease(leaseID)
+	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
 		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
@@ -241,7 +241,7 @@ func (b *Backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 		} else if ok {
 			recovery = "ambiguous-create"
 			created = mergeInstanceLabels(recovered, labels)
-			created.SSHKeyID = firstNonBlank(created.SSHKeyID, createdKey.ID)
+			created.SSHKeyID = shared.FirstNonBlank(created.SSHKeyID, createdKey.ID)
 		}
 		return core.LeaseTarget{}, err
 	}
@@ -251,16 +251,21 @@ func (b *Backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 		return core.LeaseTarget{}, err
 	}
 	waited = mergeInstanceLabels(waited, labels)
-	waited.SSHKeyID = firstNonBlank(waited.SSHKeyID, createdKey.ID)
+	waited.SSHKeyID = shared.FirstNonBlank(waited.SSHKeyID, createdKey.ID)
 	server := serverFromInstance(waited, cfg)
 	ssh := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
 	if err := b.waitSSH(ctx, &ssh, "ovh bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
 		return core.LeaseTarget{}, err
 	}
 	server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, "ready", core.ClockNow(b.RT.Clock).UTC())
-	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
+	claim, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, slug, cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, core.LeaseClaim{}, false)
+	if err != nil {
 		return core.LeaseTarget{}, err
 	}
+	if claim.LeaseID != "" {
+		server = overlayClaimLabels(server, claim)
+	}
+	core.SetServerLeaseClaimSnapshot(&server, claim, claim.LeaseID != "")
 	committed = true
 	fmt.Fprintf(b.RT.Stderr, "provisioned lease=%s ovh_instance=%s type=%s\n", leaseID, server.DisplayID(), cfg.ServerType)
 	return core.LeaseTarget{Server: server, SSH: ssh, LeaseID: leaseID}, nil
@@ -327,19 +332,21 @@ func (b *Backend) targetFromInstance(instance Instance, req core.ResolveRequest)
 	} else if req.ReleaseOnly {
 		return core.LeaseTarget{}, core.Exit(2, "refusing to release OVH instance %s without a local Crabbox claim", server.DisplayID())
 	}
-	if req.ReleaseOnly || (req.StatusOnly && !req.ReadyProbe) {
+	core.SetServerLeaseClaimSnapshot(&server, claim, claimExists)
+	if req.ReleaseOnly || (req.StatusOnly && !req.ReadyProbe && server.PublicNet.IPv4.IP == "") {
 		return core.LeaseTarget{Server: server, LeaseID: leaseID}, nil
 	}
 	ssh := core.SSHTargetFromConfig(b.Cfg, server.PublicNet.IPv4.IP)
-	if keyPath, err := core.TestboxKeyPath(leaseID); err == nil {
-		if _, statErr := os.Stat(keyPath); statErr == nil {
-			ssh.Key = keyPath
-		}
+	if err := core.UseStoredTestboxKey(&ssh, leaseID); err != nil {
+		return core.LeaseTarget{}, err
 	}
-	if req.Repo.Root != "" {
-		if _, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, server.Labels["slug"], b.Cfg, server, ssh, req.Repo.Root, b.Cfg.IdleTimeout, req.Reclaim, claim, claimExists); err != nil {
+	if req.Repo.Root != "" && !req.NoLocalStateMutations && !req.StatusOnly {
+		updated, err := core.ClaimLeaseTargetForRepoConfigWithIdleTimeoutOverrideIfUnchanged(leaseID, server.Labels["slug"], b.Cfg, server, ssh, req.Repo.Root, b.Cfg.IdleTimeout, shared.LegacyLabelIdleTimeout(claim), req.Reclaim, claim, claimExists)
+		if err != nil {
 			return core.LeaseTarget{}, err
 		}
+		server = overlayClaimLabels(server, updated)
+		core.SetServerLeaseClaimSnapshot(&server, updated, true)
 	}
 	return core.LeaseTarget{Server: server, SSH: ssh, LeaseID: leaseID}, nil
 }
@@ -460,57 +467,76 @@ func (b *Backend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
 	return fmt.Sprintf("deleted lease=%s ovh_instance=%s name=%s", lease.LeaseID, lease.Server.DisplayID(), lease.Server.Name)
 }
 
-func (b *Backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
-	server := req.Lease.Server
+func (b *Backend) AuthorizeStatusTouchClaim(ctx context.Context, lease core.LeaseTarget, claim core.LeaseClaim) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	server := lease.Server
+	if !core.IsCanonicalLeaseID(lease.LeaseID) || lease.LeaseID != claim.LeaseID || lease.LeaseID != server.Labels["lease"] ||
+		server.Provider != providerName || claim.Provider != providerName || claim.ProviderScope != "" ||
+		server.CloudID == "" || server.CloudID != claim.CloudID {
+		return core.Exit(4, "ovh lease=%s claim does not match the canonical lease, provider, or instance", lease.LeaseID)
+	}
 	if err := validateOVHServerOwnership(server); err != nil {
-		return core.Server{}, err
+		return err
 	}
-	client, err := b.clientFactory(b.Cfg, b.RT)
+	if err := validateOVHClaim(claim, server); err != nil {
+		return err
+	}
+	if server.Labels[ovhProjectLabel] != b.Cfg.OVH.ProjectID {
+		return core.Exit(3, "ovh project mismatch for lease=%s", lease.LeaseID)
+	}
+	if claim.Labels["state"] == "cleanup" {
+		return core.Exit(4, "ovh lease=%s cleanup is already in progress", claim.LeaseID)
+	}
+	return core.AuthorizeCheckpointRelease(claim, "")
+}
+
+func (b *Backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	if req.IdleTimeoutOverride == nil {
+		if expected, exists, set := core.ServerLeaseClaimSnapshot(req.Lease.Server); exists && set {
+			req.IdleTimeoutOverride = shared.LegacyLabelIdleTimeout(expected)
+		}
+	}
+	var live core.Server
+	updated, err := shared.CommitClaimTouch(ctx, req, shared.ClaimTouchPolicy{
+		Provider: providerName,
+		Authorize: func(ctx context.Context, lease core.LeaseTarget, expected core.LeaseClaim) error {
+			if err := b.AuthorizeStatusTouchClaim(ctx, lease, expected); err != nil {
+				return err
+			}
+			client, err := b.clientFactory(b.Cfg, b.RT)
+			if err != nil {
+				return err
+			}
+			instance, err := client.GetInstance(ctx, b.Cfg.OVH.ProjectID, lease.Server.CloudID)
+			if err != nil {
+				return err
+			}
+			live = overlayExpectedOVHLabels(serverFromInstance(instance, b.Cfg), lease.Server)
+			if err := validateLiveOVHInstance(live, lease.Server); err != nil {
+				return err
+			}
+			return validateOVHClaim(expected, live)
+		},
+		Prepare: func(expected core.LeaseClaim) (map[string]string, time.Time) {
+			cfg := b.Cfg
+			if req.IdleTimeout > 0 {
+				cfg.IdleTimeout = req.IdleTimeout
+			}
+			now := core.ClockNow(b.RT.Clock).UTC()
+			labels := core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(shared.LegacyLabelLifecycleLabels(expected), cfg, req.State, now, req.IdleTimeoutOverride)
+			if b.beforeTouchClaimUpdate != nil {
+				b.beforeTouchClaimUpdate()
+			}
+			return labels, now
+		},
+	})
 	if err != nil {
 		return core.Server{}, err
 	}
-	instance, err := client.GetInstance(ctx, b.Cfg.OVH.ProjectID, server.CloudID)
-	if err != nil {
-		return core.Server{}, err
-	}
-	live := overlayExpectedOVHLabels(serverFromInstance(instance, b.Cfg), server)
-	if err := validateLiveOVHInstance(live, server); err != nil {
-		return core.Server{}, err
-	}
-	labels := shared.CloneLabels(server.Labels)
-	claim, claimExists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"])
-	if err != nil {
-		return core.Server{}, err
-	}
-	if claimExists {
-		if err := validateOVHClaim(claim, live); err != nil {
-			return core.Server{}, err
-		}
-		if claim.Labels["state"] == "cleanup" {
-			return core.Server{}, core.Exit(4, "ovh lease=%s cleanup is already in progress", claim.LeaseID)
-		}
-		labels = shared.CloneLabels(claim.Labels)
-	}
-	cfg := b.Cfg
-	if req.IdleTimeout > 0 {
-		cfg.IdleTimeout = req.IdleTimeout
-		delete(labels, "idle_timeout")
-		delete(labels, "idle_timeout_secs")
-	}
-	tailscaleLabels := exactTailscaleLabels(labels)
-	labels = core.TouchDirectLeaseLabels(labels, cfg, req.State, core.ClockNow(b.RT.Clock).UTC())
-	for key, value := range tailscaleLabels {
-		labels[key] = value
-	}
-	if claimExists {
-		if b.beforeTouchClaimUpdate != nil {
-			b.beforeTouchClaimUpdate()
-		}
-		if _, err := core.UpdateLeaseClaimLabelsIfUnchanged(labels["lease"], claim, labels); err != nil {
-			return core.Server{}, err
-		}
-	}
-	live.Labels = labels
+	live.Labels = updated.Labels
+	core.SetServerLeaseClaimSnapshot(&live, updated, true)
 	return live, nil
 }
 
@@ -542,12 +568,16 @@ func (b *Backend) UpdateTailscaleMetadata(ctx context.Context, lease core.LeaseT
 			return core.Server{}, core.Exit(4, "ovh lease=%s cleanup is already in progress", claim.LeaseID)
 		}
 		labels = shared.CloneLabels(claim.Labels)
-		applyTailscaleMetadata(labels, meta)
-		if _, err := core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels); err != nil {
+		shared.ApplyTailscaleMetadata(labels, meta)
+		updated, err := core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+		if err != nil {
 			return core.Server{}, err
 		}
+		labels = updated.Labels
+		core.SetServerLeaseClaimSnapshot(&live, updated, true)
 	} else {
-		applyTailscaleMetadata(labels, meta)
+		shared.ApplyTailscaleMetadata(labels, meta)
+		core.SetServerLeaseClaimSnapshot(&live, core.LeaseClaim{}, false)
 	}
 	live.Labels = labels
 	return live, nil
@@ -710,9 +740,7 @@ func (b *Backend) resolveAcquireConfig(ctx context.Context) (core.Config, error)
 	if core.OSImageWasExplicit(cfg) && !core.OVHImageWasExplicit(cfg) && cfg.OSImage != "" && cfg.OSImage != "ubuntu:24.04" {
 		return core.Config{}, core.Exit(2, "provider=ovh does not support --os %s; use --os ubuntu:24.04 or set ovh.image explicitly", cfg.OSImage)
 	}
-	if cfg.OVH.Image == "" {
-		cfg.OVH.Image = core.OVHConfigDefaultImage
-	}
+	cfg.OVH.Image = imageForConfig(cfg)
 	if cfg.ServerTypeExplicit && cfg.ServerType != "" {
 		cfg.OVH.Flavor = cfg.ServerType
 	} else if cfg.OVH.Flavor == "" {
@@ -786,13 +814,13 @@ func selectFlavor(flavors []Flavor, value string) (Flavor, error) {
 
 func validateFlavor(flavor Flavor) (Flavor, error) {
 	if flavor.Available != nil && !*flavor.Available {
-		return Flavor{}, core.Exit(2, "ovh flavor %q is unavailable", firstNonBlank(flavor.ID, flavor.Name))
+		return Flavor{}, core.Exit(2, "ovh flavor %q is unavailable", shared.FirstNonBlank(flavor.ID, flavor.Name))
 	}
 	if flavor.Quota != nil && *flavor.Quota <= 0 {
-		return Flavor{}, core.Exit(2, "ovh flavor %q has no remaining project quota", firstNonBlank(flavor.ID, flavor.Name))
+		return Flavor{}, core.Exit(2, "ovh flavor %q has no remaining project quota", shared.FirstNonBlank(flavor.ID, flavor.Name))
 	}
 	if osType := strings.ToLower(strings.TrimSpace(flavor.OSType)); osType != "" && osType != "linux" {
-		return Flavor{}, core.Exit(2, "ovh flavor %q is for osType=%s, not linux", firstNonBlank(flavor.ID, flavor.Name), flavor.OSType)
+		return Flavor{}, core.Exit(2, "ovh flavor %q is for osType=%s, not linux", shared.FirstNonBlank(flavor.ID, flavor.Name), flavor.OSType)
 	}
 	return flavor, nil
 }
@@ -822,14 +850,14 @@ func selectImage(images []Image, value string) (Image, error) {
 
 func validateImage(image Image, selectedByID bool) (Image, error) {
 	if status := strings.ToLower(strings.TrimSpace(image.Status)); status != "" && status != "active" {
-		return Image{}, core.Exit(2, "ovh image %q has status=%s", firstNonBlank(image.ID, image.Name), image.Status)
+		return Image{}, core.Exit(2, "ovh image %q has status=%s", shared.FirstNonBlank(image.ID, image.Name), image.Status)
 	}
 	if imageType := strings.ToLower(strings.TrimSpace(image.Type)); imageType != "" && imageType != "linux" {
-		return Image{}, core.Exit(2, "ovh image %q has type=%s, not linux", firstNonBlank(image.ID, image.Name), image.Type)
+		return Image{}, core.Exit(2, "ovh image %q has type=%s, not linux", shared.FirstNonBlank(image.ID, image.Name), image.Type)
 	}
 	imageName := strings.ToLower(strings.TrimSpace(image.Name))
 	if !strings.Contains(imageName, "ubuntu") && !strings.Contains(imageName, "debian") {
-		return Image{}, core.Exit(2, "ovh image %q is not a supported Debian or Ubuntu image", firstNonBlank(image.ID, image.Name))
+		return Image{}, core.Exit(2, "ovh image %q is not a supported Debian or Ubuntu image", shared.FirstNonBlank(image.ID, image.Name))
 	}
 	if !selectedByID {
 		visibility := strings.ToLower(strings.TrimSpace(image.Visibility))
@@ -894,7 +922,7 @@ func (b *Backend) reconcileCreatedInstance(ctx context.Context, client API, clai
 			lastErr = err
 		}
 		if attempt+1 < b.effectiveRecoveryPolls() {
-			if err := sleepContext(ctx, b.effectiveRecoveryInterval()); err != nil {
+			if err := core.SleepContext(ctx, b.effectiveRecoveryInterval()); err != nil {
 				return Instance{}, false, err
 			}
 		}
@@ -918,7 +946,7 @@ func (b *Backend) reconcileSSHKey(ctx context.Context, client API, projectID, na
 			lastErr = err
 		}
 		if attempt+1 < b.effectiveRecoveryPolls() {
-			if err := sleepContext(ctx, b.effectiveRecoveryInterval()); err != nil {
+			if err := core.SleepContext(ctx, b.effectiveRecoveryInterval()); err != nil {
 				return SSHKey{}, false, err
 			}
 		}
@@ -935,7 +963,7 @@ func (b *Backend) reconcilePendingSSHKey(ctx context.Context, client API, claim 
 	if err != nil {
 		return core.LeaseTarget{}, false, fmt.Errorf("read retained OVH public key: %w", err)
 	}
-	key, found, err := b.reconcileSSHKey(ctx, client, b.Cfg.OVH.ProjectID, providerKeyForLease(claim.LeaseID), strings.TrimSpace(string(publicKey)))
+	key, found, err := b.reconcileSSHKey(ctx, client, b.Cfg.OVH.ProjectID, core.ProviderKeyForLease(claim.LeaseID), strings.TrimSpace(string(publicKey)))
 	if err != nil || !found {
 		return core.LeaseTarget{}, false, err
 	}
@@ -991,17 +1019,6 @@ func selectSSHKey(keys []SSHKey, name, publicKey string) (SSHKey, bool, error) {
 	}
 }
 
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
 func claimOnlyServer(claim core.LeaseClaim) core.Server {
 	return core.Server{
 		Provider: providerName,
@@ -1012,38 +1029,54 @@ func claimOnlyServer(claim core.LeaseClaim) core.Server {
 }
 
 func (b *Backend) waitForInstanceIP(ctx context.Context, client API, projectID, instanceID string) (Instance, error) {
-	deadline := core.ClockNow(b.RT.Clock).UTC().Add(5 * time.Minute)
+	timeout := 5 * time.Minute
 	if b.ipWaitTimeout > 0 {
-		deadline = core.ClockNow(b.RT.Clock).UTC().Add(b.ipWaitTimeout)
+		timeout = b.ipWaitTimeout
 	}
 	interval := 3 * time.Second
 	if b.ipWaitInterval > 0 {
 		interval = b.ipWaitInterval
 	}
-	result, err := shared.Poll(context.WithoutCancel(ctx), 0, interval,
-		func(context.Context, time.Duration) error {
-			if err := shared.SleepContext(ctx, interval); err != nil {
-				return ctx.Err()
-			}
-			return nil
-		},
-		func(context.Context) (Instance, error) { return client.GetInstance(ctx, projectID, instanceID) },
+	budgetExpired := errors.New("OVH IP readiness deadline exceeded")
+	waitCtx, cancel := context.WithTimeoutCause(ctx, timeout, budgetExpired)
+	defer cancel()
+	var lastTransient error
+	var observationError error
+	result, err := shared.Poll(waitCtx, 0, interval, shared.SleepContext,
+		func(ctx context.Context) (Instance, error) { return client.GetInstance(ctx, projectID, instanceID) },
 		func(_ context.Context, instance Instance, fetchErr error) (bool, error) {
 			if fetchErr == nil && publicIPv4(instance) != "" {
 				return true, nil
 			}
-			if fetchErr != nil && !isTransientOVHControlPlaneError(fetchErr) {
-				return false, fetchErr
-			}
-			if core.ClockNow(b.RT.Clock).UTC().After(deadline) {
-				if fetchErr != nil {
-					return false, core.Exit(5, "timed out waiting for OVH instance IP after transient error: %v", fetchErr)
+			if fetchErr != nil {
+				// Completed API responses retain their status, even near cancellation.
+				var apiErr *APIError
+				if cause := context.Cause(waitCtx); cause != nil && !errors.As(fetchErr, &apiErr) &&
+					(errors.Is(fetchErr, cause) || errors.Is(fetchErr, waitCtx.Err())) {
+					return false, errors.Join(cause, fetchErr)
 				}
-				return false, core.Exit(5, "timed out waiting for OVH instance IP")
+				if !isTransientOVHControlPlaneError(fetchErr) {
+					observationError = fetchErr
+					return false, fetchErr
+				}
 			}
+			lastTransient = fetchErr
 			return false, nil
 		}, nil)
 	if err != nil {
+		if observationError != nil {
+			return Instance{}, observationError
+		}
+		if errors.Is(err, budgetExpired) {
+			diagnostic := core.Exit(5, "timed out waiting for OVH instance IP")
+			if lastTransient != nil {
+				diagnostic = core.Exit(5, "timed out waiting for OVH instance IP after transient error: %v", lastTransient)
+			}
+			return Instance{}, shared.PollTerminationError(waitCtx, err, diagnostic)
+		}
+		if cause := context.Cause(ctx); cause != nil && errors.Is(err, cause) {
+			return Instance{}, shared.PollTerminationError(ctx, err, cause)
+		}
 		return Instance{}, err
 	}
 	return result.Value, nil
@@ -1162,7 +1195,7 @@ func claimMatchesOVHProject(claim core.LeaseClaim, projectID string) bool {
 func overlayClaimLabels(server core.Server, claim core.LeaseClaim) core.Server {
 	merged := server
 	merged.Labels = shared.CloneLabels(server.Labels)
-	for key, value := range claim.Labels {
+	for key, value := range shared.LegacyLabelLifecycleLabels(claim) {
 		if isOVHLiveIdentityLabel(key) && strings.TrimSpace(merged.Labels[key]) != "" {
 			continue
 		}
@@ -1191,30 +1224,6 @@ func overlayExpectedOVHLabels(live, expected core.Server) core.Server {
 	return merged
 }
 
-func applyTailscaleMetadata(labels map[string]string, meta core.TailscaleMetadata) {
-	shared.ApplyTailscaleMetadata(labels, meta)
-}
-
-func exactTailscaleLabels(labels map[string]string) map[string]string {
-	out := map[string]string{}
-	for _, key := range []string{
-		"tailscale",
-		"tailscale_state",
-		"tailscale_hostname",
-		"tailscale_tags",
-		"tailscale_ipv4",
-		"tailscale_fqdn",
-		"tailscale_error",
-		"tailscale_exit_node",
-		"tailscale_exit_node_allow_lan_access",
-	} {
-		if value, ok := labels[key]; ok {
-			out[key] = value
-		}
-	}
-	return out
-}
-
 func serverFromInstance(instance Instance, cfg core.Config) core.Server {
 	labels := make(map[string]string, len(instance.Labels)+6)
 	for key, value := range instance.Labels {
@@ -1227,7 +1236,7 @@ func serverFromInstance(instance Instance, cfg core.Config) core.Server {
 		labels[ovhProjectLabel] = cfg.OVH.ProjectID
 	}
 	if labels[ovhRegionLabel] == "" {
-		labels[ovhRegionLabel] = firstNonBlank(instance.Region, cfg.OVH.Region)
+		labels[ovhRegionLabel] = shared.FirstNonBlank(instance.Region, cfg.OVH.Region)
 	}
 	if labels[ovhSSHKeyIDLabel] == "" && instance.SSHKeyID != "" {
 		labels[ovhSSHKeyIDLabel] = instance.SSHKeyID
@@ -1240,7 +1249,7 @@ func serverFromInstance(instance Instance, cfg core.Config) core.Server {
 		Labels:   labels,
 	}
 	server.PublicNet.IPv4.IP = publicIPv4(instance)
-	server.ServerType.Name = firstNonBlank(instance.FlavorID, instance.Flavor.ID, instance.Flavor.Name, cfg.ServerType)
+	server.ServerType.Name = shared.FirstNonBlank(instance.FlavorID, instance.Flavor.ID, instance.Flavor.Name, cfg.ServerType)
 	return server
 }
 
@@ -1376,7 +1385,7 @@ func retryOVHDelete(ctx context.Context, interval time.Duration, resource string
 			return err
 		}
 		lastErr = err
-		if err := sleepContext(ctx, interval); err != nil {
+		if err := core.SleepContext(ctx, interval); err != nil {
 			return fmt.Errorf("could not confirm deletion of OVH %s: %w", resource, errors.Join(lastErr, err))
 		}
 	}
@@ -1445,12 +1454,4 @@ func blank(value string) string {
 		return "-"
 	}
 	return value
-}
-
-func firstNonBlank(values ...string) string {
-	return shared.FirstNonBlank(values...)
-}
-
-func providerKeyForLease(leaseID string) string {
-	return core.ProviderKeyForLease(leaseID)
 }

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -32,8 +33,8 @@ func TestProviderSpecAndFlags(t *testing.T) {
 	if spec.Name != providerName || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
 		t.Fatalf("spec=%#v", spec)
 	}
-	if len(Provider{}.Aliases()) != 0 {
-		t.Fatalf("hostinger must not register aliases, got %#v", Provider{}.Aliases())
+	if len(Provider{}.Spec().Aliases) != 0 {
+		t.Fatalf("hostinger must not register aliases, got %#v", Provider{}.Spec().Aliases)
 	}
 	if !spec.Features.Has(core.FeatureSSH) || !spec.Features.Has(core.FeatureCrabboxSync) || !spec.Features.Has(core.FeatureCleanup) {
 		t.Fatalf("features=%#v; want ssh/crabbox-sync/cleanup", spec.Features)
@@ -651,7 +652,7 @@ func TestHostingerResolveBootstrapsOnlyWhenPrepareRequested(t *testing.T) {
 
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	calls := 0
-	hostingerRunSSHQuiet = func(_ context.Context, _ SSHTarget, remote string) error {
+	hostingerRunSSHQuiet = func(_ context.Context, _ core.SSHTarget, remote string) error {
 		calls++
 		if !strings.Contains(remote, "crabbox-ready") {
 			t.Fatalf("bootstrap command missing ready helper: %s", remote)
@@ -692,11 +693,11 @@ func TestHostingerAcquireBootstrapsBeforeSSHReady(t *testing.T) {
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldWaitForSSHReady := hostingerWaitForSSHReady
 	var calls []string
-	hostingerRunSSHQuiet = func(_ context.Context, _ SSHTarget, _ string) error {
+	hostingerRunSSHQuiet = func(_ context.Context, _ core.SSHTarget, _ string) error {
 		calls = append(calls, "bootstrap")
 		return nil
 	}
-	hostingerWaitForSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+	hostingerWaitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		calls = append(calls, "ready")
 		return nil
 	}
@@ -718,7 +719,7 @@ func TestEnsureBootstrapHonorsCancelDuringWait(t *testing.T) {
 	backend := NewLeaseBackend(Provider{}.Spec(), core.Config{}, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	probed := make(chan struct{}, 1)
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		select {
 		case probed <- struct{}{}:
 		default:
@@ -732,7 +733,7 @@ func TestEnsureBootstrapHonorsCancelDuringWait(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		errCh <- backend.ensureBootstrap(ctx, core.Config{}, LeaseTarget{
+		errCh <- backend.ensureBootstrap(ctx, core.Config{}, core.LeaseTarget{
 			LeaseID: "lease-wait",
 			Server:  core.Server{CloudID: "vm-wait"},
 		}, "bootstrap")
@@ -907,28 +908,184 @@ func TestResolveVMUsesDirectHostingerGetForVMID(t *testing.T) {
 	}
 }
 
+type cancellationObservationAPI struct {
+	*fakeAPI
+	observe func(context.Context) (hostingerVM, error)
+	stop    func(context.Context) error
+}
+
+func (f cancellationObservationAPI) GetVM(ctx context.Context, _ string) (hostingerVM, error) {
+	return f.observe(ctx)
+}
+
+func (f cancellationObservationAPI) StopVM(ctx context.Context, id string) error {
+	if f.stop != nil {
+		return f.stop(ctx)
+	}
+	return f.fakeAPI.StopVM(ctx, id)
+}
+
+func TestHostingerWaitBudgetsBoundReadsAndSleep(t *testing.T) {
+	for _, operation := range []string{"acquire", "stop"} {
+		for _, sleepCancellation := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/sleep-cancel=%t", operation, sleepCancellation), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					api := cancellationObservationAPI{fakeAPI: &fakeAPI{},
+						stop: func(context.Context) error {
+							if !sleepCancellation {
+								time.Sleep(30 * time.Second)
+							}
+							return nil
+						},
+						observe: func(ctx context.Context) (hostingerVM, error) {
+							if sleepCancellation {
+								go func() { time.Sleep(time.Second); cancel() }()
+								return hostingerVM{ID: "vm-budget", State: "starting"}, nil
+							}
+							<-ctx.Done()
+							return hostingerVM{}, ctx.Err()
+						},
+					}
+					started := time.Now()
+					backend := &leaseBackend{}
+					var err error
+					wantTime := 10 * time.Minute
+					if operation == "stop" {
+						err = backend.stopVMAndWait(ctx, api, "vm-budget")
+						wantTime = hostingerStopWaitTimeout
+					} else {
+						_, err = backend.waitForVM(ctx, api, "vm-budget")
+					}
+					wantCause := context.DeadlineExceeded
+					if sleepCancellation {
+						wantTime, wantCause = time.Second, context.Canceled
+					}
+					if !errors.Is(err, wantCause) || time.Since(started) != wantTime {
+						t.Fatalf("elapsed=%s want=%s error=%v", time.Since(started), wantTime, err)
+					}
+					if !sleepCancellation && core.ExitCodeForError(err, 1) != 5 {
+						t.Fatalf("budget diagnostic lost exit 5: %v", err)
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestHostingerStopSubmissionCancellationPrecedence(t *testing.T) {
+	for _, outcome := range []string{"completed-error", "context-error", "wrapped-cause"} {
+		t.Run(outcome, func(t *testing.T) {
+			interrupted := outcome != "completed-error"
+			cause := errors.New("synthetic stop caller cancellation")
+			wrappedCause := fmt.Errorf("interrupted submission: %w", cause)
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			api := cancellationObservationAPI{fakeAPI: &fakeAPI{}, stop: func(ctx context.Context) error {
+				cancel(cause)
+				if outcome == "wrapped-cause" {
+					return wrappedCause
+				}
+				if interrupted {
+					return ctx.Err()
+				}
+				return errors.New("completed stop rejection")
+			}}
+			err := (&leaseBackend{}).stopVMAndWait(ctx, api, "vm-submit")
+			if err == nil || core.ExitCodeForError(err, 1) != 1 {
+				t.Fatalf("stop submission error=%v", err)
+			}
+			if errors.Is(err, context.Canceled) != interrupted || errors.Is(err, cause) != interrupted {
+				t.Fatalf("interrupted=%t error=%v", interrupted, err)
+			}
+			if outcome == "wrapped-cause" && !errors.Is(err, wrappedCause) {
+				t.Fatal("original wrapped submission error was lost")
+			}
+			if strings.Contains(err.Error(), cause.Error()) {
+				t.Fatal("public submission diagnostic exposed the custom cancellation cause")
+			}
+		})
+	}
+}
+
+func TestHostingerWaitCallerCancellationClassification(t *testing.T) {
+	for _, operation := range []string{"acquire", "stop"} {
+		for _, observation := range []string{"interrupted", "completed-ready", "completed-error", "completed-pending"} {
+			if operation == "acquire" && observation == "completed-pending" {
+				continue
+			}
+			t.Run(operation+"/"+observation, func(t *testing.T) {
+				cause := errors.New("synthetic caller canceled wait")
+				ctx, cancel := context.WithCancelCause(context.Background())
+				defer cancel(nil)
+				api := cancellationObservationAPI{fakeAPI: &fakeAPI{}, observe: func(ctx context.Context) (hostingerVM, error) {
+					cancel(cause)
+					switch observation {
+					case "interrupted":
+						return hostingerVM{}, ctx.Err()
+					case "completed-error":
+						return hostingerVM{}, errors.New("synthetic completed provider failure")
+					case "completed-pending":
+						return hostingerVM{ID: "vm-cancel", State: "stopping"}, nil
+					default:
+						state := "running"
+						if operation == "stop" {
+							state = "stopped"
+						}
+						return hostingerVM{ID: "vm-cancel", State: state, IPv4: hostingerIPAddresses{"192.0.2.1"}}, nil
+					}
+				}}
+				backend := &leaseBackend{}
+				var err error
+				if operation == "stop" {
+					err = backend.stopVMAndWait(ctx, api, "vm-cancel")
+				} else {
+					_, err = backend.waitForVM(ctx, api, "vm-cancel")
+				}
+				switch observation {
+				case "completed-ready":
+					if err != nil {
+						t.Fatalf("completed ready observation lost to cancellation: %v", err)
+					}
+				case "completed-error":
+					if err == nil || !strings.Contains(err.Error(), "synthetic completed provider failure") || errors.Is(err, context.Canceled) {
+						t.Fatalf("completed provider error lost precedence: %v", err)
+					}
+				default:
+					if !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
+						t.Errorf("caller cancellation identity lost: %v", err)
+					}
+					if err != nil && strings.Contains(err.Error(), "timed out") {
+						t.Errorf("caller cancellation misclassified as timeout: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestWaitForVMRequiresPublicIPBeforeReady(t *testing.T) {
-	api := &fakeAPI{
-		vms: []hostingerVM{{ID: "vm-new", Hostname: "srv.example.test", State: "running"}},
-	}
-	backend := NewLeaseBackend(Provider{}.Spec(), core.Config{Hostinger: core.HostingerConfig{APIToken: "token"}}, core.Runtime{}).(*leaseBackend)
+	synctest.Test(t, func(t *testing.T) {
+		api := &fakeAPI{
+			getSequence: []hostingerVM{
+				{ID: "vm-new", Hostname: "srv.example.test", State: "running"},
+				{ID: "vm-new", Hostname: "srv.example.test", State: "running", IPv4: hostingerIPAddresses{"203.0.113.77"}},
+			},
+		}
+		backend := NewLeaseBackend(Provider{}.Spec(), core.Config{Hostinger: core.HostingerConfig{APIToken: "token"}}, core.Runtime{}).(*leaseBackend)
 
-	oldSleep := hostingerSleep
-	hostingerSleep = func(time.Duration) {
-		api.vms[0].IPv4 = hostingerIPAddresses{"203.0.113.77"}
-	}
-	t.Cleanup(func() { hostingerSleep = oldSleep })
-
-	vm, err := backend.waitForVM(context.Background(), api, "vm-new")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if api.getCalls < 2 {
-		t.Fatalf("getCalls=%d, want wait for second poll with public IP", api.getCalls)
-	}
-	if vm.Host() != "203.0.113.77" {
-		t.Fatalf("host=%q, want public IP before ready", vm.Host())
-	}
+		vm, err := backend.waitForVM(context.Background(), api, "vm-new")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if api.getCalls < 2 {
+			t.Fatalf("getCalls=%d, want wait for second poll with public IP", api.getCalls)
+		}
+		if vm.Host() != "203.0.113.77" {
+			t.Fatalf("host=%q, want public IP before ready", vm.Host())
+		}
+	})
 }
 
 func TestWaitForVMFailsFastOnTerminalState(t *testing.T) {
@@ -938,10 +1095,6 @@ func TestWaitForVMFailsFastOnTerminalState(t *testing.T) {
 				vms: []hostingerVM{{ID: "vm-terminal", Hostname: "srv.example.test", State: state}},
 			}
 			backend := NewLeaseBackend(Provider{}.Spec(), core.Config{Hostinger: core.HostingerConfig{APIToken: "token"}}, core.Runtime{}).(*leaseBackend)
-			oldSleep := hostingerSleep
-			hostingerSleep = func(time.Duration) { t.Fatal("terminal state should not sleep") }
-			t.Cleanup(func() { hostingerSleep = oldSleep })
-
 			_, err := backend.waitForVM(context.Background(), api, "vm-terminal")
 			if err == nil || !strings.Contains(err.Error(), "terminal state="+state) {
 				t.Fatalf("waitForVM error=%v", err)
@@ -987,80 +1140,82 @@ func TestAcquireRecoversAmbiguousPurchaseByExactHostname(t *testing.T) {
 }
 
 func TestAcquireRetainsPendingClaimForInvisibleAmbiguousPurchase(t *testing.T) {
-	isolateHostingerTestState(t)
-	api := &fakeAPI{purchaseErrBeforeCreate: errors.New("request timed out")}
-	cfg := core.Config{
-		Provider: providerName,
-		Hostinger: core.HostingerConfig{
-			APIToken:       "token",
-			ItemID:         "hostingercom-vps-kvm2-usd-1m",
-			TemplateID:     "2",
-			DataCenterID:   "3",
-			HostnamePrefix: "crabbox",
-			AllowPurchase:  true,
-		},
-	}
-	backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
-	backend.client = api
-	backend.skipSSHWait = true
+	synctest.Test(t, func(t *testing.T) {
+		isolateHostingerTestState(t)
+		api := &fakeAPI{purchaseErrBeforeCreate: errors.New("request timed out")}
+		cfg := core.Config{
+			Provider: providerName,
+			Hostinger: core.HostingerConfig{
+				APIToken:       "token",
+				ItemID:         "hostingercom-vps-kvm2-usd-1m",
+				TemplateID:     "2",
+				DataCenterID:   "3",
+				HostnamePrefix: "crabbox",
+				AllowPurchase:  true,
+			},
+		}
+		backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
+		backend.client = api
+		backend.skipSSHWait = true
 
-	oldTimeout := hostingerPurchaseRecoveryTimeout
-	hostingerPurchaseRecoveryTimeout = time.Nanosecond
-	t.Cleanup(func() { hostingerPurchaseRecoveryTimeout = oldTimeout })
+		oldTimeout := hostingerPurchaseRecoveryTimeout
+		hostingerPurchaseRecoveryTimeout = time.Nanosecond
+		t.Cleanup(func() { hostingerPurchaseRecoveryTimeout = oldTimeout })
 
-	_, err := backend.Acquire(context.Background(), core.AcquireRequest{
-		Repo:          core.Repo{Root: t.TempDir()},
-		Keep:          true,
-		RequestedSlug: "pending",
+		_, err := backend.Acquire(context.Background(), core.AcquireRequest{
+			Repo:          core.Repo{Root: t.TempDir()},
+			Keep:          true,
+			RequestedSlug: "pending",
+		})
+		if err == nil || !strings.Contains(err.Error(), "recovery claim retained") {
+			t.Fatalf("Acquire err=%v", err)
+		}
+		if api.stopCalls != 0 {
+			t.Fatalf("ambiguous purchase without a vm id attempted stop: %v", api.stopped)
+		}
+
+		claims, listErr := core.ListLeaseClaims()
+		if listErr != nil || len(claims) != 1 {
+			t.Fatalf("claims=%#v err=%v", claims, listErr)
+		}
+		claim := claims[0]
+		hostname := claim.Labels[hostingerRecoveryHostnameLabel]
+		if claim.CloudID != "" ||
+			claim.Labels[hostingerRecoveryLabel] != hostingerRecoveryAmbiguous ||
+			!strings.HasPrefix(hostname, "crabbox-pending-") {
+			t.Fatalf("pending claim=%#v", claim)
+		}
+		keyPath, keyErr := core.TestboxKeyPath(claim.LeaseID)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		if _, statErr := os.Stat(keyPath); statErr != nil {
+			t.Fatalf("pending recovery key missing: %v", statErr)
+		}
+
+		api.vms = append(api.vms, hostingerVM{
+			ID:       "vm-late",
+			Hostname: hostname,
+			State:    "running",
+			IPv4:     hostingerIPAddresses{"203.0.113.43"},
+		})
+		lease, resolveErr := backend.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID})
+		if resolveErr != nil {
+			t.Fatal(resolveErr)
+		}
+		if lease.LeaseID != claim.LeaseID || lease.Server.CloudID != "vm-late" {
+			t.Fatalf("lease=%#v", lease)
+		}
+		recovered, ok, resolveClaimErr := core.ResolveLeaseClaimForProvider(claim.LeaseID, providerName)
+		if resolveClaimErr != nil || !ok {
+			t.Fatalf("claim=%#v ok=%v err=%v", recovered, ok, resolveClaimErr)
+		}
+		if recovered.CloudID != "vm-late" ||
+			recovered.Labels[hostingerRecoveryLabel] != "" ||
+			recovered.Labels[hostingerRecoveryHostnameLabel] != "" {
+			t.Fatalf("recovered claim=%#v", recovered)
+		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "recovery claim retained") {
-		t.Fatalf("Acquire err=%v", err)
-	}
-	if api.stopCalls != 0 {
-		t.Fatalf("ambiguous purchase without a vm id attempted stop: %v", api.stopped)
-	}
-
-	claims, listErr := core.ListLeaseClaims()
-	if listErr != nil || len(claims) != 1 {
-		t.Fatalf("claims=%#v err=%v", claims, listErr)
-	}
-	claim := claims[0]
-	hostname := claim.Labels[hostingerRecoveryHostnameLabel]
-	if claim.CloudID != "" ||
-		claim.Labels[hostingerRecoveryLabel] != hostingerRecoveryAmbiguous ||
-		!strings.HasPrefix(hostname, "crabbox-pending-") {
-		t.Fatalf("pending claim=%#v", claim)
-	}
-	keyPath, keyErr := core.TestboxKeyPath(claim.LeaseID)
-	if keyErr != nil {
-		t.Fatal(keyErr)
-	}
-	if _, statErr := os.Stat(keyPath); statErr != nil {
-		t.Fatalf("pending recovery key missing: %v", statErr)
-	}
-
-	api.vms = append(api.vms, hostingerVM{
-		ID:       "vm-late",
-		Hostname: hostname,
-		State:    "running",
-		IPv4:     hostingerIPAddresses{"203.0.113.43"},
-	})
-	lease, resolveErr := backend.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID})
-	if resolveErr != nil {
-		t.Fatal(resolveErr)
-	}
-	if lease.LeaseID != claim.LeaseID || lease.Server.CloudID != "vm-late" {
-		t.Fatalf("lease=%#v", lease)
-	}
-	recovered, ok, resolveClaimErr := core.ResolveLeaseClaimForProvider(claim.LeaseID, providerName)
-	if resolveClaimErr != nil || !ok {
-		t.Fatalf("claim=%#v ok=%v err=%v", recovered, ok, resolveClaimErr)
-	}
-	if recovered.CloudID != "vm-late" ||
-		recovered.Labels[hostingerRecoveryLabel] != "" ||
-		recovered.Labels[hostingerRecoveryHostnameLabel] != "" {
-		t.Fatalf("recovered claim=%#v", recovered)
-	}
 }
 
 func TestAcquireRecoversAfterPendingClaimWriteFailure(t *testing.T) {
@@ -1083,10 +1238,10 @@ func TestAcquireRecoversAfterPendingClaimWriteFailure(t *testing.T) {
 
 	oldClaim := claimLeaseTargetForRepoConfigIfUnchanged
 	claimCalls := 0
-	claimLeaseTargetForRepoConfigIfUnchanged = func(leaseID, slug string, cfg Config, server Server, target SSHTarget, repoRoot string, idleTimeout time.Duration, reclaim bool, expected LeaseClaim, expectedExists bool) (LeaseClaim, error) {
+	claimLeaseTargetForRepoConfigIfUnchanged = func(leaseID, slug string, cfg core.Config, server core.Server, target core.SSHTarget, repoRoot string, idleTimeout time.Duration, reclaim bool, expected core.LeaseClaim, expectedExists bool) (core.LeaseClaim, error) {
 		claimCalls++
 		if claimCalls == 1 {
-			return LeaseClaim{}, errors.New("claim storage unavailable")
+			return core.LeaseClaim{}, errors.New("claim storage unavailable")
 		}
 		return oldClaim(leaseID, slug, cfg, server, target, repoRoot, idleTimeout, reclaim, expected, expectedExists)
 	}
@@ -1128,8 +1283,8 @@ func TestAcquireClaimFailureRetainsRecoverableLeaseKeyMapping(t *testing.T) {
 	backend.skipSSHWait = true
 
 	oldClaim := claimLeaseTargetForRepoConfigIfUnchanged
-	claimLeaseTargetForRepoConfigIfUnchanged = func(string, string, Config, Server, SSHTarget, string, time.Duration, bool, LeaseClaim, bool) (LeaseClaim, error) {
-		return LeaseClaim{}, errors.New("claim storage unavailable")
+	claimLeaseTargetForRepoConfigIfUnchanged = func(string, string, core.Config, core.Server, core.SSHTarget, string, time.Duration, bool, core.LeaseClaim, bool) (core.LeaseClaim, error) {
+		return core.LeaseClaim{}, errors.New("claim storage unavailable")
 	}
 	_, err := backend.Acquire(context.Background(), core.AcquireRequest{
 		Repo:          core.Repo{Root: t.TempDir()},
@@ -1199,49 +1354,51 @@ func TestRecoveryLookupSkipsCorruptUnrelatedRecords(t *testing.T) {
 }
 
 func TestAcquireRetainsKeyWhenPendingClaimAndRecoveryFail(t *testing.T) {
-	isolateHostingerTestState(t)
-	api := &fakeAPI{purchaseErrBeforeCreate: errors.New("request timed out")}
-	cfg := core.Config{
-		Provider: providerName,
-		Hostinger: core.HostingerConfig{
-			APIToken:       "token",
-			ItemID:         "hostingercom-vps-kvm2-usd-1m",
-			TemplateID:     "2",
-			DataCenterID:   "3",
-			HostnamePrefix: "crabbox",
-			AllowPurchase:  true,
-		},
-	}
-	backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
-	backend.client = api
+	synctest.Test(t, func(t *testing.T) {
+		isolateHostingerTestState(t)
+		api := &fakeAPI{purchaseErrBeforeCreate: errors.New("request timed out")}
+		cfg := core.Config{
+			Provider: providerName,
+			Hostinger: core.HostingerConfig{
+				APIToken:       "token",
+				ItemID:         "hostingercom-vps-kvm2-usd-1m",
+				TemplateID:     "2",
+				DataCenterID:   "3",
+				HostnamePrefix: "crabbox",
+				AllowPurchase:  true,
+			},
+		}
+		backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
+		backend.client = api
 
-	oldClaim := claimLeaseTargetForRepoConfigIfUnchanged
-	claimLeaseTargetForRepoConfigIfUnchanged = func(string, string, Config, Server, SSHTarget, string, time.Duration, bool, LeaseClaim, bool) (LeaseClaim, error) {
-		return LeaseClaim{}, errors.New("claim storage unavailable")
-	}
-	t.Cleanup(func() { claimLeaseTargetForRepoConfigIfUnchanged = oldClaim })
-	oldTimeout := hostingerPurchaseRecoveryTimeout
-	hostingerPurchaseRecoveryTimeout = time.Nanosecond
-	t.Cleanup(func() { hostingerPurchaseRecoveryTimeout = oldTimeout })
+		oldClaim := claimLeaseTargetForRepoConfigIfUnchanged
+		claimLeaseTargetForRepoConfigIfUnchanged = func(string, string, core.Config, core.Server, core.SSHTarget, string, time.Duration, bool, core.LeaseClaim, bool) (core.LeaseClaim, error) {
+			return core.LeaseClaim{}, errors.New("claim storage unavailable")
+		}
+		t.Cleanup(func() { claimLeaseTargetForRepoConfigIfUnchanged = oldClaim })
+		oldTimeout := hostingerPurchaseRecoveryTimeout
+		hostingerPurchaseRecoveryTimeout = time.Nanosecond
+		t.Cleanup(func() { hostingerPurchaseRecoveryTimeout = oldTimeout })
 
-	_, err := backend.Acquire(context.Background(), core.AcquireRequest{
-		Repo:          core.Repo{Root: t.TempDir()},
-		Keep:          true,
-		RequestedSlug: "pending",
+		_, err := backend.Acquire(context.Background(), core.AcquireRequest{
+			Repo:          core.Repo{Root: t.TempDir()},
+			Keep:          true,
+			RequestedSlug: "pending",
+		})
+		if err == nil || !strings.Contains(err.Error(), "recovery claim failed and key retained") {
+			t.Fatalf("Acquire err=%v", err)
+		}
+		message := err.Error()
+		keyStart := strings.Index(message, " key=")
+		keyEnd := strings.Index(message, ": purchase_error=")
+		if keyStart < 0 || keyEnd <= keyStart {
+			t.Fatalf("Acquire error missing retained key path: %v", err)
+		}
+		keyPath := message[keyStart+len(" key=") : keyEnd]
+		if _, statErr := os.Stat(keyPath); statErr != nil {
+			t.Fatalf("retained recovery key missing: %v", statErr)
+		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "recovery claim failed and key retained") {
-		t.Fatalf("Acquire err=%v", err)
-	}
-	message := err.Error()
-	keyStart := strings.Index(message, " key=")
-	keyEnd := strings.Index(message, ": purchase_error=")
-	if keyStart < 0 || keyEnd <= keyStart {
-		t.Fatalf("Acquire error missing retained key path: %v", err)
-	}
-	keyPath := message[keyStart+len(" key=") : keyEnd]
-	if _, statErr := os.Stat(keyPath); statErr != nil {
-		t.Fatalf("retained recovery key missing: %v", statErr)
-	}
 }
 
 func TestAcquireFailureStopsPaidVPSButRetainsRecoveryState(t *testing.T) {
@@ -1261,7 +1418,7 @@ func TestAcquireFailureStopsPaidVPSButRetainsRecoveryState(t *testing.T) {
 
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldSleep := hostingerSleep
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		cancel()
 		return errors.New("ssh unavailable")
 	}
@@ -1316,7 +1473,7 @@ func TestAcquireFailureDoesNotStopPaidVPSWhenClaimDisappears(t *testing.T) {
 
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldSleep := hostingerSleep
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		claims, err := core.ListLeaseClaims()
 		if err != nil {
 			return err
@@ -1359,14 +1516,14 @@ func TestResolveStartsStoppedHostingerVMForSSHCommands(t *testing.T) {
 	oldWaitForSSHReady := hostingerWaitForSSHReady
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	waitCalls := 0
-	hostingerWaitForSSHReady = func(_ context.Context, target *SSHTarget, _ io.Writer, phase string, _ time.Duration) error {
+	hostingerWaitForSSHReady = func(_ context.Context, target *core.SSHTarget, _ io.Writer, phase string, _ time.Duration) error {
 		waitCalls++
 		if phase != "restart" || target.ReadyCheck != "true" {
 			t.Fatalf("restart wait phase=%q readyCheck=%q", phase, target.ReadyCheck)
 		}
 		return nil
 	}
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error { return nil }
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error { return nil }
 	t.Cleanup(func() {
 		hostingerWaitForSSHReady = oldWaitForSSHReady
 		hostingerRunSSHQuiet = oldRunSSHQuiet
@@ -1551,9 +1708,9 @@ func TestResolveRestoresStoredSSHConfiguration(t *testing.T) {
 	backend.client = api
 
 	oldRunSSHQuiet := hostingerRunSSHQuiet
-	var bootstrapTarget SSHTarget
+	var bootstrapTarget core.SSHTarget
 	var bootstrapCommand string
-	hostingerRunSSHQuiet = func(_ context.Context, target SSHTarget, command string) error {
+	hostingerRunSSHQuiet = func(_ context.Context, target core.SSHTarget, command string) error {
 		bootstrapTarget = target
 		bootstrapCommand = command
 		return nil
@@ -1650,10 +1807,10 @@ func TestResolveRollsBackRestartWhenPreparationFails(t *testing.T) {
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldWaitForSSHReady := hostingerWaitForSSHReady
 	oldSleep := hostingerSleep
-	hostingerWaitForSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+	hostingerWaitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		return nil
 	}
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		cancel()
 		return errors.New("bootstrap failed")
 	}
@@ -1700,10 +1857,10 @@ func TestResolveDoesNotRollbackRestartAfterClaimChanges(t *testing.T) {
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldWaitForSSHReady := hostingerWaitForSSHReady
 	oldSleep := hostingerSleep
-	hostingerWaitForSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+	hostingerWaitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		return nil
 	}
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		claims, err := core.ListLeaseClaims()
 		if err != nil || len(claims) != 1 {
 			return fmt.Errorf("claims=%#v err=%v", claims, err)
@@ -1773,10 +1930,10 @@ func TestResolvePreservesProvisioningClaimWhenRestartStopFails(t *testing.T) {
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldWaitForSSHReady := hostingerWaitForSSHReady
 	oldSleep := hostingerSleep
-	hostingerWaitForSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+	hostingerWaitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		return nil
 	}
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		cancel()
 		return errors.New("bootstrap failed")
 	}
@@ -1835,10 +1992,10 @@ func TestResolveRestoresOwnershipWithoutStaleRunningState(t *testing.T) {
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldWaitForSSHReady := hostingerWaitForSSHReady
 	oldSleep := hostingerSleep
-	hostingerWaitForSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+	hostingerWaitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		return nil
 	}
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		cancel()
 		return errors.New("bootstrap failed")
 	}
@@ -2047,54 +2204,56 @@ func TestResolveRejectsAmbiguousHostingerSlug(t *testing.T) {
 }
 
 func TestReleaseRetainsClaimUntilStopConfirmed(t *testing.T) {
-	isolateHostingerTestState(t)
-	leaseID := "cbx_abcdef123456"
-	cfg := core.Config{
-		Provider: providerName,
-		Hostinger: core.HostingerConfig{
-			APIToken: "token",
-		},
-	}
-	server := core.Server{
-		CloudID:  "vm-running",
-		Provider: providerName,
-		Name:     "crabbox-blue-abcdef123456",
-		Labels:   core.DirectLeaseLabels(cfg, leaseID, "blue", providerName, "", true, time.Now()),
-	}
-	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "blue", cfg, server, core.SSHTarget{}, t.TempDir(), time.Hour, true); err != nil {
-		t.Fatal(err)
-	}
-	keyPath, _, keyErr := core.EnsureTestboxKey(leaseID)
-	if keyErr != nil {
-		t.Fatal(keyErr)
-	}
-	api := &fakeAPI{
-		vms:                     []hostingerVM{{ID: "vm-running", Hostname: "crabbox-blue-abcdef123456", State: "running", IPv4: hostingerIPAddresses{"203.0.113.60"}}},
-		stopLeavesRunning:       true,
-		getWaitForContextAtCall: 2,
-	}
-	backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
-	backend.client = api
-	oldTimeout := hostingerStopWaitTimeout
-	hostingerStopWaitTimeout = time.Nanosecond
-	t.Cleanup(func() { hostingerStopWaitTimeout = oldTimeout })
+	synctest.Test(t, func(t *testing.T) {
+		isolateHostingerTestState(t)
+		leaseID := "cbx_abcdef123456"
+		cfg := core.Config{
+			Provider: providerName,
+			Hostinger: core.HostingerConfig{
+				APIToken: "token",
+			},
+		}
+		server := core.Server{
+			CloudID:  "vm-running",
+			Provider: providerName,
+			Name:     "crabbox-blue-abcdef123456",
+			Labels:   core.DirectLeaseLabels(cfg, leaseID, "blue", providerName, "", true, time.Now()),
+		}
+		if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "blue", cfg, server, core.SSHTarget{}, t.TempDir(), time.Hour, true); err != nil {
+			t.Fatal(err)
+		}
+		keyPath, _, keyErr := core.EnsureTestboxKey(leaseID)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		api := &fakeAPI{
+			vms:                     []hostingerVM{{ID: "vm-running", Hostname: "crabbox-blue-abcdef123456", State: "running", IPv4: hostingerIPAddresses{"203.0.113.60"}}},
+			stopLeavesRunning:       true,
+			getWaitForContextAtCall: 2,
+		}
+		backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*leaseBackend)
+		backend.client = api
+		oldTimeout := hostingerStopWaitTimeout
+		hostingerStopWaitTimeout = time.Nanosecond
+		t.Cleanup(func() { hostingerStopWaitTimeout = oldTimeout })
 
-	err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{
-		Lease: core.LeaseTarget{LeaseID: leaseID, Server: server},
+		err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{
+			Lease: core.LeaseTarget{LeaseID: leaseID, Server: server},
+		})
+		if err == nil || !strings.Contains(err.Error(), "timed out waiting for hostinger vps vm-running to stop") {
+			t.Fatalf("ReleaseLease err=%v", err)
+		}
+		if api.stopCalls != 1 {
+			t.Fatalf("stopCalls=%d", api.stopCalls)
+		}
+		claim, ok, claimErr := core.ResolveLeaseClaimForProvider(leaseID, providerName)
+		if claimErr != nil || !ok || claim.CloudID != "vm-running" {
+			t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, claimErr)
+		}
+		if _, statErr := os.Stat(keyPath); statErr != nil {
+			t.Fatalf("failed release removed recovery key: %v", statErr)
+		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for hostinger vps vm-running to stop") {
-		t.Fatalf("ReleaseLease err=%v", err)
-	}
-	if api.stopCalls != 1 {
-		t.Fatalf("stopCalls=%d", api.stopCalls)
-	}
-	claim, ok, claimErr := core.ResolveLeaseClaimForProvider(leaseID, providerName)
-	if claimErr != nil || !ok || claim.CloudID != "vm-running" {
-		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, claimErr)
-	}
-	if _, statErr := os.Stat(keyPath); statErr != nil {
-		t.Fatalf("failed release removed recovery key: %v", statErr)
-	}
 }
 
 func TestReleaseRejectsChangedClaimBeforeStop(t *testing.T) {
@@ -2211,7 +2370,7 @@ func TestFailedHostingerAdoptionRemainsNonDestructiveUntilSSHValidation(t *testi
 	oldRunSSHQuiet := hostingerRunSSHQuiet
 	oldSleep := hostingerSleep
 	ctx, cancel := context.WithCancel(context.Background())
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error {
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error {
 		cancel()
 		return errors.New("ssh validation failed")
 	}
@@ -2251,7 +2410,7 @@ func TestFailedHostingerAdoptionRemainsNonDestructiveUntilSSHValidation(t *testi
 		t.Fatalf("failed adoption stopped VPS: %v", api.stopped)
 	}
 
-	hostingerRunSSHQuiet = func(context.Context, SSHTarget, string) error { return nil }
+	hostingerRunSSHQuiet = func(context.Context, core.SSHTarget, string) error { return nil }
 	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{
 		ID:      "crabbox-blue-abcdef123456",
 		Repo:    core.Repo{Root: repoRoot},
@@ -2684,7 +2843,7 @@ func (f *fakeAPI) GetVM(ctx context.Context, id string) (hostingerVM, error) {
 			return vm, nil
 		}
 	}
-	return hostingerVM{}, exit(4, "not found")
+	return hostingerVM{}, core.Exit(4, "not found")
 }
 
 func (f *fakeAPI) PurchaseVM(_ context.Context, input hostingerPurchaseInput) (hostingerVM, error) {
@@ -2711,7 +2870,7 @@ func (f *fakeAPI) SetupVM(_ context.Context, id string, input hostingerSetupInpu
 			return f.vms[i], nil
 		}
 	}
-	return hostingerVM{}, exit(4, "not found")
+	return hostingerVM{}, core.Exit(4, "not found")
 }
 
 func (f *fakeAPI) StartVM(_ context.Context, id string) error {
@@ -2726,7 +2885,7 @@ func (f *fakeAPI) StartVM(_ context.Context, id string) error {
 			return nil
 		}
 	}
-	return exit(4, "not found")
+	return core.Exit(4, "not found")
 }
 
 func (f *fakeAPI) StopVM(_ context.Context, id string) error {
@@ -2744,4 +2903,111 @@ func (f *fakeAPI) StopVM(_ context.Context, id string) error {
 		}
 	}
 	return nil
+}
+
+func TestCompactJSONRequestEnvelope(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "ctx")
+	const base = "https://api.example.test/base"
+	var ptr *string
+	var slice []string
+	for _, tc := range []struct {
+		name string
+		body any
+		want string
+	}{
+		{name: "nil"}, {name: "typed nil pointer", body: ptr, want: "null"}, {name: "typed nil slice", body: slice, want: "null"}, {name: "compact escaped JSON", body: map[string]string{"message": "<&>"}, want: "{\"message\":\"\\u003c\\u0026\\u003e\"}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			path := "/records"
+			endpoint := base + path
+			headers := http.Header{}
+			headers.Set("Authorization", "Bearer synthetic-token")
+			headers.Set("Accept", "application/json")
+			if tc.body != nil {
+				headers.Set("Content-Type", "application/json")
+			}
+			httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				testutil.RequireRequestEnvelope(t, req, ctx, http.MethodPost, endpoint, tc.want, headers)
+				return nil, errors.New("synthetic-transport-stop")
+			})}
+			c := &hostingerClient{apiURL: base, token: "synthetic-token", httpClient: httpClient}
+			err := c.do(ctx, http.MethodPost, path, tc.body, nil)
+			if err == nil || !strings.Contains(err.Error(), "synthetic-transport-stop") || calls != 1 {
+				t.Fatalf("error=%v calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestHostingerBindingFlagPresenceAndExactSelection(t *testing.T) {
+	for _, provider := range []string{"hostinger", "HOSTINGER", " hostinger ", "other"} {
+		for _, visited := range []bool{false, true} {
+			cfg := core.Config{Provider: provider, SSHUser: "generic-user", SSHPort: "2209", SSHFallbackPorts: []string{"2210"}, WorkRoot: "/generic/root"}
+			fs := flag.NewFlagSet("binding", flag.ContinueOnError)
+			values := RegisterHostingerProviderFlags(fs, cfg)
+			count := 0
+			fs.VisitAll(func(*flag.Flag) { count++ })
+			if count != 10 || fs.Lookup("hostinger-url") == nil || fs.Lookup("hostinger-api-url") != nil {
+				t.Fatal("public Hostinger flag surface changed")
+			}
+			if visited {
+				if err := fs.Parse([]string{"--hostinger-user=", "--hostinger-work-root=  ", "--hostinger-allow-purchase=false"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := cfg
+			if err := ApplyHostingerProviderFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+				t.Fatal("foreign flag values changed configuration")
+			}
+			if err := ApplyHostingerProviderFlags(&cfg, fs, values); err != nil {
+				t.Fatal(err)
+			}
+			if core.IsHostingerUserExplicit(&cfg) != visited || core.IsHostingerWorkRootExplicit(&cfg) != visited {
+				t.Fatal("visited empty flags lost explicit-field markers")
+			}
+			if provider == "hostinger" {
+				if cfg.SSHUser != "root" || cfg.Hostinger.User != "root" || cfg.SSHPort != "22" || cfg.SSHFallbackPorts != nil {
+					t.Fatal("exact-provider final defaults changed")
+				}
+			} else {
+				wantUser := "generic-user"
+				if visited {
+					wantUser = ""
+				}
+				if cfg.SSHUser != wantUser || cfg.SSHPort != before.SSHPort || !reflect.DeepEqual(cfg.SSHFallbackPorts, before.SSHFallbackPorts) || cfg.WorkRoot != before.WorkRoot {
+					t.Fatal("flag user effect or exact selection boundary changed")
+				}
+			}
+			if visited && cfg.Hostinger.WorkRoot != "  " {
+				t.Fatal("raw flag root was normalized")
+			}
+		}
+	}
+}
+
+func TestHostingerScalarFallbackValues(t *testing.T) {
+	for _, tc := range []struct{ raw, url, prefix, user, action, root string }{
+		{"", "https://developers.hostinger.com", "crabbox", "root", "stop", "/home/root/crabbox"},
+		{"  ", "  ", "  ", "  ", "  ", "/home/root/crabbox"},
+		{" custom ", " custom ", " custom ", " custom ", " custom ", "/home/custom/crabbox"},
+	} {
+		cfg := core.Config{Hostinger: core.HostingerConfig{APIURL: tc.raw, HostnamePrefix: tc.raw, User: tc.raw, ReleaseAction: tc.raw}}
+		applyDefaults(&cfg)
+		if cfg.Hostinger.APIURL != tc.url || cfg.Hostinger.HostnamePrefix != tc.prefix || cfg.Hostinger.User != tc.user || cfg.Hostinger.ReleaseAction != tc.action || cfg.Hostinger.WorkRoot != tc.root || cfg.WorkRoot != tc.root || cfg.SSHUser != tc.user {
+			t.Fatalf("raw=%q changed scalar or per-user fallback", tc.raw)
+		}
+	}
+	cfg := core.Config{WorkRoot: "/explicit/root", Hostinger: core.HostingerConfig{User: " alice "}}
+	core.MarkWorkRootExplicit(&cfg)
+	cfg.WorkRoot = "/derived/other"
+	if got := core.EffectiveHostingerWorkRoot(cfg); got != "/explicit/root" {
+		t.Fatalf("explicit generic root=%q", got)
+	}
+	cfg.Hostinger.WorkRoot = "  "
+	if got := core.EffectiveHostingerWorkRoot(cfg); got != "  " {
+		t.Fatalf("raw provider root=%q", got)
+	}
 }

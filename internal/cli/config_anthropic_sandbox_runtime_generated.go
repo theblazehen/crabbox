@@ -20,29 +20,21 @@ func defaultAnthropicSRTConfig() AnthropicSRTConfig {
 	}
 }
 
-func (cfg *AnthropicSRTConfig) applyFile(file *fileAnthropicSRTConfig) error {
-	if file == nil {
-		return nil
-	}
-	if file.CLIPath != "" {
-		cfg.CLIPath = file.CLIPath
-	}
-	if file.Settings != nil {
-		cfg.Settings = *file.Settings
-	}
-	if file.Debug != nil {
-		cfg.Debug = *file.Debug
-	}
-	return nil
+// AnthropicSRTConfigApplied records accepted assignments during one application.
+type AnthropicSRTConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *AnthropicSRTConfig) applyEnv() error {
-	cfg.CLIPath = getenv("CRABBOX_ANTHROPIC_SANDBOX_RUNTIME_CLI", cfg.CLIPath)
-	cfg.Settings = getenv("CRABBOX_ANTHROPIC_SANDBOX_RUNTIME_SETTINGS", cfg.Settings)
-	if value, ok := getenvBool("CRABBOX_ANTHROPIC_SANDBOX_RUNTIME_DEBUG"); ok {
-		cfg.Debug = value
-	}
-	return nil
+func (cfg *AnthropicSRTConfig) applyFile(file *fileAnthropicSRTConfig) (AnthropicSRTConfigApplied, error) {
+	var applied AnthropicSRTConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "anthropic-sandbox-runtime")
+	return applied, err
+}
+
+func (cfg *AnthropicSRTConfig) applyEnv() (AnthropicSRTConfigApplied, error) {
+	var applied AnthropicSRTConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 3)
+	return applied, err
 }
 
 // AnthropicSRTConfigFlagValues holds parsed values; only visited flags are applied.
@@ -54,22 +46,14 @@ type AnthropicSRTConfigFlagValues struct {
 
 // RegisterAnthropicSRTConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterAnthropicSRTConfigFlags(fs *flag.FlagSet, defaults AnthropicSRTConfig) AnthropicSRTConfigFlagValues {
-	return AnthropicSRTConfigFlagValues{
-		CLIPath:  fs.String("anthropic-sandbox-runtime-cli", defaults.CLIPath, "path to the srt CLI binary"),
-		Settings: fs.String("anthropic-sandbox-runtime-settings", defaults.Settings, "path to an Anthropic Sandbox Runtime settings JSON file; empty uses srt defaults"),
-		Debug:    fs.Bool("anthropic-sandbox-runtime-debug", defaults.Debug, "pass --debug to the srt CLI"),
-	}
+	var values AnthropicSRTConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values AnthropicSRTConfigFlagValues) Apply(cfg *AnthropicSRTConfig, fs *flag.FlagSet) {
-	if flagWasSet(fs, "anthropic-sandbox-runtime-cli") {
-		cfg.CLIPath = *values.CLIPath
-	}
-	if flagWasSet(fs, "anthropic-sandbox-runtime-settings") {
-		cfg.Settings = *values.Settings
-	}
-	if flagWasSet(fs, "anthropic-sandbox-runtime-debug") {
-		cfg.Debug = *values.Debug
-	}
+func (values AnthropicSRTConfigFlagValues) Apply(cfg *AnthropicSRTConfig, fs *flag.FlagSet) (AnthropicSRTConfigApplied, error) {
+	var applied AnthropicSRTConfigApplied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

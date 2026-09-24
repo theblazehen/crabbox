@@ -107,6 +107,16 @@ commit. That gate constructs a complete read-only local module proxy from the
 exact commit and verifies a cold, version-suffixed `go install` outside the
 checkout. It must pass before candidate production begins.
 
+The online dependency-seeding phase retries once, after five seconds, only for
+recognized HTTP/2 `INTERNAL_ERROR` diagnostics from checksum-database tile reads
+or `proxy.golang.org` module-ZIP reads with the exact matching module/version URL.
+Both attempts use the same source, isolated cache and enabled checksum
+verification. Any unknown or checksum-mismatch diagnostic remains fatal, even
+alongside a recognized transport error; interruptions also remain fatal.
+Multiple recognized errors still permit only one retry. Original diagnostics
+remain visible after recovery; the read-only proxy, offline install and binary
+checks are not retried.
+
 Run the credential-free producer first and capture its printed manifest digest:
 
 ```sh
@@ -120,6 +130,37 @@ commit and release configuration, exact SHA-256, size, and mode of all six
 archives and the raw VMD, plus the actual Go, GoReleaser, Swift, Xcode, macOS,
 and architecture facts. Treat the printed SHA-256 as a separate handoff value;
 do not re-read or infer it from a replaceable candidate directory.
+
+Tagged sources containing the filesystem entrypoint template
+`internal/runner/development/main.go.txt` build six companions once,
+credential-free, for Darwin, Linux, and Windows on amd64 and arm64. Baseline CPU
+settings remain `GOAMD64=v1` and `GOARM64=v8.0`. Each unsigned archive contains
+the complete set under `crabbox-runtime/`; these are not extra public assets.
+Candidate and final provenance use schema 3 and bind the helper source
+fingerprint. Protected tooling computes that fingerprint from frozen source
+bytes without executing candidate code. The producer injects it into each
+companion's filesystem handshake.
+
+Historical tags containing only `cmd/crabbox-runtime/main.go` retain the Linux
+pair and schema 2. Tags without that command retain schema 1 and their legacy
+member inventory. The packager and verifier independently check the frozen tag's
+capability, so a runtime-enabled source cannot select an older layout.
+Historical final provenance verifies its producer configuration against the
+`.goreleaser.yaml` and literal toolchain versions in `scripts/release-config.sh`
+at the originally pinned verifier commit, not the newer tooling checkout. The
+policy reader never executes historical shell code. New candidate production
+uses the current protected configuration, including Go 1.26.5. Missing historical Git objects fail verification; this lookup
+does not lazily fetch them or consult replacement objects.
+
+The protected `scripts/runtime-artifacts` tool stages exact archive inventories
+without executing candidate files. The packager generates each final runtime
+manifest only after its controller bytes, including macOS signatures, are final.
+For schema 3, each Darwin companion is signed and notarized once under
+`org.openclaw.crabbox.runtime`, then those identical signed bytes are copied
+into all six archives. The final manifest binds the controller hash and every
+final companion; it is generated only after companion signing as well. Linux
+and Windows companions remain unchanged through signing. Source provenance comes from the frozen
+producer and independent Go build-info checks, not from this local manifest.
 
 Pass that exact digest as the required fourth argument to the local signing
 wrapper. The packager stages the complete candidate into a private directory,
@@ -166,6 +207,18 @@ build and is not publishable. Protected native verification exports the exact
 embedded bytes, matches their provenance digest, and independently checks their
 signature, entitlements, hardened runtime, timestamp, and online notarization.
 
+The signer starts with Apple's regional S3 upload route. It retries once through
+S3 acceleration only for the recognized aborted-upload deadline, with an empty
+result, an ordinary failure exit, and the same signed archive bytes. Extra or
+unknown diagnostics, cancellation, returned receipts, and validation failures
+remain fatal. The retry does not re-sign or repack the binary, and accepted
+notarization plus the online ticket check are still required.
+For a build host with confirmed regional upload failures, set
+`CRABBOX_NOTARY_S3_ACCELERATION=1` on the managed packaging invocation to use one
+accelerated upload attempt per binary directly. The default value `0` retains
+the regional-first policy and its one bounded fallback. Both routes are
+[supported by Apple](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow#Ensure-your-build-server-has-network-access).
+
 The signing wrapper never runs candidate code while its managed keychain or
 notary profile is available. It signs the token-free producer outputs, embeds
 the accepted VMD, compiles without release credentials, and stops after static
@@ -179,12 +232,12 @@ For version `X.Y.Z`, the uploaded GitHub asset set is exactly these eight files:
 
 | Asset | Exact archive members or purpose |
 | --- | --- |
-| `crabbox_X.Y.Z_darwin_amd64.tar.gz` | `crabbox` |
-| `crabbox_X.Y.Z_darwin_arm64.tar.gz` | `crabbox`, `crabbox-apple-vm-helper` |
-| `crabbox_X.Y.Z_linux_amd64.tar.gz` | `crabbox` |
-| `crabbox_X.Y.Z_linux_arm64.tar.gz` | `crabbox` |
-| `crabbox_X.Y.Z_windows_amd64.zip` | `crabbox.exe` |
-| `crabbox_X.Y.Z_windows_arm64.zip` | `crabbox.exe` |
+| `crabbox_X.Y.Z_darwin_amd64.tar.gz` | `crabbox`, runtime pack files below |
+| `crabbox_X.Y.Z_darwin_arm64.tar.gz` | `crabbox`, `crabbox-apple-vm-helper`, runtime pack files below |
+| `crabbox_X.Y.Z_linux_amd64.tar.gz` | `crabbox`, runtime pack files below |
+| `crabbox_X.Y.Z_linux_arm64.tar.gz` | `crabbox`, runtime pack files below |
+| `crabbox_X.Y.Z_windows_amd64.zip` | `crabbox.exe`, runtime pack files below |
+| `crabbox_X.Y.Z_windows_arm64.zip` | `crabbox.exe`, runtime pack files below |
 | `checksums.txt` | Canonical SHA-256 records for the six platform archives and `provenance.json` |
 | `provenance.json` | Schema-pinned source, toolchain, signing, notarization, archive, and checksum provenance |
 
@@ -192,6 +245,37 @@ GitHub's generated source links are not uploaded assets and do not change the
 count. Reject missing, duplicate, renamed, zero-byte, or extra uploaded assets.
 Archive member names and counts are exact; no implicit documentation files or
 unlisted executables are allowed.
+
+For schema-2 releases, the runtime pack files are exactly
+`crabbox-runtime/manifest.json`, `crabbox-runtime/linux-amd64`, and
+`crabbox-runtime/linux-arm64`. Every archive includes both execution-target
+architectures, irrespective of the controller's host. Final archives contain
+explicit file entries, without directory entries. Schema-1 releases omit these
+three files and preserve their original inventories.
+
+Schema-2 provenance records each pack's controller binding, manifest identity,
+and both runtime identities separately from macOS notarization records. Protected
+extraction reports are regenerated from the archives before provenance checks.
+Homebrew must install the entire pack beside the real controller in its keg;
+verification compares all three installed files with the frozen archive and
+checks the public command symlink. The existing Go installation channel remains
+CLI-only: it does not install companion assets. Never copy a release pack beside
+an independently compiled controller; their hashes intentionally differ.
+
+Schema-3 releases instead contain `crabbox-runtime/manifest.json` and exactly
+six companions: `darwin-amd64`, `darwin-arm64`, `linux-amd64`, `linux-arm64`,
+`windows-amd64.exe`, and `windows-arm64.exe`, all beneath `crabbox-runtime/`.
+Their local manifest uses schema 2 with explicit filesystem protocol/build-ID
+claims for every target and supervisor claims only for Linux. This local schema
+number is independent of the release provenance schema. Homebrew verifies all
+seven installed pack files against the frozen archive.
+
+Schema-3 provenance additionally records both Darwin companion signatures,
+including exact bytes, identifier, Team ID, hardened runtime, timestamp, and
+notarization submission. Their hashes must agree across all six payloads. The
+six notarization submissions (two CLI, helper, VMD, two runtime) must be distinct;
+historical schemas retain their four-submission contract. Signature/notarization
+verification does not execute the companions.
 
 `provenance.json` binds the repository, version, signed tag-object ID, peeled
 source commit, protected verifier commit, exact candidate-manifest digest and
@@ -500,9 +584,11 @@ credential from the environment. Then run the downstream verifier in a new
 credential-free shell.
 
 The launcher captures absolute Homebrew, Node, and Go executable paths before
-scrubbing the environment, then preserves only those tool directories plus the
-macOS system paths in the child `PATH`. Tap setup and formula evaluation run
-inside that child with a fresh `HOME` and cache.
+scrubbing the environment, then preserves only those tool directories in their
+original `PATH` order, followed by the macOS system paths. This retains the
+selected tool versions when another selected directory contains a different Go
+or Node executable. Tap setup and formula evaluation run inside that child with
+a fresh `HOME` and cache.
 
 ```sh
 HOMEBREW_TOOLING_COMMIT=$(git rev-parse HEAD)
@@ -575,6 +661,11 @@ succeeds. Cleanup errors retain diagnostics and the temporary path, fail the
 command, and preserve any earlier verification, creation, or readback exit code.
 A cleanup failure does not undo draft creation; inspect the existing record
 read-only before considering any further action.
+
+Release and Homebrew verification use the same directory-only cleanup policy for
+their private temporary trees, including downloaded Go toolchains. Cleanup never
+follows symlinks or changes file permissions, and an earlier verification failure
+keeps its original exit status even if cleanup also fails.
 
 ### 2. Verify the draft natively
 

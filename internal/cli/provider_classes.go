@@ -156,7 +156,7 @@ func ProviderClassSpecsFromProfiles(profiles []ProviderClassProfile) []ClassSpec
 	return specs
 }
 
-func providerClassCatalogFor(provider Provider) ProviderClassCatalog {
+func ProviderClassCatalogFor(provider Provider) ProviderClassCatalog {
 	catalog := ProviderClassCatalog{
 		Disposition: provider.Spec().ClassDisposition,
 		Profiles:    []ProviderClassProfile{},
@@ -192,6 +192,18 @@ func providerClassCandidatesForConfig(cfg Config) ([]string, bool) {
 	return ProviderClassCandidatesForProfiles(source.ClassProfiles(), cfg)
 }
 
+// ProviderClassPrimaryTypeForProfiles preserves unsupported canonical selectors
+// as unresolved; only noncanonical input may use the provider's legacy fallback.
+func ProviderClassPrimaryTypeForProfiles(profiles []ProviderClassProfile, cfg Config, legacyFallback string) string {
+	if candidates, matched := ProviderClassCandidatesForProfiles(profiles, cfg); matched {
+		return candidates[0]
+	}
+	if IsCanonicalProviderClass(cfg.Class) {
+		return ""
+	}
+	return legacyFallback
+}
+
 func ProviderClassCandidatesForProfiles(profiles []ProviderClassProfile, cfg Config) ([]string, bool) {
 	class := cfg.Class
 	target := normalizeTargetOS(cfg.TargetOS)
@@ -200,7 +212,7 @@ func ProviderClassCandidatesForProfiles(profiles []ProviderClassProfile, cfg Con
 		windowsMode = normalizeWindowsMode(cfg.WindowsMode)
 	}
 	architectureValue := effectiveArchitectureForConfig(cfg)
-	if normalized, err := normalizeArchitecture(architectureValue); err == nil {
+	if normalized, err := NormalizeArchitecture(architectureValue); err == nil {
 		architectureValue = normalized
 	}
 	architecture := ProviderClassArchitecture(architectureValue)
@@ -242,7 +254,7 @@ func validateProviderClassSelector(provider Provider, cfg Config) error {
 	}
 	source, ok := provider.(ProviderClassProfileProvider)
 	if !ok {
-		return exit(2, "provider=%s declares mapped classes without class profiles", provider.Name())
+		return Exit(2, "provider=%s declares mapped classes without class profiles", provider.Spec().Name)
 	}
 	if _, matched := ProviderClassCandidatesForProfiles(source.ClassProfiles(), cfg); matched {
 		return nil
@@ -263,10 +275,10 @@ func validateProviderClassSelector(provider Provider, cfg Config) error {
 		windowsMode = normalizeWindowsMode(cfg.WindowsMode)
 	}
 	architecture := effectiveArchitectureForConfig(cfg)
-	if normalized, err := normalizeArchitecture(architecture); err == nil {
+	if normalized, err := NormalizeArchitecture(architecture); err == nil {
 		architecture = normalized
 	}
-	return exit(2, "provider=%s has no class profile for class=%s target=%s windowsMode=%s architecture=%s", provider.Name(), cfg.Class, target, blank(windowsMode, "-"), architecture)
+	return Exit(2, "provider=%s has no class profile for class=%s target=%s windowsMode=%s architecture=%s", provider.Spec().Name, cfg.Class, target, blank(windowsMode, "-"), architecture)
 }
 
 func normalizeProfileWindowsMode(target, mode string) string {

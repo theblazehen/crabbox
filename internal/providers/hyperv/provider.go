@@ -4,7 +4,6 @@ import (
 	"flag"
 
 	core "github.com/openclaw/crabbox/internal/cli"
-	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 func init() {
@@ -13,12 +12,9 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string { return nil }
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
 		Name:             providerName,
 		Family:           "local-vm",
 		Kind:             core.ProviderKindSSHLease,
@@ -50,6 +46,21 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return newBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return shared.ConfigureDoctor(providerName, func() (core.Backend, error) { return p.Configure(cfg, rt) })
+func (Provider) ConfigDefaultsTargetFinalization() core.ProviderConfigDefaultsTargetFinalization {
+	return core.ProviderConfigDefaultsCallerFinalizes
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if !core.IsTargetExplicit(cfg) {
+		cfg.TargetOS = core.TargetWindows
+	}
+	cfg.SSHFallbackPorts = nil
+	if cfg.HyperV.User != "" {
+		cfg.SSHUser = cfg.HyperV.User
+	}
+	if cfg.HyperV.WorkRoot != "" {
+		cfg.WorkRoot = cfg.HyperV.WorkRoot
+	}
+	cfg.SSHPort = "22"
+	return nil
 }

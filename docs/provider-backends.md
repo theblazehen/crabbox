@@ -47,6 +47,15 @@ Core owns the entire workflow after acquisition:
 - heartbeat/touch;
 - release.
 
+For capacity fallback, use `ProvisionServerCandidates` with an ordered list of
+`ProvisioningCandidate` values and a `ServerProvisioner`. The adapter selects
+the exact configurations and diagnostics; shared code sequences preparation and
+creation, aggregates create failures, and returns the successful configuration.
+`Prepare` errors stop immediately. Only the adapter's `CanRetry` decision allows
+another create, after its create path has handled partial-resource cleanup.
+GCP, Azure, and Hetzner use this owner. Region routing, resource identity,
+cleanup, and provider-specific market eligibility stay in the adapters.
+
 The backend owns only the provider lifecycle:
 
 ```go
@@ -108,6 +117,11 @@ Delegated backends return normalized `StatusView` values. Rendering stays
 core-owned, so provider packages should not print their own `status` or `list`
 tables unless a compatibility interface explicitly asks for native output.
 
+Use `shared.SandboxLeaseView` for the common sandbox inventory projection. The
+adapter supplies the observed ID, display name, target, and state; shared code
+adds the lease ID, slug, and pond. Scope checks, ownership validation, and state
+classification remain adapter operations, and unrelated claim labels are omitted.
+
 A delegated backend must reject run/sync options that Crabbox cannot honor
 without a Crabbox-managed SSH target:
 
@@ -156,9 +170,45 @@ some SDK/CLI transports support it without archive sync. An adapter that cannot
 skip transfer must reject it before acquisition or provider execution. Blacksmith
 Testbox does this because its native run command has no supported sync bypass.
 
+### Shared sandbox workspaces
+
+E2B-compatible adapters use `shared.EnvdWorkspace` for process-user resolution,
+home-relative workspace paths, directory preparation, and archive sync over the
+shared envd API. Adapters retain their user default, archive naming, transport
+credentials, endpoint routing, and command-stream completion policy.
+
+`shared.WithMultipartFile` owns one borrowed-source multipart producer for envd
+and Blaxel: the `file` part, pipe cancellation and producer completion. Adapters
+retain request/response interpretation and producer-error redaction. A valid early
+response does not truncate the upload; a primary exchange failure stays primary.
+The owner never closes the source. Cancellation aborts pipe work, but returning
+may wait for an in-flight noncooperative source read; it is not a universal read
+deadline. This transport owner grants no archive, claim or native-resource custody.
+
+`shared.CleanPOSIXWorkspacePath` provides the common dedicated-directory check.
+Pass any additional protected mount roots explicitly; reserved roots are exact
+matches, so dedicated subdirectories remain valid. Providers with different
+path admission rules keep those checks in their own adapter.
+
 ### Optional interfaces
 
+`ProviderServerTypeProvider` has one operation, `ServerTypeForConfig(Config)`.
+Resolve class defaults and explicit native size selectors from that request;
+providers do not need a separate class-only resolver. `ClassProfiles` remains
+the declarative catalog for supported target and architecture combinations.
+After handling explicit generic and native overrides, adapters can use
+`ProviderClassPrimaryTypeForProfiles` to select the matched primary type. It
+returns an empty type for an unsupported canonical selector and uses the
+adapter's supplied legacy fallback only for noncanonical input. Existing override
+precedence, fallback mappings, and input normalization remain with their current
+owners; do not add provider-local overrides where the caller already owns them.
+
 Add optional capabilities as small interfaces instead of widening every backend.
+
+`ProviderSpec.ActionsRunnerUnsupported` declares that an SSH backend cannot host
+`--actions-runner`. Core enforces that restriction before target admission;
+ordinary Actions hydration remains available. Providers otherwise retain the
+shared Linux and Windows runner support.
 
 Provider-owned idle activity during an SSH run is optional:
 
@@ -209,13 +259,71 @@ type IdempotentLeaseIDBackend interface {
 }
 ```
 
-Direct AWS, Machine0, and local-container backends implement this capability;
-coordinator-backed leases support it through the coordinator wrapper. External
+The ASCII Box, AWS, Azure, DigitalOcean, Daytona, Incus, Machine0, local-container, Parallels,
+Proxmox, and Tenki direct backends implement this capability; coordinator-backed
+leases support it through the coordinator wrapper. External
 backends support it only when their configured protocol explicitly advertises
 idempotent lease IDs. `crabbox warmup --lease-id` rejects other backends before
-provisioning. Built-in direct adapters reuse `core.AcquireFixedLease` for
-durable intent and replay mechanics while keeping resource creation,
-reconciliation, and identity validation provider-owned.
+provisioning. Built-in direct adapters use `core.AcquireFixedResource` and
+`core.FixedLeaseOperations[T]`: `DescribeIntent`, `Plan`, `ObserveExact`,
+`Submit`, `PrepareAccess`, and `DeleteExact`. Plans return native input data;
+core assembles labels and nonces, persists attempts, applies binding evidence,
+and publishes acquired and terminal records. Adapters supply native scope,
+identity, readiness, and exact-deletion proofs. Ordered `FixedIntentFields`
+preserve existing fingerprint field order, names, omission rules, and hash domains.
+`ReadFixedAttempt` is the common compatibility reader; format descriptors select
+legacy envelopes and required identity fields.
+
+Each acquisition declares a `FixedAdmission` policy. Fresh-only admission,
+persisted non-submission witnesses, and safe same-identity resubmission are
+distinct contracts; empty inventory never grants create authority. Core journals
+admission before calling `Submit`. Native prerequisites that must be fenced first
+use `DeferredAdmission` and call `tx.Admit` at the mutation boundary. APIs resolving
+launch inputs during submission also declare `PlanDuringSubmit` and persist each
+payload with `WriteFixedAttempt` before allocation. Only a provider-certified
+definite failure may call `tx.RejectAttempt`; unknown outcomes retain custody.
+Adapters treat the transaction claim as read-only and publish returned evidence
+through `tx.Bind` or `tx.Observe`. Binding cannot retarget a known native identity.
+
+Providers with expiring idempotency keys can combine `FreshOnly` with
+`FixedAdmission.KeyedRetry`, specifying the native attempt key and retention
+window. Core journals the key, first submission time, and submission count before
+each call. Only one recovery submission is permitted, for an unbound attempt
+inside the original window, with a context capped at that deadline. A missing
+journal, changed key, backward clock, expired window, or consumed recovery
+allowance retains the attempt without resubmission. Keyed recovery requires a
+pre-submission plan and cannot use deferred admission. `ObserveExact` can return
+an inventory-discovered candidate only when native evidence attests the attempt;
+an empty list or matching display name grants no authority.
+
+`core.InspectFixedResource` cannot persist or prepare access.
+`core.DeleteFixedResource` keeps claim comparison, native proof, and terminal
+publication under one durable claim lock. Existing shared claim resolvers and
+native cleanup graphs remain reusable; a deletion callback must prove completion,
+not merely request admission. Formats with a `FixedLeaseKind.DeletionState`
+persist their cleanup marker and the `deleting` journal phase before native
+deletion. By default, formats without that state leave the exact durable claim
+and bound evidence unchanged at deletion admission. An adapter whose deletion
+depends on captured recovery identities opts into `FixedReleasePolicy.PersistBinding`:
+core journals supplied observation or release bindings before calling `DeleteExact`,
+retaining them if native cleanup fails. Adapters may still persist native
+cleanup acknowledgements through their existing witness contract. Existing
+deletion markers block acquisition replay and retain their admitted status on
+stale retries.
+`FixedLeaseKind.AfterTerminal`, when needed, cleans
+local lease artifacts after durable terminal publication while retaining that
+same claim fence. Native absence-only recovery is a separate proof path.
+Cleanup callers can request `FixedReleasePolicy.Started` to distinguish a stale
+claim rejected by the ownership fence from an admitted deletion that failed.
+A reclaimed or renewed candidate is skipped; an already-admitted deletion retains
+its failure and recovery state. A revision change alone never authorizes deletion.
+
+New writes add a versioned journal to the original intent envelope. Legacy records
+without a journal remain readable; their missing evidence never becomes permission
+to submit. Native attempt payloads, hashes, provider markers, and selected receipt
+identity labels retain their existing meaning. External providers keep their
+controller-acknowledged delegated protocol and exact-resource rollback contract;
+their legacy records are not promoted into this engine.
 
 Cleanup is optional:
 
@@ -240,6 +348,26 @@ type PausableBackend interface {
 
 Declare `FeaturePauseResume` when implementing this interface so
 `crabbox providers` exposes the capability.
+
+Provider-owned lease heartbeats are optional, for providers with no
+Crabbox-managed SSH lease to touch:
+
+```go
+type LeaseHeartbeatBackend interface {
+	Backend
+
+	Heartbeat(ctx context.Context, req LeaseHeartbeatRequest) (LeaseHeartbeatResult, error)
+}
+```
+
+Declare `FeatureLeaseHeartbeat` when implementing this interface so
+`crabbox providers` exposes the capability. Core does no lease resolution,
+claim check, or state validation before calling, so the implementation owns
+every ownership and state check and must refuse an identifier it holds no local
+claim for. Report `LeaseHeartbeatResult.IdleTimeout` only from the provider's
+own view of the lease and leave it zero otherwise; core omits the field rather
+than substituting a local default. Do not rewrite lifecycle policy or absolute
+lifetime limits: `--idle-timeout` is refused before the call for that reason.
 
 List JSON compatibility is optional:
 
@@ -269,9 +397,10 @@ type DoctorBackend interface {
 Use `DoctorBackend` when a provider owns direct credentials or a delegated runner
 outside the coordinator. The check must validate provider-specific readiness
 without creating resources, and it must not treat unrelated coordinator health as
-proof that the provider itself is configured correctly. Expose it through the
-matching provider-level hook so `doctor` does not configure every provider just
-to discover the optional capability:
+proof that the provider itself is configured correctly. Core configures only the
+selected provider and discovers `DoctorBackend` on its normal backend. Implement
+the following override only when diagnostics need different configuration, such
+as allowing missing acquisition-only inputs:
 
 ```go
 type DoctorProvider interface {
@@ -433,12 +562,28 @@ source-only shell boundaries. Shell-local functions, builtins, and state require
 shell intent, not literal argv. Do not insert a second shell or reinterpret the
 rendered source before transport.
 
+Use `ShellScript` when the transport owns the surrounding shell and must keep
+it: it preserves shell source and quotes literal argv without adding `exec`.
+Cloudflare containers, Azure Dynamic Sessions, Anthropic Sandbox Runtime,
+Daytona, Freestyle, Cloud Run Sandbox, and Orgo use this boundary. Blaxel and
+Islo use `Argv("bash", "-lc")`; Modal uses `ShellSource` inside its workdir and
+environment wrapper. These adapters share command classification rather than
+repeating single-string, operator, and environment-assignment heuristics.
+
 `shared.WrapCommandWithShellEnvProfile` accepts execution argv, not unclassified
 user input. Its fallback quotes every word literally before terminal execution;
 it must not infer operators or assignments again. An exact three-word
 `bash -lc <body>` invocation reuses its body inside the existing profile wrapper,
 preserving the single login-shell boundary used by Modal and Tensorlake. Profile
 sourcing is failure-gated without adding global errexit to user source.
+
+Runners using the `command`, `cwd`, `env`, and `timeoutMs` JSON contract share
+`shared.CommandStreamRequest`. Cloudflare containers and Azure Dynamic Sessions
+use `shared.CommandStream` to consume their NDJSON response: bounded events,
+stdout/stderr forwarding, and explicit completion have one owner. Adapters retain
+HTTP authentication, redirects, request deadlines, status errors, response-body
+cleanup, and error redaction. A decoded completion wins over cancellation;
+an EOF without completion never establishes success.
 
 Agent Sandbox and Nomad use `shared.ShellWorkspaceCommand` for their common
 POSIX-stdin wrapper: create and enter the workdir, export validated environment
@@ -468,6 +613,15 @@ runtime route. Adapters retain identity checks, persisted-timeout defaults,
 label/TTL representation, and public result projection; they update caches only
 after the committed claim is returned. The helper does not mutate a native
 resource, create a missing claim, or replace core's checkpoint-journal fence.
+
+`shared.ObservedClaimActivityState` owns the precedence between recorded claim
+activity and native runtime observations for RunPod and Vast. Logical activity
+holds win even over a running observation. Otherwise a known non-running state
+wins, while a running observation replaces only state the adapter classifies as
+obsolete. Empty and literal `unknown` observations preserve recorded activity.
+Adapters supply their existing running/obsolete classifications; vocabulary,
+case and whitespace rules, label projection, and exact snapshot attachment stay
+local. This pure projection neither persists a claim nor renews its lifetime.
 
 Lifecycle polling is the exception that belongs in
 `internal/providers/shared`, not command core. `shared.Poll` centralizes only
@@ -519,7 +673,7 @@ unchanged. It does not prove that canceling a bridge stops its remote workload.
 
 Vanilla provider HTTP redirect policy also belongs in
 `internal/providers/shared`. `shared.SecureHTTPClient` clones an injected
-client, rejects destinations outside a trusted `shared.SameOrigin`, preserves
+client, rejects destinations outside a trusted `core.SameHTTPOrigin`, preserves
 an existing redirect hook, and otherwise applies the standard redirect limit.
 The adapter supplies the exact refusal error and retains any additional path,
 method, transport, previous-hop, or provider-specific origin policy locally.
@@ -532,6 +686,53 @@ typed API error and redaction policy, so capacity retry and purchase ambiguity
 classification remain provider-owned. This does not apply to streaming
 responses or change request construction, redirects, or client timeouts.
 
+E2B, CubeSandbox, and Azure Dynamic Sessions share unbounded buffered JSON
+decoding through `shared.DecodeUnboundedJSONResponse`. It borrows the body:
+callers retain their deferred close and any successful response-header clone.
+It reads the entire body even without an output target, returns read errors
+before interpreting status, and leaves typed API errors and body redaction to
+the adapter. Only a zero-length body skips decoding; nonempty whitespace is
+decoded, and JSON errors remain unwrapped. This separate contract adds no
+response limit and does not apply to streams or alter the bounded decoder.
+
+DigitalOcean and Linode share `shared.DecodeStatusFirstJSONResponse`: read the
+unbounded body, give a non-2xx status precedence over body-read errors, and wrap
+successful-response read/decode failures with the operation. The caller retains
+body closure, and each adapter keeps its typed API error and diagnostic policy.
+Linode still truncates raw error bytes before trimming/redaction and appends
+body-read failures afterward; this is distinct from the redacted-body helper.
+
+`shared.ErrorWithMessage` stores an adapter-prepared message and retains its
+original cause for `errors.Is`/`errors.As`. It performs no redaction and selects no
+exit code. In particular, CLI rendering may select an inner `ExitError` message;
+public code/display selection remains the delegated finalization owner's job,
+not a guarantee of this presentation wrapper.
+
+DigitalOcean, Lambda, OVH, and Vast use `shared.RedactedResponseBody` for
+status-first API-error diagnostics. It applies the adapter's redaction policy
+before truncating the body and also sanitizes appended body-read errors. The
+adapter still selects its diagnostic limit, placeholder spelling, typed HTTP
+error, and status precedence. Read failures remain diagnostic text rather than
+new causes of a completed API error; this does not change successful-response
+decoding or transport-error handling.
+
+Provider adapters refer to core types and primitives directly, for example
+`core.Config`, `core.RunRequest`, and `core.ShellQuote`. Local helpers own
+provider-specific decisions such as claim scopes, recovery prefixes, and
+credential admission. Exact forwarding functions and type aliases only add a
+second name for an existing owner; use the core definition at the call site.
+Mutable injection hooks retain their explicit adapter boundary.
+
+Core exports live beside their implementations and domain data. Exposing an
+existing operation does not need a private implementation plus a second public
+forwarder; use one exported definition for both core and adapter callers.
+
+Generated SSH configuration shares a connection-record parser in
+`shared.ParseGeneratedSSHConfig`. Adapters supply their generated format's
+comment and directive rules and keep host selection, proxy rewriting, and
+credential validation. The shared scanner reads connection fields; it is not a
+general OpenSSH configuration resolver.
+
 ## Acquisition stays adapter-owned
 
 SSH lease acquisition is a provider-owned transaction, not a shared sequence of
@@ -539,7 +740,7 @@ create, claim, bootstrap, and cleanup steps. Similar-looking acquisition bodies
 protect different ownership windows, credential dependencies, failure policies,
 and security boundaries. Share small primitives without centralizing their order.
 
-Acquisition already shares the mechanics that have provider-neutral contracts:
+Acquisition and resolution share mechanics with provider-neutral contracts:
 
 - `shared.AcquireAttemptsRetry` retries eligible fresh acquisitions outside the
   individual provider transaction and preserves bootstrap-failure/keep policy.
@@ -549,12 +750,26 @@ Acquisition already shares the mechanics that have provider-neutral contracts:
   `core.ProviderKeyForLease` names provider-side keys when applicable.
 - `shared.Poll` repeats observations while the adapter owns readiness predicates,
   identity checks, side effects, timeouts, and diagnostics.
+- `core.SleepContext` owns delays that return `ctx.Err()` on cancellation,
+  including Vultr retries and W&B provisioning backoff. Use
+  `shared.SleepContext` only when the caller's contract preserves a custom
+  `context.Cause` instead; neither helper owns retry eligibility or scheduling.
 - `core.SSHTargetFromConfig` constructs conventional SSH endpoints, and
   `core.WaitForSSHReady` proves the common SSH bootstrap contract.
+- `shared.DirectSSHBackend.ResolvedLeaseTarget` packages an adapter-built endpoint
+  and reuses stored-key rebinding for ordinary resolution. Release-only resolution
+  skips stored-key lookup while preserving the configured endpoint. Adapters retain
+  ownership of region selection, host selection, and resource validation.
 - `shared.ClaimBinding`, `shared.ValidateClaimBinding`,
   `shared.ResolveProviderClaimStrict`, and `shared.ErrStrictClaimMismatch`
   validate structural identity and exact provider/scope-bound claim lookup;
   `shared.CloneLabels` supplies writable label copies.
+- `shared.LabelsWithDefaults` copies stored labels and fills missing or empty
+  values during inventory projection. Adapters retain the default values and
+  any authoritative state, identity, redaction, or live-port overrides.
+- `shared.IndexProviderClaims` builds lookup indexes from stored snapshots
+  using adapter-owned resource keys. Index entries remain candidates for later
+  ownership validation, rather than authority to mutate a resource.
 - `core.AcquireFixedLease`, `core.FixedAcquireOptions`,
   `core.FixedLeaseBinding`, and `core.FixedLeaseKind` already share durable
   fixed-ID intent locking, replay validation, acquired-state commit, and
@@ -607,6 +822,12 @@ semantic tests required by the mechanism. Keep acquisition adapter-owned unless
 a future proposal proves both behavior preservation and meaningful net value.
 ## Shared run sequencing and provider authority
 
+`shared.CleanupSandboxClaims` owns the claim-backed sandbox cleanup scan. It
+rechecks provider scope after acquiring each adapter's operation lock, preserves
+dry-run and missing-resource reporting, and removes claims only after provider
+deletion succeeds. Adapters supply resource lookup, identity checks, expiry,
+deletion, and special recovery handling; the lock spans the complete operation.
+
 `shared.RunDelegatedSandbox` owns the common sandbox run sequence: preflight,
 archive preparation, acquisition or resolution, setup, sync, command execution,
 and one final retention/cleanup decision before timing and session reporting.
@@ -657,7 +878,7 @@ commits.
 
 Supporting mechanics remain reusable independently: `procjson.Exchange` for
 bounded subprocess JSON, `shared.Poll` for observations, operation locks for
-serialization, `core.RunDelegatedArchiveSync` for staged archive replacement,
+serialization, `core.ArchiveWorkspace` for staged archive replacement,
 and scoped claim helpers for guarded local state. None of these grants native
 resource ownership or proves that canceling transport stopped a remote command.
 
@@ -670,14 +891,22 @@ through archive construction and transfer; manifest planning and guardrails
 remain outside that budget. Both paths close and remove the owned archive on
 success or failure, and remote cleanup keeps its independent bounded context.
 
+`DelegatedSandboxLifecycle.Workspace` returns a `shared.SandboxWorkspace` bound
+to the current resource. Its factory runs before acquisition for local archive
+preparation and after admission for remote operations; constructing a workspace
+must not contact the provider. Ordinary archive transports configure one
+`core.ArchiveWorkspace` with `core.NewArchiveWorkspace`: `PrepareArchive`, `Sync`,
+and `Ensure` share the request, naming, clock, and transfer settings. The adapter
+supplies upload and execution callbacks, optional path validation, and any native
+replacement or cleanup policy. `WorkspaceOperations` supports native injection,
+disk admission checks, or a claim fence around the entire operation.
+
 ## Provider registration
 
 A provider implements `cli.Provider`:
 
 ```go
 type Provider interface {
-	Name() string
-	Aliases() []string
 	Spec() ProviderSpec
 
 	RegisterFlags(fs *flag.FlagSet, defaults Config) any
@@ -688,9 +917,11 @@ type Provider interface {
 ```
 
 Normalized selection guards use `cli.ProviderNameMatches(name, Provider{})` so
-`Name()` and `Aliases()` remain the single name-set owner. The matcher reads only
-that metadata and uses the existing name normalizer; it does not look up or
-register a provider, call `Spec` or `Configure`, or mutate configuration. Keep
+`ProviderSpec.Name` and `ProviderSpec.Aliases` remain the single name-set owner.
+`Spec` must return stable, side-effect-free metadata: registration, selection,
+and discovery can call it before configuration. The matcher uses the existing
+name normalizer; it does not look up or register a provider, call `Configure`, or
+mutate configuration. Keep
 the check at its existing position relative to flag copying and validation.
 
 This is not a replacement for raw comparisons, case-fold-only comparisons,
@@ -720,9 +951,6 @@ func init() {
 }
 
 type Provider struct{}
-
-func (Provider) Name() string      { return "example" }
-func (Provider) Aliases() []string { return nil }
 
 func (Provider) Spec() cli.ProviderSpec {
 	return cli.ProviderSpec{
@@ -835,6 +1063,7 @@ cli.FeatureRunArtifacts // "run-artifacts"
 cli.FeaturePreparedArtifactWorkspace // "prepared-artifact-workspace"
 cli.FeatureRunDownloads // "run-downloads"
 cli.FeaturePauseResume  // "pause-resume"
+cli.FeatureLeaseHeartbeat // "lease-heartbeat"
 cli.FeatureMCP          // "mcp-attachments"
 ```
 
@@ -884,6 +1113,10 @@ Checkpoint-related features are reserved for versioned workspaces:
   than over rsync.
 - `FeatureURLBridge`: delegated provider can expose a lease's port through the
   broker URL bridge.
+- `FeatureLeaseHeartbeat`: provider can keep a lease alive through its own API,
+  so `crabbox heartbeat` works without a Crabbox-managed SSH lease. The backend
+  implements `cli.LeaseHeartbeatBackend`. It refreshes activity without rewriting
+  lifecycle policy or absolute lifetime limits.
 
 Do not set the checkpoint flags for plain SSH access alone. Generic
 Git/archive/log checkpoints are core-owned and work even when a provider
@@ -944,7 +1177,16 @@ application may follow it. Single-flag rejection, supported type mapping, and
 providers without this rejection policy remain distinct contracts; do not use
 the pair helper to change them.
 
-Pattern for a provider with typed config fields:
+Generated adapters that consume only `InputAccepted` use
+`cli.ApplyProviderConfigFlags[ConfigFlagValues]` to share typed admission,
+application, and accepted-input recording, including partial application before
+an error. Its boolean reports whether the values matched: skip normalization and
+other postprocessing when false. Preserve the adapter's existing guard and
+error/postprocessing order; provider policy stays outside the helper.
+Adapters that consume per-field reports still call
+their generated `Apply` method directly.
+
+Manual pattern for a provider with custom field application:
 
 ```go
 type exampleFlagValues struct {
@@ -990,6 +1232,28 @@ Blacksmith does) when the config type is not ready to export cleanly.
 If a provider needs durable config, add typed config fields in `Config` and env
 overrides in `config.go`.
 
+Azure stores its shared account, VM, and routing inputs in `Config.Azure`.
+`config_azure.go` owns defaults, file/environment application, OS-image replacement,
+and coordinator projection, including image and OS-disk explicitness. Subscription
+and tenant inputs record provenance for
+both Azure and Azure Dynamic Sessions; the latter retains its separate
+`Config.AzureDynamicSessions` settings. Adapter flag validation, backend routing,
+and native lifecycle policy remain with their existing owners. File keys,
+config-show fields, coordinator wire fields, and fixed-lease fingerprint shapes
+do not follow internal Go field renames.
+
+GCP's values and explicit-input markers live together in `Config.GCP`, owned by
+`config_gcp.go`. That owner handles defaults, file and environment admission,
+OS-image replacement, and coordinator projection without flattening fields back
+into core. Its handwritten bindings preserve policies that differ by source:
+ambient project aliases only fill a missing project, malformed root-size input
+still records intent, and file lists retain their original values. Keep the
+public YAML, config-show, and coordinator keys stable when changing storage.
+
+`internal/atomicfile.WritePrivate` shares private-file staging, file syncing,
+and replacement. Callers retain path admission, directory creation, their
+platform-specific atomic replacement, and directory-sync/error policy.
+
 `cli.ResolveInheritedWorkRoot` shares the raw work-root decision used by exe.dev
 (core loading and backend defaults), Runpod, Multipass, Hyper-V, and Tart. A
 nonempty provider root wins; otherwise a generic root that is not an exact
@@ -1001,6 +1265,18 @@ explicit-root markers, or different projection rules retain their own policy.
 
 Never pass provider secrets as command-line arguments. Use environment variables,
 local SDK config, the broker, or a credential store outside repo config.
+
+### Config-default target finalization
+
+`ProviderConfigDefaulter.ApplyConfigDefaults` runs after portable input preparation.
+By default core normalizes and validates the target immediately afterward.
+`ProviderConfigDefaultsPhase.ConfigDefaultsTargetFinalization` can instead return
+`ProviderConfigDefaultsCallerFinalizes` when the caller owns that boundary. Config
+loading still normalizes after defaults; command paths that normalized earlier
+retain provider-native values without an added normalization pass. This is a
+config-only capability, not permission to skip command admission or call a native
+runtime. Hyper-V, Windows Sandbox, and Exe.dev retain this existing caller-owned
+boundary. Other defaulters retain the zero/default dispatcher-owned phase.
 
 ## Runtime
 
@@ -1127,8 +1403,76 @@ own the remote workflow.
 `List` and `Status` should return normalized views. If the provider only offers a
 table or lossy native status shape, keep that parsing inside the backend.
 
+Providers that bound in-flight status requests use `shared.StatusWait` for the
+wait context, deadline, and cancellation precedence, then its `Poll` method for
+observation sequencing. Construct it at the adapter's existing resolution
+boundary; keep ownership validation, readiness, terminal states, retry policy,
+and status-view fields in the adapter.
+
+DigitalOcean, Vast, and RunPod ordinary acquisition waits use `shared.PollReadiness` for the
+elapsed-time budget, interrupted-read classification, completed-observation
+precedence, and cause-preserving termination errors. Adapters supply their typed
+response-error predicate, readiness and retry decisions, optional sleep/backoff,
+and public diagnostic. A completed provider response is not replaced merely
+because cancellation happened concurrently. Interrupted reads do not reach the
+adapter's observation callback or overwrite its last completed retry diagnostic.
+The helper retains cancellation identity without automatically displaying its
+cause; diagnostic wording and disclosure policy remain adapter-owned.
+
+Observation-only status waits use `shared.PollStatus` for the polling deadline
+and two-second delay. Adapters return complete `StatusView` values and identify
+final observations, retaining their ownership checks, terminal-state behavior,
+and error diagnostics. The helper preserves observed results before checking
+the deadline or cancellation; it does not add a timeout to provider requests.
+Both waiting contracts use the same observation driver. Transport and probe
+errors retain the adapter's existing context-error classification boundary;
+ownership failures are never reclassified by the shared driver.
+
+E2B-compatible adapters use `shared.EnvdSandboxViews` to project their common
+wire metadata. Provider identity and legacy ID prefixes stay explicit; resource
+ownership validation remains in each adapter.
+
+Cloud Run Sandbox uses `shared.SandboxStatusView` for its public Linux sandbox
+status fields. Claim expiry, gateway ownership probes, and missing-resource
+classification remain in the adapter; ownership tokens never enter public labels.
+
+E2B and CubeSandbox use `shared.DeleteClaimedEnvdSandbox` after resolving and
+checking their exact endpoint-bound claim. The helper holds the unchanged-claim
+fence across the remote read, ownership validation, deletion, and claim removal.
+Each adapter retains its ownership validator, not-found classification, and error
+formatting. Provider-approved absence completes cleanup; other failures retain
+the claim. Reclaim/adoption and endpoint admission remain adapter-owned.
+
+RunPod and Vast use `shared.AdmitResolvedLease` for the common resolved-lease
+admission transaction: authorize activity on the observed claim, then commit
+repository admission only if that exact claim still matches. The returned claim
+is the committed snapshot. Adapters retain admission eligibility, native and
+account identity checks, reclaim policy, SSH preparation, and projection; status,
+release-only, and other observation requests never enter this transaction. Vast
+passes its legacy idle-policy override explicitly, while RunPod preserves the
+core's recorded policy without an override.
+
+AWS and Azure endpoint refreshes use `shared.PreserveClaimIdentityLabels` to
+retain cleanup-authority labels from the recorded claim. Observations may confirm
+or omit those values, but conflicting values are rejected and unrecorded values
+are not adopted into legacy claims. Each adapter chooses its protected keys and
+keeps resource identity validation and error diagnostics local.
+
 `Stop` should stop the provider resource, remove local claims, and remove local
 per-resource keys if the backend created them.
+
+Persisted claim idle seconds are converted by `shared.PositiveIdleDuration`,
+which rejects nonpositive values and values exceeding the largest representable
+whole-second duration. Both shared idle-expiry helpers use this conversion.
+`ClaimIdleCleanupDue` trims timestamps and expires at equality without grace;
+`ClaimIdleExpiredAfterGrace` retains caller-owned timestamp normalization and
+strict expiry after separately adding idle time and grace. Invalid values never
+authorize idle cleanup; adapter TTL and terminal-state decisions remain separate.
+
+Local Container uses `shared.ClaimIdleExpiredAfterGrace` for claimed-container
+idle expiry, retaining its twelve-hour grace and strict expiry boundary. Keep
+labels, terminal states, claimless label timestamps, and fenced deletion remain
+adapter-owned; malformed claim timestamps never fall back to label expiry.
 
 Do not make delegated providers support `crabbox ssh`, `vnc`, `webvnc`,
 `screenshot`, `code`, or Actions runner hydration unless the provider exposes a
@@ -1252,3 +1596,11 @@ Before landing a new backend:
 - [Authoring a provider](features/provider-authoring.md): step-by-step guide.
 - [Provider Reference](providers/README.md): the full provider catalog.
 - [Concepts](concepts.md): how providers fit the lease/run model.
+
+### Existing desktop admission
+
+`DesktopLeaseCapabilityProvider.DesktopLeaseWithoutLabel` can admit an existing
+macOS desktop without a creation-time desktop label. The provider owns the exact
+resource/claim checks; core retains the macOS gate and the existing coordinator
+fallback. Returning an error stops admission. An allowance does not set the
+lease's desktop label or bypass SSH/RFB authentication and readiness checks.

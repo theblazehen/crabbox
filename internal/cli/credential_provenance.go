@@ -170,10 +170,11 @@ func markCredentialDestinationFlagSources(cfg *Config, fs *flag.FlagSet) {
 		return
 	}
 	provenance := &cfg.credentialProvenance
-	if flagWasSet(fs, "proxmox-api-url") {
+	proxmoxFlags := ProxmoxConfigFlagPresence(fs)
+	if proxmoxFlags.APIURL {
 		provenance.proxmoxAPIURL = credentialSourceFlag
 	}
-	if flagWasSet(fs, "proxmox-insecure-tls") {
+	if proxmoxFlags.InsecureTLS {
 		provenance.proxmoxInsecureTLS = credentialSourceFlag
 	}
 	morphFlags := MorphConfigFlagPresence(fs)
@@ -183,10 +184,11 @@ func markCredentialDestinationFlagSources(cfg *Config, fs *flag.FlagSet) {
 	if morphFlags.SSHGatewayHost {
 		provenance.morphSSHGatewayHost = credentialSourceFlag
 	}
-	if flagWasSet(fs, "daytona-api-url") {
+	daytonaFlags := DaytonaConfigFlagPresence(fs)
+	if daytonaFlags.APIURL {
 		provenance.daytonaAPIURL = credentialSourceFlag
 	}
-	if flagWasSet(fs, "daytona-ssh-gateway-host") {
+	if daytonaFlags.SSHGatewayHost {
 		provenance.daytonaSSHGateway = credentialSourceFlag
 	}
 	e2bFlags := E2BConfigFlagPresence(fs)
@@ -220,7 +222,7 @@ func markCredentialDestinationFlagSources(cfg *Config, fs *flag.FlagSet) {
 	if OrgoConfigFlagPresence(fs).APIBase {
 		provenance.orgoAPIBase = credentialSourceFlag
 	}
-	if flagWasSet(fs, "unikraft-cloud-url") {
+	if UnikraftCloudConfigFlagPresence(fs).APIURL {
 		provenance.unikraftCloudAPIURL = credentialSourceFlag
 	}
 	if RunpodConfigFlagPresence(fs).APIURL {
@@ -229,13 +231,14 @@ func markCredentialDestinationFlagSources(cfg *Config, fs *flag.FlagSet) {
 	if VastConfigFlagPresence(fs).APIURL {
 		provenance.vastAPIURL = credentialSourceFlag
 	}
-	if flagWasSet(fs, "islo-base-url") {
+	if IsloConfigFlagPresence(fs).BaseURL {
 		provenance.isloBaseURL = credentialSourceFlag
 	}
-	if flagWasSet(fs, "tenki-endpoint") {
+	tenkiFlags := TenkiConfigFlagPresence(fs)
+	if tenkiFlags.Endpoint {
 		provenance.tenkiEndpoint = credentialSourceFlag
 	}
-	if flagWasSet(fs, "tenki-gateway") {
+	if tenkiFlags.Gateway {
 		provenance.tenkiGateway = credentialSourceFlag
 	}
 	if TensorlakeConfigFlagPresence(fs).APIURL {
@@ -253,16 +256,17 @@ func markCredentialDestinationFlagSources(cfg *Config, fs *flag.FlagSet) {
 	if CloudflareConfigFlagPresence(fs).APIURL {
 		provenance.cloudflareAPIURL = credentialSourceFlag
 	}
-	if flagWasSet(fs, "nomad-address") {
+	nomadFlags := NomadConfigFlagPresence(fs)
+	if nomadFlags.Address {
 		provenance.nomadAddress = credentialSourceFlag
 	}
-	if flagWasSet(fs, "nomad-token-env") {
+	if nomadFlags.TokenEnv {
 		provenance.nomadTokenEnv = credentialSourceFlag
 	}
 	if SemaphoreConfigFlagPresence(fs).Host {
 		provenance.semaphoreHost = credentialSourceFlag
 	}
-	if flagWasSet(fs, "sprites-api-url") {
+	if SpritesConfigFlagPresence(fs).APIURL {
 		provenance.spritesAPIURL = credentialSourceFlag
 	}
 	if AzureDynamicSessionsConfigFlagPresence(fs).Endpoint {
@@ -274,7 +278,7 @@ func markCredentialDestinationFlagSources(cfg *Config, fs *flag.FlagSet) {
 	if flagWasSet(fs, "parallels-host-key") {
 		provenance.parallelsHostKey = credentialSourceFlag
 	}
-	if flagWasSet(fs, "static-host") {
+	if StaticConfigFlagPresence(fs).Host {
 		provenance.staticHost = credentialSourceFlag
 	}
 	if ExeDevConfigFlagPresence(fs).ControlHost {
@@ -305,7 +309,7 @@ func validateCoordinatorCredentialDestination(cfg Config) error {
 		{cfg.Access.Token, provenance.accessToken},
 	}
 	if inheritedCredential(credentials...) {
-		return exit(2, "repository-configured broker.url cannot be combined with inherited coordinator credentials; set CRABBOX_COORDINATOR or pass an explicit coordinator URL to approve the credential destination")
+		return Exit(2, "repository-configured broker.url cannot be combined with inherited coordinator credentials; set CRABBOX_COORDINATOR or pass an explicit coordinator URL to approve the credential destination")
 	}
 	return nil
 }
@@ -314,7 +318,7 @@ func validateProviderCredentialDestination(cfg Config) error {
 	provenance := cfg.credentialProvenance
 	providerName := normalizeProviderName(cfg.Provider)
 	if provider, err := ProviderFor(providerName); err == nil {
-		providerName = provider.Name()
+		providerName = provider.Spec().Name
 	}
 	switch providerName {
 	case "proxmox":
@@ -467,7 +471,7 @@ func validateProviderCredentialDestination(cfg Config) error {
 		}
 	case "external":
 		if err := ValidateExternalDesktopPasswordEnvironmentName(cfg.External.Connection.Desktop.PasswordEnv); err != nil {
-			return exit(2, "%v", err)
+			return Exit(2, "%v", err)
 		}
 		if cfg.External.Connection.SSH.TrustProviderOutput && provenance.externalSSHOutput == credentialSourceRepository {
 			return repositoryCredentialDestinationError("external", "external.connection.ssh.trustProviderOutput", "the same provider-output contract in trusted user config")
@@ -663,7 +667,7 @@ func ValidateProviderCredentialDestination(cfg Config) error {
 // before adapter output may supply SSH coordinates directly.
 func ValidateExternalProviderSSHOutput(cfg Config) error {
 	if !cfg.External.Connection.SSH.TrustProviderOutput {
-		return exit(2, "external provider SSH output requires external.connection.ssh.trustProviderOutput in trusted user config")
+		return Exit(2, "external provider SSH output requires external.connection.ssh.trustProviderOutput in trusted user config")
 	}
 	if cfg.credentialProvenance.externalSSHOutput == credentialSourceRepository {
 		return repositoryCredentialDestinationError("external", "external.connection.ssh.trustProviderOutput", "the same provider-output contract in trusted user config")
@@ -1157,9 +1161,9 @@ func nomadSelectedTokenEnvHasValue(cfg Config) bool {
 }
 
 func repositoryCredentialDestinationError(provider, field, override string) error {
-	return exit(2, "provider=%s refuses repository-configured %s with inherited credentials; set %s to explicitly approve the credential destination", provider, field, override)
+	return Exit(2, "provider=%s refuses repository-configured %s with inherited credentials; set %s to explicitly approve the credential destination", provider, field, override)
 }
 
 func repositoryCubeSandboxDestinationError(field, override string) error {
-	return exit(2, "provider=cubesandbox refuses repository-configured %s because CubeSandbox routes receive ephemeral credentials and workspace data; set %s to explicitly approve the destination", field, override)
+	return Exit(2, "provider=cubesandbox refuses repository-configured %s because CubeSandbox routes receive ephemeral credentials and workspace data; set %s to explicitly approve the destination", field, override)
 }

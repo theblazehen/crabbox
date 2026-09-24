@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
-	"github.com/openclaw/crabbox/internal/providers/shared"
+	"github.com/openclaw/crabbox/internal/fat16"
 )
 
 type xcpNgCloudInitPayload struct {
@@ -28,7 +28,7 @@ type xcpNgWindowsAutounattendPayload struct {
 	Username            string
 }
 
-func newCloudInitPayload(cfg Config, leaseID, slug, publicKey string) (xcpNgCloudInitPayload, error) {
+func newCloudInitPayload(cfg core.Config, leaseID, slug, publicKey string) (xcpNgCloudInitPayload, error) {
 	user := strings.TrimSpace(core.Blank(cfg.XCPNg.User, cfg.SSHUser))
 	if user == "" {
 		return xcpNgCloudInitPayload{}, exit(2, "xcp-ng cloud-init user is required")
@@ -93,7 +93,7 @@ func newCloudInitPayload(cfg Config, leaseID, slug, publicKey string) (xcpNgClou
 	return xcpNgCloudInitPayload{UserData: userData.String(), MetaData: metaData}, nil
 }
 
-func newLinuxAutoinstallPayload(cfg Config, leaseID, slug, publicKey string) (xcpNgLinuxAutoinstallPayload, error) {
+func newLinuxAutoinstallPayload(cfg core.Config, leaseID, slug, publicKey string) (xcpNgLinuxAutoinstallPayload, error) {
 	user := strings.TrimSpace(core.Blank(cfg.XCPNg.User, cfg.SSHUser))
 	if user == "" {
 		return xcpNgLinuxAutoinstallPayload{}, exit(2, "xcp-ng linux autoinstall user is required")
@@ -160,7 +160,7 @@ func newLinuxAutoinstallPayload(cfg Config, leaseID, slug, publicKey string) (xc
 	return xcpNgLinuxAutoinstallPayload{UserData: userData.String(), MetaData: metaData}, nil
 }
 
-func newWindowsAutounattendPayload(cfg Config, leaseID, slug, publicKey, initialPassword string) (xcpNgWindowsAutounattendPayload, error) {
+func newWindowsAutounattendPayload(cfg core.Config, leaseID, slug, publicKey, initialPassword string) (xcpNgWindowsAutounattendPayload, error) {
 	rawUser := strings.TrimSpace(core.Blank(cfg.XCPNg.User, cfg.SSHUser))
 	if rawUser == "" {
 		return xcpNgWindowsAutounattendPayload{}, exit(2, "xcp-ng windows autounattend user is required")
@@ -300,7 +300,7 @@ if (-not (Test-Path -LiteralPath $scriptPath)) { throw "Crabbox bootstrap script
 	}, nil
 }
 
-func cloudInitSSHPortConfig(cfg Config) string {
+func cloudInitSSHPortConfig(cfg core.Config) string {
 	portLines := ""
 	for _, port := range xcpNgSSHPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts) {
 		portLines += fmt.Sprintf("      Port %s\n", port)
@@ -444,15 +444,17 @@ func isoMediaLabels(base map[string]string) map[string]string {
 }
 
 func buildConfigDriveImage(payload xcpNgCloudInitPayload) ([]byte, error) {
-	files := []fatFile{
+	files := []fat16.File{
 		{Name: "user-data", Data: []byte(payload.UserData)},
 		{Name: "meta-data", Data: []byte(payload.MetaData)},
 	}
 	return buildFAT16Image("cidata", files)
 }
 
-type fatFile = shared.FATFile
-
-func buildFAT16Image(label string, files []fatFile) ([]byte, error) {
-	return shared.BuildFAT16Image(label, files, "CRAB%04dTXT", "config-drive")
+func buildFAT16Image(label string, files []fat16.File) ([]byte, error) {
+	image, err := fat16.Build(label, files, "CRAB%04dTXT")
+	if err != nil {
+		return nil, core.Exit(2, "config-drive %v", err)
+	}
+	return image, nil
 }

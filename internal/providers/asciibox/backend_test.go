@@ -16,20 +16,57 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func TestManualConfigInputFlags(t *testing.T) {
+	cfg := core.BaseConfig()
+	cfg.Provider = "fixture-other"
+	fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+	values := RegisterAsciiBoxProviderFlags(fs, cfg)
+	before := cfg
+	if err := ApplyAsciiBoxProviderFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+		t.Fatalf("foreign values changed configuration: %v", err)
+	}
+	if err := ApplyAsciiBoxProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	want := cfg
+	core.RecordProviderFlagInputs(&want, true, "ascii-box")
+	if reflect.DeepEqual(cfg, want) {
+		t.Fatal("unvisited flags recorded input")
+	}
+	for repeat := 0; repeat < 2; repeat++ {
+		if err := fs.Set("ascii-box-workdir", "/work/fixture"); err != nil {
+			t.Fatal(err)
+		}
+		if err := ApplyAsciiBoxProviderFlags(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		want = cfg
+		core.RecordProviderFlagInputs(&want, true, "ascii-box")
+		if !reflect.DeepEqual(cfg, want) {
+			t.Fatal("accepted/equal flag value was not recorded")
+		}
+	}
+}
+
+func TestMain(m *testing.M) {
+	os.Exit(testutil.RunWithIsolatedUserDirs(m))
+}
 
 func TestProviderSpecAndAliases(t *testing.T) {
 	p := Provider{}
-	if p.Name() != providerName {
-		t.Fatalf("Name=%q want %s", p.Name(), providerName)
+	if p.Spec().Name != providerName {
+		t.Fatalf("Name=%q want %s", p.Spec().Name, providerName)
 	}
-	for _, alias := range []string{"ascii", "asciibox", "ascii-box"} {
+	for _, alias := range []string{"boat", "ascii", "asciibox", "ascii-box"} {
 		got, err := core.ProviderFor(alias)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", alias, err)
 		}
-		if got.Name() != providerName {
-			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Name())
+		if got.Spec().Name != providerName {
+			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Spec().Name)
 		}
 	}
 	spec := p.Spec()
@@ -87,6 +124,11 @@ func TestClientUsesOfficialAsciiBoxCLI(t *testing.T) {
 	if !reflect.DeepEqual(runner.commands, want) {
 		t.Fatalf("commands=%v want=%v", runner.commands, want)
 	}
+	for _, req := range runner.requests {
+		if req.MaxCapturedOutputBytes <= 0 || req.MaxCapturedOutputBytes > 8<<20 || req.DisableOutputCapture || req.Stdout != nil || req.Stderr != nil {
+			t.Fatalf("native command must use bounded, non-streaming capture: %+v", req.Args)
+		}
+	}
 	for _, env := range runner.env {
 		if !hasEnv(env, "BOX_API_KEY=box_key") {
 			t.Fatal("child environment missing the synthetic BOX_API_KEY")
@@ -110,10 +152,10 @@ func TestReleaseBoxRecoversFromRecentSnapshotGuard(t *testing.T) {
 			"stop":     {snapshotGuardOutcome()},
 			"delete":   {snapshotGuardOutcome(), deletionOutcome(testDeletionID, "bx_guard", "box", "pending")},
 			"deletion": {deletionOutcome(testDeletionID, "bx_guard", "box", "completed")},
-			"extend":   {{result: LocalCommandResult{Stdout: `{"id":"bx_guard","archiveAfter":"soon"}`}}},
+			"extend":   {{result: core.LocalCommandResult{Stdout: `{"id":"bx_guard","archiveAfter":"soon"}`}}},
 			"info": {
-				{result: LocalCommandResult{Stdout: `{"box":{"id":"bx_guard","state":"idle"}}`}},
-				{result: LocalCommandResult{Stdout: `{"box":{"id":"bx_guard","state":"idle","status":"stopping"}}`}},
+				{result: core.LocalCommandResult{Stdout: `{"box":{"id":"bx_guard","state":"idle"}}`}},
+				{result: core.LocalCommandResult{Stdout: `{"box":{"id":"bx_guard","state":"idle","status":"stopping"}}`}},
 			},
 		},
 	}
@@ -149,8 +191,8 @@ func TestReleaseBoxDoesNotRecoverUnrelatedDeleteFailure(t *testing.T) {
 	runner := &releaseCommandRunner{
 		configPath: filepath.Join(t.TempDir(), "config.json"),
 		outcomes: map[string][]commandOutcome{
-			"stop":   {{result: LocalCommandResult{}}},
-			"delete": {{result: LocalCommandResult{Stderr: "permission denied"}, err: fmt.Errorf("exit status 1")}},
+			"stop":   {{result: core.LocalCommandResult{}}},
+			"delete": {{result: core.LocalCommandResult{Stderr: "permission denied"}, err: fmt.Errorf("exit status 1")}},
 		},
 	}
 	client := &client{apiKey: "box_key", apiURL: "https://ascii.dev", cliPath: "box", home: t.TempDir(), runner: runner}
@@ -170,7 +212,7 @@ func TestReleaseBoxReportsSnapshotRecoveryExtendFailure(t *testing.T) {
 		outcomes: map[string][]commandOutcome{
 			"stop":   {snapshotGuardOutcome()},
 			"delete": {snapshotGuardOutcome()},
-			"extend": {{result: LocalCommandResult{Stderr: "extend throttled"}, err: fmt.Errorf("exit status 1")}},
+			"extend": {{result: core.LocalCommandResult{Stderr: "extend throttled"}, err: fmt.Errorf("exit status 1")}},
 		},
 	}
 	client := &client{apiKey: "box_key", apiURL: "https://ascii.dev", cliPath: "box", home: t.TempDir(), runner: runner}
@@ -213,7 +255,7 @@ func deletionOutcome(id, target, kind, state string) commandOutcome {
 	if state == "completed" {
 		completedAt = `"2026-09-02T09:00:00Z"`
 	}
-	return commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"operation":{"id":%q,"targetId":%q,"kind":%q,"status":%q,"completedAt":%s}}`, id, target, kind, state, completedAt)}}
+	return commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"operation":{"id":%q,"targetId":%q,"kind":%q,"status":%q,"completedAt":%s}}`, id, target, kind, state, completedAt)}}
 }
 
 func TestReleaseBoxRequiresCompletedDeletionOperation(t *testing.T) {
@@ -227,20 +269,20 @@ func TestReleaseBoxRequiresCompletedDeletionOperation(t *testing.T) {
 		{name: "pending processing completed", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{deletionOutcome(testDeletionID, "bx_guard", "box", "processing"), deletionOutcome(testDeletionID, "bx_guard", "box", "completed")}},
 		{name: "blocked completed", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "blocked"), polls: []commandOutcome{deletionOutcome(testDeletionID, "bx_guard", "box", "completed")}},
 		{name: "already completed", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "completed")},
-		{name: "missing receipt", initial: commandOutcome{result: LocalCommandResult{Stdout: `{}`}}, wantErr: true},
-		{name: "legacy deleted response", initial: commandOutcome{result: LocalCommandResult{Stdout: `{"id":"bx_guard","status":"deleted"}`}}, wantErr: true},
-		{name: "malformed receipt", initial: commandOutcome{result: LocalCommandResult{Stdout: `not json`}}, wantErr: true},
+		{name: "missing receipt", initial: commandOutcome{result: core.LocalCommandResult{Stdout: `{}`}}, wantErr: true},
+		{name: "legacy deleted response", initial: commandOutcome{result: core.LocalCommandResult{Stdout: `{"id":"bx_guard","status":"deleted"}`}}, wantErr: true},
+		{name: "malformed receipt", initial: commandOutcome{result: core.LocalCommandResult{Stdout: `not json`}}, wantErr: true},
 		{name: "invalid operation ID", initial: deletionOutcome("bdop_other", "bx_guard", "box", "completed"), wantErr: true},
 		{name: "wrong initial target", initial: deletionOutcome(testDeletionID, "bx_other", "box", "completed"), wantErr: true},
 		{name: "wrong initial kind", initial: deletionOutcome(testDeletionID, "bx_guard", "account", "completed"), wantErr: true},
 		{name: "unknown state", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "deleted"), wantErr: true},
-		{name: "missing completion timestamp", initial: commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"operation":{"id":%q,"targetId":"bx_guard","kind":"box","status":"completed","completedAt":null}}`, testDeletionID)}}, wantErr: true},
-		{name: "invalid completion timestamp", initial: commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"operation":{"id":%q,"targetId":"bx_guard","kind":"box","status":"completed","completedAt":"yesterday"}}`, testDeletionID)}}, wantErr: true},
+		{name: "missing completion timestamp", initial: commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"operation":{"id":%q,"targetId":"bx_guard","kind":"box","status":"completed","completedAt":null}}`, testDeletionID)}}, wantErr: true},
+		{name: "invalid completion timestamp", initial: commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"operation":{"id":%q,"targetId":"bx_guard","kind":"box","status":"completed","completedAt":"yesterday"}}`, testDeletionID)}}, wantErr: true},
 		{name: "changed operation", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{deletionOutcome("bdop_fedcba9876543210fedcba9876543210", "bx_guard", "box", "completed")}, wantErr: true},
-		{name: "malformed poll", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{{result: LocalCommandResult{Stdout: `{"operation":null}`}}}, wantErr: true},
+		{name: "malformed poll", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{{result: core.LocalCommandResult{Stdout: `{"operation":null}`}}}, wantErr: true},
 		{name: "changed target", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{deletionOutcome(testDeletionID, "bx_other", "box", "completed")}, wantErr: true},
 		{name: "changed kind", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{deletionOutcome(testDeletionID, "bx_guard", "account", "completed")}, wantErr: true},
-		{name: "operation lookup failure", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{{result: LocalCommandResult{Stderr: "operation not found (404)"}, err: errors.New("exit status 1")}}, wantErr: true},
+		{name: "operation lookup failure", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{{result: core.LocalCommandResult{Stderr: "operation not found (404)"}, err: errors.New("exit status 1")}}, wantErr: true},
 		{name: "canceled acceptance", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), cancelOn: "delete", wantErr: true},
 		{name: "canceled completed response", initial: deletionOutcome(testDeletionID, "bx_guard", "box", "pending"), polls: []commandOutcome{deletionOutcome(testDeletionID, "bx_guard", "box", "completed")}, cancelOn: "deletion", wantErr: true},
 	} {
@@ -248,7 +290,7 @@ func TestReleaseBoxRequiresCompletedDeletionOperation(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			runner := &releaseCommandRunner{configPath: filepath.Join(t.TempDir(), "config.json"), outcomes: map[string][]commandOutcome{
-				"stop": {{result: LocalCommandResult{}}}, "delete": {test.initial}, "deletion": append([]commandOutcome(nil), test.polls...),
+				"stop": {{result: core.LocalCommandResult{}}}, "delete": {test.initial}, "deletion": append([]commandOutcome(nil), test.polls...),
 			}, onAction: func(action string) {
 				if action == test.cancelOn {
 					cancel()
@@ -277,7 +319,7 @@ func TestReleaseBoxRequiresCompletedDeletionOperation(t *testing.T) {
 func TestReleaseBoxPendingOperationHonorsDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		runner := &releaseCommandRunner{configPath: filepath.Join(t.TempDir(), "config.json"), outcomes: map[string][]commandOutcome{
-			"stop": {{result: LocalCommandResult{}}}, "delete": {deletionOutcome(testDeletionID, "bx_guard", "box", "blocked")},
+			"stop": {{result: core.LocalCommandResult{}}}, "delete": {deletionOutcome(testDeletionID, "bx_guard", "box", "blocked")},
 		}}
 		c := &client{apiKey: "box_key", apiURL: "https://ascii.dev", cliPath: "box", home: t.TempDir(), runner: runner, releasePollInterval: time.Hour}
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -287,6 +329,147 @@ func TestReleaseBoxPendingOperationHonorsDeadline(t *testing.T) {
 			t.Fatalf("pending deletion err=%v commands=%v", err, runner.commands)
 		}
 	})
+}
+
+func TestReleaseBoxReportsLastDeletionStatusWhenNativeLookupTimesOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		lookups := 0
+		runner := &releaseCommandRunner{configPath: filepath.Join(t.TempDir(), "config.json"), outcomes: map[string][]commandOutcome{
+			"stop":     {{result: core.LocalCommandResult{}}},
+			"delete":   {deletionOutcome(testDeletionID, "bx_guard", "box", "pending")},
+			"deletion": {deletionOutcome(testDeletionID, "bx_guard", "box", "blocked")},
+		}}
+		native := boxCommandRunnerFunc(func(commandCtx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+			if boxCLIAction(req.Args) == "deletion" {
+				lookups++
+				if lookups == 2 {
+					// A real command observes its own context. The caller's Done
+					// can close before cancellation reaches ReleaseBox's child.
+					<-commandCtx.Done()
+					return core.LocalCommandResult{}, commandCtx.Err()
+				}
+			}
+			return runner.Run(commandCtx, req)
+		})
+		c := &client{apiKey: "box_key", apiURL: "https://ascii.dev", cliPath: "box", home: t.TempDir(), runner: native, releasePollInterval: 100 * time.Millisecond}
+		started := time.Now()
+		err := c.ReleaseBox(ctx, "bx_guard", func(context.Context) error { return nil })
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("lost deadline cause: %v", err)
+		}
+		if lookups != 2 || time.Since(started) != 500*time.Millisecond {
+			t.Fatalf("deadline did not interrupt the second lookup: lookups=%d elapsed=%s", lookups, time.Since(started))
+		}
+		for _, want := range []string{"phase=deletion-operation", testDeletionID, "last_observed_status=blocked", "retaining claim"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("missing %q in %v", want, err)
+			}
+		}
+		var incomplete *boxDeletionIncompleteError
+		if !errors.As(err, &incomplete) || incomplete.operation.ID != testDeletionID || incomplete.operation.Status != "pending" {
+			t.Fatalf("lost original accepted operation: %v", err)
+		}
+	})
+}
+
+func TestBoxCleanupProgressReportsDuringNativeCallAndJoins(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		output := make(boxProgressOutput, 32)
+		ctx, cancel := context.WithTimeout(withBoxCleanupProgress(context.Background(), output), time.Second)
+		defer cancel()
+		ctx.Value(boxCleanupProgressKey{}).(*boxCleanupProgress).interval = 5 * time.Millisecond
+		entered := make(chan struct{})
+		runner := boxCommandRunnerFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+			close(entered)
+			<-ctx.Done()
+			return core.LocalCommandResult{Stdout: "native output must not become progress"}, ctx.Err()
+		})
+		c := &client{cliPath: "box", runner: runner}
+		done := make(chan error, 1)
+		go func() { _, err := c.runPrepared(ctx, "delete", "bx_guard", "--yes"); done <- err }()
+		<-entered
+		for range 2 {
+			select {
+			case line := <-output:
+				if !strings.Contains(line, "phase=native-delete") || !strings.Contains(line, "remaining=") || strings.Contains(line, "native output") {
+					t.Fatalf("unexpected progress: %s", line)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("no progress while native command was blocked")
+			}
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("native cancellation lost: %v", err)
+		}
+		for len(output) > 0 {
+			<-output
+		}
+		select {
+		case line := <-output:
+			t.Fatalf("progress after native command returned: %s", line)
+		case <-time.After(15 * time.Millisecond):
+		}
+	})
+}
+
+func TestBoxCleanupProgressRetainsCadenceAcrossFastPolls(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		output := make(boxProgressOutput, 32)
+		ctx := withBoxCleanupProgress(context.Background(), output)
+		ctx.Value(boxCleanupProgressKey{}).(*boxCleanupProgress).interval = 5 * time.Millisecond
+		c := &client{cliPath: "box", runner: boxCommandRunnerFunc(func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error) {
+			return core.LocalCommandResult{}, nil
+		})}
+		deadline := time.Now().Add(time.Second)
+		for len(output) < 2 && time.Now().Before(deadline) {
+			if _, err := c.runPrepared(ctx, "deletion", "status", testDeletionID); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if len(output) < 2 {
+			t.Fatal("fast native calls reset progress cadence")
+		}
+		for len(output) > 0 {
+			if line := <-output; !strings.Contains(line, "phase=deletion-operation") || strings.Contains(line, "remaining=-") {
+				t.Fatalf("unexpected progress: %s", line)
+			}
+		}
+	})
+}
+
+func TestNativeCaptureErrorCannotAuthorizeCleanupJSON(t *testing.T) {
+	for _, action := range []string{"status", "list", "deletion"} {
+		t.Run(action, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.json")
+			runner := boxCommandRunnerFunc(func(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+				current := boxCLIAction(req.Args)
+				result := core.LocalCommandResult{Stdout: fmt.Sprintf(`{"config":{"path":%q}}`, configPath)}
+				if current == "list" {
+					result.Stdout = `{"boxes":[],"pageInfo":{"hasMore":false}}`
+				} else if current == "deletion" {
+					result = deletionOutcome(testDeletionID, "bx_guard", "box", "completed").result
+				}
+				if current == action {
+					return result, errors.New("captured command output exceeded limit")
+				}
+				return result, nil
+			})
+			c := &client{apiKey: "box_key", apiURL: "https://ascii.dev", cliPath: "box", home: t.TempDir(), runner: runner}
+			var err error
+			if action == "deletion" {
+				_, err = c.GetDeletionOperation(context.Background(), "bx_guard", testDeletionID)
+			} else {
+				_, err = c.ListBoxes(context.Background(), true)
+			}
+			if err == nil {
+				t.Fatal("valid-looking JSON from failed capture was accepted")
+			}
+		})
+	}
 }
 
 func TestAsciiBoxBaseURLValidation(t *testing.T) {
@@ -345,7 +528,7 @@ func TestNewAPIRejectsUnsafeBaseURLBeforeCommandOrConfigWrite(t *testing.T) {
 	cfg := testConfig()
 	cfg.AsciiBox.BaseURL = "http://ascii.dev"
 
-	client, err := newAPI(cfg, Runtime{Exec: runner})
+	client, err := newAPI(cfg, core.Runtime{Exec: runner})
 	if err == nil || client != nil || !strings.Contains(err.Error(), "must use HTTPS") {
 		t.Fatalf("client=%#v err=%v", client, err)
 	}
@@ -360,7 +543,7 @@ func TestNewAPIRejectsUnsafeBaseURLBeforeCommandOrConfigWrite(t *testing.T) {
 func TestNewAPICanonicalizesBaseURL(t *testing.T) {
 	cfg := testConfig()
 	cfg.AsciiBox.BaseURL = " HTTPS://ASCII.DEV:443/api/ "
-	got, err := newAPI(cfg, Runtime{Exec: &fakeCommandRunner{}})
+	got, err := newAPI(cfg, core.Runtime{Exec: &fakeCommandRunner{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +664,7 @@ func TestClientPreservesObservedGenerationAfterReadinessFailure(t *testing.T) {
 	}
 	replacement := &fakeAPI{box: boxData{ID: "bx_2", CreatedAt: "2026-08-30T12:00:01Z", State: "ready", IP: "203.0.113.20"}}
 	b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	if err := b.rollbackBox(context.Background(), replacement, "cbx_123456789abc", box, LeaseClaim{}, false); err == nil || replacement.deleted {
+	if err := b.rollbackBox(context.Background(), replacement, "cbx_123456789abc", box, core.LeaseClaim{}, false); err == nil || replacement.deleted {
 		t.Fatalf("unpublished rollback adopted a later generation: err=%v deleted=%t", err, replacement.deleted)
 	}
 }
@@ -515,6 +698,263 @@ func TestRedactBoxSecrets(t *testing.T) {
 	}
 }
 
+// The Boat rename issues "boat_"-prefixed API keys. They must redact like the
+// legacy "box_" keys instead of reaching diagnostics in the clear.
+func TestRedactBoxSecretsCoversBothKeyPrefixes(t *testing.T) {
+	for _, tt := range []struct {
+		name, secret, wantPrefix string
+	}{
+		{"legacy box key", "box_realTokenValue", "box_REDACTED"},
+		{"renamed boat key", "boat_realTokenValue", "boat_REDACTED"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactBoxSecrets("ascii-box CLI limits failed: rejected " + tt.secret)
+			if strings.Contains(got, tt.secret) {
+				t.Fatalf("redacted output leaked the key: %q", got)
+			}
+			if !strings.Contains(got, tt.wantPrefix) {
+				t.Fatalf("redacted=%q want it to contain %q", got, tt.wantPrefix)
+			}
+		})
+	}
+}
+
+// Pin connection resolution: an advertised endpoint wins, and the ip:22 fallback stays
+// available for a box that reports no endpoint at all.
+func TestBoxSSHConnectionPrefersAdvertisedEndpoint(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		box      boxData
+		wantHost string
+		wantPort string
+		wantErr  bool
+	}{
+		{name: "advertised endpoint", box: boxData{ID: "bx_1", IP: "203.0.113.10", SSHEndpoint: "198.51.100.20:19040"}, wantHost: "198.51.100.20", wantPort: "19040"},
+		{name: "snake_case endpoint alias", box: boxData{ID: "bx_1", SSHEndpointAlt: "198.51.100.20:19041"}, wantHost: "198.51.100.20", wantPort: "19041"},
+		{name: "no endpoint falls back to ip:22", box: boxData{ID: "bx_1", IP: "203.0.113.10"}, wantHost: "203.0.113.10", wantPort: "22"},
+		{name: "malformed endpoint is rejected", box: boxData{ID: "bx_1", IP: "203.0.113.10", SSHEndpoint: "198.51.100.20"}, wantErr: true},
+		{name: "no host at all is rejected", box: boxData{ID: "bx_1"}, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			host, port, err := boxSSHConnection(tt.box)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("host=%q port=%q want error", host, port)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if host != tt.wantHost || port != tt.wantPort {
+				t.Fatalf("host=%q port=%q want %q %q", host, port, tt.wantHost, tt.wantPort)
+			}
+		})
+	}
+}
+
+// Releasing a lease must survive the rename: the current CLI reports deletion
+// operations with kind "sandbox" while older Box CLIs reported "box". Any other
+// kind must still be rejected so the claim is retained.
+func TestValidateBoxDeletionOperationAcceptsRenamedKind(t *testing.T) {
+	const opID = "bdop_e896e624d8af4d9e92cab7848ecb8a83"
+	for _, tt := range []struct {
+		name, kind string
+		wantErr    bool
+	}{
+		{"renamed sandbox kind", "sandbox", false},
+		{"legacy box kind", "box", false},
+		{"unrelated kind is rejected", "snapshot", true},
+		{"empty kind is rejected", "", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			operation := boxDeletionOperation{ID: opID, Kind: tt.kind, TargetID: "bx_1", Status: "pending"}
+			err := validateBoxDeletionOperation(operation, "bx_1", opID)
+			if tt.wantErr && err == nil {
+				t.Fatalf("kind %q was accepted", tt.kind)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("kind %q rejected: %v", tt.kind, err)
+			}
+		})
+	}
+}
+
+// The CLI owns this key. Crabbox falls forward to the renamed name only when
+// the legacy key is absent, so a pre-rename home keeps presenting the exact
+// credential it always did and no existing setup can change behavior. The
+// legacy key wins whenever it exists, whatever its age relative to a renamed
+// key that the configured CLI never authorized.
+func TestBoxSSHKeyPrefersTheLegacyKeyWhenPresent(t *testing.T) {
+	legacy, renamed := "ascii_box_ed25519", "ascii_sandbox_ed25519"
+	for _, tt := range []struct {
+		name        string
+		present     []string
+		legacyOlder bool
+		want        string
+	}{
+		{name: "only the renamed CLI has run", present: []string{renamed}, want: renamed},
+		{name: "only a legacy CLI has run", present: []string{legacy}, want: legacy},
+		{name: "both present keeps the legacy key", present: []string{legacy, renamed}, want: legacy},
+		{name: "legacy key older than an unused renamed key still wins", present: []string{legacy, renamed}, legacyOlder: true, want: legacy},
+		{name: "neither present keeps the legacy name", want: legacy},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("CRABBOX_ASCII_BOX_HOME", home)
+			dir := filepath.Join(home, ".ssh")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range tt.present {
+				if err := os.WriteFile(filepath.Join(dir, key), []byte("key"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.legacyOlder {
+				old := time.Now().Add(-90 * 24 * time.Hour)
+				if err := os.Chtimes(filepath.Join(dir, legacy), old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, want := boxSSHKey(core.Config{}), filepath.Join(dir, tt.want); got != want {
+				t.Fatalf("boxSSHKey()=%q want %q", got, want)
+			}
+		})
+	}
+}
+
+// ASCII renamed the Box CLI to Boat. A current install ships only "boat", but an
+// explicitly configured command must always be honored exactly as given.
+func TestResolveAsciiBoxCLIPrefersInstalledBinary(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		configured string
+		installed  map[string]bool
+		want       string
+	}{
+		{"legacy box still installed", "box", map[string]bool{"box": true, "boat": true}, "box"},
+		{"only renamed boat installed", "box", map[string]bool{"boat": true}, "boat"},
+		{"empty falls back to boat when box absent", "", map[string]bool{"boat": true}, "boat"},
+		{"neither installed keeps legacy name", "box", nil, "box"},
+		{"explicit boat honored", "boat", map[string]bool{"box": true}, "boat"},
+		{"explicit absolute path honored", "/opt/ascii/bin/box", nil, "/opt/ascii/bin/box"},
+		{"explicit relative path honored", "./box", map[string]bool{"boat": true}, "./box"},
+		{"explicit other name honored", "box-legacy", map[string]bool{"boat": true}, "box-legacy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := asciiBoxCLILookPath
+			t.Cleanup(func() { asciiBoxCLILookPath = original })
+			asciiBoxCLILookPath = func(name string) (string, error) {
+				if tt.installed[name] {
+					return "/usr/local/bin/" + name, nil
+				}
+				return "", fmt.Errorf("%s: not found", name)
+			}
+			if got := resolveAsciiBoxCLI(tt.configured); got != tt.want {
+				t.Fatalf("resolveAsciiBoxCLI(%q)=%q want %q", tt.configured, got, tt.want)
+			}
+		})
+	}
+}
+
+// ASCII renamed Box to Boat and renamed the CLI's JSON envelope from
+// "box"/"boxes" to "sandbox"/"sandboxes". One build must read both.
+func TestDecodeBoxAcceptsRenamedEnvelope(t *testing.T) {
+	for _, tt := range []struct {
+		name, payload string
+	}{
+		{"renamed sandbox envelope", `{"sandbox":{"id":"bx_1","state":"idle","sshEndpoint":"198.51.100.20:19035"}}`},
+		{"legacy box envelope", `{"box":{"id":"bx_1","state":"idle","sshEndpoint":"198.51.100.20:19035"}}`},
+		{"bare object", `{"id":"bx_1","state":"idle","sshEndpoint":"198.51.100.20:19035"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			box, err := decodeBox([]byte(tt.payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if box.ID != "bx_1" || box.State != "idle" || box.SSHEndpoint != "198.51.100.20:19035" {
+				t.Fatalf("decoded=%#v", box)
+			}
+		})
+	}
+}
+
+func TestDecodeBoxesAcceptsRenamedEnvelope(t *testing.T) {
+	for _, tt := range []struct {
+		name, payload string
+		want          int
+	}{
+		{"renamed sandboxes envelope", `{"sandboxes":[{"id":"bx_1"},{"id":"bx_2"}],"pageInfo":{"hasMore":false,"nextCursor":null}}`, 2},
+		{"legacy boxes envelope", `{"boxes":[{"id":"bx_1"},{"id":"bx_2"}]}`, 2},
+		{"renamed empty inventory proves absence", `{"sandboxes":[],"pageInfo":{"hasMore":false,"nextCursor":null}}`, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			boxes, err := decodeBoxes([]byte(tt.payload), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(boxes) != tt.want {
+				t.Fatalf("decoded %d boxes, want %d: %#v", len(boxes), tt.want, boxes)
+			}
+		})
+	}
+}
+
+// A transitional CLI can report a Box under only one envelope. Cleanup reads
+// this inventory as proof that a Box is really gone, so every reported resource
+// has to survive decoding or a still-present Box could have its claim removed.
+func TestDecodeBoxesReconcilesBothEnvelopes(t *testing.T) {
+	for _, tt := range []struct {
+		name, payload string
+		want          []string
+	}{
+		{"conflicting equal-length envelopes keep both", `{"sandboxes":[{"id":"bx_other"}],"boxes":[{"id":"bx_target"}]}`, []string{"bx_other", "bx_target"}},
+		{"empty sandboxes cannot hide populated boxes", `{"sandboxes":[],"boxes":[{"id":"bx_target"}]}`, []string{"bx_target"}},
+		{"empty boxes cannot hide populated sandboxes", `{"boxes":[],"sandboxes":[{"id":"bx_target"}]}`, []string{"bx_target"}},
+		{"same Box in both envelopes is not duplicated", `{"sandboxes":[{"id":"bx_target"}],"boxes":[{"id":"bx_target"}]}`, []string{"bx_target"}},
+		{"both genuinely empty still proves absence", `{"sandboxes":[],"boxes":[]}`, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			boxes, err := decodeBoxes([]byte(tt.payload), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, box := range boxes {
+				got = append(got, box.ID)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("decoded %v want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("decoded %v want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// Merging the two envelopes must not lose fields reported by only one of them.
+func TestDecodeBoxesMergesFieldsAcrossEnvelopes(t *testing.T) {
+	boxes, err := decodeBoxes([]byte(`{"sandboxes":[{"id":"bx_1","state":"ready"}],"boxes":[{"id":"bx_1","sshEndpoint":"198.51.100.20:19036"}]}`), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boxes) != 1 || boxes[0].State != "ready" || boxes[0].SSHEndpoint != "198.51.100.20:19036" {
+		t.Fatalf("merged=%#v", boxes)
+	}
+}
+
+// A paginated inventory can never prove complete absence, whichever envelope
+// the CLI used to report it.
+func TestDecodeBoxesRejectsPaginatedRenamedInventory(t *testing.T) {
+	if _, err := decodeBoxes([]byte(`{"sandboxes":[{"id":"bx_1"}],"pageInfo":{"hasMore":true,"nextCursor":"c1"}}`), true); err == nil {
+		t.Fatal("paginated renamed inventory was accepted as complete")
+	}
+}
+
 func TestAcquireClaimsBoxAndReturnsSSHTarget(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	fake := &fakeAPI{box: testBox()}
@@ -522,7 +962,7 @@ func TestAcquireClaimsBoxAndReturnsSSHTarget(t *testing.T) {
 	stubSSHWait(t)
 
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	lease, err := backend.Acquire(context.Background(), AcquireRequest{
+	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{
 		Repo:          core.Repo{Name: "repo", Root: t.TempDir()},
 		Options:       core.LeaseOptions{TTL: 45 * time.Minute},
 		Keep:          true,
@@ -553,6 +993,9 @@ func TestAcquireClaimsBoxAndReturnsSSHTarget(t *testing.T) {
 	if claim.Provider != providerName || claim.ProviderScope != (Provider{}).ClaimScope(testConfig()) || claim.Slug != "proof" {
 		t.Fatalf("claim=%#v", claim)
 	}
+	if claim.Labels["ttl_secs"] != "2700" || lease.Server.Labels["created_at"] != claim.Labels["created_at"] {
+		t.Fatalf("acquisition policy was not seeded once from its request: claim=%v lease=%v", claim.Labels, lease.Server.Labels)
+	}
 }
 
 func TestAcquireUsesBoxSSHEndpoint(t *testing.T) {
@@ -563,7 +1006,7 @@ func TestAcquireUsesBoxSSHEndpoint(t *testing.T) {
 	stubSSHWait(t)
 
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	lease, err := backend.Acquire(context.Background(), AcquireRequest{
+	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{
 		Repo: core.Repo{Name: "repo", Root: t.TempDir()},
 		Keep: true,
 	})
@@ -578,12 +1021,94 @@ func TestAcquireUsesBoxSSHEndpoint(t *testing.T) {
 	}
 }
 
+func TestLeaseFromBoxScopesHostTrustToLease(t *testing.T) {
+	for _, endpoint := range []string{"", "198.51.100.20:19036"} {
+		t.Run(core.Blank(endpoint, "legacy-ip"), func(t *testing.T) {
+			testutil.IsolateUserDirs(t)
+			t.Setenv("CRABBOX_ASCII_BOX_HOME", t.TempDir())
+			cfg := testConfig()
+			sharedKey := boxSSHKey(cfg)
+			if err := os.MkdirAll(filepath.Dir(sharedKey), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sharedTrust := filepath.Join(filepath.Dir(sharedKey), "known_hosts")
+			if err := os.WriteFile(sharedTrust, []byte("shared provider trust\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stubSSHWait(t)
+			var waited []core.SSHTarget
+			waitForSSHReadyFunc = func(_ context.Context, target *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+				waited = append(waited, *target)
+				return nil
+			}
+			b := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
+			box := testBox()
+			box.SSHEndpoint = endpoint
+			first, err := b.leaseFromBox(context.Background(), cfg, box, core.LeaseClaim{LeaseID: "cbx_123456789abc", Slug: "first"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.SSH.KnownHostsFile == "" || first.SSH.KnownHostsFile == sharedTrust || filepath.Base(filepath.Dir(first.SSH.KnownHostsFile)) != first.LeaseID {
+				t.Fatalf("host trust is not lease-scoped: %+v", first.SSH)
+			}
+			const enrolled = "first lease host key\n"
+			if err := os.WriteFile(first.SSH.KnownHostsFile, []byte(enrolled), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			again, err := b.leaseFromBox(context.Background(), cfg, box, core.LeaseClaim{LeaseID: first.LeaseID, Slug: "first"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			box.ID = "bx_2"
+			second, err := b.leaseFromBox(context.Background(), cfg, box, core.LeaseClaim{LeaseID: "cbx_abcdef123456", Slug: "second"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if again.SSH.KnownHostsFile != first.SSH.KnownHostsFile || second.SSH.KnownHostsFile == first.SSH.KnownHostsFile || second.SSH.Host != first.SSH.Host || second.SSH.Port != first.SSH.Port {
+				t.Fatalf("incorrect host trust reuse: first=%+v again=%+v second=%+v", first.SSH, again.SSH, second.SSH)
+			}
+			for _, lease := range []core.LeaseTarget{first, again, second} {
+				if lease.SSH.Key != sharedKey || lease.SSH.DisableHostKeyChecking || !lease.SSH.NoControlMaster {
+					t.Fatalf("changed native authentication or SSH policy: %+v", lease.SSH)
+				}
+			}
+			if len(waited) != 3 || waited[0].KnownHostsFile != first.SSH.KnownHostsFile || waited[2].KnownHostsFile != second.SSH.KnownHostsFile {
+				t.Fatalf("readiness did not use scoped trust: %+v", waited)
+			}
+			if data, err := os.ReadFile(first.SSH.KnownHostsFile); err != nil || string(data) != enrolled {
+				t.Fatalf("reuse overwrote enrolled host trust: %q, %v", data, err)
+			}
+			if _, err := os.Stat(second.SSH.KnownHostsFile); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("new lease inherited host trust: %v", err)
+			}
+			if data, err := os.ReadFile(sharedTrust); err != nil || string(data) != "shared provider trust\n" {
+				t.Fatalf("shared trust changed: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestLeaseFromBoxRejectsUnsafeHostTrustPathBeforeReadiness(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	stubSSHWait(t)
+	waited := false
+	waitForSSHReadyFunc = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
+		waited = true
+		return nil
+	}
+	b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
+	_, err := b.leaseFromBox(context.Background(), testConfig(), testBox(), core.LeaseClaim{LeaseID: "../outside", Slug: "unsafe"})
+	if err == nil || waited {
+		t.Fatalf("unsafe lease host trust reached readiness: err=%v waited=%t", err, waited)
+	}
+}
+
 func TestBoxSSHTargetRejectsMalformedEndpoint(t *testing.T) {
 	_, err := boxSSHTarget(testConfig(), boxData{
 		ID:          "bx_malformed",
 		IP:          "203.0.113.10",
 		SSHEndpoint: "gateway-without-port",
-	})
+	}, "cbx_123456789abc")
 	if err == nil || !strings.Contains(err.Error(), "invalid SSH endpoint") {
 		t.Fatalf("err=%v, want malformed endpoint error", err)
 	}
@@ -598,7 +1123,7 @@ func TestAcquireReleasesPartiallyCreatedBox(t *testing.T) {
 	withFakeAPI(t, fake)
 
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, err := backend.Acquire(context.Background(), AcquireRequest{
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{
 		Repo: core.Repo{Name: "repo", Root: t.TempDir()},
 		Keep: true,
 	})
@@ -620,14 +1145,14 @@ func TestResolveUsesClaimScopeAndReleaseDeletesBox(t *testing.T) {
 	}
 
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: "proof"})
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "proof"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lease.LeaseID != "cbx_123456789abc" || lease.Server.CloudID != "bx_1" || lease.SSH.Host != "203.0.113.10" {
 		t.Fatalf("lease=%#v", lease)
 	}
-	if err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(fake.deletedIDs, []string{"bx_1"}) {
@@ -647,7 +1172,7 @@ func TestResolveReleaseOnlyDoesNotRequireSSHFields(t *testing.T) {
 	}
 
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: "booting", ReleaseOnly: true})
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "booting", ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +1187,7 @@ func TestResolveRawBoxIDDoesNotAdopt(t *testing.T) {
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
 	for _, releaseOnly := range []bool{false, true} {
-		_, err := backend.Resolve(context.Background(), ResolveRequest{ID: "bx_external", Repo: core.Repo{Root: t.TempDir()}, ReleaseOnly: releaseOnly, Reclaim: true})
+		_, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "bx_external", Repo: core.Repo{Root: t.TempDir()}, ReleaseOnly: releaseOnly, Reclaim: true})
 		if err == nil {
 			t.Fatal("unclaimed raw ID was accepted")
 		}
@@ -674,24 +1199,130 @@ func TestResolveRawBoxIDDoesNotAdopt(t *testing.T) {
 }
 
 func TestStatusMapsBoxAPIFields(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	fake := &fakeAPI{box: testBox()}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	view, err := backend.Status(context.Background(), StatusRequest{ID: "bx_1"})
+	view, err := backend.Status(context.Background(), core.StatusRequest{ID: "bx_1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if view.ID != "ascii_bx_1" || view.ServerID != "bx_1" || view.SSHHost != "203.0.113.10" || view.SSHUser != "user" || !view.Ready {
 		t.Fatalf("view=%#v", view)
 	}
+	created, _ := time.Parse(time.RFC3339Nano, boxCreationTime(fake.box))
+	if view.Labels["created_at"] != core.LeaseLabelTime(created) || view.Labels[boxCreationLabel] != boxCreationTime(fake.box) {
+		t.Fatalf("native creation lost: %v", view.Labels)
+	}
+	for _, key := range []string{"expires_at", "ttl_secs", "idle_timeout_secs", "last_touched_at", "keep"} {
+		if _, ok := view.Labels[key]; ok {
+			t.Fatalf("unclaimed observation invented %s: %v", key, view.Labels)
+		}
+	}
+	if view.ExpiresAt != "" {
+		t.Fatalf("invented native expiry: %q", view.ExpiresAt)
+	}
 }
+
+func TestObservedBoxMetadataPreservesRecordedHistory(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fake := &fakeAPI{box: testBox()}
+	fake.box.UpdatedAt = "2026-08-30T12:01:00Z"
+	fake.box.ExpiresAt = "2026-08-30T13:00:00Z"
+	withFakeAPI(t, fake)
+	stubSSHWait(t)
+	cfg := testConfig()
+	cfg.TTL, cfg.IdleTimeout = 10*time.Minute, 5*time.Minute
+	b := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
+	repo := core.Repo{Root: t.TempDir(), Name: "fixture"}
+	lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: repo, RequestedSlug: "history"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := core.ReadLeaseClaim(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.cfg.TTL, b.cfg.IdleTimeout = 90*time.Minute, 30*time.Minute
+	lease, err = b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := core.UpdateLeaseClaimEndpointIfUnchanged(lease.LeaseID, original, lease.Server, lease.SSH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, before, true)
+	for _, key := range []string{"created_at", "ttl_secs", "keep", "last_touched_at", "expires_at"} {
+		if before.Labels[key] != original.Labels[key] {
+			t.Fatalf("reuse reset recorded %s: before=%q after=%q", key, original.Labels[key], before.Labels[key])
+		}
+	}
+	status, err := b.Status(t.Context(), core.StatusRequest{ID: lease.LeaseID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := b.List(t.Context(), core.ListRequest{})
+	if err != nil || len(inventory) != 1 {
+		t.Fatalf("inventory=%v err=%v", inventory, err)
+	}
+	readOnly, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _ := time.Parse(time.RFC3339Nano, boxCreationTime(fake.box))
+	updated, _ := time.Parse(time.RFC3339Nano, fake.box.UpdatedAt.(string))
+	for _, labels := range []map[string]string{status.Labels, inventory[0].Labels, readOnly.Server.Labels} {
+		if labels["created_at"] != core.LeaseLabelTime(created) || labels["updated_at"] != core.LeaseLabelTime(updated) || labels["expires_at"] != fake.box.ExpiresAt || labels["ttl_secs"] != "600" || labels["idle_timeout_secs"] != "300" || labels["keep"] != "false" {
+			t.Fatalf("observation mixed native facts and reader defaults: %v", labels)
+		}
+	}
+	after, err := core.ReadLeaseClaim(lease.LeaseID)
+	if err != nil || !reflect.DeepEqual(after, before) {
+		t.Fatalf("observation changed recorded history: %v", err)
+	}
+	used, _ := time.Parse(time.RFC3339Nano, before.LastUsedAt)
+	b.rt.Clock = metadataClock(used.Add(time.Minute))
+	touched, err := b.Touch(t.Context(), core.TouchRequest{Lease: lease, State: "working"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err = core.ReadLeaseClaim(lease.LeaseID)
+	if err != nil || after.LastUsedAt != b.now().Format(time.RFC3339) || after.IdleTimeoutSeconds != 300 || after.Labels["created_at"] != original.Labels["created_at"] || after.Labels["ttl_secs"] != "600" || after.Labels["keep"] != "false" {
+		t.Fatalf("touch lost recorded policy or did not persist activity: claim=%#v err=%v", after, err)
+	}
+	lease.Server = touched
+	override := 10 * time.Minute
+	if _, err := b.Touch(t.Context(), core.TouchRequest{Lease: lease, State: "ready", IdleTimeoutOverride: &override}); err != nil {
+		t.Fatal(err)
+	}
+	status, err = b.Status(t.Context(), core.StatusRequest{ID: lease.LeaseID})
+	if err != nil || status.Labels["idle_timeout_secs"] != "600" || status.Labels["created_at"] != core.LeaseLabelTime(created) || status.ExpiresAt != fake.box.ExpiresAt {
+		t.Fatalf("explicit idle replacement changed native facts or was not persisted: view=%#v err=%v", status, err)
+	}
+}
+
+func TestObservedBoxMissingNativeTimes(t *testing.T) {
+	box := testBox()
+	box.CreatedAt, box.UpdatedAt = "invalid", nil
+	view := statusFromBox(testConfig(), box, "ascii_bx_1", "unknown", nil)
+	for _, key := range []string{"created_at", "updated_at", "expires_at", "ttl_secs", "last_touched_at"} {
+		if _, ok := view.Labels[key]; ok {
+			t.Fatalf("invented missing %s: %v", key, view.Labels)
+		}
+	}
+}
+
+type metadataClock time.Time
+
+func (c metadataClock) Now() time.Time { return time.Time(c) }
 
 func TestStatusMapsBoxSSHEndpoint(t *testing.T) {
 	fake := &fakeAPI{box: testBox()}
 	fake.box.SSHEndpoint = "198.51.100.20:19036"
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	view, err := backend.Status(context.Background(), StatusRequest{ID: "bx_1"})
+	view, err := backend.Status(context.Background(), core.StatusRequest{ID: "bx_1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,7 +1335,7 @@ func TestStatusWaitReturnsTerminalBoxState(t *testing.T) {
 	fake := &fakeAPI{box: boxData{ID: "bx_failed", State: "error", IP: "203.0.113.10"}}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	view, err := backend.Status(context.Background(), StatusRequest{ID: "bx_failed", Wait: true, WaitTimeout: time.Minute})
+	view, err := backend.Status(context.Background(), core.StatusRequest{ID: "bx_failed", Wait: true, WaitTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,11 +1377,11 @@ func hasFeature(features core.FeatureSet, want core.Feature) bool {
 	return false
 }
 
-func testConfig() Config {
-	return Config{
+func testConfig() core.Config {
+	return core.Config{
 		Provider: providerName,
 		SSHKey:   "/tmp/global-crabbox-key",
-		AsciiBox: AsciiBoxConfig{
+		AsciiBox: core.AsciiBoxConfig{
 			APIKey:  "box_key",
 			BaseURL: "https://ascii.dev",
 			CLIPath: "box",
@@ -759,8 +1390,8 @@ func testConfig() Config {
 	}
 }
 
-func testRuntime() Runtime {
-	return Runtime{Stdout: io.Discard, Stderr: io.Discard}
+func testRuntime() core.Runtime {
+	return core.Runtime{Stdout: io.Discard, Stderr: io.Discard}
 }
 
 func testBox() boxData {
@@ -770,14 +1401,14 @@ func testBox() boxData {
 func withFakeAPI(t *testing.T, fake api) {
 	t.Helper()
 	original := newAPI
-	newAPI = func(Config, Runtime) (api, error) { return fake, nil }
+	newAPI = func(core.Config, core.Runtime) (api, error) { return fake, nil }
 	t.Cleanup(func() { newAPI = original })
 }
 
 func stubSSHWait(t *testing.T) {
 	t.Helper()
 	original := waitForSSHReadyFunc
-	waitForSSHReadyFunc = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error { return nil }
+	waitForSSHReadyFunc = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error { return nil }
 	t.Cleanup(func() { waitForSSHReadyFunc = original })
 }
 
@@ -808,6 +1439,8 @@ func (f *fakeAPI) CreateBox(_ context.Context, req createRequest) (boxData, erro
 
 func (f *fakeAPI) Check(context.Context) error { return nil }
 
+func (f *fakeAPI) waitForBoxReady(_ context.Context, box boxData) (boxData, error) { return box, nil }
+
 func (f *fakeAPI) PrepareSSH(_ context.Context, id string) error {
 	f.prepareIDs = append(f.prepareIDs, id)
 	if f.prepareHook != nil {
@@ -821,13 +1454,13 @@ func (f *fakeAPI) GetBox(_ context.Context, id string) (boxData, error) {
 		return f.getHook(id)
 	}
 	if f.deleted {
-		return boxData{}, fmt.Errorf("404 not found")
+		return boxData{}, &boxNotFoundError{id: "bx_1"}
 	}
 	if f.box.ID == "" {
 		f.box = testBox()
 	}
 	if id != f.box.ID {
-		return boxData{}, fmt.Errorf("404 not found")
+		return boxData{}, &boxNotFoundError{id: "bx_1"}
 	}
 	return f.box, nil
 }
@@ -868,6 +1501,7 @@ func (f *fakeAPI) GetDeletionOperation(_ context.Context, targetID, operationID 
 
 type fakeCommandRunner struct {
 	commands   []string
+	requests   []core.LocalCommandRequest
 	env        [][]string
 	configPath string
 	newStdout  string
@@ -877,7 +1511,7 @@ type fakeCommandRunner struct {
 }
 
 type commandOutcome struct {
-	result LocalCommandResult
+	result core.LocalCommandResult
 	err    error
 }
 
@@ -888,15 +1522,15 @@ type releaseCommandRunner struct {
 	onAction   func(string)
 }
 
-func (r *releaseCommandRunner) Run(_ context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+func (r *releaseCommandRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	r.commands = append(r.commands, strings.Join(append([]string{req.Name}, req.Args...), " "))
 	action := boxCLIAction(req.Args)
 	if action == "status" {
-		return LocalCommandResult{Stdout: fmt.Sprintf(`{"account":null,"api":{},"config":{"path":%q}}`, r.configPath)}, nil
+		return core.LocalCommandResult{Stdout: fmt.Sprintf(`{"account":null,"api":{},"config":{"path":%q}}`, r.configPath)}, nil
 	}
 	queue := r.outcomes[action]
 	if len(queue) == 0 {
-		return LocalCommandResult{Stderr: "unexpected command"}, fmt.Errorf("unexpected %s command", action)
+		return core.LocalCommandResult{Stderr: "unexpected command"}, fmt.Errorf("unexpected %s command", action)
 	}
 	outcome := queue[0]
 	r.outcomes[action] = queue[1:]
@@ -918,12 +1552,13 @@ func boxCLIAction(args []string) string {
 
 func snapshotGuardOutcome() commandOutcome {
 	return commandOutcome{
-		result: LocalCommandResult{Stdout: `{"code":"snapshot_required","error":"Refusing request: no successful snapshot in the last 30 minutes.","status":409}`},
+		result: core.LocalCommandResult{Stdout: `{"code":"snapshot_required","error":"Refusing request: no successful snapshot in the last 30 minutes.","status":409}`},
 		err:    fmt.Errorf("exit status 1"),
 	}
 }
 
-func (r *fakeCommandRunner) Run(_ context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+func (r *fakeCommandRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+	r.requests = append(r.requests, req)
 	r.commands = append(r.commands, strings.Join(append([]string{req.Name}, req.Args...), " "))
 	r.env = append(r.env, req.Env)
 	joined := strings.Join(req.Args, " ")
@@ -931,36 +1566,49 @@ func (r *fakeCommandRunner) Run(_ context.Context, req LocalCommandRequest) (Loc
 	case strings.Contains(joined, " deletion status "+testDeletionID):
 		return deletionOutcome(testDeletionID, "bx_1", "box", "completed").result, nil
 	case strings.Contains(joined, " status"):
-		return LocalCommandResult{Stdout: fmt.Sprintf(`{"account":null,"api":{},"config":{"path":%q}}`, r.configPath)}, nil
+		return core.LocalCommandResult{Stdout: fmt.Sprintf(`{"account":null,"api":{},"config":{"path":%q}}`, r.configPath)}, nil
 	case strings.Contains(joined, " new "):
 		if r.newStdout != "" || r.newErr != nil {
-			return LocalCommandResult{Stdout: r.newStdout}, r.newErr
+			return core.LocalCommandResult{Stdout: r.newStdout}, r.newErr
 		}
-		return LocalCommandResult{Stdout: strings.Join([]string{
+		return core.LocalCommandResult{Stdout: strings.Join([]string{
 			`{"event":"created","id":"bx_1","ttlSeconds":1800}`,
 			`{"event":"state","id":"bx_1","state":"provisioning"}`,
 			`{"event":"ready","id":"bx_1","state":"ready","ip":"203.0.113.10","archiveAfter":"2026-05-30T20:00:00Z"}`,
 		}, "\n")}, nil
 	case strings.Contains(joined, " ssh bx_1 -- true"):
-		return LocalCommandResult{}, nil
+		return core.LocalCommandResult{}, nil
 	case strings.Contains(joined, " info bx_1"):
-		return LocalCommandResult{Stdout: `{"box":{"id":"bx_1","state":"ready","ip":"203.0.113.10"}}`}, nil
+		return core.LocalCommandResult{Stdout: `{"box":{"id":"bx_1","state":"ready","ip":"203.0.113.10"}}`}, nil
 	case strings.Contains(joined, " info bx_2"):
 		if len(r.infoResponses) == 0 {
-			return LocalCommandResult{Stderr: "missing info response"}, fmt.Errorf("missing info response")
+			return core.LocalCommandResult{Stderr: "missing info response"}, fmt.Errorf("missing info response")
 		}
 		out := r.infoResponses[0]
 		r.infoResponses = r.infoResponses[1:]
-		return LocalCommandResult{Stdout: out}, nil
+		return core.LocalCommandResult{Stdout: out}, nil
 	case strings.Contains(joined, " list"):
-		return LocalCommandResult{Stdout: `{"boxes":[{"id":"bx_1","state":"ready","ip":"203.0.113.10"}]}`}, nil
+		return core.LocalCommandResult{Stdout: `{"boxes":[{"id":"bx_1","state":"ready","ip":"203.0.113.10"}]}`}, nil
 	case strings.Contains(joined, " stop bx_1"):
-		return LocalCommandResult{Stdout: `{"id":"bx_1","status":"deleted"}`}, nil
+		return core.LocalCommandResult{Stdout: `{"id":"bx_1","status":"deleted"}`}, nil
 	case strings.Contains(joined, " delete bx_1"):
 		return deletionOutcome(testDeletionID, "bx_1", "box", "completed").result, nil
 	default:
-		return LocalCommandResult{Stderr: "unexpected command"}, fmt.Errorf("unexpected command")
+		return core.LocalCommandResult{Stderr: "unexpected command"}, fmt.Errorf("unexpected command")
 	}
+}
+
+type boxCommandRunnerFunc func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error)
+
+func (f boxCommandRunnerFunc) Run(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+	return f(ctx, req)
+}
+
+type boxProgressOutput chan string
+
+func (out boxProgressOutput) Write(data []byte) (int, error) {
+	out <- string(data)
+	return len(data), nil
 }
 
 func hasEnv(env []string, want string) bool {

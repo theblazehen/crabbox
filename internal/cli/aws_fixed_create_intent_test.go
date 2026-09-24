@@ -188,11 +188,8 @@ func TestFixedAWSCreateIntentClassifiesEveryExportedConfigField(t *testing.T) {
 	`)
 	classify("non-AWS provider selection", `
 		Location Image AWSLambdaMicroVM
-		AzureSubscription AzureTenant AzureClientID AzureLocation AzureBackend AzureResourceGroup
-		AzureImage AzureSnapshot AzureSnapshotSKU AzureOSDisk AzureOSDiskExplicit AzureOSDiskSKU
-		AzureVNet AzureSubnet AzureNSG AzureSSHCIDRs AzureNetwork AzureDynamicSessions
-		GCPProject GCPZone GCPImage GCPMachineImage GCPSnapshot GCPNetwork GCPSubnet GCPTags
-		GCPSSHCIDRs GCPRootGB GCPServiceAccount DigitalOcean Vultr Linode GitHubCodespaces
+		Azure AzureDynamicSessions
+		GCP DigitalOcean Vultr Linode GitHubCodespaces
 		Lambda Nebius OVH Scaleway TencentCloud Incus Proxmox Firecracker XCPNg Parallels
 		Blacksmith KubeVirt SealosDevbox AgentSandbox External Namespace NamespaceInstance
 		Phala Boxd Coder Morph Daytona E2B CubeSandbox ExeDev Railway FastAPICloud UnikraftCloud
@@ -203,7 +200,7 @@ func TestFixedAWSCreateIntentClassifiesEveryExportedConfigField(t *testing.T) {
 		AppleContainer AppleVM MXC Multipass Machine0 Tart Lume HyperV WindowsSandbox Static
 	`)
 	classify("post-acquisition command, transport, or reporting behavior", `
-		Sync Run EnvAllow Actions Results Shard Profiles Presets ProofTemplates Jobs
+		Sync Run EnvAllow Actions Results Shard Profiles Presets ProofTemplates Jobs RecordLocal
 	`)
 
 	configType := reflect.TypeOf(Config{})

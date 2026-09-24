@@ -12,6 +12,22 @@ const workflow = fs.readFileSync(
   "utf8",
 );
 
+function runScript(step) {
+  const marker = "        run: |\n";
+  assert.ok(step.includes(marker), "step has a literal run block");
+  const lines = step.slice(step.indexOf(marker) + marker.length).split("\n");
+  const end = lines.findIndex((line) => line.trim() && !line.startsWith("          "));
+  return lines.slice(0, end < 0 ? undefined : end)
+    .map((line) => line.replace(/^ {10}/, "")).join("\n");
+}
+
+test("run block extraction stops at the next step or job and accepts EOF", () => {
+  const block = "        run: |\n          echo fixture\n";
+  for (const suffix of ["", "      - name: Next\n", "  next-job:\n"]) {
+    assert.equal(runScript(block + suffix).trim(), "echo fixture");
+  }
+});
+
 test("connector lifecycle gate runs on pull requests, main pushes, and manual dispatch only", () => {
   const trigger = workflow.slice(workflow.indexOf("\non:"), workflow.indexOf("permissions:"));
   assert.match(trigger, /pull_request:/);
@@ -38,7 +54,7 @@ test("matrix rows do not fail fast and are time-bounded", () => {
     /- name: local-container\n([\s\S]*?)(?=\n {10}- name:)/,
   )?.[1];
   assert.ok(localContainer, "local-container row exists");
-  assert.match(localContainer, /timeout-minutes: 30/);
+  assert.match(localContainer, /timeout-minutes: 40/);
   assert.equal((workflow.match(/^ {12}timeout-minutes:/gm) ?? []).length, 1);
 });
 
@@ -79,8 +95,7 @@ for (const scenario of [
       .split("\n      - name:")[0];
     assert.match(step, /RSYNC_VERSION: 3\.4\.4\n/);
     assert.match(step, /RSYNC_SHA256: bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96\n/);
-    const script = step.split("        run: |\n")[1].split("\n")
-      .map((line) => line.replace(/^ {10}/, "")).join("\n");
+    const script = runScript(step);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-rsync-download-"));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const bin = path.join(dir, "bin");
@@ -147,14 +162,55 @@ fs.appendFileSync(process.env.FIXTURE_CALLS, JSON.stringify({tool:path.basename(
   });
 }
 
+// The gate requires the concurrency subtest to run and pass alongside its
+// parent, so a successful fixture has to emit both. The negative scenarios keep
+// the subtest's own missing and skipped cases covered.
+for (const scenario of [
+  { name: "executed successfully", actions: ["run", "pass"], concurrency: ["run", "pass"], succeeds: true },
+  { name: "skipped native fixture", actions: ["run", "skip"], concurrency: ["run", "skip"] },
+  { name: "missing native fixture", actions: [] },
+  { name: "Go fails after a passing test event", actions: ["run", "pass"], concurrency: ["run", "pass"], exit: 1 },
+  { name: "missing concurrency coverage", actions: ["run", "pass"] },
+  { name: "skipped concurrency coverage", actions: ["run", "pass"], concurrency: ["run", "skip"] },
+  { name: "concurrency skip after pass", actions: ["run", "pass"], concurrency: ["run", "pass", "skip"] },
+]) {
+  test(`native lifecycle gate: ${scenario.name}`, (t) => {
+    const marker = "      - name: Verify native local-container lifecycle and cleanup\n";
+    const script = runScript(workflow.slice(workflow.indexOf(marker) + marker.length));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-native-lifecycle-gate-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const bin = path.join(dir, "bin");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "go"), `#!${process.execPath}
+process.stdout.write(process.env.NATIVE_RECORDS);
+process.exit(Number(process.env.NATIVE_EXIT));
+`, { mode: 0o755 });
+    const records = [
+      ...scenario.actions.map((Action) => ({ Test: "TestLocalContainerProviderE2E", Action })),
+      ...(scenario.concurrency ?? []).map((Action) => ({
+        Test: "TestLocalContainerProviderE2E/concurrent-cli-warmups",
+        Action,
+      })),
+    ];
+    // Match the implicit Actions bash shell; the step must own pipefail.
+    const result = spawnSync("bash", ["-e", "-c", script], {
+      encoding: "utf8", timeout: 10000,
+      env: {
+        PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: dir,
+        NATIVE_RECORDS: records.map((record) => JSON.stringify(record)).join("\n"),
+        NATIVE_EXIT: String(scenario.exit ?? 0),
+      },
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
+    assert.equal(result.status === 0, Boolean(scenario.succeeds), result.stdout + result.stderr);
+  });
+}
+
 test("failed bootstrap diagnostics read only the unique smoke container", (t) => {
   const marker = "      - name: Diagnose local-container bootstrap\n";
   const step = workflow.slice(workflow.indexOf(marker) + marker.length);
-  const script = step
-    .slice(step.indexOf("        run: |\n") + "        run: |\n".length)
-    .split("\n")
-    .map((line) => line.replace(/^ {10}/, ""))
-    .join("\n");
+  const script = runScript(step);
   assert.match(step, /if: failure\(\) && matrix\.name == 'local-container'/);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-bootstrap-diagnostics-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

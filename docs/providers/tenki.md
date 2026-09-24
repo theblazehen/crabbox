@@ -11,6 +11,20 @@ sandbox sessions, then runs normal Crabbox sync/commands over SSH through
 Tenki's sandbox SSH WebSocket proxy using the Tenki-managed SSH key and
 per-session cert.
 
+Crabbox verifies gateway host certificates against Tenki's certificate authority.
+If the Tenki CLI reports a `known_hosts_file`, that file is authoritative. When
+the CLI omits it, Crabbox uses the same workspace key and API endpoint as the CLI
+to retrieve the CA and discover the session's gateway identity. It writes a
+separate authority file alongside the native session certificate, without
+changing Tenki's private keys or certificates. This path requires a workspace
+API key from `tenki onboard` or `TENKI_API_KEY`.
+
+Gateway certificates signed by the trusted CA can rotate without enrolling
+individual leaf keys. Failed discovery, unknown authorities, or missing trust
+files fail closed; Crabbox does not enroll leaf keys or consult other host-trust
+sources. Each new SSH connection rereads the authority file instead of reusing
+a multiplexed connection. Existing connections are not retroactively revoked.
+
 ## When To Use
 
 Use Tenki when the remote Linux machine should be a Tenki sandbox session but
@@ -31,6 +45,53 @@ crabbox stop --provider tenki swift-crab
 crabbox list --provider tenki --json
 ```
 
+## Fixed Lease IDs For Orchestration
+
+Use `warmup --lease-id` when a controller must retry allocation after an
+interrupted dispatch. Choose one canonical ID (`cbx_` plus 12 lowercase hex
+characters) per operation, and keep that ID and the same allocation settings
+for every retry:
+
+```sh
+lease="cbx_$(openssl rand -hex 6)"
+crabbox warmup --provider tenki --network public --tailscale=false \
+  --lease-id "$lease" --slug worker-job --keep=true \
+  --ttl 1h --idle-timeout 10m
+
+# Repeat the same warmup command after an interrupted dispatch.
+crabbox inspect --provider tenki --network public --id "$lease" --json
+crabbox run --provider tenki --network public --tailscale=false \
+  --id "$lease" --keep=true --no-sync --script-stdin <<'SH'
+printf 'worker-ready\n'
+SH
+crabbox heartbeat --provider tenki --id "$lease" --idle-timeout 10m --json
+crabbox stop --provider tenki --id "$lease"
+```
+
+Crabbox saves a durable create attempt before it calls Tenki. A retry verifies
+that attempt against the exact session and reuses the session; it does not
+allocate another sandbox when a create reply or readiness check is lost.
+Changed allocation settings, conflicting ownership, and multiple matching
+sessions fail closed. An empty inventory after an attempted create is not
+proof that creation failed: retain the claim and retry inspection or stop when
+the provider can confirm the session.
+
+Keep the controller's Crabbox state directory on persistent storage. Do not
+delete claims to force a retry, move the operation to another state directory,
+or switch the authenticated Tenki workspace during an operation. A successful
+stop keeps a terminal receipt for a fixed ID. Repeated stop is safe, but that
+ID cannot allocate another session; use a new ID for the next operation.
+
+For Linux worker clients, omit `class` and use Tenki-specific sizing in Crabbox
+config. Disable native warm-image/checkpoint reuse (for clients with a
+`warmImage` setting, use `false`). Desktop, browser, and native checkpoint
+features are not part of this integration. `inspect --json` checks SSH
+readiness without resuming a paused sandbox.
+
+`--keep=true` selects a sticky Tenki session with no maximum duration, so the
+controller must call `stop` when it is done. Heartbeat refreshes the local
+Crabbox lease record; it does not add a provider-side expiry to the session.
+
 ## Auth
 
 Authenticate with the Tenki CLI's browser flow:
@@ -39,8 +100,14 @@ Authenticate with the Tenki CLI's browser flow:
 tenki login
 ```
 
-Crabbox shells out to `tenki`, so it reuses the Tenki CLI's normal config and
-auth state. The current Tenki CLI selects the workspace from the authenticated
+Crabbox reuses the Tenki CLI's normal config and auth state. For host-authority
+discovery, it reads `~/.config/tenki/config.yaml` (or the basename selected by
+`TENKI_CONFIG_FILE`), with the CLI's `TENKI_AUTH_TOKEN`, `TENKI_API_KEY`, and
+`TENKI_API_ENDPOINT` overrides. The API endpoint must use HTTPS; Crabbox never
+follows authority requests to another origin. `TENKI_API_URL` and
+`XDG_CONFIG_HOME` do not change the native CLI's credential context.
+
+The current Tenki CLI selects the workspace from the authenticated
 API key; it does not accept separate sandbox `--workspace` or `--project`
 selectors. Run `tenki login` again when you need a different workspace. Do not
 pass Tenki auth tokens as command-line arguments.
@@ -139,8 +206,9 @@ These map to Tenki create flags as `--cpu`, `--memory-mb`, and
 4. Let core Crabbox perform rsync, command execution, `ssh`, and artifacts.
 5. On release, verify the exact local claim, session ID, and fresh
    provider-side lease metadata, then run `tenki sandbox terminate <session-id>`
-   under the claim lock. Crabbox removes the claim only after the same session
-   reports `TERMINATING` or `TERMINATED`. A mismatched or missing session ID,
+   under the claim lock. Only after the same session reports `TERMINATING` or
+   `TERMINATED` does Crabbox remove an ordinary claim or replace a fixed-ID
+   claim with a terminal receipt. A mismatched or missing session ID,
    lookup error, or cancellation preserves the claim for a safe retry; generic
    "not found" diagnostics are not proof of session deletion.
 
@@ -151,16 +219,45 @@ Tenki sessions cannot independently prove lost-claim ownership.
 
 The provider does not expose Tenki's internal node-agent, mesh IPs, or guest IPs.
 All SSH traffic goes through Tenki's supported cert-backed `ssh-proxy` path.
+Server authentication uses the gateway certificate authority described above;
+the SSH client certificate authenticates the client. All connections retain
+host-key verification and use the Tenki-managed key and session certificate.
+
+The cert-backed gateway selects the sandbox from the signed SSH certificate.
+Changing the proxy's session URL alone does not grant access to another sandbox:
+a certificate for session A still selects A. Crabbox obtains the certificate and
+proxy command together for the requested session.
+
+An issued SSH certificate is an access credential until it expires. Expired
+certificates are rejected on new connections, but Crabbox does not guarantee
+that revoking an API key immediately invalidates a cached SSH certificate or
+closes an existing SSH connection. Do not treat an API-key authentication error
+as proof that earlier SSH access has ended.
 
 ## Capabilities
 
 - SSH: yes, through Tenki `ssh-proxy`.
 - Crabbox sync: yes, normal SSH/rsync sync.
+- Fixed lease IDs: yes, with durable local attempt recovery and single-use IDs.
 - Desktop / browser / code: no.
+- Native checkpoints / warm images: no.
 - Actions hydration: yes, as a normal Linux SSH lease.
-- Cleanup: no. Tenki TTL/idle timeout own stale-session cleanup; `stop`
-  terminates known Crabbox leases.
+- Cleanup: no. Explicit `stop` terminates known Crabbox leases; paused sessions
+  still require cleanup according to Tenki's retention policy.
 - Coordinator (broker): no — always direct from the CLI.
+
+## Lifetime
+
+Current Tenki sandboxes do not auto-pause or stop on inactivity. Crabbox retains
+idle-timeout and timing metadata for claim compatibility, but these values are
+bookkeeping and do not enforce native idle expiry. A touch does not extend
+Tenki's maximum duration.
+
+Kept leases use Tenki's `--sticky` mode and have no maximum duration. In
+particular, `warmup` defaults to `--keep=true`, so its TTL does not bound a sticky
+sandbox. Use `--keep=false --ttl 15m` for a bounded test. For non-kept leases,
+Crabbox passes TTL as `--max-duration`; reaching that limit pauses the sandbox,
+not destroys it. Always finish with `crabbox stop --provider tenki <lease>`.
 
 ## Live Smoke
 
@@ -168,7 +265,7 @@ All SSH traffic goes through Tenki's supported cert-backed `ssh-proxy` path.
 tenki login
 go build -trimpath -o bin/crabbox ./cmd/crabbox
 
-bin/crabbox warmup --provider tenki --timing-json
+bin/crabbox warmup --provider tenki --keep=false --ttl 15m --timing-json
 lease=<slug-or-cbx_id-from-warmup-output>
 
 bin/crabbox status --provider tenki --id "$lease" --wait

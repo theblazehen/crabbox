@@ -6,7 +6,6 @@ import {
   applyAWSRunInstanceTargetOptions,
   awsAvailabilityZoneForRegion,
   awsCapacityReadinessCheckForQuota,
-  awsInstanceTypeVCPUs,
   awsHostIDsFromSet,
   awsLeaseImageIdentity,
   awsLaunchCandidates,
@@ -359,9 +358,30 @@ describe("aws provider", () => {
       attempted: ["spot:t3.small"],
       reads: ["spot"],
     },
+    {
+      market: "on-demand" as const,
+      quota: 191,
+      types: ["c7a.metal-48xl"],
+      attempted: [],
+      reads: ["on-demand"],
+    },
+    {
+      market: "on-demand" as const,
+      quota: 192,
+      types: ["c7a.metal-48xl"],
+      attempted: ["on-demand:c7a.metal-48xl"],
+      reads: ["on-demand"],
+    },
+    {
+      market: "on-demand" as const,
+      quota: 32,
+      types: ["g4dn.metal"],
+      attempted: ["on-demand:g4dn.metal"],
+      reads: ["on-demand"],
+    },
   ])("keeps quota admission and market-scoped reuse ($market, quota=$quota)", async (scenario) => {
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
-    const { client, config, attempted } = awsMarketFallbackHarness(
+    const { client, config, attempted, metadataReads } = awsMarketFallbackHarness(
       "",
       scenario.market,
       scenario.types,
@@ -391,11 +411,98 @@ describe("aws provider", () => {
     expect(outcome).toMatch(scenario.attempted.length ? /^created$/ : /quota/);
     expect(attempted).toEqual(scenario.attempted);
     expect(reads).toEqual(scenario.reads);
+    expect(metadataReads).toEqual([scenario.types]);
     const diagnostic = JSON.parse(String(log.mock.calls[0]![0]));
     expect(diagnostic.steps).toContainEqual(
       expect.objectContaining({ name: "quota", count: reads.length }),
     );
   });
+
+  it.each([
+    { name: "missing", metadata: {} },
+    { name: "zero", metadata: { "c7a.metal-48xl": 0 } },
+    { name: "malformed", metadata: { "c7a.metal-48xl": "invalid" } },
+    { name: "denied", metadata: "denied" as const },
+  ])(
+    "keeps $name instance metadata unknown without blocking ordinary launches",
+    async ({ metadata }) => {
+      const { client, config, attempted } = awsMarketFallbackHarness(
+        "",
+        "on-demand",
+        ["c7a.metal-48xl"],
+        metadata,
+      );
+      const [readiness] = await client.capacityReadinessChecks(config);
+      expect(readiness).toMatchObject({
+        status: "skip",
+        details: { default_needed_vcpus: "unknown", hint: "unknown_instance_vcpus" },
+      });
+      expect(readiness?.details).not.toHaveProperty("recommended_type");
+      await client.createServerWithFallback(
+        config,
+        "cbx_abcdef123456",
+        "violet-prawn",
+        "alice@example.com",
+      );
+      expect(attempted).toEqual(["on-demand:c7a.metal-48xl"]);
+    },
+  );
+
+  it("uses described vCPUs for readiness and omits candidates whose cost is unknown", async () => {
+    const { client, config, metadataReads } = awsMarketFallbackHarness(
+      "",
+      "on-demand",
+      ["c7a.metal-48xl"],
+      { "c7a.metal-48xl": 192 },
+    );
+    const baseFetch = globalThis.fetch;
+    let quota = 191;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      return new URL(request.url).hostname.startsWith("servicequotas.")
+        ? Response.json({ Quota: { Value: quota } })
+        : baseFetch(request);
+    });
+    const [warning] = await client.capacityReadinessChecks(config);
+    expect(warning).toMatchObject({ status: "warning", details: { default_needed_vcpus: "192" } });
+    expect(warning?.details).not.toHaveProperty("recommended_type");
+    quota = 192;
+    expect(await client.capacityReadinessChecks(config)).toMatchObject([{ status: "ok" }]);
+    expect(metadataReads).toHaveLength(2);
+  });
+
+  it.each(["im4gn.16xlarge", "is4gen.8xlarge"])(
+    "checks Standard-instance quotas for %s",
+    async (serverType) => {
+      const { client, config } = awsMarketFallbackHarness("", "on-demand", [serverType], {
+        [serverType]: 96,
+      });
+      expect(await client.capacityReadinessChecks(config)).toMatchObject([
+        { status: "ok", details: { default_needed_vcpus: "96", quota_code: "L-1216C47A" } },
+      ]);
+      expect(awsQuotaPreflightAttempt(serverType, "on-demand", "eu-west-1", 32, 96)).toMatchObject({
+        category: "quota",
+      });
+    },
+  );
+
+  it.each(["g4dn.metal", "p5.48xlarge", "trn1.32xlarge", "inf2.48xlarge", "hpc7a.96xlarge"])(
+    "does not compare %s against Standard-instance quotas",
+    async (serverType) => {
+      const { client, config } = awsMarketFallbackHarness("", "on-demand", [serverType], {
+        [serverType]: 96,
+      });
+      expect(await client.capacityReadinessChecks(config)).toMatchObject([
+        {
+          status: "skip",
+          details: { hint: "unsupported_instance_quota", default_needed_vcpus: "96" },
+        },
+      ]);
+      expect(
+        awsQuotaPreflightAttempt(serverType, "on-demand", "eu-west-1", 32, 96),
+      ).toBeUndefined();
+    },
+  );
 
   it("tags every checkpoint AMI backing snapshot with its exact ownership claim", async () => {
     let submitted: URLSearchParams | undefined;
@@ -435,6 +542,7 @@ describe("aws provider", () => {
       provider: "aws",
       kind: "aws-ami",
       region: "eu-west-1",
+      revision: "selected-revision",
     };
     config.awsPromotedAMIs[awsPromotedAMIConfigKey("us-east-1", config.serverType)] =
       "ami-fallback";
@@ -444,6 +552,15 @@ describe("aws provider", () => {
       source: "promoted",
       region: "us-east-1",
     });
+    expect(awsLeaseImageIdentity(config, "ami-fallback", "us-east-1")).not.toHaveProperty(
+      "revision",
+    );
+    expect(awsLeaseImageIdentity(config, "ami-primary", "eu-west-1").revision).toBe(
+      "selected-revision",
+    );
+    expect(awsLeaseImageIdentity(config, "ami-primary", "us-east-1")).not.toHaveProperty(
+      "revision",
+    );
   });
 
   it("rejects a canonical SSH key name reserved for another lease", async () => {
@@ -514,7 +631,9 @@ describe("aws provider", () => {
     ).resolves.toBeUndefined();
 
     owned = false;
-    await client.deleteSSHKey("crabbox-cbx-abcdef123456", "cbx_abcdef123456");
+    await expect(
+      client.deleteSSHKey("crabbox-cbx-abcdef123456", "cbx_abcdef123456"),
+    ).rejects.toThrow("ownership does not match lease cbx_abcdef123456");
     owned = true;
     await client.deleteSSHKey("crabbox-cbx-abcdef123456", "cbx_abcdef123456");
     expect(actions).toEqual([
@@ -927,6 +1046,183 @@ describe("aws provider", () => {
     await expect(client.findServer("i-abcdef123456")).rejects.toThrow("AuthFailure");
   });
 
+  it("treats an empty successful DescribeInstances response as an absent optional lookup", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ec2XMLResponse(
+          "<DescribeInstancesResponse><requestId>req-empty</requestId><reservationSet /></DescribeInstancesResponse>",
+        ),
+      ),
+    );
+    const client = new EC2SpotClient(
+      { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+      "us-east-1",
+    );
+
+    await expect(client.findServer("i-abcdef123456")).resolves.toBeUndefined();
+    await expect(client.getServer("i-abcdef123456")).rejects.toThrow(
+      "aws instance not found: i-abcdef123456",
+    );
+  });
+
+  it("preserves a leading-zero AWS account ID", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ec2XMLResponse(`<GetCallerIdentityResponse><GetCallerIdentityResult>
+          <Account>001234567890</Account>
+          <Arn>arn:aws:iam::001234567890:user/crabbox</Arn>
+          <UserId>AIDAEXAMPLE</UserId>
+        </GetCallerIdentityResult></GetCallerIdentityResponse>`),
+      ),
+    );
+    const client = new EC2SpotClient(
+      { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+      "us-east-1",
+    );
+
+    await expect(client.identity()).resolves.toMatchObject({ account: "001234567890" });
+  });
+
+  it.each([
+    {
+      name: "generic Response envelope",
+      response: "<Response><requestId>req-generic</requestId><reservationSet /></Response>",
+    },
+    {
+      name: "missing requestId",
+      response: "<DescribeInstancesResponse><reservationSet /></DescribeInstancesResponse>",
+    },
+    {
+      name: "empty requestId",
+      response:
+        "<DescribeInstancesResponse><requestId> </requestId><reservationSet /></DescribeInstancesResponse>",
+    },
+    {
+      name: "sibling fallback root",
+      response:
+        "<DescribeInstancesResponse><requestId>req-extra</requestId><reservationSet /></DescribeInstancesResponse><Response />",
+    },
+    { name: "HTML", response: "<html><body>ok</body></html>" },
+    { name: "empty body", response: "" },
+    { name: "malformed XML", response: "<DescribeInstancesResponse>" },
+    {
+      name: "mismatched closing tag",
+      response:
+        "<DescribeInstancesResponse><requestId>req-mismatch</requestId><reservationSet /></Response>",
+    },
+  ])(
+    "rejects a noncanonical successful DescribeInstances response: $name",
+    async ({ response }) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ec2XMLResponse(response)),
+      );
+      const client = new EC2SpotClient(
+        { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+        "us-east-1",
+      );
+
+      await expect(client.findServer("i-abcdef123456")).rejects.toThrow(
+        "malformed AWS DescribeInstances response",
+      );
+    },
+  );
+
+  it("rejects a malformed optional DescribeInstances ownerId", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ec2XMLResponse(`<DescribeInstancesResponse><requestId>req-owner</requestId>
+          <reservationSet><item><ownerId>not-an-account</ownerId><instancesSet><item>
+            <instanceId>i-abcdef123456</instanceId>
+            <instanceState><name>running</name></instanceState>
+          </item></instancesSet></item></reservationSet>
+        </DescribeInstancesResponse>`),
+      ),
+    );
+    const client = new EC2SpotClient(
+      { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+      "us-east-1",
+    );
+
+    await expect(client.findServer("i-abcdef123456")).rejects.toThrow(
+      "malformed AWS DescribeInstances response: ownerId is invalid",
+    );
+  });
+
+  it.each([
+    {
+      name: "missing reservationSet",
+      response:
+        "<DescribeInstancesResponse><requestId>req-missing</requestId></DescribeInstancesResponse>",
+    },
+    {
+      name: "reservationSet without items",
+      response:
+        "<DescribeInstancesResponse><requestId>req-items</requestId><reservationSet><nextToken>next</nextToken></reservationSet></DescribeInstancesResponse>",
+    },
+    {
+      name: "empty reservation item",
+      response:
+        "<DescribeInstancesResponse><requestId>req-reservation</requestId><reservationSet><item /></reservationSet></DescribeInstancesResponse>",
+    },
+    {
+      name: "reservation without instancesSet",
+      response:
+        "<DescribeInstancesResponse><requestId>req-instances</requestId><reservationSet><item><ownerId>123456789012</ownerId></item></reservationSet></DescribeInstancesResponse>",
+    },
+    {
+      name: "empty instancesSet",
+      response:
+        "<DescribeInstancesResponse><requestId>req-empty-instances</requestId><reservationSet><item><instancesSet /></item></reservationSet></DescribeInstancesResponse>",
+    },
+    {
+      name: "instancesSet without items",
+      response:
+        "<DescribeInstancesResponse><requestId>req-instance-items</requestId><reservationSet><item><instancesSet><nextToken>next</nextToken></instancesSet></item></reservationSet></DescribeInstancesResponse>",
+    },
+    {
+      name: "empty instance item",
+      response:
+        "<DescribeInstancesResponse><requestId>req-instance</requestId><reservationSet><item><instancesSet><item /></instancesSet></item></reservationSet></DescribeInstancesResponse>",
+    },
+  ])("rejects malformed successful DescribeInstances XML: $name", async ({ response }) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ec2XMLResponse(response)),
+    );
+    const client = new EC2SpotClient(
+      { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+      "us-east-1",
+    );
+
+    await expect(client.findServer("i-abcdef123456")).rejects.toThrow(
+      "malformed AWS DescribeInstances response",
+    );
+  });
+
+  it("rejects a successful DescribeInstances response for a different instance", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ec2XMLResponse(`<DescribeInstancesResponse><requestId>req-wrong</requestId>
+          <reservationSet><item><instancesSet><item>
+          <instanceId>i-different123456</instanceId><instanceState><name>running</name></instanceState>
+        </item></instancesSet></item></reservationSet></DescribeInstancesResponse>`),
+      ),
+    );
+    const client = new EC2SpotClient(
+      { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+      "us-east-1",
+    );
+
+    await expect(client.findServer("i-abcdef123456")).rejects.toThrow(
+      "returned instance i-different123456 for i-abcdef123456",
+    );
+  });
+
   it.each([
     { attached: false, profileXML: "" },
     {
@@ -940,7 +1236,8 @@ describe("aws provider", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async () =>
-          ec2XMLResponse(`<DescribeInstancesResponse><reservationSet><item><instancesSet><item>
+          ec2XMLResponse(`<DescribeInstancesResponse><requestId>req-profile</requestId>
+          <reservationSet><item><instancesSet><item>
           <instanceId>i-abcdef123456</instanceId>
           <instanceState><name>running</name></instanceState>
           <instanceType>c7a.8xlarge</instanceType>
@@ -1006,26 +1303,11 @@ describe("aws provider", () => {
     const client = new EC2SpotClient(
       { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
       "us-east-1",
-    ) as EC2SpotClient & {
-      getServer: (instanceID: string) => Promise<{
-        id: string;
-        name: string;
-        provider: "aws";
-        cloudID: string;
-        host: string;
-        status: string;
-        serverType: string;
-      }>;
-    };
-    let calls = 0;
-    client.getServer = async () => {
-      calls += 1;
-      if (calls === 1) {
-        throw new Error(
-          "aws DescribeInstances: http 400: InvalidInstanceID.NotFound: The instance ID 'i-1' does not exist",
-        );
-      }
-      return {
+    );
+    const findServer = vi
+      .spyOn(client, "findServer")
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({
         id: "i-1",
         name: "blue-lobster",
         provider: "aws",
@@ -1033,13 +1315,38 @@ describe("aws provider", () => {
         host: "203.0.113.10",
         status: "running",
         serverType: "m7i.large",
-      };
-    };
+        labels: {},
+      });
 
     const resultPromise = client.waitForServerIP("i-1");
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(resultPromise).resolves.toMatchObject({ host: "203.0.113.10" });
-    expect(calls).toBe(2);
+    expect(findServer).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps empty visibility reads bounded and fails closed", async () => {
+    const delays: number[] = [];
+    const fetchMock = vi.fn<() => Promise<Response>>(async () =>
+      ec2XMLResponse(
+        "<DescribeInstancesResponse><requestId>req-visibility</requestId><reservationSet /></DescribeInstancesResponse>",
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("setTimeout", ((callback: () => void, delay?: number) => {
+      delays.push(delay ?? 0);
+      queueMicrotask(callback);
+      return 0;
+    }) as typeof setTimeout);
+    const client = new EC2SpotClient(
+      { AWS_ACCESS_KEY_ID: "test", AWS_SECRET_ACCESS_KEY: "secret" } as never,
+      "us-east-1",
+    );
+
+    await expect(client.waitForServerVisibility("i-abcdef123456")).rejects.toThrow(
+      "aws instance not found: i-abcdef123456",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, 15_000, 30_000]);
   });
 
   it("turns low AWS vCPU quota into a doctor readiness warning", () => {
@@ -1056,6 +1363,12 @@ describe("aws provider", () => {
       "spot",
       "eu-west-1",
       32,
+      new Map([
+        ["c7a.48xlarge", 192],
+        ["c7a.8xlarge", 32],
+        ["c7a.2xlarge", 8],
+        ["m7a.large", 2],
+      ]),
     );
 
     expect(check).toMatchObject({
@@ -1092,6 +1405,12 @@ describe("aws provider", () => {
         "spot",
         "eu-west-1",
         limit,
+        new Map([
+          ["c7a.48xlarge", 192],
+          ["c7a.8xlarge", 32],
+          ["c7a.2xlarge", 8],
+          ["m7a.large", 2],
+        ]),
       );
 
       expect(check).toMatchObject({
@@ -1131,6 +1450,12 @@ describe("aws provider", () => {
       "spot",
       "eu-west-1",
       undefined,
+      new Map([
+        ["c7a.48xlarge", 192],
+        ["c7a.8xlarge", 32],
+        ["c7a.2xlarge", 8],
+        ["m7a.large", 2],
+      ]),
     );
 
     expect(check).toMatchObject({
@@ -2094,6 +2419,21 @@ describe("aws provider", () => {
               `<DescribeKeyPairsResponse><keySet><item><keyName>crabbox-cbx</keyName><publicKey>ssh-rsa ${"a".repeat(724)}</publicKey></item></keySet></DescribeKeyPairsResponse>`,
             );
           }
+          if (action === "DescribeInstanceTypes") {
+            return ec2InstanceTypesResponse(params, {
+              "c7a.8xlarge": 32,
+              "c7i.8xlarge": 32,
+              "m7a.8xlarge": 32,
+              "m7i.8xlarge": 32,
+              "c7g.8xlarge": 32,
+              "m7g.8xlarge": 32,
+              "r7g.8xlarge": 32,
+              "c7a.4xlarge": 16,
+              "c7g.4xlarge": 16,
+              "t3.small": 2,
+              "t4g.small": 2,
+            });
+          }
           if (action === "DescribeImages") {
             return ec2XMLResponse(`<?xml version="1.0" encoding="UTF-8"?>
 <DescribeImagesResponse>
@@ -2203,6 +2543,9 @@ describe("aws provider", () => {
           return ec2XMLResponse(
             "<DescribeKeyPairsResponse><keySet><item><keyName>crabbox-cbx</keyName><publicKey>ssh-ed25519 test</publicKey></item></keySet></DescribeKeyPairsResponse>",
           );
+        }
+        if (action === "DescribeInstanceTypes") {
+          return ec2InstanceTypesResponse(params, { "t3.small": 2 });
         }
         if (action === "DescribeImages") {
           imageQueries += 1;
@@ -3178,6 +3521,13 @@ describe("aws provider", () => {
     };
     client.ec2 = async (action, params) => {
       calls.push(`${action}:${params?.ImageId ?? ""}`);
+      if (action === "DescribeInstanceTypes") {
+        return {
+          instanceTypeSet: {
+            item: { instanceType: "t3.small", vCpuInfo: { defaultVCpus: 2 } },
+          },
+        };
+      }
       if (action === "RunInstances") {
         userData = params?.UserData ?? "";
         return {
@@ -3212,6 +3562,7 @@ describe("aws provider", () => {
       "register-snapshot",
       "wait:ami-transient",
       "security-group",
+      "DescribeInstanceTypes:",
       "RunInstances:ami-transient",
       "DeregisterImage:ami-transient",
     ]);
@@ -3323,10 +3674,12 @@ describe("aws provider", () => {
     client.ec2 = async (action, params = {}) => {
       if (action === "DescribeInstances") {
         return {
+          requestId: "req-snapshot-source",
           reservationSet: {
             item: {
               instancesSet: {
                 item: {
+                  instanceId: "i-000000000001",
                   rootDeviceName: "/dev/xvda",
                   architecture: "arm64",
                   blockDeviceMapping: {
@@ -3359,25 +3712,20 @@ describe("aws provider", () => {
     });
   });
 
-  it("maps AWS instance types to vCPU quota units", () => {
-    expect(awsInstanceTypeVCPUs("c7a.48xlarge")).toBe(192);
-    expect(awsInstanceTypeVCPUs("c7a.xlarge")).toBe(4);
-    expect(awsInstanceTypeVCPUs("t3.small")).toBe(2);
-    expect(awsInstanceTypeVCPUs("c7gn.metal")).toBeUndefined();
-  });
-
   it("builds quota preflight attempts when applied quota is too low", () => {
     expect(awsQuotaCodeForMarket("spot")).toBe("L-34B43A08");
     expect(awsQuotaCodeForMarket("on-demand")).toBe("L-1216C47A");
-    expect(awsQuotaPreflightAttempt("c7a.48xlarge", "on-demand", "eu-west-1", 32)).toEqual({
+    expect(awsQuotaPreflightAttempt("c7a.48xlarge", "on-demand", "eu-west-1", 32, 192)).toEqual({
       region: "eu-west-1",
       serverType: "c7a.48xlarge",
       market: "on-demand",
       category: "quota",
       message: "quota L-1216C47A in eu-west-1 is 32 vCPUs; c7a.48xlarge needs 192 vCPUs",
     });
-    expect(awsQuotaPreflightAttempt("t3.small", "on-demand", "eu-west-1", 32)).toBeUndefined();
-    expect(awsQuotaPreflightAttempt("c7gn.metal", "spot", "eu-west-1", 32)).toBeUndefined();
+    expect(awsQuotaPreflightAttempt("t3.small", "on-demand", "eu-west-1", 32, 2)).toBeUndefined();
+    expect(
+      awsQuotaPreflightAttempt("c7gn.metal", "spot", "eu-west-1", 32, undefined),
+    ).toBeUndefined();
   });
 
   it("retries snapshot deletion after deregistering an image", async () => {
@@ -3576,11 +3924,38 @@ function ec2XMLResponse(body: string, status = 200): Response {
   return new Response(body, { status, headers: { "content-type": "application/xml" } });
 }
 
+function ec2InstanceTypesResponse(
+  params: URLSearchParams,
+  metadata: Record<string, number | string>,
+): Response {
+  const requested = [...params]
+    .filter(([key]) => key.startsWith("InstanceType."))
+    .map(([, value]) => value);
+  return ec2XMLResponse(
+    `<DescribeInstanceTypesResponse><instanceTypeSet>${requested
+      .flatMap((name) =>
+        metadata[name] === undefined
+          ? []
+          : [
+              `<item><instanceType>${name}</instanceType><vCpuInfo><defaultVCpus>${metadata[name]}</defaultVCpus></vCpuInfo></item>`,
+            ],
+      )
+      .join("")}</instanceTypeSet></DescribeInstanceTypesResponse>`,
+  );
+}
+
 function awsMarketFallbackHarness(
   failureCode: string | string[],
   capacityMarket: "spot" | "on-demand" = "spot",
   instanceTypes: string[] = ["t3.small"],
+  metadata: Record<string, number | string> | "denied" = {
+    "t3.small": 2,
+    "c7a.48xlarge": 192,
+    "c7a.metal-48xl": 192,
+    "g4dn.metal": 96,
+  },
 ) {
+  const metadataReads: string[][] = [];
   const markets: string[] = [];
   const attempted: string[] = [];
   vi.stubGlobal(
@@ -3600,6 +3975,14 @@ function awsMarketFallbackHarness(
         return ec2XMLResponse(
           "<DescribeKeyPairsResponse><keySet><item><keyName>test-key</keyName><publicKey>ssh-ed25519 test</publicKey></item></keySet></DescribeKeyPairsResponse>",
         );
+      }
+      if (action === "DescribeInstanceTypes") {
+        const requested = [...params]
+          .filter(([key]) => key.startsWith("InstanceType."))
+          .map(([, value]) => value);
+        metadataReads.push(requested);
+        if (metadata === "denied") return ec2XMLResponse("<Response />", 403);
+        return ec2InstanceTypesResponse(params, metadata);
       }
       if (action === "RunInstances") {
         const market = params.has("InstanceMarketOptions.MarketType") ? "spot" : "on-demand";
@@ -3649,6 +4032,7 @@ function awsMarketFallbackHarness(
     }),
     markets,
     attempted,
+    metadataReads,
   };
 }
 

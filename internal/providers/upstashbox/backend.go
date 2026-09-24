@@ -3,6 +3,8 @@ package upstashbox
 import (
 	"context"
 	"fmt"
+	"io"
+	"maps"
 	"net/url"
 	"path"
 	"regexp"
@@ -14,21 +16,21 @@ import (
 )
 
 type backend struct {
-	spec ProviderSpec
-	cfg  Config
-	rt   Runtime
+	spec core.ProviderSpec
+	cfg  core.Config
+	rt   core.Runtime
 }
 
-func NewBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func NewBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	cfg.Provider = providerName
 	return &backend{spec: spec, cfg: cfg, rt: rt}
 }
 
-func (b *backend) Spec() ProviderSpec { return b.spec }
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
-func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
+func (b *backend) Warmup(ctx context.Context, req core.WarmupRequest) error {
 	if req.ActionsRunner {
-		return exit(2, "--actions-runner is not supported for provider=%s", providerName)
+		return core.Exit(2, "--actions-runner is not supported for provider=%s", providerName)
 	}
 	started := core.ClockNow(b.rt.Clock)
 	client, err := newAPI(b.cfg, b.rt)
@@ -52,7 +54,7 @@ func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
 	})
 }
 
-func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+func (b *backend) Run(ctx context.Context, req core.RunRequest) (core.RunResult, error) {
 	workdir, validationErr := cleanWorkdir(workdir(b.cfg))
 	folder := ""
 	if validationErr == nil {
@@ -74,8 +76,18 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			client, err = newAPI(b.cfg, b.rt)
 			return err
 		},
-		PrepareArchive: func(ctx context.Context) (*core.PreparedArchive, error) {
-			return b.prepareArchive(ctx, req)
+		Workspace: func() shared.SandboxWorkspace {
+			return shared.WorkspaceOperations{
+				PrepareArchiveFunc: func(ctx context.Context) (*core.PreparedArchive, error) {
+					return b.prepareArchive(ctx, req)
+				},
+				SyncFunc: func(ctx context.Context, archive *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
+					return b.syncWorkspace(ctx, client, boxID, req, workdir, folder, archive)
+				},
+				EnsureFunc: func(ctx context.Context) error {
+					return b.prepareWorkspace(ctx, client, boxID, folder)
+				},
+			}
 		},
 		Acquire: func(ctx context.Context) (shared.DelegatedSandbox, error) {
 			var box boxData
@@ -96,12 +108,6 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			}
 			return session(), nil
 		},
-		Sync: func(ctx context.Context, archive *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
-			return b.syncWorkspace(ctx, client, boxID, req, workdir, folder, archive)
-		},
-		NoSync: func(ctx context.Context) error {
-			return b.prepareWorkspace(ctx, client, boxID, folder)
-		},
 		Command: func(ctx context.Context) (shared.DelegatedSandboxCommand, error) {
 			intent, err := core.ParseCommandIntent(req.Command, req.ShellMode, req.CommandLiteralArgs)
 			if err != nil {
@@ -109,7 +115,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			}
 			command := intent.ShellSource()
 			if req.EnvSummary {
-				printEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, req.Env)
+				core.PrintEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, req.Env)
 			}
 			var closeCommand func(context.Context) error
 			if len(req.Env) > 0 {
@@ -128,8 +134,9 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 				command = shared.ShellScriptWithEnvProfile(command, envPath)
 			}
 			return shared.DelegatedSandboxCommand{Text: strings.Join(req.Command, " "), Close: closeCommand,
-				Run: func(ctx context.Context) (int, error) {
-					return client.ExecStream(ctx, boxID, command, folder, b.rt.Stdout)
+				Run: func(ctx context.Context, stdout, _ io.Writer) (int, error) {
+					req.Observation.OmitStream("stderr", "provider-combines-output")
+					return client.ExecStream(ctx, boxID, command, folder, stdout)
 				}}, nil
 		},
 		Cleanup: func(ctx context.Context) error {
@@ -138,7 +145,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	})
 }
 
-func (b *backend) List(ctx context.Context, req ListRequest) ([]LeaseView, error) {
+func (b *backend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
 	_ = req
 	client, err := newAPI(b.cfg, b.rt)
 	if err != nil {
@@ -148,60 +155,56 @@ func (b *backend) List(ctx context.Context, req ListRequest) ([]LeaseView, error
 	if err != nil {
 		return nil, err
 	}
-	servers := make([]Server, 0, len(boxes))
+	servers := make([]core.Server, 0, len(boxes))
 	for _, box := range boxes {
 		if isCrabboxBox(box) {
-			servers = append(servers, boxToServer(b.cfg, box))
+			servers = append(servers, boxToServer(b.cfg, box, b.observationClaim(box)))
 		}
 	}
 	return servers, nil
 }
 
-func (b *backend) Doctor(ctx context.Context, _ DoctorRequest) (DoctorResult, error) {
-	servers, err := b.List(ctx, ListRequest{})
+func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
+	servers, err := b.List(ctx, core.ListRequest{})
 	if err != nil {
-		return DoctorResult{}, err
+		return core.DoctorResult{}, err
 	}
-	return inventoryDoctorResult(providerName, len(servers)), nil
+	return core.InventoryDoctorResult(providerName, len(servers)), nil
 }
 
-func (b *backend) Status(ctx context.Context, req StatusRequest) (StatusView, error) {
+func (b *backend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
 	client, err := newAPI(b.cfg, b.rt)
 	if err != nil {
-		return StatusView{}, err
+		return core.StatusView{}, err
 	}
-	return shared.PollDelegatedStatus(ctx, shared.DelegatedStatusRequest{
-		ID:          req.ID,
-		Provider:    providerName,
-		TargetOS:    targetLinux,
-		Network:     networkPublic,
-		Wait:        req.Wait,
-		WaitTimeout: req.WaitTimeout,
-		Now:         func() time.Time { return core.ClockNow(b.rt.Clock) },
-		Resolve: func(id string) (string, string, string, error) {
-			return b.resolveBoxID(ctx, client, id, "", false)
-		},
-		Get: func(getCtx context.Context, boxID string) (shared.DelegatedStatusResource, error) {
-			box, err := client.GetBox(getCtx, boxID)
-			if err != nil {
-				return shared.DelegatedStatusResource{}, err
-			}
-			server := boxToServer(b.cfg, box)
-			return shared.DelegatedStatusResource{
-				State:      box.Status,
-				ServerID:   box.ID,
-				ServerType: server.ServerType.Name,
-				Ready:      statusReady(box.Status),
-				Labels:     server.Labels,
-			}, nil
-		},
-		TimeoutError: func(boxID string) error {
-			return exit(5, "timed out waiting for upstash-box %s to become ready", boxID)
-		},
+	leaseID, boxID, slug, err := b.resolveBoxID(ctx, client, req.ID, "", false)
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	return shared.PollStatus(ctx, req, func() time.Time { return core.ClockNow(b.rt.Clock) }, func(ctx context.Context) (core.StatusView, bool, error) {
+		box, err := client.GetBox(ctx, boxID)
+		if err != nil {
+			return core.StatusView{}, false, err
+		}
+		server := boxToServer(b.cfg, box, b.observationClaim(box))
+		return core.StatusView{
+			ID:         leaseID,
+			Slug:       core.Blank(slug, server.Labels["slug"]),
+			Provider:   providerName,
+			TargetOS:   targetLinux,
+			Network:    networkPublic,
+			State:      box.Status,
+			ServerID:   box.ID,
+			ServerType: server.ServerType.Name,
+			Ready:      statusReady(box.Status),
+			Labels:     server.Labels,
+		}, false, nil
+	}, func() error {
+		return core.Exit(5, "timed out waiting for upstash-box %s to become ready", boxID)
 	})
 }
 
-func (b *backend) Stop(ctx context.Context, req StopRequest) error {
+func (b *backend) Stop(ctx context.Context, req core.StopRequest) error {
 	client, err := newAPI(b.cfg, b.rt)
 	if err != nil {
 		return err
@@ -230,7 +233,7 @@ func (b *backend) deleteClaimedBox(ctx context.Context, client api, leaseID, box
 	if err != nil {
 		return err
 	}
-	return shared.RemoveExactClaimAfter(claim, binding, func() error {
+	return shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
 		box, err := client.GetBox(ctx, boxID)
 		if err != nil {
 			if isNotFound(err) {
@@ -239,15 +242,15 @@ func (b *backend) deleteClaimedBox(ctx context.Context, client api, leaseID, box
 			return err
 		}
 		if box.ID != boxID || !isCrabboxBox(box) || boxLeaseID(box) != leaseID || boxSlug(leaseID, box) != slug {
-			return exit(2, "provider=%s box %s no longer matches its exact local ownership claim", providerName, boxID)
+			return core.Exit(2, "provider=%s box %s no longer matches its exact local ownership claim", providerName, boxID)
 		}
 		return client.DeleteBoxes(ctx, []string{boxID})
 	})
 }
 
-func (b *backend) createBox(ctx context.Context, client api, repo Repo, keep, reclaim bool, requestedSlug string) (string, boxData, string, error) {
-	leaseID := newLeaseID()
-	slug, err := allocateClaimLeaseSlug(leaseID, requestedSlug)
+func (b *backend) createBox(ctx context.Context, client api, repo core.Repo, keep, reclaim bool, requestedSlug string) (string, boxData, string, error) {
+	leaseID := core.NewLeaseID()
+	slug, err := core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
 	if err != nil {
 		return "", boxData{}, "", err
 	}
@@ -262,7 +265,12 @@ func (b *backend) createBox(ctx context.Context, client api, repo Repo, keep, re
 	if err != nil {
 		return "", boxData{}, "", err
 	}
-	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, upstashBoxClaimScope(b.cfg), "", repo.Root, b.cfg.IdleTimeout, reclaim, boxToServer(b.cfg, box), core.SSHTarget{}); err != nil {
+	created := core.ClockNow(b.rt.Clock)
+	if box.CreatedAt > 0 {
+		created = time.Unix(box.CreatedAt, 0)
+	}
+	labels := core.DirectLeaseLabels(b.cfg, leaseID, slug, providerName, "", keep, created)
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, upstashBoxClaimScope(b.cfg), "", repo.Root, b.cfg.IdleTimeout, reclaim, b.claimServer(box, labels), core.SSHTarget{}); err != nil {
 		cleanupCtx, cancel := upstashBoxCleanupContext()
 		cleanupErr := client.DeleteBoxes(cleanupCtx, []string{box.ID})
 		cancel()
@@ -277,14 +285,14 @@ func (b *backend) createBox(ctx context.Context, client api, repo Repo, keep, re
 func (b *backend) resolveBoxID(ctx context.Context, client api, id, repoRoot string, reclaim bool) (string, string, string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", "", "", exit(2, "provider=%s requires a Crabbox lease id, slug, or Upstash Box id", providerName)
+		return "", "", "", core.Exit(2, "provider=%s requires a Crabbox lease id, slug, or Upstash Box id", providerName)
 	}
-	if claim, ok, err := resolveLeaseClaim(id); err != nil {
+	if claim, ok, err := core.ResolveLeaseClaim(id); err != nil {
 		return "", "", "", err
 	} else if ok && claim.Provider == providerName {
 		if repoRoot == "" {
 			if strings.TrimSpace(claim.CloudID) == "" {
-				return "", "", "", exit(2, "provider=%s lease=%s has no exact local ownership claim for an immutable box ID", providerName, claim.LeaseID)
+				return "", "", "", core.Exit(2, "provider=%s lease=%s has no exact local ownership claim for an immutable box ID", providerName, claim.LeaseID)
 			}
 			return claim.LeaseID, claim.CloudID, claim.Slug, nil
 		}
@@ -293,7 +301,7 @@ func (b *backend) resolveBoxID(ctx context.Context, client api, id, repoRoot str
 			return "", "", "", err
 		}
 		if repoRoot != "" {
-			if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(claim.LeaseID, claim.Slug, providerName, upstashBoxClaimScope(b.cfg), "", repoRoot, time.Duration(claim.IdleTimeoutSeconds)*time.Second, reclaim, boxToServer(b.cfg, box), core.SSHTarget{}); err != nil {
+			if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(claim.LeaseID, claim.Slug, providerName, upstashBoxClaimScope(b.cfg), "", repoRoot, time.Duration(claim.IdleTimeoutSeconds)*time.Second, reclaim, b.claimServer(box, claim.Labels), core.SSHTarget{}); err != nil {
 				return "", "", "", err
 			}
 		}
@@ -330,7 +338,7 @@ func resolveBoxByLease(ctx context.Context, client api, leaseID string) (boxData
 			return box, nil
 		}
 	}
-	return boxData{}, exit(4, "upstash-box lease %q was not found", leaseID)
+	return boxData{}, core.Exit(4, "upstash-box lease %q was not found", leaseID)
 }
 
 func resolveBoxBySlug(ctx context.Context, client api, slug string) (boxData, error) {
@@ -343,31 +351,72 @@ func resolveBoxBySlug(ctx context.Context, client api, slug string) (boxData, er
 			return box, nil
 		}
 	}
-	return boxData{}, exit(4, "upstash-box %q was not found", slug)
+	return boxData{}, core.Exit(4, "upstash-box %q was not found", slug)
 }
 
-func boxToServer(cfg Config, box boxData) Server {
+func (b *backend) observationClaim(box boxData) *core.LeaseClaim {
 	leaseID := boxLeaseID(box)
-	labels := directLeaseLabels(cfg, leaseID, boxSlug(leaseID, box), providerName, "", box.KeepAlive, time.Now().UTC())
+	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists {
+		return nil
+	}
+	binding := shared.ClaimBinding{
+		Provider: providerName, ProviderScope: upstashBoxClaimScope(b.cfg), ExactProviderScope: true,
+		LeaseID: leaseID, Slug: boxSlug(leaseID, box), CloudID: box.ID,
+		RequiredLabels: map[string]string{"box_id": box.ID, "box_name": box.Name},
+	}
+	if shared.ValidateClaimBinding(claim, binding) != nil {
+		return nil
+	}
+	return &claim
+}
+
+// Endpoint refresh updates provider facts without reinitializing recorded policy.
+func (b *backend) claimServer(box boxData, recorded map[string]string) core.Server {
+	server := boxToServer(b.cfg, box, nil)
+	labels := maps.Clone(recorded)
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	for key, value := range server.Labels {
+		if key != "created_at" || labels[key] == "" {
+			labels[key] = value
+		}
+	}
+	server.Labels = labels
+	return server
+}
+
+func boxToServer(cfg core.Config, box boxData, claim *core.LeaseClaim) core.Server {
+	leaseID := boxLeaseID(box)
+	labels := (shared.SandboxObservation{
+		Provider: providerName, Target: targetLinux, LeaseID: leaseID,
+		Slug: boxSlug(leaseID, box), State: box.Status,
+		CreatedAt: time.Unix(box.CreatedAt, 0), UpdatedAt: time.Unix(box.UpdatedAt, 0),
+	}).Labels(claim)
 	labels["box_id"] = box.ID
 	labels["box_name"] = box.Name
-	labels["runtime"] = blank(box.Runtime, runtimeName(cfg))
-	labels["size"] = blank(box.Size, sizeName(cfg))
-	labels["state"] = box.Status
-	server := Server{
+	labels["keep_alive"] = fmt.Sprint(box.KeepAlive)
+	if box.Runtime != "" {
+		labels["runtime"] = box.Runtime
+	}
+	if box.Size != "" {
+		labels["size"], labels["server_type"] = box.Size, box.Size
+	}
+	server := core.Server{
 		Provider: providerName,
 		CloudID:  box.ID,
-		Name:     blank(box.Name, box.ID),
+		Name:     core.Blank(box.Name, box.ID),
 		Status:   box.Status,
 		Labels:   labels,
 	}
-	server.ServerType.Name = blank(box.Size, sizeName(cfg))
+	server.ServerType.Name = box.Size
 	server.PublicNet.IPv4.IP = boxBaseHost(cfg)
 	return server
 }
 
-func boxBaseHost(cfg Config) string {
-	raw := blank(strings.TrimSpace(cfg.UpstashBox.BaseURL), core.UpstashBoxConfigDefaultBaseURL)
+func boxBaseHost(cfg core.Config) string {
+	raw := core.Blank(strings.TrimSpace(cfg.UpstashBox.BaseURL), core.UpstashBoxConfigDefaultBaseURL)
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" {
 		return raw
@@ -375,8 +424,8 @@ func boxBaseHost(cfg Config) string {
 	return parsed.Host
 }
 
-func upstashBoxClaimScope(cfg Config) string {
-	raw := blank(strings.TrimSpace(cfg.UpstashBox.BaseURL), core.UpstashBoxConfigDefaultBaseURL)
+func upstashBoxClaimScope(cfg core.Config) string {
+	raw := core.Blank(strings.TrimSpace(cfg.UpstashBox.BaseURL), core.UpstashBoxConfigDefaultBaseURL)
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" {
 		return "endpoint:" + strings.TrimRight(raw, "/")
@@ -404,7 +453,7 @@ func boxSlug(leaseID string, box boxData) string {
 	if match := boxNamePattern.FindStringSubmatch(strings.TrimSpace(box.Name)); len(match) == 3 {
 		return match[1]
 	}
-	return newLeaseSlug(leaseID)
+	return core.NewLeaseSlug(leaseID)
 }
 
 func statusReady(status string) bool {
@@ -424,40 +473,28 @@ func isNotFound(err error) bool {
 	return strings.Contains(msg, "404") || strings.Contains(msg, "not found")
 }
 
-func runtimeName(cfg Config) string {
-	return blank(strings.TrimSpace(cfg.UpstashBox.Runtime), core.UpstashBoxConfigDefaultRuntime)
+func runtimeName(cfg core.Config) string {
+	return core.Blank(strings.TrimSpace(cfg.UpstashBox.Runtime), core.UpstashBoxConfigDefaultRuntime)
 }
 
 func upstashBoxName(leaseID, slug string) string {
 	slug = strings.Trim(strings.ToLower(strings.TrimSpace(slug)), "-")
 	if slug == "" {
-		slug = newLeaseSlug(leaseID)
+		slug = core.NewLeaseSlug(leaseID)
 	}
 	return "crabbox-" + slug + "-" + strings.TrimPrefix(leaseID, "cbx_")
 }
 
-func sizeName(cfg Config) string {
-	return blank(strings.TrimSpace(cfg.UpstashBox.Size), core.UpstashBoxConfigDefaultSize)
+func sizeName(cfg core.Config) string {
+	return core.Blank(strings.TrimSpace(cfg.UpstashBox.Size), core.UpstashBoxConfigDefaultSize)
 }
 
-func workdir(cfg Config) string {
-	return blank(strings.TrimSpace(cfg.UpstashBox.Workdir), core.UpstashBoxConfigDefaultWorkdir)
+func workdir(cfg core.Config) string {
+	return core.Blank(strings.TrimSpace(cfg.UpstashBox.Workdir), core.UpstashBoxConfigDefaultWorkdir)
 }
 
 func cleanWorkdir(workdir string) (string, error) {
-	trimmed := strings.TrimSpace(workdir)
-	if trimmed == "" {
-		return "", exit(2, "upstash-box workdir is empty")
-	}
-	clean := path.Clean(trimmed)
-	if !strings.HasPrefix(clean, "/") {
-		return "", exit(2, "upstash-box workdir %q must resolve to an absolute path", workdir)
-	}
-	switch clean {
-	case "/", "/bin", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin", "/sys", "/tmp", "/usr", "/var", "/workspace", "/workspace/home":
-		return "", exit(2, "upstash-box workdir %q is too broad; choose a dedicated subdirectory", clean)
-	}
-	return clean, nil
+	return shared.CleanPOSIXWorkspacePath("upstash-box workdir", workdir, "/workspace", "/workspace/home")
 }
 
 const workspaceRoot = "/workspace/home"
@@ -469,7 +506,7 @@ func workspaceFolder(workdir string) (string, error) {
 	}
 	prefix := workspaceRoot + "/"
 	if !strings.HasPrefix(clean, prefix) {
-		return "", exit(2, "upstash-box workdir %q must be under %s", clean, workspaceRoot)
+		return "", core.Exit(2, "upstash-box workdir %q must be under %s", clean, workspaceRoot)
 	}
 	return strings.TrimPrefix(clean, prefix), nil
 }

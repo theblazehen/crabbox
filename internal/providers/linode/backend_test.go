@@ -6,10 +6,14 @@ import (
 	"io"
 	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -168,75 +172,111 @@ func newTestBackend(t *testing.T, api *fakeLinodeAPI) *linodeLeaseBackend {
 	return backend
 }
 
+func TestLinodeDoctorEffectiveType(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  core.Config
+		want string
+	}{
+		{name: "native configured type", cfg: core.Config{Linode: core.LinodeConfig{Type: "g6-nanode-1"}}, want: "g6-nanode-1"},
+		{name: "explicit generic override", cfg: core.Config{ServerType: "g6-standard-2", ServerTypeExplicit: true, Linode: core.LinodeConfig{Type: "g6-nanode-1"}}, want: "g6-standard-2"},
+		{name: "class fallback", cfg: core.Config{Class: "standard"}, want: "g6-standard-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := newLinodeLeaseBackend(Provider{}.Spec(), tc.cfg, core.Runtime{})
+			backend.clientFactory = func(core.Runtime) (linodeAPI, error) { return &fakeLinodeAPI{}, nil }
+			result, err := backend.Doctor(context.Background(), core.DoctorRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(result.Message, " default_type="+tc.want+" ") {
+				t.Fatalf("doctor message=%q, want default_type=%s", result.Message, tc.want)
+			}
+		})
+	}
+}
+
 func TestWaitForLinodeIP(t *testing.T) {
 	t.Run("pending to ready", func(t *testing.T) {
-		calls := 0
-		api := &fakeLinodeAPI{getFn: func(context.Context, int64) (linodeInstance, error) {
-			calls++
-			if calls == 1 {
-				return linodeInstance{ID: 42, Status: "provisioning"}, nil
+		synctest.Test(t, func(t *testing.T) {
+			calls := 0
+			api := &fakeLinodeAPI{getFn: func(context.Context, int64) (linodeInstance, error) {
+				calls++
+				if calls == 1 {
+					return linodeInstance{ID: 42, Status: "provisioning"}, nil
+				}
+				return linodeInstance{ID: 42, Status: "offline", IPv4: []string{"203.0.113.42"}}, nil
+			}}
+			got, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, time.Minute)
+			if err != nil || got.ID != 42 || calls != 2 {
+				t.Fatalf("instance=%#v err=%v calls=%d", got, err, calls)
 			}
-			return linodeInstance{ID: 42, Status: "offline", IPv4: []string{"203.0.113.42"}}, nil
-		}}
-		got, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, time.Minute)
-		if err != nil || got.ID != 42 || calls != 2 {
-			t.Fatalf("instance=%#v err=%v calls=%d", got, err, calls)
-		}
+		})
 	})
 
 	t.Run("read error", func(t *testing.T) {
-		wantErr := errors.New("read denied")
-		calls := 0
-		api := &fakeLinodeAPI{getFn: func(context.Context, int64) (linodeInstance, error) {
-			calls++
-			return linodeInstance{}, wantErr
-		}}
-		_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, time.Minute)
-		if !errors.Is(err, wantErr) || calls != 1 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			wantErr := errors.New("read denied")
+			calls := 0
+			api := &fakeLinodeAPI{getFn: func(context.Context, int64) (linodeInstance, error) {
+				calls++
+				return linodeInstance{}, wantErr
+			}}
+			_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, time.Minute)
+			if !errors.Is(err, wantErr) || calls != 1 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
 	})
 
 	t.Run("client deadline", func(t *testing.T) {
-		api := &fakeLinodeAPI{getErr: context.DeadlineExceeded}
-		_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, time.Minute)
-		if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out waiting") {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeLinodeAPI{getErr: context.DeadlineExceeded}
+			_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, time.Minute)
+			if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out waiting") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("read error at deadline", func(t *testing.T) {
-		wantErr := errors.New("late read denied")
-		api := &fakeLinodeAPI{getFn: func(ctx context.Context, _ int64) (linodeInstance, error) {
-			<-ctx.Done()
-			return linodeInstance{}, wantErr
-		}}
-		_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, 10*time.Millisecond)
-		if !errors.Is(err, wantErr) || strings.Contains(err.Error(), "timed out") {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			wantErr := errors.New("late read denied")
+			api := &fakeLinodeAPI{getFn: func(ctx context.Context, _ int64) (linodeInstance, error) {
+				<-ctx.Done()
+				return linodeInstance{}, wantErr
+			}}
+			_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, 10*time.Millisecond)
+			if !errors.Is(err, wantErr) || strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("cancellation during delay", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		calls := 0
-		api := &fakeLinodeAPI{getFn: func(context.Context, int64) (linodeInstance, error) {
-			calls++
-			time.AfterFunc(time.Millisecond, cancel)
-			return linodeInstance{ID: 42, Status: "provisioning"}, nil
-		}}
-		_, err := newTestBackend(t, api).waitForLinodeIP(ctx, api, 42, time.Minute)
-		if !errors.Is(err, context.Canceled) || calls != 1 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			calls := 0
+			api := &fakeLinodeAPI{getFn: func(context.Context, int64) (linodeInstance, error) {
+				calls++
+				time.AfterFunc(time.Millisecond, cancel)
+				return linodeInstance{ID: 42, Status: "provisioning"}, nil
+			}}
+			_, err := newTestBackend(t, api).waitForLinodeIP(ctx, api, 42, time.Minute)
+			if !errors.Is(err, context.Canceled) || calls != 1 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		api := &fakeLinodeAPI{linodes: []linodeInstance{{ID: 42, Status: "provisioning"}}}
-		_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, 10*time.Millisecond)
-		if err == nil || err.Error() != "timed out waiting for Linode instance IP" {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeLinodeAPI{linodes: []linodeInstance{{ID: 42, Status: "provisioning"}}}
+			_, err := newTestBackend(t, api).waitForLinodeIP(context.Background(), api, 42, 10*time.Millisecond)
+			if err == nil || err.Error() != "timed out waiting for Linode instance IP" {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 }
 
@@ -286,26 +326,41 @@ func TestAcquireCreatesLinodeClaimsLeaseAndMarksReady(t *testing.T) {
 }
 
 func TestAcquireRecordsConfiguredLinodeTypeInMetadata(t *testing.T) {
-	api := &fakeLinodeAPI{}
-	backend := newTestBackend(t, api)
-	backend.Cfg.Linode.Type = "g6-standard-2"
-
-	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "custom-type"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(api.createRequests) != 1 || api.createRequests[0].Type != "g6-standard-2" {
-		t.Fatalf("createRequests=%#v", api.createRequests)
-	}
-	if lease.Server.ServerType.Name != "g6-standard-2" || lease.Server.Labels["server_type"] != "g6-standard-2" {
-		t.Fatalf("lease server type=%#v labels=%v", lease.Server.ServerType, lease.Server.Labels)
-	}
-	claim, ok, err := core.ResolveLeaseClaimForProvider("custom-type", providerName)
-	if err != nil || !ok {
-		t.Fatalf("claim ok=%v err=%v", ok, err)
-	}
-	if claim.Labels["server_type"] != "g6-standard-2" {
-		t.Fatalf("claim labels=%v", claim.Labels)
+	for _, tc := range []struct {
+		name, providerType, explicitType, want string
+	}{
+		{"provider type", "g6-standard-2", "", "g6-standard-2"},
+		{"explicit override", "g6-standard-2", "g6-nanode-1", "g6-nanode-1"},
+		{"padded explicit override", "g6-standard-2", " g6-nanode-1 ", "g6-nanode-1"},
+		{"blank explicit uses provider type", "g6-standard-2", " \t ", "g6-standard-2"},
+		{"blank explicit uses default", "", " ", defaultType},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeLinodeAPI{}
+			backend := newTestBackend(t, api)
+			backend.Cfg.Linode.Type = tc.providerType
+			if tc.explicitType != "" {
+				backend.Cfg.ServerType = tc.explicitType
+				backend.Cfg.ServerTypeExplicit = true
+			}
+			lease, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "custom-type"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(api.createRequests) != 1 || api.createRequests[0].Type != tc.want {
+				t.Fatalf("createRequests=%#v", api.createRequests)
+			}
+			if lease.Server.ServerType.Name != tc.want || lease.Server.Labels["server_type"] != tc.want {
+				t.Fatalf("lease server type=%#v labels=%v", lease.Server.ServerType, lease.Server.Labels)
+			}
+			claim, ok, err := core.ResolveLeaseClaimForProvider("custom-type", providerName)
+			if err != nil || !ok {
+				t.Fatalf("claim ok=%v err=%v", ok, err)
+			}
+			if claim.Labels["server_type"] != tc.want {
+				t.Fatalf("claim labels=%v", claim.Labels)
+			}
+		})
 	}
 }
 
@@ -636,6 +691,9 @@ func TestReleaseMissingLiveLinodeFinalizesLocalClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(keyPath), "known_hosts"), []byte("synthetic host trust\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	resolved, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: leaseID, ReleaseOnly: true})
 	if err != nil {
@@ -653,8 +711,69 @@ func TestReleaseMissingLiveLinodeFinalizesLocalClaim(t *testing.T) {
 	if _, ok, err := core.ResolveLeaseClaimForProvider(leaseID, providerName); err != nil || ok {
 		t.Fatalf("claim after release ok=%v err=%v", ok, err)
 	}
-	if _, statErr := os.Stat(keyPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("local key retained after release: %v", statErr)
+	if _, statErr := os.Lstat(filepath.Dir(keyPath)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("local connection artifacts retained after release: %v", statErr)
+	}
+}
+
+func TestReleaseArtifactFailureRetainsClaimForAbsentInstanceRetry(t *testing.T) {
+	api := &fakeLinodeAPI{}
+	backend := newTestBackend(t, api)
+	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "artifact-retry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := backend.prepareCleanupServer(context.Background(), lease.Server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, _, _ := core.ServerLeaseClaimSnapshot(prepared)
+	keyPath, err := core.TestboxKeyPath(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(keyPath)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: lease.LeaseID, Server: prepared}})
+	if err == nil || !strings.Contains(err.Error(), "remove SSH connection artifacts") {
+		t.Fatalf("ReleaseLease err=%v, want artifact cleanup failure", err)
+	}
+	if len(api.deleted) != 1 {
+		t.Fatalf("provider deletions=%v, want one completed deletion", api.deleted)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || !exists || !reflect.DeepEqual(claim, expected) {
+		t.Fatalf("retry claim=%#v exists=%v err=%v", claim, exists, err)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.EnsureTestboxKeyForConfig(backend.Cfg, lease.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("synthetic host trust\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: resolved}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.deleted) != 1 {
+		t.Fatalf("provider deletion repeated for absent instance: %v", api.deleted)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v after retry", exists, err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("connection artifacts retained after retry: %v", err)
 	}
 }
 
@@ -840,6 +959,76 @@ func TestClaimUpdateBlocksDuringDeleteThenFailsSafely(t *testing.T) {
 	}
 	if _, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID); err != nil || exists {
 		t.Fatalf("claim exists=%v err=%v", exists, err)
+	}
+}
+
+func TestCanceledReleaseAdmissionPreservesClaimAndKey(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(strconv.FormatBool(missing), func(t *testing.T) {
+			api := &fakeLinodeAPI{}
+			backend := newTestBackend(t, api)
+			lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "canceled-release"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := backend.prepareCleanupServer(t.Context(), lease.Server)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected, _, _ := core.ServerLeaseClaimSnapshot(prepared)
+			key, err := core.TestboxKeyPath(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if missing {
+				api.getErr = &linodeAPIError{Status: 404}
+			}
+			held, release, ownerDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var ownerErr error
+			var unlock sync.Once
+			go func() {
+				defer close(ownerDone)
+				ownerErr = core.WithDurableLeaseClaimLock(lease.LeaseID, func(*core.LeaseClaim, bool, func() error) error {
+					close(held)
+					<-release
+					return nil
+				})
+			}()
+			defer func() { unlock.Do(func() { close(release) }); <-ownerDone }()
+			select {
+			case <-held:
+			case <-ownerDone:
+				t.Fatal(ownerErr)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			done := make(chan struct{})
+			var releaseErr error
+			go func() {
+				defer close(done)
+				releaseErr = backend.ReleaseLease(ctx, core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: lease.LeaseID, Server: prepared}})
+			}()
+			defer func() { unlock.Do(func() { close(release) }); <-done }()
+			returnedWhileHeld := false
+			select {
+			case <-done:
+				returnedWhileHeld = true
+			case <-time.After(time.Second):
+			}
+			unlock.Do(func() { close(release) })
+			<-ownerDone
+			<-done
+			if ownerErr != nil || !returnedWhileHeld || !errors.Is(releaseErr, context.Canceled) || len(api.deleted) != 0 {
+				t.Fatalf("returned while held=%v release=%v owner=%v deletes=%v", returnedWhileHeld, releaseErr, ownerErr, api.deleted)
+			}
+			current, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+			if err != nil || !exists || !reflect.DeepEqual(current, expected) {
+				t.Fatal("canceled release changed claim")
+			}
+			if _, err := os.Stat(key); err != nil {
+				t.Fatalf("canceled release removed key: %v", err)
+			}
+		})
 	}
 }
 
@@ -1326,44 +1515,46 @@ func TestFencedLinodeTouchReconcilesLiveTimeoutWithClaim(t *testing.T) {
 func TestFencedLinodeProviderFailureAndCancellationRetainClaim(t *testing.T) {
 	for _, mode := range []string{"touch", "metadata", "cancellation"} {
 		t.Run(mode, func(t *testing.T) {
-			backend, api, lease := setupFencedLinodeLease(t)
-			before, _, _ := core.ServerLeaseClaimSnapshot(lease.Server)
-			keyPath, err := core.TestboxKeyPath(lease.LeaseID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ctx := context.Background()
-			if mode == "cancellation" {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
-				defer cancel()
-				api.getFn = func(ctx context.Context, _ int64) (linodeInstance, error) {
-					<-ctx.Done()
-					return linodeInstance{}, ctx.Err()
+			synctest.Test(t, func(t *testing.T) {
+				backend, api, lease := setupFencedLinodeLease(t)
+				before, _, _ := core.ServerLeaseClaimSnapshot(lease.Server)
+				keyPath, err := core.TestboxKeyPath(lease.LeaseID)
+				if err != nil {
+					t.Fatal(err)
 				}
-			} else {
-				api.updateErr = errors.New("linode provider tag update failed")
-			}
-			if mode == "metadata" {
-				_, err = backend.UpdateTailscaleMetadata(ctx, lease, core.TailscaleMetadata{Enabled: true, IPv4: "100.64.1.9"})
-			} else {
-				override := time.Hour
-				_, err = backend.Touch(ctx, core.TouchRequest{Lease: lease, IdleTimeoutOverride: &override})
-			}
-			after, readErr := core.ReadLeaseClaim(lease.LeaseID)
-			wantUpdateCalls := 1
-			if mode == "cancellation" {
-				wantUpdateCalls = 0
-			}
-			if err == nil || readErr != nil || !reflect.DeepEqual(after, before) || api.updateCalls != wantUpdateCalls || len(api.updated) != 0 {
-				t.Fatalf("error=%v before=%#v after=%#v attempted provider writes=%d successful writes=%v readErr=%v", err, before, after, api.updateCalls, api.updated, readErr)
-			}
-			if _, err := os.Stat(keyPath); err != nil {
-				t.Fatalf("lease SSH key was not retained: %v", err)
-			}
-			if mode == "cancellation" && !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("cancellation error=%v", err)
-			}
+				ctx := context.Background()
+				if mode == "cancellation" {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
+					defer cancel()
+					api.getFn = func(ctx context.Context, _ int64) (linodeInstance, error) {
+						<-ctx.Done()
+						return linodeInstance{}, ctx.Err()
+					}
+				} else {
+					api.updateErr = errors.New("linode provider tag update failed")
+				}
+				if mode == "metadata" {
+					_, err = backend.UpdateTailscaleMetadata(ctx, lease, core.TailscaleMetadata{Enabled: true, IPv4: "100.64.1.9"})
+				} else {
+					override := time.Hour
+					_, err = backend.Touch(ctx, core.TouchRequest{Lease: lease, IdleTimeoutOverride: &override})
+				}
+				after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+				wantUpdateCalls := 1
+				if mode == "cancellation" {
+					wantUpdateCalls = 0
+				}
+				if err == nil || readErr != nil || !reflect.DeepEqual(after, before) || api.updateCalls != wantUpdateCalls || len(api.updated) != 0 {
+					t.Fatalf("error=%v before=%#v after=%#v attempted provider writes=%d successful writes=%v readErr=%v", err, before, after, api.updateCalls, api.updated, readErr)
+				}
+				if _, err := os.Stat(keyPath); err != nil {
+					t.Fatalf("lease SSH key was not retained: %v", err)
+				}
+				if mode == "cancellation" && !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("cancellation error=%v", err)
+				}
+			})
 		})
 	}
 }
@@ -1501,12 +1692,13 @@ func TestAmbiguousCreatePersistsRecoveryClaimAndRetainsKey(t *testing.T) {
 func TestRollbackCleanupClaimResolvesWithSnapshotAndReleases(t *testing.T) {
 	api := &fakeLinodeAPI{deleteErr: errors.New("rollback delete failed")}
 	backend := newTestBackend(t, api)
+	cause := core.Exit(5, "timed out waiting for SSH during bootstrap")
 	backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
-		return errors.New("bootstrap failed")
+		return cause
 	}
 	_, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "rollback"})
-	if err == nil || !strings.Contains(err.Error(), "rollback delete failed") {
-		t.Fatalf("Acquire err=%v", err)
+	if !errors.Is(err, cause) || !errors.Is(err, api.deleteErr) || len(api.createRequests) != 1 {
+		t.Fatalf("Acquire err=%v creates=%d", err, len(api.createRequests))
 	}
 	claim, exists, err := core.ResolveLeaseClaimForProvider("rollback", providerName)
 	if err != nil || !exists || claim.Labels["recovery"] != "rollback-cleanup" || claim.Revision == "" {
@@ -1515,6 +1707,9 @@ func TestRollbackCleanupClaimResolvesWithSnapshotAndReleases(t *testing.T) {
 	keyPath, err := core.TestboxKeyPath(claim.LeaseID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("stored key missing after rollback failure: %v", err)
 	}
 	api.deleteErr = nil
 	resolved, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
@@ -1536,5 +1731,162 @@ func TestRollbackCleanupClaimResolvesWithSnapshotAndReleases(t *testing.T) {
 	}
 	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stored key retained after rollback cleanup: %v", err)
+	}
+}
+
+func TestAcquireRollbackFinalizesSSHArtifacts(t *testing.T) {
+	for _, artifactFailure := range []bool{false, true} {
+		t.Run(strconv.FormatBool(artifactFailure), func(t *testing.T) {
+			api := &fakeLinodeAPI{}
+			backend := newTestBackend(t, api)
+			cause := errors.New("synthetic readiness failure")
+			if artifactFailure {
+				cause = core.Exit(5, "timed out waiting for SSH during bootstrap")
+			}
+			var leaseID, dir string
+			backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+				leaseID = labelsFromTags(api.created[0].Tags)["lease"]
+				keyPath, err := core.TestboxKeyPath(leaseID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dir = filepath.Dir(keyPath)
+				if artifactFailure {
+					if err := os.RemoveAll(dir); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(dir, []byte("synthetic cleanup obstruction"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("synthetic host trust\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return cause
+			}
+			_, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "rollback-artifacts"})
+			if !errors.Is(err, cause) || len(api.createRequests) != 1 || len(api.deleted) != 1 {
+				t.Fatalf("Acquire err=%v creates=%d deletes=%v", err, len(api.createRequests), api.deleted)
+			}
+			claim, exists, readErr := core.ReadLeaseClaimWithPresence(leaseID)
+			if readErr != nil || exists != artifactFailure {
+				t.Fatalf("claim exists=%v err=%v", exists, readErr)
+			}
+			if artifactFailure {
+				if !strings.Contains(err.Error(), "remove SSH connection artifacts") || claim.Labels["recovery"] != "rollback-cleanup" {
+					t.Fatalf("err=%v claim=%#v", err, claim)
+				}
+				if err := os.Remove(dir); err != nil {
+					t.Fatal(err)
+				}
+				resolved, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: leaseID, ReleaseOnly: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot, snapshotExists, set := core.ServerLeaseClaimSnapshot(resolved.Server)
+				if !set || !snapshotExists || !reflect.DeepEqual(snapshot, claim) {
+					t.Fatalf("retry snapshot=%#v exists=%v set=%v", snapshot, snapshotExists, set)
+				}
+				if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: resolved}); err != nil {
+					t.Fatal(err)
+				}
+				if len(api.deleted) != 1 {
+					t.Fatalf("remote deletion repeated for absent instance: %v", api.deleted)
+				}
+			}
+			if _, exists, err := core.ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
+				t.Fatalf("claim retained after cleanup: exists=%v err=%v", exists, err)
+			}
+			if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("SSH connection artifacts retained: %v", err)
+			}
+		})
+	}
+}
+
+func TestAcquireRollbackPreservesCompetingClaim(t *testing.T) {
+	api := &fakeLinodeAPI{}
+	backend := newTestBackend(t, api)
+	cause := core.Exit(5, "timed out waiting for SSH during bootstrap")
+	var expected core.LeaseClaim
+	var keyPath string
+	backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		server := serverFromLinode(api.created[0], backend.Cfg)
+		leaseID := server.Labels["lease"]
+		var err error
+		expected, err = core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, "competing-claim", backend.Cfg, server, core.SSHTarget{}, t.TempDir(), backend.Cfg.IdleTimeout, false, core.LeaseClaim{}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyPath, err = core.TestboxKeyPath(leaseID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cause
+	}
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "rollback-conflict"})
+	if !errors.Is(err, cause) || !strings.Contains(err.Error(), "persist linode rollback cleanup claim") || len(api.createRequests) != 1 || len(api.deleted) != 1 {
+		t.Fatalf("Acquire err=%v creates=%d deletes=%v", err, len(api.createRequests), api.deleted)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(expected.LeaseID)
+	if err != nil || !exists || !reflect.DeepEqual(claim, expected) {
+		t.Fatalf("competing claim=%#v exists=%v err=%v", claim, exists, err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("competing claim SSH key removed: %v", err)
+	}
+}
+
+func TestLinodeConfigShowCompletePassiveSection(t *testing.T) {
+	projector, ok := any(Provider{}).(core.ProviderConfigShowProjector)
+	if !ok {
+		t.Fatal("actual provider has no passive config-show projector")
+	}
+	for _, tc := range []struct {
+		name  string
+		input core.LinodeConfig
+		want  map[string]any
+		text  string
+	}{
+		{name: "nil", input: core.LinodeConfig{}, want: map[string]any{"region": "", "image": "", "type": "", "firewall": "", "sshCIDRs": []string(nil)}, text: "linode region= image= type= firewall=- ssh_cidrs=-\n"},
+		{name: "empty", input: core.LinodeConfig{SSHCIDRs: []string{}}, want: map[string]any{"region": "", "image": "", "type": "", "firewall": "", "sshCIDRs": []string{}}, text: "linode region= image= type= firewall=- ssh_cidrs=-\n"},
+		{name: "raw-references-list", input: core.LinodeConfig{Region: "raw-region", Image: "image reference", Type: "raw-type", FirewallID: "firewall reference", SSHCIDRs: []string{"second", "first", "second", " "}}, want: map[string]any{"region": "raw-region", "image": "image reference", "type": "raw-type", "firewall": "firewall reference", "sshCIDRs": []string{"second", "first", "second", " "}}, text: "linode region=raw-region image=image reference type=raw-type firewall=firewall reference ssh_cidrs=second,first,second, \n"},
+		{name: "whitespace-empty-elements", input: core.LinodeConfig{Region: " ", Image: " ", Type: " ", FirewallID: " ", SSHCIDRs: []string{"", ""}}, want: map[string]any{"region": " ", "image": " ", "type": " ", "firewall": " ", "sshCIDRs": []string{"", ""}}, text: "linode region=  image=  type=  firewall=  ssh_cidrs=,\n"},
+	} {
+		for _, selected := range []string{"linode", "static"} {
+			t.Run(tc.name+"/"+selected, func(t *testing.T) {
+				cfg := core.Config{Provider: selected, Linode: tc.input}
+				before := cfg.Linode
+				before.SSHCIDRs = slices.Clone(cfg.Linode.SSHCIDRs)
+				section := projector.ConfigShowSection(cfg)
+				if section.JSONKey != "linode" || section.TextLabel != "linode" || !reflect.DeepEqual(section.Providers, []string{"linode"}) {
+					t.Fatalf("section metadata=%#v", section)
+				}
+				wantOrder := []string{"region", "image", "type", "firewall", "sshCIDRs"}
+				if len(section.Fields) != len(wantOrder) {
+					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
+				}
+				got := map[string]any{}
+				line := section.TextLabel
+				for i, field := range section.Fields {
+					if field.JSONName != wantOrder[i] {
+						t.Fatalf("field %d name=%q want %q", i, field.JSONName, wantOrder[i])
+					}
+					got[field.JSONName] = field.JSONValue
+					if field.TextName != "" {
+						line += " " + field.TextName + "=" + field.TextValue
+					}
+				}
+				line += "\n"
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("public fields=%#v want %#v", got, tc.want)
+				}
+				if line != tc.text {
+					t.Fatalf("text=%q want %q", line, tc.text)
+				}
+				if !reflect.DeepEqual(cfg.Linode, before) {
+					t.Fatal("projection mutated supplied configuration")
+				}
+			})
+		}
 	}
 }

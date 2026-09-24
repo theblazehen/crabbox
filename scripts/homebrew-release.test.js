@@ -104,6 +104,8 @@ function writeExecutable(file, contents) {
 
 function runMockedHomebrewPhase({
   useLauncher = false,
+  runtimePack = false,
+  installedRuntimePackMissing = false,
   nativeArch = "arm64",
   alreadyInstalled = false,
   installedArch,
@@ -164,13 +166,23 @@ function runMockedHomebrewPhase({
     )}\n`,
   );
 
+  const packMembers = runtimePack === "filesystem"
+    ? ["manifest.json", "darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64", "windows-amd64.exe", "windows-arm64.exe"]
+    : ["manifest.json", "linux-amd64", "linux-arm64"];
+  if (runtimePack) {
+    fs.mkdirSync(path.join(payload, "crabbox-runtime"));
+    for (const member of packMembers) {
+      fs.writeFileSync(path.join(payload, "crabbox-runtime", member), `synthetic ${member}`);
+    }
+  }
+  const runtimeMembers = runtimePack ? packMembers.map((member) => `crabbox-runtime/${member}`) : [];
   const archivePaths = {
     darwinAmd64: path.join(assets, "crabbox_1.2.3_darwin_amd64.tar.gz"),
     darwinArm64: path.join(assets, "crabbox_1.2.3_darwin_arm64.tar.gz"),
     linuxAmd64: path.join(assets, "crabbox_1.2.3_linux_amd64.tar.gz"),
     linuxArm64: path.join(assets, "crabbox_1.2.3_linux_arm64.tar.gz"),
   };
-  execFileSync("tar", ["-czf", archivePaths.darwinAmd64, "-C", payload, "crabbox"]);
+  execFileSync("tar", ["-czf", archivePaths.darwinAmd64, "-C", payload, "crabbox", ...runtimeMembers]);
   execFileSync("tar", [
     "-czf",
     archivePaths.darwinArm64,
@@ -178,6 +190,7 @@ function runMockedHomebrewPhase({
     payload,
     "crabbox",
     "crabbox-apple-vm-helper",
+    ...runtimeMembers,
   ]);
   fs.writeFileSync(archivePaths.linuxAmd64, "mock linux amd64 archive\n");
   fs.writeFileSync(archivePaths.linuxArm64, "mock linux arm64 archive\n");
@@ -192,6 +205,7 @@ function runMockedHomebrewPhase({
   fs.writeFileSync(
     path.join(assets, "provenance.json"),
     JSON.stringify({
+      schemaVersion: runtimePack === "filesystem" ? 3 : runtimePack ? 2 : 1,
       payloads: [
         {
           binaries: [
@@ -306,8 +320,14 @@ case "\${1:-}" in
     /bin/cp ${shellQuote(cli)} ${shellQuote(installedCli)}
     ${(nativeArch === "arm64" && !helperMissing) || helperOnIntel ? `/bin/cp ${shellQuote(helper)} ${shellQuote(installedHelper)}` : ""}
     ${helperByteMismatch ? `printf '# changed\\n' >>${shellQuote(installedHelper)}` : ""}
+    ${runtimePack && !installedRuntimePackMissing ? `/bin/cp -R ${shellQuote(path.join(payload, "crabbox-runtime"))} ${shellQuote(path.join(prefix, "bin"))}` : ""}
+    ${runtimePack ? `/bin/ln -sf ${shellQuote(installedCli)} ${shellQuote(path.join(mockBin, "crabbox"))}` : ""}
     ${corruptInstall};;
   --prefix)
+    if [ "$#" = 1 ]; then
+      printf '%s\\n' ${shellQuote(root)}
+      exit 0
+    fi
     [ "$*" = "--prefix openclaw/tap/crabbox" ] || exit 82
     printf '%s\\n' ${shellQuote(prefix)}
     ;;
@@ -423,10 +443,6 @@ test("Homebrew verifier checks immutable bytes before credential-free native ins
   assert.match(source, /HOME="\$homebrew_home"/);
   assert.match(source, /HOMEBREW_CACHE="\$homebrew_cache"/);
   assert.match(source, /go_bin=\$\(command -v go\)/);
-  assert.match(
-    source,
-    /clean_path="\$\{brew_bin%\/\*\}:\$\{node_bin%\/\*\}:\$\{go_bin%\/\*\}:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/,
-  );
   assert.ok(main.indexOf("go_bin=$(command -v go)") < main.indexOf("/usr/bin/env -i"));
   assert.doesNotMatch(source, /^\s*HOME="\$HOME"/m);
   for (const credential of forbiddenCredentials) {
@@ -443,7 +459,7 @@ test("Homebrew verifier checks immutable bytes before credential-free native ins
   assert.ok(phase.indexOf("verify_homebrew_formula") < phase.indexOf('"$brew_bin" fetch'));
   assert.ok(phase.indexOf('"$brew_bin" fetch --force --formula') < phase.indexOf('"$brew_bin" install'));
   assert.ok(phase.indexOf("verify-macos-binary.sh") < phase.indexOf('"$brew_bin" test'));
-  assert.ok(phase.indexOf('"$brew_bin" test') < phase.indexOf('"$installed_cli" --version'));
+  assert.ok(phase.indexOf('"$brew_bin" test') < phase.indexOf('"$version_cli" --version'));
 });
 
 test("Homebrew verifier cleanup survives main function scope", () => {
@@ -462,6 +478,65 @@ test("Homebrew verifier cleanup survives main function scope", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(root), false);
 });
+
+for (const order of [["go", "node", "brew"], ["node", "go", "brew"], ["shared"]]) {
+  test(`Homebrew launcher preserves captured tool selection for ${order.join(" then ")} directories`, (t) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-homebrew-path-")));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const selected = {};
+    const directories = [];
+    for (const entry of order) {
+      const directory = path.join(root, `${entry} tools`);
+      fs.mkdirSync(directory);
+      directories.push(directory);
+      // A later selected directory may contain older copies of earlier tools.
+      for (const tool of Object.keys(selected)) {
+        writeExecutable(path.join(directory, tool), "#!/bin/sh\necho 'shadowed tool selected' >&2\nexit 91\n");
+      }
+      for (const tool of entry === "shared" ? ["brew", "node", "go"] : [entry]) {
+        selected[tool] = path.join(directory, tool);
+        writeExecutable(selected[tool], tool === "node"
+          ? `#!/bin/sh\nexec ${shellQuote(process.execPath)} "$@"\n`
+          : `#!/bin/sh\nprintf '%s\\n' selected-${tool}\n`);
+      }
+    }
+    const unrelated = path.join(root, "unrelated");
+    const assets = path.join(root, "assets");
+    fs.mkdirSync(unrelated);
+    fs.mkdirSync(assets);
+    writeExecutable(path.join(path.dirname(selected.brew), "uname"), "#!/bin/sh\ncase $1 in -s) echo Darwin;; -m) echo arm64;; *) exit 98;; esac\n");
+    const launcher = path.join(root, "launcher.sh");
+    writeExecutable(launcher, `#!/bin/bash
+source ${shellQuote(verifier)}
+SCRIPT_PATH=${shellQuote(launcher)}
+require_publishable_source() { :; }
+require_protected_homebrew_tooling() { :; }
+freeze_public_release() { mkdir -m 700 "$7/public-assets"; }
+homebrew_phase() {
+  assert_clean_homebrew_environment
+  [[ "$(command -v brew)" == ${shellQuote(selected.brew)} ]] || return 97
+  [[ "$(command -v node)" == ${shellQuote(selected.node)} ]] || return 97
+  [[ "$(command -v go)" == ${shellQuote(selected.go)} ]] || return 97
+  [[ "$(go version)" == selected-go ]] || return 97
+  [[ "$(node --version)" == ${shellQuote(process.version)} ]] || return 97
+  [[ ":$PATH:" != *:${shellQuote(unrelated)}:* ]] || return 97
+  printf 'captured tools preserved\\n'
+}
+if [[ "\${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
+`);
+    const result = spawnSync("/bin/bash", [launcher, "v1.2.3", assets, "a".repeat(40), "b".repeat(40), "c".repeat(40), "123"], {
+      encoding: "utf8", cwd: root,
+      env: {
+        // Trailing slashes, spaces, and unrelated entries must not change the selection.
+        PATH: `${unrelated}:${directories.map((directory) => `${directory}/`).join(":")}:/usr/bin:/bin`,
+        HOME: root, TMPDIR: root, UNRELATED_SECRET: "synthetic-secret-canary",
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /captured tools preserved/);
+    assert.equal(fs.readdirSync(root).some((name) => name.startsWith("crabbox-homebrew-verify.")), false);
+  });
+}
 
 test("run-free public validation and freeze bind the complete immutable asset inventory", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-public-proof-"));
@@ -990,3 +1065,76 @@ test("internal Homebrew phase refuses an unsanitized direct call", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("installed runtime pack follows the Homebrew CLI symlink and preserves frozen bytes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-homebrew-runtime-"));
+  const extracted = path.join(root, "extracted");
+  const cellar = path.join(root, "Cellar", "crabbox", "1.2.3", "bin");
+  const linkedCLI = path.join(root, "opt", "homebrew", "bin", "crabbox");
+  const installedCLI = path.join(cellar, "crabbox");
+  const pack = path.join(cellar, "crabbox-runtime");
+  fs.mkdirSync(path.dirname(linkedCLI), { recursive: true });
+  fs.mkdirSync(pack, { recursive: true });
+  fs.mkdirSync(path.join(extracted, "crabbox-runtime"), { recursive: true });
+  fs.writeFileSync(installedCLI, "synthetic controller");
+  fs.symlinkSync(installedCLI, linkedCLI);
+  for (const member of ["manifest.json", "linux-amd64", "linux-arm64"]) {
+    fs.writeFileSync(path.join(pack, member), `synthetic ${member}`);
+    fs.copyFileSync(path.join(pack, member), path.join(extracted, "crabbox-runtime", member));
+  }
+  const verify = () => spawnSync("/bin/bash", [
+    "-s", "--", verifier, process.execPath, extracted, installedCLI, linkedCLI,
+  ], {
+    encoding: "utf8",
+    input: 'source "$1"\nverify_homebrew_runtime_pack "$2" "$3" "$4" "$5"\n',
+  });
+  try {
+    assert.equal(verify().status, 0);
+    const runtime = path.join(pack, "linux-arm64");
+    fs.writeFileSync(runtime, "wrong runtime bytes");
+    assert.match(verify().stderr, /differs from the frozen release archive/);
+    fs.unlinkSync(runtime);
+    assert.match(verify().stderr, /member inventory is not exact/);
+    fs.symlinkSync(path.join(extracted, "crabbox-runtime", "linux-arm64"), runtime);
+    assert.match(verify().stderr, /differs from the frozen release archive/);
+    fs.unlinkSync(runtime);
+    fs.copyFileSync(path.join(extracted, "crabbox-runtime", "linux-arm64"), runtime);
+    fs.writeFileSync(path.join(pack, "extra"), "unexpected");
+    assert.match(verify().stderr, /member inventory is not exact/);
+    fs.unlinkSync(path.join(pack, "extra"));
+    fs.renameSync(pack, `${pack}-elsewhere`);
+    fs.symlinkSync(`${pack}-elsewhere`, pack);
+    assert.match(verify().stderr, /not a real directory/);
+    fs.unlinkSync(pack);
+    fs.renameSync(`${pack}-elsewhere`, pack);
+    fs.unlinkSync(linkedCLI);
+    fs.writeFileSync(linkedCLI, "other controller");
+    assert.match(verify().stderr, /does not resolve to the verified controller/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const nativeArch of ["arm64", "x86_64"]) {
+  test(`schema 2 Homebrew install verifies offline pack and linked CLI on ${nativeArch}`, () => {
+    const result = runMockedHomebrewPhase({ runtimePack: true, nativeArch });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.calls, /brew:--prefix\n/);
+    assert.match(result.stdout, /Verified Homebrew/);
+  });
+}
+
+test("schema 2 Homebrew phase rejects formulae that omit the offline pack", () => {
+  const result = runMockedHomebrewPhase({ runtimePack: true, installedRuntimePackMissing: true });
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.calls, /brew:test/);
+});
+
+for (const nativeArch of ["arm64", "x86_64"]) {
+  test(`schema 3 Homebrew install preserves all six filesystem companions on ${nativeArch}`, () => {
+    const result = runMockedHomebrewPhase({ runtimePack: "filesystem", nativeArch });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.calls, /brew:--prefix\n/);
+    assert.match(result.stdout, /Verified Homebrew/);
+  });
+}

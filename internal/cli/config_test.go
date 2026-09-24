@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,6 +20,574 @@ import (
 	"github.com/openclaw/crabbox/internal/testutil"
 	"gopkg.in/yaml.v3"
 )
+
+func TestStaticFlagInputFacts(t *testing.T) {
+	for _, name := range []string{"static-host", "static-user", "static-port", "static-work-root"} {
+		for _, value := range []string{"", "sample"} {
+			t.Run(name+"/"+value, func(t *testing.T) {
+				cfg := baseConfig()
+				cfg.Static = StaticConfig{Host: "old-host", User: "old-user", Port: "22", WorkRoot: "/old"}
+				fs := newFlagSet("test", io.Discard)
+				values := registerTargetFlags(fs, cfg)
+				if err := fs.Parse([]string{"--" + name + "=" + value}); err != nil {
+					t.Fatal(err)
+				}
+				if err := applyTargetFlagOverrides(&cfg, fs, values); err != nil {
+					t.Fatal(err)
+				}
+				got := map[string]string{"static-host": cfg.Static.Host, "static-user": cfg.Static.User, "static-port": cfg.Static.Port, "static-work-root": cfg.Static.WorkRoot}[name]
+				if got != value {
+					t.Fatalf("assigned value=%q, want=%q", got, value)
+				}
+				if cfg.inputProvenance.summary("ssh").state != "present" {
+					t.Fatal("accepted static flag source missing")
+				}
+			})
+		}
+	}
+	t.Run("unvisited-defaults", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Static = StaticConfig{Host: "old-host", User: "old-user", Port: "22", WorkRoot: "/old"}
+		before := cfg.Static
+		fs := newFlagSet("test", io.Discard)
+		values := registerTargetFlags(fs, cfg)
+		if err := applyTargetFlagOverrides(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cfg.Static, before) || cfg.inputProvenance.summary("ssh").state != "unknown" {
+			t.Fatal("unvisited static defaults changed value or acquired an input fact")
+		}
+	})
+}
+
+func TestAzureDynamicSessionsSharedInputFacts(t *testing.T) {
+	t.Run("environment alias precedence", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, primary, fallback, want string
+			accepted                      bool
+		}{
+			{"no override", "", "", "configured", false},
+			{"fallback", "", "fallback", "fallback", true},
+			{"primary", "primary", "fallback", "primary", true},
+			{"raw whitespace", " primary ", "fallback", " primary ", true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				clearConfigEnv(t)
+				for _, suffix := range []string{"SUBSCRIPTION_ID", "TENANT_ID", "CLIENT_ID"} {
+					t.Setenv("CRABBOX_AZURE_"+suffix, tc.primary)
+					t.Setenv("AZURE_"+suffix, tc.fallback)
+				}
+				cfg := baseConfig()
+				cfg.Azure.Subscription, cfg.Azure.Tenant, cfg.Azure.ClientID = "configured", "configured", "configured"
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				if cfg.Azure.Subscription != tc.want || cfg.Azure.Tenant != tc.want || cfg.Azure.ClientID != tc.want {
+					t.Fatalf("subscription=%q tenant=%q client=%q, want %q", cfg.Azure.Subscription, cfg.Azure.Tenant, cfg.Azure.ClientID, tc.want)
+				}
+				var want configInputLedger
+				if tc.accepted {
+					want = want.withInput("azure", configInputEnvironment, configInputValue).withInput("azure-dynamic-sessions", configInputEnvironment, configInputValue)
+				}
+				if !reflect.DeepEqual(cfg.inputProvenance, want) {
+					t.Fatal("alias precedence changed shared input attribution")
+				}
+			})
+		}
+	})
+	for _, tc := range []struct {
+		name   string
+		file   fileAzureConfig
+		shared bool
+	}{
+		{"tenant", fileAzureConfig{TenantID: "sample-tenant"}, true},
+		{"subscription", fileAzureConfig{SubscriptionID: "sample-subscription"}, true},
+		{"client", fileAzureConfig{ClientID: "sample-client"}, false},
+	} {
+		t.Run("file/"+tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			if err := applyFileConfig(&cfg, fileConfig{Azure: &tc.file}); err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.inputProvenance.summary("azure-dynamic-sessions").state == "present"; got != tc.shared {
+				t.Fatalf("shared source=%t, want=%t", got, tc.shared)
+			}
+			if cfg.inputProvenance.summary("azure").state != "present" {
+				t.Fatal("Azure source missing")
+			}
+		})
+	}
+	for _, name := range []string{"CRABBOX_AZURE_TENANT_ID", "AZURE_TENANT_ID", "CRABBOX_AZURE_SUBSCRIPTION_ID", "AZURE_SUBSCRIPTION_ID", "CRABBOX_AZURE_CLIENT_ID"} {
+		t.Run("env/"+name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(name, "sample-identity")
+			cfg := baseConfig()
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			want := name != "CRABBOX_AZURE_CLIENT_ID"
+			if got := cfg.inputProvenance.summary("azure-dynamic-sessions").state == "present"; got != want {
+				t.Fatalf("shared source=%t, want=%t", got, want)
+			}
+		})
+	}
+}
+
+func TestExternalInputFactsSurviveSerializationError(t *testing.T) {
+	clearConfigEnv(t)
+	cfg := baseConfig()
+	file := fileConfig{External: &fileExternalConfig{
+		Config:     map[string]any{"measurement": math.NaN()},
+		Connection: &ExternalConnectionConfig{SSH: ExternalSSHConnectionConfig{TrustProviderOutput: true}},
+	}}
+	err := applyFileConfig(&cfg, file)
+	if err == nil || !strings.Contains(err.Error(), "JSON encodable") {
+		t.Fatal("expected ordinary non-finite JSON serialization rejection")
+	}
+	if cfg.External.Config == nil || !cfg.External.Connection.SSH.TrustProviderOutput {
+		t.Fatal("source assignments unexpectedly changed")
+	}
+	if cfg.inputProvenance.summary("external").state != "present" {
+		t.Fatal("earlier applied configuration was lost at the later serialization error")
+	}
+}
+
+func TestManualBatchBFileInputFacts(t *testing.T) {
+	clearConfigEnv(t)
+	owners := map[string]configInputOwner{
+		"Freestyle": "freestyle", "GitHubCodespaces": "github-codespaces",
+		"Hostinger": "hostinger", "HyperV": "hyperv", "Incus": "incus",
+		"Islo": "islo", "MXC": "mxc", "Nebius": "nebius", "Nomad": "nomad", "NvidiaBrev": "nvidia-brev",
+	}
+	for field, owner := range owners {
+		fileType, ok := reflect.TypeFor[fileConfig]().FieldByName(field)
+		if !ok {
+			t.Fatalf("missing file owner %s", field)
+		}
+		t.Run(field+"/empty-section", func(t *testing.T) {
+			var file fileConfig
+			reflect.ValueOf(&file).Elem().FieldByName(field).Set(reflect.New(fileType.Type.Elem()))
+			cfg := baseConfig()
+			if err := applyFileConfig(&cfg, file); err != nil {
+				t.Fatal("empty owner section failed")
+			}
+			if cfg.inputProvenance.summary(owner).state != "unknown" {
+				t.Fatal("section presence alone acquired an input fact")
+			}
+		})
+		for i := 0; i < fileType.Type.Elem().NumField(); i++ {
+			member := fileType.Type.Elem().Field(i)
+			t.Run(field+"/"+member.Name, func(t *testing.T) {
+				var file fileConfig
+				input := reflect.New(fileType.Type.Elem())
+				value := input.Elem().Field(i)
+				if value.Kind() == reflect.Pointer {
+					value.Set(reflect.New(value.Type().Elem()))
+					value = value.Elem()
+				}
+				switch value.Kind() {
+				case reflect.String:
+					raw := "sample"
+					if strings.Contains(member.Name, "Timeout") || member.Name == "RetentionPeriod" {
+						raw = "5m"
+					}
+					value.SetString(raw)
+				case reflect.Int, reflect.Int32, reflect.Int64:
+					value.SetInt(1)
+				case reflect.Bool:
+					value.SetBool(false)
+				case reflect.Slice:
+					value.Set(reflect.ValueOf([]string{"sample"}))
+				default:
+					t.Fatalf("add an ordinary fixture for %s", member.Name)
+				}
+				reflect.ValueOf(&file).Elem().FieldByName(field).Set(input)
+				cfg := baseConfig()
+				if err := applyFileConfig(&cfg, file); err != nil {
+					t.Fatalf("ordinary file input failed for %s", member.Name)
+				}
+				summary := cfg.inputProvenance.summary(owner)
+				if summary.state != "present" || !reflect.DeepEqual(summary.sources, []string{"user_config"}) || summary.complete {
+					t.Fatalf("input fact missing or incorrectly complete: %+v", summary)
+				}
+			})
+		}
+	}
+}
+
+func TestManualBatchBInputNoOpsAndPartialErrors(t *testing.T) {
+	clearConfigEnv(t)
+	for _, owner := range []configInputOwner{"freestyle", "github-codespaces", "hostinger", "hyperv", "incus", "islo", "mxc", "nebius", "nomad", "nvidia-brev"} {
+		cfg := baseConfig()
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.inputProvenance.summary(owner).state != "unknown" {
+			t.Fatalf("absent environment acquired an input fact for %s", owner)
+		}
+	}
+	for _, name := range []string{"CRABBOX_FREESTYLE_VCPUS", "CRABBOX_NEBIUS_DISK_SIZE_GIB", "CRABBOX_HYPERV_CPUS", "CRABBOX_ISLO_VCPUS"} {
+		t.Setenv(name, "invalid")
+	}
+	cfg := baseConfig()
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, owner := range []configInputOwner{"freestyle", "nebius", "hyperv", "islo"} {
+		if cfg.inputProvenance.summary(owner).state != "unknown" {
+			t.Fatalf("ignored malformed integer acquired an input fact for %s", owner)
+		}
+	}
+	negative := -1
+	cfg = baseConfig()
+	err := applyFileConfig(&cfg, fileConfig{Nomad: &fileNomadConfig{Region: "sample", MemoryMB: &negative}})
+	if ExitCodeForError(err, 0) != 2 || cfg.Nomad.Region != "sample" || cfg.inputProvenance.summary("nomad").state != "present" {
+		t.Fatal("earlier Nomad input did not survive its later file error")
+	}
+	t.Setenv("CRABBOX_NOMAD_REGION", "sample")
+	t.Setenv("CRABBOX_NOMAD_EXEC_TIMEOUT_SECS", "-1")
+	cfg = baseConfig()
+	if err := applyEnv(&cfg); ExitCodeForError(err, 0) != 2 || cfg.inputProvenance.summary("nomad").state != "present" {
+		t.Fatal("earlier Nomad input did not survive its later environment error")
+	}
+}
+
+func TestManualBatchBEnvironmentInputFacts(t *testing.T) {
+	groups := []struct {
+		owner         configInputOwner
+		prefix, names string
+	}{
+		{"freestyle", "CRABBOX_FREESTYLE_", "API_KEY API_URL WORKDIR VCPUS MEMORY_GB"},
+		{"github-codespaces", "CRABBOX_GITHUB_CODESPACES_", "API_URL GH_PATH REPO REF MACHINE DEVCONTAINER_PATH WORKING_DIRECTORY GEO IDLE_TIMEOUT RETENTION_PERIOD DELETE_ON_RELEASE WORK_ROOT"},
+		{"hostinger", "CRABBOX_HOSTINGER_", "API_TOKEN API_URL ITEM_ID PAYMENT_METHOD_ID TEMPLATE_ID DATA_CENTER_ID HOSTNAME_PREFIX USER WORK_ROOT ALLOW_PURCHASE RELEASE_ACTION"},
+		{"hyperv", "CRABBOX_HYPERV_", "IMAGE USER WORK_ROOT CPUS MEMORY SWITCH GUEST_PASSWORD INIT_PASSWORD"},
+		{"incus", "CRABBOX_INCUS_", "REMOTE PROJECT ADDRESS SOCKET INSTANCE_TYPE IMAGE PROFILE USER WORK_ROOT DELETE_ON_RELEASE START_TIMEOUT LAUNCH_PORT PROXY_LISTEN_HOST PROXY_LISTEN_PORT PROXY_DEVICE TLS_SERVER_CERT INSECURE_TLS REMOTE_IMAGE_SERVER"},
+		{"islo", "CRABBOX_ISLO_", "API_KEY BASE_URL IMAGE WORKDIR GATEWAY_PROFILE SNAPSHOT_NAME VCPUS MEMORY_MB DISK_GB"},
+		{"mxc", "CRABBOX_MXC_", "CLI VERSION CONTAINMENT NETWORK READONLY_PATHS READWRITE_PATHS ALLOWED_HOSTS BLOCKED_HOSTS ALLOW_DACL_MUTATION ALLOW_WINDOWS_UI EXPERIMENTAL"},
+		{"nebius", "CRABBOX_NEBIUS_", "CLI PROFILE PARENT_ID SUBNET_ID PLATFORM PRESET IMAGE_FAMILY DISK_TYPE DISK_SIZE_GIB USER PUBLIC_IP SECURITY_GROUP_IDS SERVICE_ACCOUNT_ID RECOVERY_POLICY"},
+		{"nomad", "CRABBOX_NOMAD_", "ADDR REGION NAMESPACE TOKEN_ENV CA_CERT CA_PATH CLIENT_CERT CLIENT_KEY TLS_SERVER_NAME SKIP_VERIFY TASK DRIVER IMAGE WORKDIR JOBSPEC_TEMPLATE NODE_POOL DATACENTERS CPU MEMORY_MB DISK_MB ALLOC_READY_TIMEOUT EVAL_TIMEOUT EXEC_TIMEOUT_SECS"},
+		{"nvidia-brev", "CRABBOX_NVIDIA_BREV_", "CLI ORG TYPE GPU_NAME PROVIDER MODE LAUNCHABLE STARTUP_SCRIPT RELEASE_ACTION TARGET USER WORK_ROOT"},
+	}
+	for _, group := range groups {
+		for _, suffix := range strings.Fields(group.names) {
+			t.Run(string(group.owner)+"/"+suffix, func(t *testing.T) {
+				clearConfigEnv(t)
+				raw := "sample"
+				switch suffix {
+				case "VCPUS", "MEMORY_GB", "CPUS", "MEMORY", "MEMORY_MB", "DISK_GB", "DISK_SIZE_GIB", "CPU", "DISK_MB", "EXEC_TIMEOUT_SECS":
+					raw = "1"
+				case "IDLE_TIMEOUT", "RETENTION_PERIOD", "START_TIMEOUT", "ALLOC_READY_TIMEOUT", "EVAL_TIMEOUT":
+					raw = "5m"
+				case "DELETE_ON_RELEASE", "ALLOW_PURCHASE", "INIT_PASSWORD", "INSECURE_TLS", "ALLOW_DACL_MUTATION", "ALLOW_WINDOWS_UI", "EXPERIMENTAL", "SKIP_VERIFY":
+					raw = "false"
+				}
+				t.Setenv(group.prefix+suffix, raw)
+				cfg := baseConfig()
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatalf("ordinary environment input failed for %s", suffix)
+				}
+				summary := cfg.inputProvenance.summary(group.owner)
+				if summary.state != "present" || !reflect.DeepEqual(summary.sources, []string{"environment"}) || summary.complete {
+					t.Fatalf("missing or incorrectly complete environment fact: %+v", summary)
+				}
+			})
+		}
+	}
+}
+
+func TestFlatProviderFileInputTracking(t *testing.T) {
+	fields := map[string][]string{
+		"hetzner": {"location", "image", "sshKey"},
+		"aws":     {"region", "ami", "securityGroupId", "subnetId", "instanceProfile", "rootGB", "sshCIDRs", "macHostId"},
+		"azure":   {"backend", "subscriptionId", "tenantId", "clientId", "location", "resourceGroup", "image", "osDisk", "snapshotSKU", "osDiskSKU", "vnet", "subnet", "nsg", "sshCIDRs", "network"},
+		"gcp":     {"project", "zone", "image", "network", "subnet", "tags", "sshCIDRs", "rootGB", "serviceAccount"},
+	}
+	for owner, keys := range fields {
+		for _, key := range keys {
+			t.Run(owner+"/"+key, func(t *testing.T) {
+				clearConfigEnv(t)
+				for _, trusted := range []bool{true, false} {
+					for _, accepted := range []bool{false, true} {
+						value := "''"
+						if accepted {
+							value = "fixture"
+						}
+						if key == "rootGB" {
+							value = "0"
+							if accepted {
+								value = "1"
+							}
+						}
+						if key == "tags" || key == "sshCIDRs" {
+							value = "[]"
+							if accepted {
+								value = "[fixture]"
+							}
+						}
+						var file fileConfig
+						if err := yaml.Unmarshal([]byte(owner+": {"+key+": "+value+"}"), &file); err != nil {
+							t.Fatal(err)
+						}
+						cfg := baseConfig()
+						source := configInputUser
+						if !trusted {
+							source = configInputRepo
+						}
+						for repeat := 0; repeat < 2; repeat++ {
+							cfg.inputProvenance = nil
+							if err := applyFileConfigWithTrust(&cfg, file, trusted); err != nil {
+								t.Fatal(err)
+							}
+							var want configInputLedger
+							if accepted {
+								want = want.withInput(configInputOwner(owner), source, configInputValue)
+								if owner == "aws" && key == "region" {
+									want = want.withInput("aws-lambda-microvm", source, configInputValue)
+								}
+								if owner == "azure" && (key == "tenantId" || key == "subscriptionId") {
+									want = want.withInput("azure-dynamic-sessions", source, configInputValue)
+								}
+							}
+							if !reflect.DeepEqual(cfg.inputProvenance, want) {
+								t.Fatalf("wrong accepted owner/source for %s.%s", owner, key)
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFlatProviderEnvironmentInputTracking(t *testing.T) {
+	t.Run("empty environment", func(t *testing.T) {
+		clearConfigEnv(t)
+		cfg := baseConfig()
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		for _, owner := range []configInputOwner{"aws", "aws-lambda-microvm", "azure", "gcp", "hetzner"} {
+			if cfg.inputProvenance.summary(owner).state != "unknown" {
+				t.Fatal("fallback recorded as input")
+			}
+		}
+	})
+
+	fields := map[string][]string{
+		"hetzner": {"CRABBOX_HETZNER_LOCATION", "CRABBOX_HETZNER_IMAGE", "CRABBOX_HETZNER_SSH_KEY"},
+		"aws":     {"CRABBOX_AWS_REGION", "AWS_REGION", "CRABBOX_AWS_AMI", "CRABBOX_AWS_SECURITY_GROUP_ID", "CRABBOX_AWS_SUBNET_ID", "CRABBOX_AWS_INSTANCE_PROFILE", "CRABBOX_AWS_ROOT_GB", "CRABBOX_AWS_MAC_HOST_ID", "CRABBOX_AWS_SSH_CIDRS"},
+		"azure":   {"CRABBOX_AZURE_BACKEND", "CRABBOX_AZURE_SUBSCRIPTION_ID", "AZURE_SUBSCRIPTION_ID", "CRABBOX_AZURE_TENANT_ID", "AZURE_TENANT_ID", "CRABBOX_AZURE_CLIENT_ID", "AZURE_CLIENT_ID", "CRABBOX_AZURE_LOCATION", "CRABBOX_AZURE_RESOURCE_GROUP", "CRABBOX_AZURE_IMAGE", "CRABBOX_AZURE_OS_DISK", "CRABBOX_AZURE_SNAPSHOT_SKU", "CRABBOX_AZURE_OS_DISK_SKU", "CRABBOX_AZURE_VNET", "CRABBOX_AZURE_SUBNET", "CRABBOX_AZURE_NSG", "CRABBOX_AZURE_SSH_CIDRS", "CRABBOX_AZURE_NETWORK"},
+		"gcp":     {"CRABBOX_GCP_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT_ID", "CRABBOX_GCP_ZONE", "CRABBOX_GCP_IMAGE", "CRABBOX_GCP_NETWORK", "CRABBOX_GCP_SUBNET", "CRABBOX_GCP_ROOT_GB", "CRABBOX_GCP_SERVICE_ACCOUNT", "CRABBOX_GCP_TAGS", "CRABBOX_GCP_SSH_CIDRS"},
+	}
+	for owner, keys := range fields {
+		for _, key := range keys {
+			t.Run(owner+"/"+key, func(t *testing.T) {
+				clearConfigEnv(t)
+				value := "fixture"
+				if strings.HasSuffix(key, "ROOT_GB") {
+					value = "0"
+				}
+				t.Setenv(key, value)
+				cfg := baseConfig()
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				want := configInputLedger(nil).withInput(configInputOwner(owner), configInputEnvironment, configInputValue)
+				if key == "CRABBOX_AWS_REGION" || key == "AWS_REGION" {
+					want = want.withInput("aws-lambda-microvm", configInputEnvironment, configInputValue)
+				}
+				if key == "CRABBOX_AZURE_TENANT_ID" || key == "AZURE_TENANT_ID" || key == "CRABBOX_AZURE_SUBSCRIPTION_ID" || key == "AZURE_SUBSCRIPTION_ID" {
+					want = want.withInput("azure-dynamic-sessions", configInputEnvironment, configInputValue)
+				}
+				if key == "CRABBOX_GCP_ROOT_GB" {
+					want = want.withInput("gcp", configInputEnvironment, configInputIntent)
+				}
+				if !reflect.DeepEqual(cfg.inputProvenance, want) {
+					t.Fatalf("wrong accepted environment owner for %s", key)
+				}
+			})
+		}
+	}
+	for _, tc := range []struct {
+		key, raw string
+		effect   configInputEffect
+	}{{"CRABBOX_AWS_ROOT_GB", "invalid", 0}, {"CRABBOX_AWS_ROOT_GB", "2147483648", 0}, {"CRABBOX_AWS_ROOT_GB", "5", configInputValue}, {"CRABBOX_GCP_ROOT_GB", "invalid", configInputIntent}, {"CRABBOX_GCP_ROOT_GB", "5", configInputValue | configInputIntent}} {
+		t.Run(tc.key+"/"+tc.raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(tc.key, tc.raw)
+			cfg := baseConfig()
+			cfg.AWSRootGB = 5
+			cfg.GCP.RootGB = 5
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AWSRootGB != 5 || cfg.GCP.RootGB != 5 {
+				t.Fatal("fallback/equal value changed")
+			}
+			owner := configInputOwner("aws")
+			if strings.Contains(tc.key, "GCP") {
+				owner = "gcp"
+				if !cfg.GCP.rootGBExplicit {
+					t.Fatal("existing intent lost")
+				}
+			}
+			if cfg.inputProvenance.summary(owner).effects != tc.effect {
+				t.Fatal("parse acceptance confused with fallback intent")
+			}
+		})
+	}
+	t.Run("ignored project alias", func(t *testing.T) {
+		clearConfigEnv(t)
+		t.Setenv("GOOGLE_CLOUD_PROJECT", "fixture")
+		cfg := baseConfig()
+		cfg.GCP.Project = "prior"
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.GCP.Project != "prior" || cfg.inputProvenance.summary("gcp").state != "unknown" {
+			t.Fatal("ignored alias recorded as accepted")
+		}
+	})
+	t.Run("region primary and copy isolation", func(t *testing.T) {
+		clearConfigEnv(t)
+		t.Setenv("CRABBOX_AWS_REGION", "same")
+		t.Setenv("AWS_REGION", "alias")
+		cfg := baseConfig()
+		cfg.AWSRegion = "same"
+		original := cfg
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AWSRegion != "same" || cfg.inputProvenance.summary("aws").state != "present" || cfg.inputProvenance.summary("aws-lambda-microvm").state != "present" || original.inputProvenance != nil {
+			t.Fatal("shared equal region/copy handling")
+		}
+	})
+}
+
+func TestConfigInputProvenance(t *testing.T) {
+	const provider configInputOwner = "machine0"
+	for _, tc := range []struct {
+		name     string
+		ledger   configInputLedger
+		state    string
+		sources  []string
+		effects  configInputEffect
+		complete bool
+	}{
+		{"untracked", nil, "unknown", []string{}, 0, false},
+		{"complete defaults", configInputLedger(nil).withCoverage(provider, true), "none", []string{}, 0, true},
+		{"ignored input", configInputLedger(nil).withInput(provider, configInputEnvironment, 0), "unknown", []string{}, 0, false},
+		{"accepted value", configInputLedger(nil).withInput(provider, configInputUser, configInputValue), "present", []string{"user_config"}, configInputValue, false},
+		{"intent without parsed value", configInputLedger(nil).withInput(provider, configInputEnvironment, configInputIntent), "present", []string{"environment"}, configInputIntent, false},
+		{"both effects one source", configInputLedger(nil).withInput(provider, configInputFlag, configInputValue|configInputIntent), "present", []string{"flag"}, configInputValue | configInputIntent, false},
+		{"covered accepted value", configInputLedger(nil).withInput(provider, configInputRepo, configInputValue).withCoverage(provider, true), "present", []string{"repo_config"}, configInputValue, true},
+		{"invalidated coverage", configInputLedger(nil).withCoverage(provider, true).withCoverage(provider, false), "unknown", []string{}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.ledger.summary(provider)
+			want := configInputSummary{tc.state, tc.sources, tc.effects, tc.complete}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("summary=%#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestConfigInputProvenanceCopyIsolation(t *testing.T) {
+	const provider configInputOwner = "machine0"
+	original := Config{inputProvenance: configInputLedger(nil).withInput(provider, configInputUser, configInputValue).withCoverage(provider, true)}
+	copy := original
+	copy.inputProvenance = copy.inputProvenance.withInput(provider, configInputEnvironment, configInputIntent).withCoverage(provider, false)
+	copy.inputProvenance = copy.inputProvenance.withInput(configInputGeneric, configInputRepo, configInputValue)
+	if got := original.inputProvenance.summary(provider); !reflect.DeepEqual(got, configInputSummary{"present", []string{"user_config"}, configInputValue, true}) {
+		t.Fatalf("copy changed original: %#v", got)
+	}
+	if got := original.inputProvenance.summary(configInputGeneric); got.state != "unknown" || len(got.sources) != 0 {
+		t.Fatalf("copy added generic input to original: %#v", got)
+	}
+	got := copy.inputProvenance.summary(provider)
+	if !reflect.DeepEqual(got, configInputSummary{"present", []string{"user_config", "environment"}, configInputValue | configInputIntent, false}) {
+		t.Fatalf("copy summary=%#v", got)
+	}
+	got.sources[0] = "changed"
+	if copy.inputProvenance.summary(provider).sources[0] != "user_config" {
+		t.Fatal("projection shares mutable source storage")
+	}
+}
+
+func TestConfigInputProvenanceSourceSets(t *testing.T) {
+	const provider configInputOwner = "machine0"
+	var ledger configInputLedger
+	for _, source := range []configInputSource{configInputFlag, configInputEnvironment, configInputUser, configInputRepo, configInputUser} {
+		ledger = ledger.withInput(provider, source, configInputValue)
+	}
+	if got := ledger.summary(provider).sources; !reflect.DeepEqual(got, []string{"user_config", "repo_config", "environment", "flag"}) {
+		t.Fatalf("ordered unique sources=%v", got)
+	}
+	before := ledger.summary(provider)
+	for _, source := range []configInputSource{0, 5, 255} {
+		ledger = ledger.withInput(provider, source, configInputIntent)
+	}
+	ledger = ledger.withInput("", configInputUser, configInputIntent).withCoverage("", true)
+	if !reflect.DeepEqual(ledger.summary(provider), before) || len(ledger) != 1 {
+		t.Fatalf("unknown source or owner changed ledger: %#v", ledger)
+	}
+	if got := ledger.summary("tart"); got.state != "unknown" || len(got.sources) != 0 {
+		t.Fatalf("untracked provider inherited another input owner: %#v", got)
+	}
+	ledger = ledger.withInput(provider, configInputUser, configInputIntent).withInput(provider, configInputEnvironment, configInputIntent)
+	if facts := ledger[provider]; facts.values != 0b1111 || facts.intents != 0b0101 {
+		t.Fatalf("lost per-source effect attribution: %#v", facts)
+	}
+}
+
+func TestConfigInputProvenanceCoverageCopyIsolation(t *testing.T) {
+	const provider configInputOwner = "machine0"
+	original := Config{inputProvenance: configInputLedger(nil).withInput(provider, configInputUser, configInputValue)}
+	covered := original
+	covered.inputProvenance = covered.inputProvenance.withCoverage(provider, true)
+	if original.inputProvenance.summary(provider).complete || !covered.inputProvenance.summary(provider).complete {
+		t.Fatal("coverage change mutated original or did not apply to copy")
+	}
+	untracked := covered
+	untracked.inputProvenance = untracked.inputProvenance.withCoverage(provider, false)
+	if !covered.inputProvenance.summary(provider).complete || untracked.inputProvenance.summary(provider).complete {
+		t.Fatal("coverage invalidation mutated original or did not apply to copy")
+	}
+	for _, cfg := range []Config{original, covered, untracked} {
+		if got := cfg.inputProvenance.summary(provider); got.state != "present" || !reflect.DeepEqual(got.sources, []string{"user_config"}) {
+			t.Fatalf("coverage update changed accepted input: %#v", got)
+		}
+	}
+}
+
+func TestConfigInputApplicationSources(t *testing.T) {
+	var cfg Config
+	recordConfigInput(&cfg, "machine0", configInputSourceForFile(providerSelectionUserConfig), true)
+	recordConfigInput(&cfg, "machine0", configInputSourceForFile(providerSelectionRepoConfig), true)
+	recordConfigInput(&cfg, "machine0", configInputSourceForFile(providerSelectionCompiledDefault), true)
+	recordConfigInput(&cfg, configInputGeneric, configInputEnvironment, true)
+	RecordProviderFlagInputs(&cfg, false, "machine0")
+	RecordProviderFlagInputs(&cfg, true, "apple-container", "apple-machine")
+	for _, tc := range []struct {
+		owner   configInputOwner
+		sources []string
+	}{
+		{"machine0", []string{"user_config", "repo_config"}},
+		{configInputGeneric, []string{"environment"}},
+		{"apple-container", []string{"flag"}},
+		{"apple-machine", []string{"flag"}},
+	} {
+		got := cfg.inputProvenance.summary(tc.owner)
+		if got.state != "present" || got.complete || !reflect.DeepEqual(got.sources, tc.sources) {
+			t.Fatalf("%s: %#v", tc.owner, got)
+		}
+	}
+	if got := cfg.inputProvenance.summary("tart"); got.state != "unknown" {
+		t.Fatalf("unobserved owner: %#v", got)
+	}
+}
 
 func TestLocalContainerBaseConfig(t *testing.T) {
 	cfg := baseConfig()
@@ -122,10 +691,38 @@ func isolateTestUserDirs(t *testing.T) testutil.UserDirs {
 	return testutil.IsolateUserDirs(t)
 }
 
+func TestClearConfigEnvPreservesAbsence(t *testing.T) {
+	const key = "CRABBOX_NOMAD_DATACENTERS"
+	t.Setenv(key, "prior")
+	t.Run("absent is not an explicit clear", func(t *testing.T) {
+		for range 2 {
+			clearConfigEnv(t)
+			if _, present := os.LookupEnv(key); present {
+				t.Fatal("environment reset must unset presence-aware inputs")
+			}
+		}
+		t.Setenv(key, "")
+		t.Run("restore explicit empty", func(t *testing.T) {
+			clearConfigEnv(t)
+			if _, present := os.LookupEnv(key); present {
+				t.Fatal("nested reset must remove explicit empty input")
+			}
+		})
+		if value, present := os.LookupEnv(key); !present || value != "" {
+			t.Fatal("an explicit empty input must remain distinguishable")
+		}
+	})
+	if os.Getenv(key) != "prior" {
+		t.Fatal("test cleanup did not restore the previous environment")
+	}
+}
+
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	isolateTestUserDirs(t)
 	for _, key := range []string{
+		"CRABBOX_SYNC_SOURCE",
+		"CRABBOX_SYNC_GIT_SEED_SOURCE",
 		"CRABBOX_ENV_ALLOW",
 		"CRABBOX_RESULTS_JUNIT",
 		"CRABBOX_RESULTS_AUTO",
@@ -409,6 +1006,7 @@ func clearConfigEnv(t *testing.T) {
 		"CRABBOX_ISLO_VCPUS",
 		"CRABBOX_ISLO_MEMORY_MB",
 		"CRABBOX_ISLO_DISK_GB",
+		"CRABBOX_ISLO_IDLE_PAUSE",
 		"CRABBOX_FREESTYLE_API_KEY",
 		"FREESTYLE_API_KEY",
 		"CRABBOX_FREESTYLE_API_URL",
@@ -713,7 +1311,15 @@ func clearConfigEnv(t *testing.T) {
 		"CRABBOX_HOSTINGER_RELEASE_ACTION",
 		"CRABBOX_EXTERNAL_IDEMPOTENT_LEASE_ID",
 	} {
+		// Recreating absent keys accumulates Go environment tombstones and makes
+		// later subprocess environment copies progressively more expensive.
+		if _, present := os.LookupEnv(key); !present {
+			continue
+		}
 		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -743,6 +1349,63 @@ func TestIsloCreateDefaultsTrackExplicitConfigAndEnvironment(t *testing.T) {
 	}
 	if !IsloImageExplicit(fromEnv) || !IsloVCPUsExplicit(fromEnv) || !IsloMemoryMBExplicit(fromEnv) || !IsloDiskGBExplicit(fromEnv) {
 		t.Fatalf("environment explicit markers missing: %#v", fromEnv)
+	}
+}
+
+// TestIsloIdlePauseDefaultsOffAndOptsInExplicitly pins the opt-in: the shipped
+// config leaves the Islo idle pause off despite a positive default idle timeout,
+// and only an explicit config-file or environment opt-in turns it on.
+func TestIsloIdlePauseDefaultsOffAndOptsInExplicitly(t *testing.T) {
+	base := baseConfig()
+	if base.IdleTimeout <= 0 {
+		t.Fatalf("base idle timeout=%s want the positive shipped default", base.IdleTimeout)
+	}
+	if base.Islo.IdlePause {
+		t.Fatal("islo idle pause must ship off")
+	}
+
+	untouched := base
+	if err := applyFileConfig(&untouched, fileConfig{Islo: &fileIsloConfig{Workdir: "crabbox"}}); err != nil {
+		t.Fatal(err)
+	}
+	if untouched.Islo.IdlePause {
+		t.Fatal("an islo config block without idlePause must not opt in")
+	}
+
+	optIn := true
+	fromFile := base
+	if err := applyFileConfig(&fromFile, fileConfig{Islo: &fileIsloConfig{IdlePause: &optIn}}); err != nil {
+		t.Fatal(err)
+	}
+	if !fromFile.Islo.IdlePause {
+		t.Fatal("islo.idlePause: true did not opt in")
+	}
+
+	clearConfigEnv(t)
+	sealed := base
+	if err := applyEnv(&sealed); err != nil {
+		t.Fatal(err)
+	}
+	if sealed.Islo.IdlePause {
+		t.Fatal("clearConfigEnv must unset CRABBOX_ISLO_IDLE_PAUSE; a value exported in the developer's shell must not opt in")
+	}
+
+	t.Setenv("CRABBOX_ISLO_IDLE_PAUSE", "1")
+	fromEnv := base
+	if err := applyEnv(&fromEnv); err != nil {
+		t.Fatal(err)
+	}
+	if !fromEnv.Islo.IdlePause {
+		t.Fatal("CRABBOX_ISLO_IDLE_PAUSE=1 did not opt in")
+	}
+
+	t.Setenv("CRABBOX_ISLO_IDLE_PAUSE", "0")
+	envOff := fromFile
+	if err := applyEnv(&envOff); err != nil {
+		t.Fatal(err)
+	}
+	if envOff.Islo.IdlePause {
+		t.Fatal("CRABBOX_ISLO_IDLE_PAUSE=0 did not override a config-file opt-in")
 	}
 }
 
@@ -779,6 +1442,299 @@ func TestProviderExplicitMarkerHelpers(t *testing.T) {
 		!IsTartCPUsExplicit(&cfg) || !IsTartMemoryExplicit(&cfg) || !IsTargetExplicit(&cfg) ||
 		!IsSSHUserExplicit(&cfg) || !IsSSHKeyExplicit(&cfg) || !IsSSHPortExplicit(&cfg) || !IsWorkRootExplicit(&cfg) {
 		t.Fatalf("explicit marker API did not preserve every setting: %#v", cfg)
+	}
+}
+
+func TestBlacksmithOrdinarySources(t *testing.T) {
+	clearConfigEnv(t)
+	if got := baseConfig().Blacksmith; got != (BlacksmithConfig{}) {
+		t.Fatalf("raw defaults: %#v", got)
+	}
+	for _, source := range []string{"user", "repo", "env"} {
+		for _, value := range []string{"", "same", " padded "} {
+			t.Run(source+"/"+value, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Blacksmith: BlacksmithConfig{Org: "same", Workflow: "same", Job: "same", Ref: "same"}}
+				want := cfg.Blacksmith
+				if value != "" {
+					want.Org, want.Workflow, want.Job, want.Ref = value, value, value, value
+				}
+				inputSource := configInputEnvironment
+				if source == "env" {
+					for _, name := range []string{"ORG", "WORKFLOW", "JOB", "REF"} {
+						t.Setenv("CRABBOX_BLACKSMITH_"+name, value)
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					selection := providerSelectionUserConfig
+					inputSource = configInputUser
+					if source == "repo" {
+						selection = providerSelectionRepoConfig
+						inputSource = configInputRepo
+					}
+					file := fileConfig{Blacksmith: &fileBlacksmithConfig{Org: value, Workflow: value, Job: value, Ref: value}}
+					original := *file.Blacksmith
+					if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, source == "user", selection); err != nil {
+						t.Fatal(err)
+					}
+					if *file.Blacksmith != original {
+						t.Fatal("input mutated")
+					}
+				}
+				var wantLedger configInputLedger
+				if value != "" {
+					wantLedger = wantLedger.withInput("blacksmith-testbox", inputSource, configInputValue)
+				}
+				if cfg.Blacksmith != want || !reflect.DeepEqual(cfg.inputProvenance, wantLedger) {
+					t.Fatalf("source result: %#v ledger %#v", cfg.Blacksmith, cfg.inputProvenance)
+				}
+			})
+		}
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, duration := range []string{"", "bad", "0s", "-1s", " 2m ", "2m"} {
+			for _, debug := range []string{"", "false", "true", "null", "invalid", " FALSE "} {
+				if source == "file" && (debug == "invalid" || debug == " FALSE ") {
+					continue
+				}
+				t.Run(source+"/"+duration+"/"+debug, func(t *testing.T) {
+					clearConfigEnv(t)
+					cfg := Config{Blacksmith: BlacksmithConfig{IdleTimeout: time.Minute, Debug: true}}
+					want := cfg.Blacksmith
+					accepted := duration == "2m"
+					if accepted {
+						want.IdleTimeout = 2 * time.Minute
+					}
+					if debug == "false" || debug == " FALSE " {
+						want.Debug = false
+						accepted = true
+					}
+					if debug == "true" {
+						accepted = true
+					}
+					inputSource := configInputEnvironment
+					if source == "env" {
+						t.Setenv("CRABBOX_BLACKSMITH_IDLE_TIMEOUT", duration)
+						t.Setenv("CRABBOX_BLACKSMITH_DEBUG", debug)
+						if err := applyEnv(&cfg); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						inputSource = configInputUser
+						file := fileConfig{Blacksmith: &fileBlacksmithConfig{IdleTimeout: duration}}
+						if debug == "true" || debug == "false" {
+							v := debug == "true"
+							file.Blacksmith.Debug = &v
+						}
+						if err := applyFileConfig(&cfg, file); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var wantLedger configInputLedger
+					if accepted {
+						wantLedger = wantLedger.withInput("blacksmith-testbox", inputSource, configInputValue)
+					}
+					if cfg.Blacksmith != want || !reflect.DeepEqual(cfg.inputProvenance, wantLedger) {
+						t.Fatalf("options: %#v ledger %#v want %#v %#v", cfg.Blacksmith, cfg.inputProvenance, want, wantLedger)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBlacksmithOrdinaryEnvironmentPhase(t *testing.T) {
+	for _, early := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			t.Run(fmt.Sprintf("early=%t/error=%t", early, fail), func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Blacksmith: BlacksmithConfig{Org: "prior", Workflow: "prior", Job: "prior", Ref: "prior", IdleTimeout: time.Minute, Debug: true}}
+				want := cfg.Blacksmith
+				if early {
+					for _, name := range []string{"ORG", "WORKFLOW", "JOB", "REF"} {
+						t.Setenv("CRABBOX_BLACKSMITH_"+name, "next")
+					}
+					want.Org, want.Workflow, want.Job, want.Ref = "next", "next", "next", "next"
+				}
+				t.Setenv("CRABBOX_BLACKSMITH_IDLE_TIMEOUT", "2m")
+				t.Setenv("CRABBOX_BLACKSMITH_DEBUG", "false")
+				if fail {
+					t.Setenv("CRABBOX_AGENT_SANDBOX_EXEC_TIMEOUT_SECS", "ordinary-invalid-integer")
+				} else {
+					want.IdleTimeout, want.Debug = 2*time.Minute, false
+				}
+				err := applyEnv(&cfg)
+				if (err != nil) != fail || (err != nil && !strings.Contains(err.Error(), "CRABBOX_AGENT_SANDBOX_EXEC_TIMEOUT_SECS")) {
+					t.Fatalf("error=%v", err)
+				}
+				var wantFacts configInputFacts
+				if early || !fail {
+					wantFacts.values = 1 << (configInputEnvironment - 1)
+				}
+				if cfg.Blacksmith != want || cfg.inputProvenance["blacksmith-testbox"] != wantFacts {
+					t.Fatalf("partial state: %#v facts %#v", cfg.Blacksmith, cfg.inputProvenance["blacksmith-testbox"])
+				}
+			})
+		}
+	}
+}
+
+func TestBlacksmithOrdinaryWriter(t *testing.T) {
+	for _, input := range []string{"{}", "blacksmith: null", "blacksmith: {}", "blacksmith: {org: '', workflow: '', job: '', ref: '', idleTimeout: '', debug: null}", "blacksmith: {org: ' padded ', workflow: ' padded ', job: ' padded ', ref: ' padded ', idleTimeout: 'bad', debug: false}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{}
+		if strings.Contains(input, "blacksmith: {") {
+			want["blacksmith"] = map[string]any{}
+		}
+		if strings.Contains(input, "padded") {
+			want["blacksmith"] = map[string]any{"org": " padded ", "workflow": " padded ", "job": " padded ", "ref": " padded ", "idleTimeout": "bad", "debug": false}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer %q: %#v want %#v", input, got, want)
+		}
+	}
+}
+
+func TestNvidiaBrevOrdinarySourcesAndWriter(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefaults := NvidiaBrevConfig{CLI: "brev", GPUName: "A100", Mode: "vm", ReleaseAction: "delete", Target: "container", WorkRoot: "/tmp/crabbox"}
+	if got := baseConfig().NvidiaBrev; got != wantDefaults {
+		t.Fatalf("initial defaults: %#v want %#v", got, wantDefaults)
+	}
+	fields := []struct{ field, key, env string }{
+		{"CLI", "cli", "CLI"}, {"Org", "org", "ORG"}, {"Type", "type", "TYPE"},
+		{"GPUName", "gpuName", "GPU_NAME"}, {"Provider", "provider", "PROVIDER"},
+		{"Mode", "mode", "MODE"}, {"Launchable", "launchable", "LAUNCHABLE"},
+		{"StartupScript", "startupScript", "STARTUP_SCRIPT"}, {"ReleaseAction", "releaseAction", "RELEASE_ACTION"},
+		{"Target", "target", "TARGET"}, {"User", "user", "USER"}, {"WorkRoot", "workRoot", "WORK_ROOT"},
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, value := range []string{"", "same", " padded "} {
+			t.Run(source+"/"+value, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Provider: "other", WorkRoot: "/generic", SSHUser: "generic"}
+				for _, field := range fields {
+					reflect.ValueOf(&cfg.NvidiaBrev).Elem().FieldByName(field.field).SetString("same")
+				}
+				want := cfg.NvidiaBrev
+				if value != "" {
+					for _, field := range fields {
+						reflect.ValueOf(&want).Elem().FieldByName(field.field).SetString(value)
+					}
+				}
+				input := map[string]string{}
+				for _, field := range fields {
+					input[field.key] = value
+				}
+				data, err := yaml.Marshal(map[string]any{"nvidiaBrev": input})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var file fileConfig
+				if err := yaml.Unmarshal(data, &file); err != nil {
+					t.Fatal(err)
+				}
+				original := *file.NvidiaBrev
+				inputSource := configInputUser
+				if source == "file" {
+					if err := applyFileConfig(&cfg, file); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					inputSource = configInputEnvironment
+					for _, field := range fields {
+						t.Setenv("CRABBOX_NVIDIA_BREV_"+field.env, value)
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if cfg.NvidiaBrev != want || *file.NvidiaBrev != original {
+					t.Fatalf("raw values or input changed: got %#v want %#v", cfg.NvidiaBrev, want)
+				}
+				accepted := value != ""
+				if DeleteOnReleaseExplicit(cfg, "nvidia-brev") != accepted || IsNvidiaBrevWorkRootExplicit(&cfg) != accepted || IsNvidiaBrevTargetExplicit(&cfg) != accepted {
+					t.Fatal("accepted marker mismatch")
+				}
+				var expected configInputLedger
+				if accepted {
+					expected = expected.withInput("nvidia-brev", inputSource, configInputValue)
+				}
+				if !reflect.DeepEqual(cfg.inputProvenance, expected) {
+					t.Fatalf("accepted input: %#v want %#v", cfg.inputProvenance, expected)
+				}
+				if cfg.WorkRoot != "/generic" || cfg.SSHUser != "generic" || IsWorkRootExplicit(&cfg) || IsSSHUserExplicit(&cfg) {
+					t.Fatal("provider input changed generic state")
+				}
+			})
+		}
+	}
+	for _, shape := range []string{"absent", "null", "empty", "zeros", "raw"} {
+		t.Run("writer/"+shape, func(t *testing.T) {
+			path := isolatedConfigPath(t)
+			input := map[string]any{}
+			want := map[string]any{}
+			switch shape {
+			case "null":
+				input["nvidiaBrev"] = nil
+			case "empty", "zeros", "raw":
+				fieldsIn, fieldsOut := map[string]any{}, map[string]any{}
+				for _, field := range fields {
+					if shape == "zeros" {
+						fieldsIn[field.key] = ""
+					}
+					if shape == "raw" {
+						fieldsIn[field.key], fieldsOut[field.key] = " padded ", " padded "
+					}
+				}
+				input["nvidiaBrev"], want["nvidiaBrev"] = fieldsIn, fieldsOut
+			}
+			data, err := yaml.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := readFileConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writeUserFileConfig(file); err != nil {
+				t.Fatal(err)
+			}
+			data, err = os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := yaml.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("writer got %#v want %#v", got, want)
+			}
+		})
 	}
 }
 
@@ -1772,6 +2728,172 @@ func TestAgentSandboxConfigDefaultsFileAndEnv(t *testing.T) {
 	}
 }
 
+func TestNamespaceConfigBindingSources(t *testing.T) {
+	clearConfigEnv(t)
+	defaults := baseConfig().Namespace
+	if defaults.Image != "builtin:base" || defaults.Size != "" || defaults.Repository != "" || defaults.Site != "" || defaults.VolumeSizeGB != 0 || defaults.AutoStopIdleTimeout != 30*time.Minute || defaults.WorkRoot != "/workspaces/crabbox" || defaults.DeleteOnRelease {
+		t.Fatalf("Namespace defaults=%#v", defaults)
+	}
+	for _, tc := range []struct {
+		name, duration, volumeEnv     string
+		volumeFile, fileWant, envWant int
+		wantDuration                  time.Duration
+	}{
+		{"positive", "45m", "9", 9, 9, 9, 45 * time.Minute},
+		{"zero", "0s", "0", 0, 7, 0, 17 * time.Minute},
+		{"negative", "-1m", "-2", -2, 7, -2, 17 * time.Minute},
+		{"malformed", "invalid", "invalid", 0, 7, 7, 17 * time.Minute},
+		{"padded", " 45m ", "7", 0, 7, 7, 17 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			newConfig := func() Config {
+				cfg := baseConfig()
+				cfg.Namespace.VolumeSizeGB = 7
+				cfg.Namespace.AutoStopIdleTimeout = 17 * time.Minute
+				cfg.Namespace.DeleteOnRelease = true
+				return cfg
+			}
+			value := false
+			file := fileConfig{Namespace: &fileNamespaceConfig{Image: " raw-image ", Size: " l ", Repository: " raw-repo ", Site: " raw-site ", VolumeSizeGB: tc.volumeFile, AutoStopIdleTimeout: tc.duration, WorkRoot: " /workspaces/raw ", DeleteOnRelease: &value}}
+			cfg := newConfig()
+			priorRoot, priorType := cfg.WorkRoot, cfg.ServerType
+			if err := applyFileConfig(&cfg, file); err != nil {
+				t.Fatal(err)
+			}
+			assertRaw := func(cfg Config, volume int) {
+				t.Helper()
+				got := cfg.Namespace
+				if got.Image != " raw-image " || got.Size != " l " || got.Repository != " raw-repo " || got.Site != " raw-site " || got.WorkRoot != " /workspaces/raw " || got.VolumeSizeGB != volume || got.AutoStopIdleTimeout != tc.wantDuration || got.DeleteOnRelease || !DeleteOnReleaseExplicit(cfg, "namespace-devbox") {
+					t.Fatalf("raw source binding=%#v", got)
+				}
+				if cfg.WorkRoot != priorRoot || cfg.ServerType != priorType {
+					t.Fatal("file/environment input acquired flag-only generic effects")
+				}
+			}
+			assertRaw(cfg, tc.fileWant)
+			encoded, err := yaml.Marshal(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded fileConfig
+			if err := yaml.Unmarshal(encoded, &decoded); err != nil || !reflect.DeepEqual(file.Namespace, decoded.Namespace) {
+				t.Fatalf("raw Namespace writer representation changed: %s (%v)", encoded, err)
+			}
+			for name, raw := range map[string]string{"IMAGE": " raw-image ", "SIZE": " l ", "REPOSITORY": " raw-repo ", "SITE": " raw-site ", "WORK_ROOT": " /workspaces/raw ", "VOLUME_SIZE_GB": tc.volumeEnv, "AUTO_STOP_IDLE_TIMEOUT": tc.duration, "DELETE_ON_RELEASE": "false"} {
+				t.Setenv("CRABBOX_NAMESPACE_"+name, raw)
+			}
+			cfg = newConfig()
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			assertRaw(cfg, tc.envWant)
+		})
+	}
+}
+
+func TestAgentSandboxDurationOverlays(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 13 * time.Second}, {"0", 13 * time.Second}, {"0s", 13 * time.Second},
+		{"-1s", 13 * time.Second}, {"invalid", 13 * time.Second}, {" 2m ", 13 * time.Second},
+		{"999999999999999999999h", 13 * time.Second}, {"2m", 2 * time.Minute}, {"1500ms", 1500 * time.Millisecond},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			cfg.AgentSandbox.SandboxReadyTimeout = 13 * time.Second
+			cfg.AgentSandbox.PodReadyTimeout = 13 * time.Second
+			file := fileConfig{AgentSandbox: &fileAgentSandboxConfig{SandboxReadyTimeout: tc.raw, PodReadyTimeout: tc.raw}}
+			if err := applyFileConfigWithTrust(&cfg, file, false); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AgentSandbox.SandboxReadyTimeout != tc.want || cfg.AgentSandbox.PodReadyTimeout != tc.want {
+				t.Fatalf("file durations=%v/%v, want %v", cfg.AgentSandbox.SandboxReadyTimeout, cfg.AgentSandbox.PodReadyTimeout, tc.want)
+			}
+			encoded, err := yaml.Marshal(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded fileConfig
+			if err := yaml.Unmarshal(encoded, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.AgentSandbox == nil || decoded.AgentSandbox.SandboxReadyTimeout != tc.raw || decoded.AgentSandbox.PodReadyTimeout != tc.raw {
+				t.Fatalf("duration storage changed raw input %q", tc.raw)
+			}
+			cfg.AgentSandbox.SandboxReadyTimeout = 13 * time.Second
+			cfg.AgentSandbox.PodReadyTimeout = 13 * time.Second
+			t.Setenv("CRABBOX_AGENT_SANDBOX_SANDBOX_READY_TIMEOUT", tc.raw)
+			t.Setenv("CRABBOX_AGENT_SANDBOX_POD_READY_TIMEOUT", tc.raw)
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AgentSandbox.SandboxReadyTimeout != tc.want || cfg.AgentSandbox.PodReadyTimeout != tc.want {
+				t.Fatalf("env durations=%v/%v, want %v", cfg.AgentSandbox.SandboxReadyTimeout, cfg.AgentSandbox.PodReadyTimeout, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentSandboxPartialInputAndPathEvents(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	negative, disabled, forgotten := -1, false, true
+	file := fileConfig{AgentSandbox: &fileAgentSandboxConfig{
+		Kubectl: "custom-kubectl", Kubeconfig: "~/accepted", Namespace: "changed",
+		SandboxReadyTimeout: "2m", PodReadyTimeout: "invalid", ExecTimeoutSecs: &negative,
+		DeleteOnRelease: &disabled, ForgetMissing: &forgotten,
+	}}
+	cfg := baseConfig()
+	err := applyFileConfig(&cfg, file)
+	if err == nil || err.Error() != "agentSandbox execTimeoutSecs must be non-negative" {
+		t.Fatalf("file error=%v", err)
+	}
+	if cfg.AgentSandbox.Kubeconfig != filepath.Join(home, "accepted") || cfg.AgentSandbox.Namespace != "changed" ||
+		cfg.AgentSandbox.SandboxReadyTimeout != 2*time.Minute || cfg.AgentSandbox.PodReadyTimeout != 180*time.Second || cfg.AgentSandbox.ExecTimeoutSecs != 600 {
+		t.Fatalf("file partial values=%#v", cfg.AgentSandbox)
+	}
+	if !cfg.AgentSandbox.DeleteOnRelease || cfg.AgentSandbox.ForgetMissing || DeleteOnReleaseExplicit(cfg, "agent-sandbox") {
+		t.Fatal("later booleans applied after file error")
+	}
+	if file.AgentSandbox.Kubeconfig != "~/accepted" {
+		t.Fatal("file input was normalized in place")
+	}
+
+	cfg = baseConfig()
+	cfg.AgentSandbox.Kubeconfig = "~/inherited"
+	file.AgentSandbox.ExecTimeoutSecs = nil
+	if err := applyFileConfigWithTrust(&cfg, file, false); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentSandbox.Kubeconfig != "~/inherited" || cfg.AgentSandbox.Kubectl != "kubectl" || cfg.AgentSandbox.Namespace != "default" {
+		t.Fatal("unaccepted strings changed")
+	}
+	if cfg.AgentSandbox.DeleteOnRelease || !cfg.AgentSandbox.ForgetMissing || !DeleteOnReleaseExplicit(cfg, "agent-sandbox") {
+		t.Fatal("admitted explicit booleans were lost")
+	}
+
+	cfg = baseConfig()
+	cfg.AgentSandbox.Kubeconfig = "~/inherited"
+	t.Setenv("CRABBOX_AGENT_SANDBOX_SANDBOX_READY_TIMEOUT", "90s")
+	t.Setenv("CRABBOX_AGENT_SANDBOX_EXEC_TIMEOUT_SECS", "invalid")
+	t.Setenv("CRABBOX_AGENT_SANDBOX_DELETE_ON_RELEASE", "false")
+	t.Setenv("CRABBOX_AGENT_SANDBOX_FORGET_MISSING", "true")
+	if err := applyEnv(&cfg); err == nil {
+		t.Fatal("missing integer environment error")
+	}
+	if cfg.AgentSandbox.Kubeconfig != filepath.Join(home, "inherited") || cfg.AgentSandbox.SandboxReadyTimeout != 90*time.Second || cfg.AgentSandbox.ExecTimeoutSecs != 0 {
+		t.Fatalf("env partial values=%#v", cfg.AgentSandbox)
+	}
+	if !cfg.AgentSandbox.DeleteOnRelease || cfg.AgentSandbox.ForgetMissing || DeleteOnReleaseExplicit(cfg, "agent-sandbox") {
+		t.Fatal("later booleans applied after environment error")
+	}
+}
+
 func TestSealosDevboxUntrustedConfigCannotRedirectClusterWorkload(t *testing.T) {
 	cfg := baseConfig()
 	cfg.SealosDevbox.Kubectl = "/trusted/kubectl"
@@ -1942,6 +3064,178 @@ func TestDockerSandboxConfigDefaultsFileAndEnv(t *testing.T) {
 	}
 }
 
+func TestGCPProjectSourcePrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name, configured, primary, google, legacy, want string
+		priorExplicit, wantExplicit, accepted           bool
+	}{
+		{name: "unchanged", configured: "configured", want: "configured", priorExplicit: true, wantExplicit: true},
+		{name: "configured blocks ambient", configured: "configured", google: "google", legacy: "legacy", want: "configured"},
+		{name: "primary overrides configured", configured: "configured", primary: "primary", google: "google", want: "primary", wantExplicit: true, accepted: true},
+		{name: "google wins legacy", google: "google", legacy: "legacy", want: "google", priorExplicit: true, accepted: true},
+		{name: "legacy fallback", legacy: "legacy", want: "legacy", priorExplicit: true, accepted: true},
+		{name: "primary whitespace remains explicit", primary: "  ", google: "google", want: "  ", wantExplicit: true, accepted: true},
+		{name: "configured whitespace blocks ambient", configured: "  ", google: "google", want: "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CRABBOX_GCP_PROJECT", tc.primary)
+			t.Setenv("GOOGLE_CLOUD_PROJECT", tc.google)
+			t.Setenv("GCP_PROJECT_ID", tc.legacy)
+			cfg := baseConfig()
+			cfg.GCP.Project, cfg.GCP.projectExplicit = tc.configured, tc.priorExplicit
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.GCP.Project != tc.want || cfg.GCP.projectExplicit != tc.wantExplicit || (cfg.inputProvenance["gcp"].values != 0) != tc.accepted {
+				t.Fatalf("project=%q explicit=%t input=%+v", cfg.GCP.Project, cfg.GCP.projectExplicit, cfg.inputProvenance["gcp"])
+			}
+		})
+	}
+}
+
+func TestGCPRootGBSeparatesValueAndIntent(t *testing.T) {
+	for _, tc := range []struct {
+		raw      string
+		want     int64
+		accepted bool
+	}{
+		{"", 77, false}, {"77", 77, true}, {"0", 0, true}, {"-1", -1, true},
+		{"bad", 77, false}, {" 80 ", 77, false}, {"999999999999999999999999", 77, false},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CRABBOX_GCP_ROOT_GB", tc.raw)
+			cfg := baseConfig()
+			cfg.GCP.RootGB = 77
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			facts := cfg.inputProvenance["gcp"]
+			if cfg.GCP.RootGB != tc.want || cfg.GCP.rootGBExplicit != (tc.raw != "") || (facts.values != 0) != tc.accepted || (facts.intents != 0) != (tc.raw != "") {
+				t.Fatalf("root=%d explicit=%t input=%+v", cfg.GCP.RootGB, cfg.GCP.rootGBExplicit, facts)
+			}
+		})
+	}
+	t.Run("fallback uses native integer width", func(t *testing.T) {
+		clearConfigEnv(t)
+		t.Setenv("CRABBOX_GCP_ROOT_GB", "malformed")
+		cfg := baseConfig()
+		cfg.GCP.RootGB = 1<<40 + 55
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		want := int64(1<<40 + 55)
+		if strconv.IntSize == 32 {
+			want = 55
+		}
+		if cfg.GCP.RootGB != want || !cfg.GCP.rootGBExplicit {
+			t.Fatalf("native-width fallback=%d want=%d explicit=%t", cfg.GCP.RootGB, want, cfg.GCP.rootGBExplicit)
+		}
+	})
+}
+
+func TestGCPFileAdmissionPreservesRawListsAndRuntimeValues(t *testing.T) {
+	for _, admitted := range []bool{false, true} {
+		cfg := baseConfig()
+		cfg.GCP.MachineImage, cfg.GCP.Snapshot = "runtime-image", "runtime-snapshot"
+		file := &fileGCPConfig{}
+		if admitted {
+			file = &fileGCPConfig{Project: " project ", Zone: " zone ", Image: " image ", Network: " network ", Subnet: " subnet ", Tags: []string{" tag ", "tag", ""}, SSHCIDRs: []string{" cidr ", ""}, RootGB: 88, ServiceAccount: " account "}
+		}
+		prior := cfg
+		if err := applyFileConfig(&cfg, fileConfig{GCP: file}); err != nil {
+			t.Fatal(err)
+		}
+		if !admitted {
+			if !reflect.DeepEqual(cfg.GCP, prior.GCP) {
+				t.Fatal("empty GCP file changed configuration")
+			}
+			continue
+		}
+		if cfg.GCP.Project != file.Project || cfg.GCP.Zone != file.Zone || cfg.GCP.Image != file.Image || cfg.GCP.Network != file.Network || cfg.GCP.Subnet != file.Subnet || cfg.GCP.RootGB != file.RootGB || cfg.GCP.ServiceAccount != file.ServiceAccount || !reflect.DeepEqual(cfg.GCP.Tags, file.Tags) || !reflect.DeepEqual(cfg.GCP.SSHCIDRs, file.SSHCIDRs) {
+			t.Fatal("GCP file values were normalized or omitted")
+		}
+		if !cfg.GCP.projectExplicit || !cfg.GCP.zoneExplicit || !cfg.GCP.imageExplicit || !cfg.GCP.networkExplicit || !cfg.GCP.tagsExplicit || !cfg.GCP.rootGBExplicit {
+			t.Fatal("accepted GCP file inputs lost explicitness")
+		}
+		if cfg.GCP.MachineImage != "runtime-image" || cfg.GCP.Snapshot != "runtime-snapshot" {
+			t.Fatal("file application changed runtime-only inputs")
+		}
+	}
+}
+
+func TestCubeSandboxPortEnvironmentContract(t *testing.T) {
+	for _, tc := range []struct {
+		primary, alias string
+		want           int
+		invalid        bool
+	}{
+		{"", "", 81, false}, {"0", "82", 0, false}, {"-1", "82", -1, false},
+		{"", "-2", -2, false}, {"83", "bad", 83, false}, {"+84", "", 84, false},
+		{"bad", "82", 81, true}, {"", "bad", 81, true}, {" 80 ", "82", 81, true},
+		{"999999999999999999999999", "82", 81, true},
+	} {
+		t.Run(tc.primary+"/"+tc.alias, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CRABBOX_CUBESANDBOX_PROXY_PORT_HTTP", tc.primary)
+			t.Setenv("CUBE_PROXY_PORT_HTTP", tc.alias)
+			t.Setenv("CRABBOX_CUBESANDBOX_API_URL", "http://127.0.0.1:3333")
+			t.Setenv("CRABBOX_CUBESANDBOX_PROXY_SCHEME", "https")
+			cfg := baseConfig()
+			cfg.CubeSandbox.ProxyPortHTTP = 81
+			cfg.CubeSandbox.ProxyScheme = "http"
+			cfg.credentialProvenance.cubeSandboxProxyPort = credentialSourceTrustedFile
+			cfg.credentialProvenance.cubeSandboxProxyProto = credentialSourceTrustedFile
+			err := applyEnv(&cfg)
+			if cfg.CubeSandbox.ProxyPortHTTP != tc.want || cfg.credentialProvenance.cubeSandboxAPIURL != credentialSourceEnvironment {
+				t.Fatalf("port or earlier provenance changed: port=%d provenance=%v", cfg.CubeSandbox.ProxyPortHTTP, cfg.credentialProvenance.cubeSandboxAPIURL)
+			}
+			if tc.invalid {
+				raw := tc.primary
+				if raw == "" {
+					raw = tc.alias
+				}
+				if err == nil || err.Error() != fmt.Sprintf("invalid cubesandbox proxy HTTP port %q", raw) || ExitCodeForError(err, 1) != 2 {
+					t.Fatalf("invalid port diagnostic changed: %v", err)
+				}
+				if cfg.CubeSandbox.ProxyScheme != "http" || cfg.credentialProvenance.cubeSandboxProxyProto != credentialSourceTrustedFile {
+					t.Fatal("later field applied after port failure")
+				}
+			} else if err != nil || cfg.CubeSandbox.ProxyScheme != "https" || cfg.credentialProvenance.cubeSandboxProxyProto != credentialSourceEnvironment {
+				t.Fatalf("later field not applied after accepted/absent port: %v", err)
+			}
+			wantSource := credentialSourceTrustedFile
+			if !tc.invalid && (tc.primary != "" || tc.alias != "") {
+				wantSource = credentialSourceEnvironment
+			}
+			if cfg.credentialProvenance.cubeSandboxProxyPort != wantSource {
+				t.Fatal("port provenance changed")
+			}
+		})
+	}
+}
+
+func TestCubeSandboxFilePositivePortContract(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		for _, port := range []int{-1, 0, 81} {
+			cfg := baseConfig()
+			cfg.CubeSandbox.ProxyPortHTTP = 80
+			cfg.credentialProvenance.cubeSandboxProxyPort = credentialSourceEnvironment
+			if err := applyFileConfigWithTrust(&cfg, fileConfig{CubeSandbox: &fileCubeSandboxConfig{ProxyPortHTTP: port}}, trusted); err != nil {
+				t.Fatal(err)
+			}
+			want, source := 80, credentialSourceEnvironment
+			if port > 0 {
+				want, source = port, credentialSourceForFile(trusted)
+			}
+			if cfg.CubeSandbox.ProxyPortHTTP != want || cfg.credentialProvenance.cubeSandboxProxyPort != source {
+				t.Fatalf("file port=%d trusted=%t admission changed", port, trusted)
+			}
+		}
+	}
+}
+
 func TestE2BFileAcceptanceAndSource(t *testing.T) {
 	if _, ok := reflect.TypeOf(fileE2BConfig{}).FieldByName("APIKey"); ok {
 		t.Fatal("API key YAML field introduced")
@@ -2047,19 +3341,6 @@ func TestE2BEnvironmentAcceptanceAndSource(t *testing.T) {
 			if source != want {
 				t.Fatalf("source=%s mode=%s", suffix, mode)
 			}
-		}
-	}
-}
-
-func TestE2BCoreTemplateDefaultKeepsRawWhitespace(t *testing.T) {
-	for _, raw := range []string{"", "  ", "custom"} {
-		cfg := Config{Provider: "e2b", E2B: E2BConfig{Template: raw}}
-		want := raw
-		if want == "" {
-			want = "base"
-		}
-		if got := serverTypeForConfig(cfg); got != want {
-			t.Fatalf("template=%q got=%q want=%q", raw, got, want)
 		}
 	}
 }
@@ -2268,24 +3549,6 @@ func TestUpstashBoxEnvironmentAcceptanceAndSource(t *testing.T) {
 			}
 			if cfg.UpstashBox.KeepAlive != want {
 				t.Fatalf("bool raw=%q prior=%t", raw, prior)
-			}
-		}
-	}
-}
-
-func TestUpstashBoxCoreSizePresentationUsesExactAliases(t *testing.T) {
-	for _, name := range []string{"upstash-box", "upstash", "box", "upstashbox", " Upstash "} {
-		for _, size := range []string{"", "  ", "medium"} {
-			cfg := Config{Provider: name, UpstashBox: UpstashBoxConfig{Size: size}}
-			want := ""
-			if name == "upstash-box" || name == "upstash" {
-				want = size
-				if want == "" {
-					want = "small"
-				}
-			}
-			if got := serverTypeForConfig(cfg); got != want {
-				t.Fatalf("name=%q raw=%q type=%q want=%q", name, size, got, want)
 			}
 		}
 	}
@@ -3697,6 +4960,127 @@ func TestLambdaImageFamilyEnvClearsFileImage(t *testing.T) {
 	}
 }
 
+func TestNebiusOrdinarySources(t *testing.T) {
+	for _, source := range []string{"file", "env"} {
+		for _, tc := range []struct {
+			text, disk, groups string
+			fileDisk, envDisk  int
+			fileGroups         []string
+			wantFile, wantEnv  []string
+		}{{"", "0", "", 5, 0, nil, []string{"prior"}, []string{"prior"}}, {"same", "-2", ", ,", 5, -2, []string{}, []string{"prior"}, []string{}}, {"~/literal", "bad", " a, ,b,a ", 5, 5, []string{" a ", "b", "a"}, []string{" a ", "b", "a"}, []string{"a", "b", "a"}}, {" ", "3", "none", 3, 3, []string{"none"}, []string{"none"}, []string{"none"}}} {
+			t.Run(source+"/"+tc.text, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := baseConfig()
+				cfg.Provider = "other"
+				cfg.SSHUser = "generic"
+				cfg.WorkRoot = "/workspace/generic"
+				cfg.ServerType = "generic"
+				cfg.Nebius = NebiusConfig{CLI: "same", Profile: "same", ParentID: "same", SubnetID: "same", Platform: "same", Preset: "same", ImageFamily: "same", DiskType: "same", DiskSizeGiB: 5, User: "same", PublicIP: "same", SecurityGroupIDs: []string{"prior"}, ServiceAccountID: "same", RecoveryPolicy: "same"}
+				wantDisk, groups := tc.fileDisk, tc.wantFile
+				if source == "file" {
+					disk, _ := strconv.Atoi(tc.disk)
+					if err := applyFileConfig(&cfg, fileConfig{Nebius: &fileNebiusConfig{CLI: tc.text, Profile: tc.text, ParentID: tc.text, SubnetID: tc.text, Platform: tc.text, Preset: tc.text, ImageFamily: tc.text, DiskType: tc.text, DiskSizeGiB: disk, User: tc.text, PublicIP: tc.text, SecurityGroupIDs: tc.fileGroups, ServiceAccountID: tc.text, RecoveryPolicy: tc.text}}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					wantDisk, groups = tc.envDisk, tc.wantEnv
+					for _, key := range []string{"CLI", "PROFILE", "PARENT_ID", "SUBNET_ID", "PLATFORM", "PRESET", "IMAGE_FAMILY", "DISK_TYPE", "USER", "PUBLIC_IP", "SERVICE_ACCOUNT_ID", "RECOVERY_POLICY"} {
+						t.Setenv("CRABBOX_NEBIUS_"+key, tc.text)
+					}
+					t.Setenv("CRABBOX_NEBIUS_DISK_SIZE_GIB", tc.disk)
+					t.Setenv("CRABBOX_NEBIUS_SECURITY_GROUP_IDS", tc.groups)
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				text := tc.text
+				if text == "" {
+					text = "same"
+				}
+				want := NebiusConfig{CLI: text, Profile: text, ParentID: text, SubnetID: text, Platform: text, Preset: text, ImageFamily: text, DiskType: text, DiskSizeGiB: wantDisk, User: text, PublicIP: text, SecurityGroupIDs: groups, ServiceAccountID: text, RecoveryPolicy: text}
+				if !reflect.DeepEqual(cfg.Nebius, want) || cfg.SSHUser != "generic" || cfg.WorkRoot != "/workspace/generic" || cfg.ServerType != "generic" || cfg.ServerTypeExplicit || IsWorkRootExplicit(&cfg) {
+					t.Fatalf("ordinary %s values or generic state changed", source)
+				}
+				if source == "file" && len(tc.fileGroups) > 0 && &cfg.Nebius.SecurityGroupIDs[0] != &tc.fileGroups[0] {
+					t.Fatal("file groups must retain original backing array")
+				}
+			})
+		}
+	}
+}
+
+func TestNebiusOrdinaryDefaultsAndWriter(t *testing.T) {
+	clearConfigEnv(t)
+	compiled := NebiusConfig{CLI: "nebius", Platform: "cpu-d3", Preset: "4vcpu-16gb", ImageFamily: "ubuntu24.04-driverless", DiskType: "network_ssd", DiskSizeGiB: 50, User: "crabbox", PublicIP: "dynamic", RecoveryPolicy: "fail"}
+	if !reflect.DeepEqual(baseConfig().Nebius, compiled) {
+		t.Fatal("compiled tuple changed")
+	}
+	for _, tc := range []struct {
+		text string
+		disk int
+	}{{"", 0}, {"custom", 7}, {" padded ", -2}} {
+		cfg := baseConfig()
+		cfg.Provider = "nebius"
+		cfg.SSHUser = "generic"
+		cfg.SSHPort = "2200"
+		cfg.WorkRoot = "/workspace/generic"
+		MarkSSHUserExplicit(&cfg)
+		MarkSSHPortExplicit(&cfg)
+		MarkWorkRootExplicit(&cfg)
+		groups := []string{"sentinel"}
+		cfg.Nebius = NebiusConfig{CLI: tc.text, Profile: "profile", ParentID: "parent", SubnetID: "subnet", Platform: tc.text, Preset: tc.text, ImageFamily: tc.text, DiskType: tc.text, DiskSizeGiB: tc.disk, User: tc.text, PublicIP: tc.text, SecurityGroupIDs: groups, ServiceAccountID: "account", RecoveryPolicy: tc.text}
+		want := cfg.Nebius
+		if tc.text == "" {
+			want.CLI = compiled.CLI
+			want.Platform = compiled.Platform
+			want.Preset = compiled.Preset
+			want.ImageFamily = compiled.ImageFamily
+			want.DiskType = compiled.DiskType
+			want.User = compiled.User
+			want.PublicIP = compiled.PublicIP
+			want.RecoveryPolicy = compiled.RecoveryPolicy
+		}
+		if tc.disk == 0 {
+			want.DiskSizeGiB = 50
+		}
+		for repeat := 0; repeat < 2; repeat++ {
+			if err := applyProviderConfigDefaults(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Nebius, want) || &cfg.Nebius.SecurityGroupIDs[0] != &groups[0] || cfg.SSHUser != "generic" || cfg.SSHPort != "2200" || cfg.WorkRoot != "/workspace/generic" || !IsWorkRootExplicit(&cfg) || !IsSSHUserExplicit(&cfg) || !IsSSHPortExplicit(&cfg) || cfg.inputProvenance != nil {
+				t.Fatal("raw tuple/idempotence/generic policy changed")
+			}
+		}
+	}
+	for _, tc := range []struct{ input, want string }{{"nebius: null", "{}"}, {"nebius: {}", "nebius: {}"}, {"nebius: {cli: '', profile: '', parentId: '', subnetId: '', platform: '', preset: '', imageFamily: '', diskType: '', diskSizeGiB: 0, user: '', publicIP: '', securityGroupIds: [], serviceAccountId: '', recoveryPolicy: ''}", "nebius: {}"}, {"nebius: {cli: '~/literal', profile: fixture, parentId: parent, subnetId: subnet, platform: platform, preset: preset, imageFamily: image, diskType: disk, diskSizeGiB: -2, user: user, publicIP: dynamic, securityGroupIds: [' a ', a], serviceAccountId: account, recoveryPolicy: fail}", "nebius: {cli: '~/literal', profile: fixture, parentId: parent, subnetId: subnet, platform: platform, preset: preset, imageFamily: image, diskType: disk, diskSizeGiB: -2, user: user, publicIP: dynamic, securityGroupIds: [' a ', a], serviceAccountId: account, recoveryPolicy: fail}"}} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(tc.input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got, want map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("value-backed DTO=%#v want %#v", got, want)
+		}
+	}
+}
+
 func TestNebiusConfigFileEnvAndDefaults(t *testing.T) {
 	clearConfigEnv(t)
 	cfg := baseConfig()
@@ -4954,6 +6338,104 @@ func TestAppleVMConfigDefaultsRedactSignedImageServerType(t *testing.T) {
 	}
 }
 
+func TestMultipassOrdinarySourceMetadata(t *testing.T) {
+	clearConfigEnv(t)
+	cfg := baseConfig()
+	image, err := osImageDefaultMultipassImage(cfg.OSImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDefault := MultipassConfig{CLIPath: "multipass", Image: image, User: "crabbox", WorkRoot: "/work/crabbox", CPUs: 4, Memory: "8G", Disk: "30G", LaunchTimeout: 20 * time.Minute}
+	if cfg.Multipass != wantDefault || cfg.multipassImageExplicit {
+		t.Fatalf("defaults=%#v want %#v", cfg.Multipass, wantDefault)
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, tc := range []struct {
+			text, cpu, duration string
+			fileCPU, envCPU     int
+			wantDuration        time.Duration
+		}{{"", "0", "", 5, 0, time.Minute}, {"~/literal", "-2", "0s", 5, -2, time.Minute}, {" ", "3", " 2m ", 3, 3, time.Minute}, {"same", "bad", "invalid", 5, 5, time.Minute}, {"same", "6", "2m", 6, 6, 2 * time.Minute}} {
+			t.Run(source+"/"+tc.text+"/"+tc.duration, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := baseConfig()
+				cfg.Multipass = MultipassConfig{CLIPath: "same", Image: "same", User: "same", WorkRoot: "same", CPUs: 5, Memory: "same", Disk: "same", LaunchTimeout: time.Minute}
+				genericRoot, genericUser := cfg.WorkRoot, cfg.SSHUser
+				wantCPU := tc.fileCPU
+				if source == "file" {
+					cpu, _ := strconv.Atoi(tc.cpu)
+					if err := applyFileConfig(&cfg, fileConfig{Multipass: &fileMultipassConfig{CLIPath: tc.text, Image: tc.text, User: tc.text, WorkRoot: tc.text, CPUs: cpu, Memory: tc.text, Disk: tc.text, LaunchTimeout: tc.duration}}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					wantCPU = tc.envCPU
+					for key, value := range map[string]string{"CLI": tc.text, "IMAGE": tc.text, "USER": tc.text, "WORK_ROOT": tc.text, "CPUS": tc.cpu, "MEMORY": tc.text, "DISK": tc.text, "LAUNCH_TIMEOUT": tc.duration} {
+						t.Setenv("CRABBOX_MULTIPASS_"+key, value)
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				text := tc.text
+				if text == "" {
+					text = "same"
+				}
+				want := MultipassConfig{CLIPath: text, Image: text, User: text, WorkRoot: text, CPUs: wantCPU, Memory: text, Disk: text, LaunchTimeout: tc.wantDuration}
+				if cfg.Multipass != want || cfg.multipassImageExplicit != (tc.text != "") || cfg.WorkRoot != genericRoot || cfg.SSHUser != genericUser {
+					t.Fatalf("source=%#v want %#v", cfg.Multipass, want)
+				}
+			})
+		}
+	}
+}
+
+func TestMultipassOrdinaryWriterMetadata(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{{"multipass: null", "{}"}, {"multipass: {}", "multipass: {}"}, {"multipass: {cliPath: '', image: '', user: '', workRoot: '', cpus: 0, memory: '', disk: '', launchTimeout: ''}", "multipass: {}"}, {"multipass: {cliPath: '~/literal', image: custom-image, user: example, workRoot: '~/guest', cpus: -2, memory: 4G, disk: 20G, launchTimeout: 0s}", "multipass: {cliPath: '~/literal', image: custom-image, user: example, workRoot: '~/guest', cpus: -2, memory: 4G, disk: 20G, launchTimeout: 0s}"}} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(tc.input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := baseConfig()
+		if err := applyFileConfig(&cfg, file); err != nil {
+			t.Fatal(err)
+		}
+		after, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("source overlay changed file DTO")
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got, want map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer=%#v want %#v", got, want)
+		}
+	}
+	if reflect.TypeOf(fileMultipassConfig{}).Name() != "fileMultipassConfig" {
+		t.Fatal("file DTO identity")
+	}
+}
+
 func TestMultipassConfigDefaultsFileAndEnv(t *testing.T) {
 	clearConfigEnv(t)
 	cfg := baseConfig()
@@ -4988,6 +6470,107 @@ func TestMultipassConfigDefaultsFileAndEnv(t *testing.T) {
 	applyEnv(&cfg)
 	if cfg.Multipass.CLIPath != "/usr/local/bin/multipass" || cfg.Multipass.Image != "26.04" || cfg.Multipass.User != "env-user" || cfg.Multipass.WorkRoot != "/work/env" || cfg.Multipass.CPUs != 6 || cfg.Multipass.Memory != "12G" || cfg.Multipass.Disk != "80G" || cfg.Multipass.LaunchTimeout != 11*time.Minute {
 		t.Fatalf("env multipass config not applied: %#v", cfg.Multipass)
+	}
+}
+
+func TestMachine0OrdinarySourceMetadata(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefault := Machine0Config{CLIPath: "machine0", Image: "ubuntu-24-04-loaded", Size: "large", Region: "eu", ReleasePolicy: "destroy", CreateTimeout: 15 * time.Minute, PollInterval: time.Minute}
+	if got := baseConfig().Machine0; got != wantDefault {
+		t.Fatalf("defaults=%#v want %#v", got, wantDefault)
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, marked := range []bool{false, true} {
+			for _, tc := range []struct {
+				text, version, duration string
+				wantVersion             int
+				wantDuration            time.Duration
+			}{{"", "", "", 5, time.Minute}, {"large", "0", "0s", 0, time.Minute}, {"~/literal", "-2", " 2m ", -2, time.Minute}, {" ", "bad", "invalid", 5, time.Minute}, {"large", "3", "2m", 3, 2 * time.Minute}} {
+				t.Run(source+"/"+tc.text+"/"+tc.version+"/"+strconv.FormatBool(marked), func(t *testing.T) {
+					clearConfigEnv(t)
+					cfg := baseConfig()
+					cfg.Machine0 = Machine0Config{CLIPath: "prior", Image: "prior", ImageVersion: 5, DesktopImage: "prior", Size: "large", SizeExplicit: marked, Region: "prior", Key: "prior", WorkRoot: "prior", ReleasePolicy: "prior", CreateTimeout: time.Minute, PollInterval: time.Minute}
+					genericRoot, genericSize := cfg.WorkRoot, cfg.ServerType
+					if source == "file" {
+						var version *int
+						if tc.version != "" && tc.version != "bad" {
+							value, err := strconv.Atoi(tc.version)
+							if err != nil {
+								t.Fatal(err)
+							}
+							version = &value
+						}
+						if err := applyFileConfig(&cfg, fileConfig{Machine0: &fileMachine0Config{CLIPath: tc.text, Image: tc.text, ImageVersion: version, DesktopImage: tc.text, Size: tc.text, Region: tc.text, Key: tc.text, WorkRoot: tc.text, ReleasePolicy: tc.text, CreateTimeout: tc.duration, PollInterval: tc.duration}}); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						for key, value := range map[string]string{"CLI": tc.text, "IMAGE": tc.text, "IMAGE_VERSION": tc.version, "DESKTOP_IMAGE": tc.text, "SIZE": tc.text, "REGION": tc.text, "KEY": tc.text, "WORK_ROOT": tc.text, "RELEASE_POLICY": tc.text, "CREATE_TIMEOUT": tc.duration, "POLL_INTERVAL": tc.duration} {
+							t.Setenv("CRABBOX_MACHINE0_"+key, value)
+						}
+						if err := applyEnv(&cfg); err != nil {
+							t.Fatal(err)
+						}
+					}
+					text := tc.text
+					if text == "" {
+						text = "prior"
+					}
+					size := tc.text
+					if size == "" {
+						size = "large"
+					}
+					want := Machine0Config{CLIPath: text, Image: text, ImageVersion: tc.wantVersion, DesktopImage: text, Size: size, SizeExplicit: marked || tc.text != "", Region: text, Key: text, WorkRoot: text, ReleasePolicy: text, CreateTimeout: tc.wantDuration, PollInterval: tc.wantDuration}
+					if cfg.Machine0 != want || cfg.WorkRoot != genericRoot || cfg.ServerType != genericSize || cfg.ServerTypeExplicit {
+						t.Fatalf("source=%#v want %#v", cfg.Machine0, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMachine0OrdinaryWriterMetadata(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{{"machine0: null", "{}"}, {"machine0: {}", "machine0: {}"}, {"machine0: {cliPath: '', image: '', imageVersion: null, desktopImage: '', size: '', region: '', key: '', workRoot: '', releasePolicy: '', createTimeout: '', pollInterval: ''}", "machine0: {}"}, {"machine0: {imageVersion: 0, createTimeout: 0s, pollInterval: 0s}", "machine0: {imageVersion: 0, createTimeout: 0s, pollInterval: 0s}"}, {"machine0: {cliPath: '~/literal', image: image-example, imageVersion: -2, desktopImage: desktop-example, size: large, region: eu, key: name-example, workRoot: '~/guest', releasePolicy: suspend, createTimeout: 2m, pollInterval: 3s}", "machine0: {cliPath: '~/literal', image: image-example, imageVersion: -2, desktopImage: desktop-example, size: large, region: eu, key: name-example, workRoot: '~/guest', releasePolicy: suspend, createTimeout: 2m, pollInterval: 3s}"}} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(tc.input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := baseConfig()
+		if err := applyFileConfig(&cfg, file); err != nil {
+			t.Fatal(err)
+		}
+		after, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("overlay changed DTO input")
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got, want map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer=%#v want %#v", got, want)
+		}
 	}
 }
 
@@ -5125,6 +6708,135 @@ func TestTartConfigDefaultsFileAndEnv(t *testing.T) {
 	}
 }
 
+func TestCoderOrdinaryFileMetadata(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	wantDefault := CoderConfig{CLIPath: "coder", WorkspacePrefix: "crabbox-", WorkRoot: "/home/coder/crabbox", Wait: "yes"}
+	if got := baseConfig().Coder; !reflect.DeepEqual(got, wantDefault) {
+		t.Fatalf("defaults=%#v want %#v", got, wantDefault)
+	}
+	for _, tc := range []struct {
+		name        string
+		input, want []string
+	}{{"nil", nil, []string{"prior"}}, {"empty", []string{}, []string{"prior"}}, {"all blank", []string{" ", ""}, []string{}}, {"normalized clone", []string{" a=1 ", " ", "b=2", "a=1"}, []string{"a=1", "b=2", "a=1"}}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Coder.Parameters = []string{"prior"}
+			generic := cfg.WorkRoot
+			no := false
+			file := fileConfig{Coder: &fileCoderConfig{CLIPath: "~/coder", Template: " template ", Preset: " preset ", WorkspacePrefix: " prefix ", WorkRoot: "~/guest", DeleteOnRelease: &no, Wait: " auto ", UseParameterDefaults: &no, Parameters: tc.input, RichParameterFile: "~/params"}}
+			if err := applyFileConfig(&cfg, file); err != nil {
+				t.Fatal(err)
+			}
+			want := CoderConfig{CLIPath: filepath.Join(home, "coder"), Template: " template ", Preset: " preset ", WorkspacePrefix: " prefix ", WorkRoot: "~/guest", Wait: " auto ", Parameters: tc.want, RichParameterFile: filepath.Join(home, "params")}
+			if !reflect.DeepEqual(cfg.Coder, want) || cfg.WorkRoot != generic {
+				t.Fatalf("file=%#v want %#v", cfg.Coder, want)
+			}
+			if len(tc.input) > 0 && len(tc.want) > 0 {
+				tc.input[0] = "changed"
+				if cfg.Coder.Parameters[0] != "a=1" {
+					t.Fatal("file list not cloned")
+				}
+			}
+		})
+	}
+	for _, input := range []string{"{}", "{cliPath: '', richParameterFile: '', deleteOnRelease: null, useParameterDefaults: null}", "{cliPath: '~/coder', richParameterFile: '~/params', deleteOnRelease: false, useParameterDefaults: false}"} {
+		var file fileConfig
+		if err := yaml.Unmarshal([]byte("coder: "+input), &file); err != nil {
+			t.Fatal(err)
+		}
+		cfg := baseConfig()
+		cfg.Coder.CLIPath = "~/coder"
+		cfg.Coder.RichParameterFile = "~/params"
+		cfg.Coder.DeleteOnRelease = true
+		cfg.Coder.UseParameterDefaults = true
+		if err := applyFileConfig(&cfg, file); err != nil {
+			t.Fatal(err)
+		}
+		accepted := strings.Contains(input, "~/")
+		wantCLI, wantRich := "~/coder", "~/params"
+		if accepted {
+			wantCLI, wantRich = filepath.Join(home, "coder"), filepath.Join(home, "params")
+		}
+		if cfg.Coder.CLIPath != wantCLI || cfg.Coder.RichParameterFile != wantRich || cfg.Coder.DeleteOnRelease == accepted || cfg.Coder.UseParameterDefaults == accepted {
+			t.Fatal("file accepted path/bool presence")
+		}
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Coder.CLIPath != filepath.Join(home, "coder") || cfg.Coder.RichParameterFile != filepath.Join(home, "params") {
+			t.Fatal("env fallback path expansion")
+		}
+	}
+}
+
+func TestCoderOrdinaryEnvMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want []string
+	}{{"", []string{"prior"}}, {" \t ", []string{"prior"}}, {" NoNe ", []string{}}, {", ,", []string{}}, {" a=1, ,b=2,a=1 ", []string{"a=1", "b=2", "a=1"}}} {
+		t.Run(tc.raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			for key, value := range map[string]string{"CLI": "~/coder", "TEMPLATE": " template ", "PRESET": " preset ", "WORKSPACE_PREFIX": " prefix ", "WORK_ROOT": "~/guest", "DELETE_ON_RELEASE": "false", "WAIT": " auto ", "USE_PARAMETER_DEFAULTS": "false", "PARAMETERS": tc.raw, "RICH_PARAMETER_FILE": "~/params"} {
+				t.Setenv("CRABBOX_CODER_"+key, value)
+			}
+			cfg := baseConfig()
+			cfg.Coder.Parameters = []string{"prior"}
+			cfg.Coder.DeleteOnRelease = true
+			cfg.Coder.UseParameterDefaults = true
+			generic := cfg.WorkRoot
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			want := CoderConfig{CLIPath: filepath.Join(home, "coder"), Template: " template ", Preset: " preset ", WorkspacePrefix: " prefix ", WorkRoot: "~/guest", Wait: " auto ", Parameters: tc.want, RichParameterFile: filepath.Join(home, "params")}
+			if !reflect.DeepEqual(cfg.Coder, want) || cfg.WorkRoot != generic {
+				t.Fatalf("env=%#v want %#v", cfg.Coder, want)
+			}
+		})
+	}
+}
+
+func TestCoderOrdinaryCodecAndWriter(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{{"coder: {}\n", "coder: {}\n"}, {"coder: {parameters: [], deleteOnRelease: false, useParameterDefaults: false}\n", "coder: {deleteOnRelease: false, useParameterDefaults: false}\n"}, {"coder: {parameters: [' a=1 ', '', 'a=1']}\n", "coder: {parameters: ['a=1', 'a=1']}\n"}, {"coder: {parameters: [' ', '']}\n", "coder: {}\n"}} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(tc.input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got, want map[string]any
+		if err := yaml.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer=%#v want %#v", got, want)
+		}
+	}
+	for _, tc := range []struct{ input, kind string }{{"parameters: a=1", "!!str `a=1`"}, {"parameters: {a: b}", "!!map"}} {
+		file := fileCoderConfig{Template: "prior"}
+		err := yaml.Unmarshal([]byte(tc.input), &file)
+		want := "yaml: unmarshal errors:\n  line 1: cannot unmarshal " + tc.kind + " into []string"
+		if err == nil || err.Error() != want || file.Template != "prior" {
+			t.Fatalf("codec error=%v, want %q; template=%q", err, want, file.Template)
+		}
+	}
+}
+
 func TestCoderConfigDefaultsSetWorkRoot(t *testing.T) {
 	clearConfigEnv(t)
 	cfg := baseConfig()
@@ -5152,6 +6864,165 @@ func TestCoderConfigDefaultsSetWorkRoot(t *testing.T) {
 	}
 	if cfg.Coder.WorkRoot != "/tmp/explicit" || cfg.WorkRoot != "/tmp/explicit" {
 		t.Fatalf("explicit top-level work root not propagated: coder=%q work=%q", cfg.Coder.WorkRoot, cfg.WorkRoot)
+	}
+}
+
+func TestIncusOrdinarySourcesAndMetadata(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefaults := IncusConfig{Remote: "local", InstanceType: "container", Image: "images:ubuntu/24.04/cloud", User: "crabbox", WorkRoot: "/work/crabbox", DeleteOnRelease: true, StartTimeout: 10 * time.Minute, LaunchPort: "22", ProxyListenHost: "127.0.0.1", ProxyDevice: "crabbox-ssh"}
+	if got := baseConfig().Incus; !reflect.DeepEqual(got, wantDefaults) {
+		t.Fatalf("defaults %#v", got)
+	}
+	fields := []struct{ field, key, env string }{
+		{"Remote", "remote", "REMOTE"}, {"Project", "project", "PROJECT"}, {"Address", "address", "ADDRESS"}, {"Socket", "socket", "SOCKET"}, {"InstanceType", "instanceType", "INSTANCE_TYPE"}, {"Image", "image", "IMAGE"}, {"Profile", "profile", "PROFILE"}, {"User", "user", "USER"}, {"WorkRoot", "workRoot", "WORK_ROOT"}, {"LaunchPort", "launchPort", "LAUNCH_PORT"}, {"ProxyListenHost", "proxyListenHost", "PROXY_LISTEN_HOST"}, {"ProxyListenPort", "proxyListenPort", "PROXY_LISTEN_PORT"}, {"ProxyDevice", "proxyDevice", "PROXY_DEVICE"}, {"TLSServerCert", "tlsServerCert", "TLS_SERVER_CERT"}, {"RemoteImageServer", "remoteImageServer", "REMOTE_IMAGE_SERVER"},
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, value := range []string{"", "same", " padded ", "~/fixture"} {
+			t.Run(source+"/"+value, func(t *testing.T) {
+				clearConfigEnv(t)
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				metadata := map[string]string{"fixture": "retained"}
+				cfg := Config{WorkRoot: "/generic", SSHUser: "generic", Incus: IncusConfig{CheckpointMetadata: metadata}}
+				for _, f := range fields {
+					reflect.ValueOf(&cfg.Incus).Elem().FieldByName(f.field).SetString("same")
+				}
+				cfg.Incus.Socket, cfg.Incus.TLSServerCert = "~/inherited", "~/inherited"
+				want := cfg.Incus
+				if value != "" {
+					for _, f := range fields {
+						reflect.ValueOf(&want).Elem().FieldByName(f.field).SetString(value)
+					}
+				}
+				if source == "env" || value != "" {
+					for _, name := range []string{"Socket", "TLSServerCert"} {
+						v := reflect.ValueOf(&want).Elem().FieldByName(name)
+						if strings.HasPrefix(v.String(), "~/") {
+							v.SetString(filepath.Join(home, strings.TrimPrefix(v.String(), "~/")))
+						}
+					}
+				}
+				inputSource := configInputUser
+				if source == "file" {
+					body := map[string]any{}
+					for _, f := range fields {
+						body[f.key] = value
+					}
+					data, err := yaml.Marshal(map[string]any{"incus": body})
+					if err != nil {
+						t.Fatal(err)
+					}
+					var file fileConfig
+					if err := yaml.Unmarshal(data, &file); err != nil {
+						t.Fatal(err)
+					}
+					original := *file.Incus
+					if err := applyFileConfig(&cfg, file); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(*file.Incus, original) {
+						t.Fatal("file mutated")
+					}
+				} else {
+					inputSource = configInputEnvironment
+					for _, f := range fields {
+						t.Setenv("CRABBOX_INCUS_"+f.env, value)
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !reflect.DeepEqual(cfg.Incus, want) || cfg.WorkRoot != "/generic" || cfg.SSHUser != "generic" {
+					t.Fatalf("source %#v want %#v", cfg.Incus, want)
+				}
+				var ledger configInputLedger
+				if value != "" {
+					ledger = ledger.withInput("incus", inputSource, configInputValue)
+				}
+				if !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+					t.Fatal("accepted source mismatch")
+				}
+				cfg.Incus.CheckpointMetadata["same-map"] = "yes"
+				if metadata["same-map"] != "yes" {
+					t.Fatal("runtime metadata map replaced")
+				}
+			})
+		}
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, duration := range []string{"", "bad", "0s", "-1s", " 2m ", "2m"} {
+			t.Run(source+"/options/"+duration, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Incus: IncusConfig{StartTimeout: time.Minute, DeleteOnRelease: true, InsecureTLS: true}}
+				if source == "file" {
+					v := false
+					if err := applyFileConfig(&cfg, fileConfig{Incus: &fileIncusConfig{StartTimeout: duration, DeleteOnRelease: &v, InsecureTLS: &v}}); err != nil {
+						t.Fatal(err)
+					}
+					if v {
+						t.Fatal("bool input mutated")
+					}
+				} else {
+					t.Setenv("CRABBOX_INCUS_START_TIMEOUT", duration)
+					t.Setenv("CRABBOX_INCUS_DELETE_ON_RELEASE", " false ")
+					t.Setenv("CRABBOX_INCUS_INSECURE_TLS", "OFF")
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want := time.Minute
+				if duration == "2m" {
+					want = 2 * time.Minute
+				}
+				if cfg.Incus.StartTimeout != want || cfg.Incus.DeleteOnRelease || cfg.Incus.InsecureTLS || !DeleteOnReleaseExplicit(cfg, "incus") || cfg.Incus.CheckpointMetadata != nil {
+					t.Fatalf("options %#v", cfg.Incus)
+				}
+			})
+		}
+	}
+	metadata := IncusConfig{CheckpointMetadata: map[string]string{"ordinary-metadata": "not-input"}}
+	for _, marshal := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
+		data, err := marshal(metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "ordinary-metadata") || strings.Contains(strings.ToLower(string(data)), "checkpointmetadata") {
+			t.Fatal("runtime metadata serialized")
+		}
+	}
+}
+
+func TestIncusOrdinaryWriter(t *testing.T) {
+	for _, input := range []string{"incus: null", "incus: {}", "incus: {remote: '', startTimeout: '', deleteOnRelease: null, insecureTLS: null}", "incus: {remote: ' padded ', socket: '~/ordinary', startTimeout: 'bad', deleteOnRelease: false, insecureTLS: false}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{}
+		if strings.Contains(input, "incus: {") {
+			want["incus"] = map[string]any{}
+		}
+		if strings.Contains(input, "padded") {
+			want["incus"] = map[string]any{"remote": " padded ", "socket": "~/ordinary", "startTimeout": "bad", "deleteOnRelease": false, "insecureTLS": false}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer %#v want %#v", got, want)
+		}
 	}
 }
 
@@ -5298,6 +7169,195 @@ func TestLoadConfigIncusSpecificUserAndWorkRootOverrideTopLevel(t *testing.T) {
 	}
 	if cfg.WorkRoot != "/workspace/incus" {
 		t.Fatalf("WorkRoot=%q want /workspace/incus", cfg.WorkRoot)
+	}
+}
+
+func TestFirecrackerOrdinarySources(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefaults := FirecrackerConfig{Binary: "firecracker", Kernel: "/var/lib/crabbox/firecracker/vmlinux", RootFS: "/var/lib/crabbox/firecracker/rootfs.ext4", User: "crabbox", WorkRoot: defaultPOSIXWorkRoot, CPUs: 4, MemoryMiB: 4096, DiskMiB: 16384, Network: "cni", CNINetwork: "crabbox-firecracker", CNIConfDir: "/etc/cni/conf.d", CNIBinDir: "/opt/cni/bin", LaunchTimeout: 2 * time.Minute, DeleteOnRelease: true}
+	if got := baseConfig().Firecracker; got != wantDefaults {
+		t.Fatalf("defaults %#v", got)
+	}
+	fields := []struct {
+		field, key, env string
+		path            bool
+	}{
+		{"Binary", "binary", "BINARY", true}, {"Jailer", "jailer", "JAILER", true}, {"Kernel", "kernel", "KERNEL", true}, {"RootFS", "rootfs", "ROOTFS", true}, {"User", "user", "USER", false}, {"WorkRoot", "workRoot", "WORK_ROOT", false}, {"Network", "network", "NETWORK", false}, {"CNINetwork", "cniNetwork", "CNI_NETWORK", false}, {"CNIConfDir", "cniConfDir", "CNI_CONF_DIR", true}, {"CNIBinDir", "cniBinDir", "CNI_BIN_DIR", true},
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, value := range []string{"", "same", " padded ", "~/ordinary"} {
+			t.Run(source+"/"+value, func(t *testing.T) {
+				clearConfigEnv(t)
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				cfg := Config{WorkRoot: "/generic", SSHUser: "generic"}
+				for _, f := range fields {
+					prior := "same"
+					if f.path {
+						prior = "~/inherited"
+					}
+					reflect.ValueOf(&cfg.Firecracker).Elem().FieldByName(f.field).SetString(prior)
+				}
+				want := cfg.Firecracker
+				for _, f := range fields {
+					v := reflect.ValueOf(&want).Elem().FieldByName(f.field)
+					if value != "" {
+						v.SetString(value)
+					}
+					if f.path && (source == "env" || value != "") && strings.HasPrefix(v.String(), "~/") {
+						v.SetString(filepath.Join(home, strings.TrimPrefix(v.String(), "~/")))
+					}
+				}
+				inputSource := configInputUser
+				if source == "file" {
+					body := map[string]any{}
+					for _, f := range fields {
+						body[f.key] = value
+					}
+					data, err := yaml.Marshal(map[string]any{"firecracker": body})
+					if err != nil {
+						t.Fatal(err)
+					}
+					var file fileConfig
+					if err := yaml.Unmarshal(data, &file); err != nil {
+						t.Fatal(err)
+					}
+					original := *file.Firecracker
+					if err := applyFileConfig(&cfg, file); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(*file.Firecracker, original) {
+						t.Fatal("input mutated")
+					}
+				} else {
+					inputSource = configInputEnvironment
+					for _, f := range fields {
+						t.Setenv("CRABBOX_FIRECRACKER_"+f.env, value)
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var ledger configInputLedger
+				if value != "" {
+					ledger = ledger.withInput("firecracker", inputSource, configInputValue)
+				}
+				if cfg.Firecracker != want || !reflect.DeepEqual(cfg.inputProvenance, ledger) || cfg.WorkRoot != "/generic" || cfg.SSHUser != "generic" {
+					t.Fatalf("source %#v ledger %#v", cfg.Firecracker, cfg.inputProvenance)
+				}
+			})
+		}
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, value := range []string{"null", "0", "-2", "7", "bad", " 7 "} {
+			if source == "file" && (value == "bad" || value == " 7 ") {
+				continue
+			}
+			t.Run(source+"/integers/"+value, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Firecracker: FirecrackerConfig{CPUs: 7, MemoryMiB: 7, DiskMiB: 7}}
+				want := 7
+				accepted := value == "0" || value == "-2" || value == "7"
+				if value == "0" {
+					want = 0
+				}
+				if value == "-2" {
+					want = -2
+				}
+				inputSource := configInputUser
+				if source == "file" {
+					var file fileConfig
+					if err := yaml.Unmarshal([]byte("firecracker: {cpus: "+value+", memoryMiB: "+value+", diskMiB: "+value+"}"), &file); err != nil {
+						t.Fatal(err)
+					}
+					if err := applyFileConfig(&cfg, file); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					inputSource = configInputEnvironment
+					for _, name := range []string{"CPUS", "MEMORY_MIB", "DISK_MIB"} {
+						t.Setenv("CRABBOX_FIRECRACKER_"+name, value)
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var ledger configInputLedger
+				if accepted {
+					ledger = ledger.withInput("firecracker", inputSource, configInputValue)
+				}
+				if cfg.Firecracker.CPUs != want || cfg.Firecracker.MemoryMiB != want || cfg.Firecracker.DiskMiB != want || !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+					t.Fatalf("integers %#v ledger %#v", cfg.Firecracker, cfg.inputProvenance)
+				}
+			})
+		}
+	}
+}
+
+func TestFirecrackerOrdinaryOptionsAndWriter(t *testing.T) {
+	for _, source := range []string{"file", "env"} {
+		for _, duration := range []string{"", "bad", "0s", "-1s", " 2m ", "2m"} {
+			t.Run(source+"/"+duration, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Firecracker: FirecrackerConfig{LaunchTimeout: time.Minute, DeleteOnRelease: true}}
+				inputSource := configInputUser
+				if source == "file" {
+					v := false
+					if err := applyFileConfig(&cfg, fileConfig{Firecracker: &fileFirecrackerConfig{LaunchTimeout: duration, DeleteOnRelease: &v}}); err != nil {
+						t.Fatal(err)
+					}
+					if v {
+						t.Fatal("bool mutated")
+					}
+				} else {
+					inputSource = configInputEnvironment
+					t.Setenv("CRABBOX_FIRECRACKER_LAUNCH_TIMEOUT", duration)
+					t.Setenv("CRABBOX_FIRECRACKER_DELETE_ON_RELEASE", " false ")
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want := time.Minute
+				if duration == "2m" {
+					want = 2 * time.Minute
+				}
+				ledger := configInputLedger(nil).withInput("firecracker", inputSource, configInputValue|configInputIntent)
+				if cfg.Firecracker.LaunchTimeout != want || cfg.Firecracker.DeleteOnRelease || !DeleteOnReleaseExplicit(cfg, "firecracker") || !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+					t.Fatalf("options %#v ledger %#v", cfg.Firecracker, cfg.inputProvenance)
+				}
+			})
+		}
+	}
+	for _, input := range []string{"firecracker: null", "firecracker: {}", "firecracker: {binary: '', cpus: null, memoryMiB: null, diskMiB: null, launchTimeout: '', deleteOnRelease: null}", "firecracker: {binary: '~/ordinary', cpus: 0, memoryMiB: -2, diskMiB: 7, launchTimeout: 'bad', deleteOnRelease: false}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{}
+		if strings.Contains(input, "firecracker: {") {
+			want["firecracker"] = map[string]any{}
+		}
+		if strings.Contains(input, "ordinary") {
+			want["firecracker"] = map[string]any{"binary": "~/ordinary", "cpus": 0, "memoryMiB": -2, "diskMiB": 7, "launchTimeout": "bad", "deleteOnRelease": false}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer %#v want %#v", got, want)
+		}
 	}
 }
 
@@ -5834,6 +7894,133 @@ func TestSuperserveConfigDefaultsAndNoPersistentSecretSurface(t *testing.T) {
 	}
 	if _, ok := reflect.TypeOf(fileSuperserveConfig{}).FieldByName(fieldName); ok {
 		t.Fatal("file config must not accept API keys")
+	}
+}
+
+func TestCrownestOrdinaryFileAndWriter(t *testing.T) {
+	for _, body := range []string{"crownest: null", "crownest: {}", "crownest: {apiUrl: ' ', projectId: null, template: null, timeoutSecs: null, forgetMissing: null}", "crownest: {apiUrl: ' https://example.invalid ', projectId: '', template: '', timeoutSecs: 0, forgetMissing: false}", "crownest: {apiUrl: ' https://example.invalid ', projectId: 'next', template: 'next', timeoutSecs: -1, forgetMissing: false}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{Crownest: CrownestConfig{APIURL: "https://prior.invalid", ProjectID: "prior", Template: "prior", TimeoutSecs: 7, ForgetMissing: true}}
+		want := cfg.Crownest
+		accepted := strings.Contains(body, "https://example.invalid")
+		negative := strings.Contains(body, "-1")
+		if accepted {
+			want.APIURL = " https://example.invalid "
+			want.ProjectID, want.Template = "", ""
+			if negative {
+				want.ProjectID, want.Template = "next", "next"
+			} else {
+				want.TimeoutSecs, want.ForgetMissing = 0, false
+			}
+		}
+		err = applyFileConfig(&cfg, file)
+		if (err != nil) != negative || (err != nil && err.Error() != "crownest timeoutSecs must be non-negative") {
+			t.Fatalf("file error %v", err)
+		}
+		var ledger configInputLedger
+		if accepted {
+			ledger = ledger.withInput("crownest", configInputUser, configInputValue)
+		}
+		if cfg.Crownest != want || !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+			t.Fatalf("partial file %#v ledger %#v", cfg.Crownest, cfg.inputProvenance)
+		}
+		after, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(original, after) {
+			t.Fatal("input DTO changed")
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		written, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(written, &got); err != nil {
+			t.Fatal(err)
+		}
+		wantFile := map[string]any{}
+		if strings.Contains(body, "crownest: {") {
+			wantFile["crownest"] = map[string]any{}
+		}
+		if strings.Contains(body, "apiUrl: ' '") {
+			wantFile["crownest"] = map[string]any{"apiUrl": " "}
+		}
+		if accepted {
+			values := map[string]any{"apiUrl": " https://example.invalid ", "projectId": "", "template": "", "timeoutSecs": 0, "forgetMissing": false}
+			if negative {
+				values["projectId"], values["template"], values["timeoutSecs"] = "next", "next", -1
+			}
+			wantFile["crownest"] = values
+		}
+		if !reflect.DeepEqual(got, wantFile) {
+			t.Fatalf("writer %#v want %#v", got, wantFile)
+		}
+	}
+}
+
+func TestCrownestOrdinaryEnvironmentAliases(t *testing.T) {
+	for _, tc := range []struct {
+		primary, alias string
+		want           int
+		diagnostic     string
+	}{{"", "", 7, ""}, {"", "0", 0, ""}, {"0", "12", 0, ""}, {"7", "12", 7, ""}, {"bad", "12", 7, "CRABBOX_CROWNEST_TIMEOUT_SECS must be an integer"}, {" 7 ", "12", 7, "CRABBOX_CROWNEST_TIMEOUT_SECS must be an integer"}, {" ", "12", 7, "CRABBOX_CROWNEST_TIMEOUT_SECS must be an integer"}, {"-1", "12", 7, "CRABBOX_CROWNEST_TIMEOUT_SECS must be non-negative"}, {"", "bad", 7, "CROWNEST_TIMEOUT_SECS must be an integer"}, {"", "-1", 7, "CROWNEST_TIMEOUT_SECS must be non-negative"}} {
+		t.Run(tc.primary+"/"+tc.alias, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := Config{Crownest: CrownestConfig{TimeoutSecs: 7, ForgetMissing: true}}
+			for _, name := range []string{"API_URL", "PROJECT_ID", "TEMPLATE"} {
+				t.Setenv("CRABBOX_CROWNEST_"+name, " raw ")
+				t.Setenv("CROWNEST_"+name, "alias")
+			}
+			t.Setenv("CRABBOX_CROWNEST_TIMEOUT_SECS", tc.primary)
+			t.Setenv("CROWNEST_TIMEOUT_SECS", tc.alias)
+			t.Setenv("CRABBOX_CROWNEST_FORGET_MISSING", "false")
+			err := applyEnv(&cfg)
+			if (err != nil) != (tc.diagnostic != "") || (err != nil && err.Error() != tc.diagnostic) {
+				t.Fatalf("error %v want %q", err, tc.diagnostic)
+			}
+			want := CrownestConfig{APIURL: " raw ", ProjectID: " raw ", Template: " raw ", TimeoutSecs: tc.want, ForgetMissing: tc.diagnostic != ""}
+			if cfg.Crownest != want {
+				t.Fatalf("partial env %#v want %#v", cfg.Crownest, want)
+			}
+			ledger := configInputLedger(nil).withInput("crownest", configInputEnvironment, configInputValue)
+			if !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+				t.Fatal("accepted prefix missing")
+			}
+		})
+	}
+	for _, tc := range []struct {
+		primary, alias string
+		want, accepted bool
+	}{{"false", "true", false, true}, {"invalid", "true", true, true}, {"", " OFF ", false, true}, {" TRUE ", "false", true, true}, {"invalid", "bad", true, false}, {"", "", true, false}} {
+		clearConfigEnv(t)
+		cfg := Config{Crownest: CrownestConfig{ForgetMissing: true}}
+		t.Setenv("CRABBOX_CROWNEST_FORGET_MISSING", tc.primary)
+		t.Setenv("CROWNEST_FORGET_MISSING", tc.alias)
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		var ledger configInputLedger
+		if tc.accepted {
+			ledger = ledger.withInput("crownest", configInputEnvironment, configInputValue)
+		}
+		if cfg.Crownest.ForgetMissing != tc.want || !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+			t.Fatal("bool alias parsing/acceptance mismatch")
+		}
 	}
 }
 
@@ -7333,6 +9520,144 @@ func TestHostingerPurchaseOptInRequiresTrustedConfig(t *testing.T) {
 	}
 }
 
+func TestGenericScalarInputSources(t *testing.T) {
+	clearConfigEnv(t)
+	cfg := baseConfig()
+	if err := applyFileConfig(&cfg, fileConfig{Provider: "machine0"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.inputProvenance) != 0 {
+		t.Fatal("provider selection is not a configuration setting")
+	}
+	value := false
+	if err := applyFileConfig(&cfg, fileConfig{Desktop: &value}); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.inputProvenance.summary(configInputGeneric); got.state != "present" || !reflect.DeepEqual(got.sources, []string{"user_config"}) {
+		t.Fatalf("explicit false was not recorded: %#v", got)
+	}
+	for _, source := range []providerSelectionSource{providerSelectionUserConfig, providerSelectionRepoConfig} {
+		if err := applyFileConfigWithTrustAndProviderSource(&cfg, fileConfig{Profile: "same"}, source == providerSelectionUserConfig, source); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := cfg
+	t.Setenv("CRABBOX_PROFILE", "same")
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.inputProvenance.summary(configInputGeneric)
+	if cfg.Profile != "same" || got.complete || !reflect.DeepEqual(got.sources, []string{"user_config", "repo_config", "environment"}) {
+		t.Fatalf("equal-value layers: %#v", got)
+	}
+	if len(original.inputProvenance.summary(configInputGeneric).sources) != 2 {
+		t.Fatal("environment application changed a copied ledger")
+	}
+	t.Setenv("CRABBOX_PROFILE", "")
+	for _, raw := range []string{"", "invalid", "false"} {
+		t.Run("desktop/"+raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CRABBOX_DESKTOP", raw)
+			cfg := baseConfig()
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if (cfg.inputProvenance.summary(configInputGeneric).state == "present") != (raw == "false") {
+				t.Fatal("invalid/omitted boolean confused with accepted false")
+			}
+		})
+	}
+}
+
+func TestTartInputValueAndIntent(t *testing.T) {
+	for _, field := range []struct {
+		name string
+		read func(Config) (int, bool)
+	}{
+		{"CPUS", func(c Config) (int, bool) { return c.Tart.CPUs, c.tartCPUsExplicit }},
+		{"MEMORY", func(c Config) (int, bool) { return c.Tart.Memory, c.tartMemoryExplicit }},
+		{"DISK", func(c Config) (int, bool) { return c.Tart.Disk, c.tartDiskExplicit }},
+	} {
+		for _, raw := range []string{"", "invalid", " 4 ", "0", "-1", "7", "9223372036854775808", "-9223372036854775809"} {
+			t.Run(field.name+"/"+raw, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Tart: TartConfig{CPUs: 7, Memory: 7, Disk: 7}}
+				t.Setenv("CRABBOX_TART_"+field.name, raw)
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				value, explicit := field.read(cfg)
+				want, parseErr := strconv.Atoi(raw)
+				accepted := parseErr == nil
+				if !accepted {
+					want = 7
+				}
+				wantExplicit := raw != "" && (field.name != "DISK" || want > 0)
+				if value != want || explicit != wantExplicit {
+					t.Fatalf("value=%d explicit=%v, want %d/%v", value, explicit, want, wantExplicit)
+				}
+				facts := cfg.inputProvenance["tart"]
+				if (facts.values != 0) != accepted || (facts.intents != 0) != (raw != "") || facts.complete {
+					t.Fatalf("incorrect value/intent facts: %#v", facts)
+				}
+				if got := cfg.inputProvenance.summary("tart"); raw != "" && !reflect.DeepEqual(got.sources, []string{"environment"}) {
+					t.Fatalf("sources=%v", got.sources)
+				}
+			})
+		}
+	}
+	// Invalid disk input can clear intent even though it preserves the value.
+	t.Run("disk marker clear", func(t *testing.T) {
+		clearConfigEnv(t)
+		cfg := Config{tartDiskExplicit: true}
+		t.Setenv("CRABBOX_TART_DISK", "invalid")
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Tart.Disk != 0 || cfg.tartDiskExplicit || cfg.inputProvenance["tart"].intents == 0 || cfg.inputProvenance["tart"].values != 0 {
+			t.Fatal("disk fallback must preserve zero, clear marker, and record only intent")
+		}
+	})
+}
+
+func TestConfigInputEnvFallbacks(t *testing.T) {
+	const primary, alias = "CRABBOX_TEST_INPUT_PRIMARY", "CRABBOX_TEST_INPUT_ALIAS"
+	for _, tc := range []struct {
+		primary, alias string
+		want           int
+		accepted       bool
+	}{
+		{"", "", 7, false}, {"invalid", "", 7, false},
+		{" 4 ", "", 7, false}, {"7", "", 7, true},
+		{"0", "9", 0, true}, {"invalid", "-2", -2, true},
+		{"3", "9", 3, true}, {"", "7", 7, true},
+	} {
+		t.Run(tc.primary+"/"+tc.alias, func(t *testing.T) {
+			t.Setenv(primary, tc.primary)
+			t.Setenv(alias, tc.alias)
+			var cfg Config
+			got := configInputEnvInt(&cfg, "example", 7, primary, alias)
+			if got != tc.want || (cfg.inputProvenance["example"].values != 0) != tc.accepted {
+				t.Fatalf("value=%d facts=%#v", got, cfg.inputProvenance["example"])
+			}
+		})
+	}
+	for _, raw := range []string{"", "kept", " "} {
+		t.Run("string/"+raw, func(t *testing.T) {
+			t.Setenv(primary, raw)
+			var cfg Config
+			got := configInputEnvString(&cfg, "example", "kept", primary)
+			want := raw
+			if raw == "" {
+				want = "kept"
+			}
+			if got != want || (cfg.inputProvenance["example"].values != 0) != (raw != "") {
+				t.Fatalf("value=%q facts=%#v", got, cfg.inputProvenance["example"])
+			}
+		})
+	}
+}
+
 func TestTartEnvExplicitFlags(t *testing.T) {
 	clearConfigEnv(t)
 	cfg := baseConfig()
@@ -7791,7 +10116,7 @@ func TestXCPNgHigherPrecedenceNamesClearInheritedUUIDs(t *testing.T) {
 			want: selectors{" template ", " template-uuid\t", " sr ", " sr-uuid\t", " network ", " network-uuid\t"},
 		},
 	}
-	for _, source := range []string{"file", "env"} {
+	for _, source := range []string{"file", "repo", "env"} {
 		for _, tt := range tests {
 			t.Run(source+"/"+tt.name, func(t *testing.T) {
 				clearConfigEnv(t)
@@ -7806,11 +10131,12 @@ func TestXCPNgHigherPrecedenceNamesClearInheritedUUIDs(t *testing.T) {
 					Network: prior[4], NetworkUUID: prior[5],
 					Host: "prior-host", User: "prior-user", WorkRoot: t.TempDir(),
 				}
+				cfg.ServerType, cfg.SSHUser, cfg.WorkRoot = "prior-type", "generic-user", "/generic"
 				want := cfg.XCPNg
 				want.Template, want.TemplateUUID = tt.want[0], tt.want[1]
 				want.SR, want.SRUUID = tt.want[2], tt.want[3]
 				want.Network, want.NetworkUUID = tt.want[4], tt.want[5]
-				if source == "file" {
+				if source != "env" {
 					file := fileConfig{}
 					wantFile := fileConfig{}
 					if !tt.absent {
@@ -7822,7 +10148,7 @@ func TestXCPNgHigherPrecedenceNamesClearInheritedUUIDs(t *testing.T) {
 						inputCopy := input
 						file.XCPNg, wantFile.XCPNg = &input, &inputCopy
 					}
-					if err := applyFileConfig(&cfg, file); err != nil {
+					if err := applyFileConfigWithTrust(&cfg, file, source == "file"); err != nil {
 						t.Fatal(err)
 					}
 					if !reflect.DeepEqual(file, wantFile) {
@@ -7845,8 +10171,153 @@ func TestXCPNgHigherPrecedenceNamesClearInheritedUUIDs(t *testing.T) {
 				if !reflect.DeepEqual(cfg.XCPNg, want) {
 					t.Fatalf("XCPNg=%#v, want %#v", cfg.XCPNg, want)
 				}
+				if cfg.ServerType != "prior-type" || cfg.SSHUser != "generic-user" || cfg.WorkRoot != "/generic" {
+					t.Fatal("file/environment selectors gained generic side effects")
+				}
+				inputSource := configInputEnvironment
+				if source == "file" {
+					inputSource = configInputUser
+				}
+				if source == "repo" {
+					inputSource = configInputRepo
+				}
+				accepted := false
+				for _, value := range tt.in {
+					accepted = accepted || value != ""
+				}
+				wantLedger := Config{}
+				recordConfigInput(&wantLedger, "xcp-ng", inputSource, accepted)
+				if cfg.inputProvenance["xcp-ng"] != wantLedger.inputProvenance["xcp-ng"] {
+					t.Fatal("selector accepted-input source changed")
+				}
 			})
 		}
+	}
+}
+
+func TestFreestyleOrdinarySources(t *testing.T) {
+	clearConfigEnv(t)
+	if got := baseConfig().Freestyle; got != (FreestyleConfig{APIURL: "https://api.freestyle.sh", Workdir: "crabbox"}) {
+		t.Fatalf("defaults %#v", got)
+	}
+	for _, source := range []string{"file", "env"} {
+		for _, tc := range []struct {
+			raw, num string
+			want     int
+			accepted bool
+		}{{"", "0", 7, false}, {"same", "-2", -2, true}, {" padded ", "7", 7, true}, {"same", "bad", 7, true}, {"same", " 7 ", 7, true}} {
+			if source == "file" && (tc.num == "bad" || tc.num == " 7 ") {
+				continue
+			}
+			t.Run(source+"/"+tc.raw+"/"+tc.num, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := Config{Freestyle: FreestyleConfig{APIURL: "same", Workdir: "same", VCPUs: 7, MemoryGB: 7}}
+				want := cfg.Freestyle
+				if tc.raw != "" {
+					want.APIURL, want.Workdir = tc.raw, tc.raw
+				}
+				want.VCPUs, want.MemoryGB = tc.want, tc.want
+				inputSource := configInputUser
+				if source == "file" {
+					if tc.num == "-2" {
+						want.VCPUs, want.MemoryGB = 7, 7
+					}
+					var file fileConfig
+					data := fmt.Sprintf("freestyle: {apiUrl: %q, workdir: %q, vcpus: %s, memoryGB: %s}", tc.raw, tc.raw, tc.num, tc.num)
+					if err := yaml.Unmarshal([]byte(data), &file); err != nil {
+						t.Fatal(err)
+					}
+					original := *file.Freestyle
+					if err := applyFileConfig(&cfg, file); err != nil {
+						t.Fatal(err)
+					}
+					if *file.Freestyle != original {
+						t.Fatal("file input mutated")
+					}
+				} else {
+					inputSource = configInputEnvironment
+					if tc.num == "0" {
+						want.VCPUs, want.MemoryGB = 0, 0
+					}
+					t.Setenv("CRABBOX_FREESTYLE_API_URL", tc.raw)
+					t.Setenv("CRABBOX_FREESTYLE_WORKDIR", tc.raw)
+					t.Setenv("CRABBOX_FREESTYLE_VCPUS", tc.num)
+					t.Setenv("CRABBOX_FREESTYLE_MEMORY_GB", tc.num)
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+				accepted := tc.accepted || source == "env" && tc.num == "0"
+				var ledger configInputLedger
+				if accepted {
+					ledger = ledger.withInput("freestyle", inputSource, configInputValue)
+				}
+				if cfg.Freestyle != want || !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+					t.Fatalf("source %#v ledger %#v want %#v", cfg.Freestyle, cfg.inputProvenance, want)
+				}
+			})
+		}
+	}
+	for _, field := range []struct {
+		name string
+		read func(Config) string
+	}{{"API_KEY", func(c Config) string { return c.Freestyle.APIKey }}, {"API_URL", func(c Config) string { return c.Freestyle.APIURL }}} {
+		for _, tc := range []struct{ primary, alias, want string }{{"", "", ""}, {"", "synthetic-alias", "synthetic-alias"}, {"synthetic-primary", "synthetic-alias", "synthetic-primary"}, {" ", "synthetic-alias", " "}, {"synthetic-equal", "synthetic-equal", "synthetic-equal"}} {
+			clearConfigEnv(t)
+			cfg := Config{}
+			t.Setenv("CRABBOX_FREESTYLE_"+field.name, tc.primary)
+			t.Setenv("FREESTYLE_"+field.name, tc.alias)
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if field.read(cfg) != tc.want {
+				t.Fatalf("%s alias precedence", field.name)
+			}
+			var ledger configInputLedger
+			if tc.want != "" {
+				ledger = ledger.withInput("freestyle", configInputEnvironment, configInputValue)
+			}
+			if !reflect.DeepEqual(cfg.inputProvenance, ledger) {
+				t.Fatal("alias accepted source mismatch")
+			}
+		}
+	}
+}
+
+func TestFreestyleOrdinaryWriter(t *testing.T) {
+	for _, input := range []string{"freestyle: null", "freestyle: {}", "freestyle: {apiUrl: '', workdir: '', vcpus: 0, memoryGB: 0}", "freestyle: {apiUrl: ' padded ', workdir: ' raw ', vcpus: -2, memoryGB: 7}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{}
+		if strings.Contains(input, "freestyle: {") {
+			want["freestyle"] = map[string]any{}
+		}
+		if strings.Contains(input, "padded") {
+			want["freestyle"] = map[string]any{"apiUrl": " padded ", "workdir": " raw ", "vcpus": -2, "memoryGB": 7}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer %#v want %#v", got, want)
+		}
+	}
+	if _, present := reflect.TypeOf(fileFreestyleConfig{}).FieldByName("APIKey"); present {
+		t.Fatal("environment-only API key admitted to file DTO")
 	}
 }
 
@@ -7891,6 +10362,29 @@ func TestRepoConfigCannotOverrideFreestyleAPIURL(t *testing.T) {
 	}
 	if cfg.Freestyle.Workdir != "repo-workdir" {
 		t.Fatalf("Freestyle.Workdir=%q, want repository config applied", cfg.Freestyle.Workdir)
+	}
+	if got := cfg.inputProvenance.summary("freestyle").sources; !reflect.DeepEqual(got, []string{"user_config", "repo_config"}) {
+		t.Fatalf("accepted workdir source missing: %v", got)
+	}
+	if err := os.WriteFile(".crabbox.yaml", []byte("freestyle:\n  apiUrl: https://untrusted.example.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.inputProvenance.summary("freestyle").sources; !reflect.DeepEqual(got, []string{"user_config"}) {
+		t.Fatalf("restored repository URL acquired a source: %v", got)
+	}
+	if err := os.Remove(userPath); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.inputProvenance.summary("freestyle"); got.state != "none" || len(got.sources) != 0 {
+		t.Fatalf("complete load should record no accepted Freestyle input: %+v", got)
 	}
 }
 
@@ -8111,6 +10605,111 @@ func TestApplyFileParallelsHostConfig(t *testing.T) {
 	}
 	if got.MaxVMs != 3 || len(got.Targets) != 2 || got.Targets[0] != targetMacOS || got.Targets[1] != targetLinux {
 		t.Fatalf("targets/max=%#v", got)
+	}
+}
+
+func TestParallelsDirectHostMaxVMsConfigLayers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		repo string
+		env  string
+		want int
+	}{
+		{name: "omitted inherits", repo: "{}", want: 4},
+		{name: "explicit zero clears", repo: "{maxVMs: 0}", want: 0},
+		{name: "positive overrides", repo: "{maxVMs: 2}", want: 2},
+		{name: "negative is unlimited", repo: "{maxVMs: -1}", want: -1},
+		{name: "environment zero clears", repo: "{maxVMs: 2}", env: "0", want: 0},
+		{name: "environment positive overrides", repo: "{maxVMs: 2}", env: "3", want: 3},
+		{name: "environment negative is unlimited", repo: "{maxVMs: 2}", env: "-1", want: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			var user, repo fileConfig
+			if err := yaml.Unmarshal([]byte("parallels: {maxVMs: 4}"), &user); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyFileConfigWithTrust(&cfg, user, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := yaml.Unmarshal([]byte("parallels: "+tc.repo), &repo); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyFileConfigWithTrust(&cfg, repo, false); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_PARALLELS_MAX_VMS", tc.env)
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Parallels.MaxVMs != tc.want {
+				t.Fatalf("maxVMs=%d, want %d", cfg.Parallels.MaxVMs, tc.want)
+			}
+			if tc.want <= 0 && !parallelsHostWithinCapacity(cfg, []ParallelsVM{{Name: "crabbox-existing"}}) {
+				t.Fatal("nonpositive direct-host maxVMs should be unlimited")
+			}
+		})
+	}
+}
+
+func TestParallelsBootstrapKeyRequiresTrustedFileOrExplicitEnvironment(t *testing.T) {
+	file := fileConfig{Parallels: &fileParallelsConfig{BootstrapKey: "/Users/build/.ssh/bootstrap"}}
+
+	repositoryCfg := baseConfig()
+	if err := applyFileConfigWithTrust(&repositoryCfg, file, false); err != nil {
+		t.Fatal(err)
+	}
+	if repositoryCfg.Parallels.BootstrapKey != "" {
+		t.Fatalf("repository config selected bootstrap key %q", repositoryCfg.Parallels.BootstrapKey)
+	}
+
+	trustedCfg := baseConfig()
+	if err := applyFileConfigWithTrust(&trustedCfg, file, true); err != nil {
+		t.Fatal(err)
+	}
+	if trustedCfg.Parallels.BootstrapKey != "/Users/build/.ssh/bootstrap" {
+		t.Fatalf("trusted bootstrap key=%q", trustedCfg.Parallels.BootstrapKey)
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("CRABBOX_PARALLELS_BOOTSTRAP_KEY", "/Users/build/.ssh/from-env")
+	envCfg := baseConfig()
+	if err := applyEnv(&envCfg); err != nil {
+		t.Fatal(err)
+	}
+	if envCfg.Parallels.BootstrapKey != "/Users/build/.ssh/from-env" {
+		t.Fatalf("environment bootstrap key=%q", envCfg.Parallels.BootstrapKey)
+	}
+}
+
+func TestParallelsPasswordRequiresTrustedFileOrExplicitEnvironment(t *testing.T) {
+	file := fileConfig{Parallels: &fileParallelsConfig{Password: "user-config-password"}}
+
+	repositoryCfg := baseConfig()
+	if err := applyFileConfigWithTrust(&repositoryCfg, file, false); err != nil {
+		t.Fatal(err)
+	}
+	if repositoryCfg.Parallels.Password != "" {
+		t.Fatal("repository config selected the Parallels guest credential")
+	}
+
+	trustedCfg := baseConfig()
+	if err := applyFileConfigWithTrust(&trustedCfg, file, true); err != nil {
+		t.Fatal(err)
+	}
+	if trustedCfg.Parallels.Password != "user-config-password" {
+		t.Fatalf("trusted password was not loaded")
+	}
+
+	clearConfigEnv(t)
+	t.Setenv("CRABBOX_PARALLELS_PASSWORD", "environment-password")
+	envCfg := baseConfig()
+	if err := applyEnv(&envCfg); err != nil {
+		t.Fatal(err)
+	}
+	if envCfg.Parallels.Password != "environment-password" {
+		t.Fatalf("environment password was not loaded")
 	}
 }
 
@@ -8742,8 +11341,8 @@ azureDynamicSessions:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider != "azure-dynamic-sessions" || cfg.AzureBackend != AzureBackendDynamicSessions || cfg.ServerType != "" {
-		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.AzureBackend, cfg.ServerType)
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.Azure.Backend != AzureBackendDynamicSessions || cfg.ServerType != "" {
+		t.Fatalf("provider=%q azureBackend=%q serverType=%q", cfg.Provider, cfg.Azure.Backend, cfg.ServerType)
 	}
 }
 
@@ -8759,8 +11358,8 @@ func TestLoadConfigRoutesAzureBackendFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider != "azure-dynamic-sessions" || cfg.AzureBackend != AzureBackendDynamicSessions {
-		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.AzureBackend)
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.Azure.Backend != AzureBackendDynamicSessions {
+		t.Fatalf("provider=%q azureBackend=%q", cfg.Provider, cfg.Azure.Backend)
 	}
 }
 
@@ -9153,23 +11752,23 @@ func TestEnvOverridesConfig(t *testing.T) {
 	if len(cfg.AWSSSHCIDRs) != 2 || cfg.AWSSSHCIDRs[0] != "198.51.100.7/32" || cfg.AWSSSHCIDRs[1] != "203.0.113.8/32" {
 		t.Fatalf("AWSSSHCIDRs=%v", cfg.AWSSSHCIDRs)
 	}
-	if len(cfg.AzureSSHCIDRs) != 2 || cfg.AzureSSHCIDRs[0] != "198.51.100.9/32" || cfg.AzureSSHCIDRs[1] != "203.0.113.10/32" {
-		t.Fatalf("AzureSSHCIDRs=%v", cfg.AzureSSHCIDRs)
+	if len(cfg.Azure.SSHCIDRs) != 2 || cfg.Azure.SSHCIDRs[0] != "198.51.100.9/32" || cfg.Azure.SSHCIDRs[1] != "203.0.113.10/32" {
+		t.Fatalf("AzureSSHCIDRs=%v", cfg.Azure.SSHCIDRs)
 	}
-	if cfg.AzureOSDisk != "managed" {
-		t.Fatalf("AzureOSDisk=%q", cfg.AzureOSDisk)
+	if cfg.Azure.OSDisk != "managed" {
+		t.Fatalf("AzureOSDisk=%q", cfg.Azure.OSDisk)
 	}
-	if !cfg.AzureOSDiskExplicit {
+	if !cfg.Azure.OSDiskExplicit {
 		t.Fatal("AzureOSDiskExplicit=false, want true")
 	}
 	if cfg.AzureDynamicSessions.Endpoint != "https://env-pool.env.westus.azurecontainerapps.io" || cfg.AzureDynamicSessions.Pool != "env-pool" || cfg.AzureDynamicSessions.Workdir != "/workspace/env" || cfg.AzureDynamicSessions.TimeoutSecs != 90 {
 		t.Fatalf("unexpected azure dynamic sessions env: %#v", cfg.AzureDynamicSessions)
 	}
-	if cfg.GCPProject != "crabbox-project" || cfg.GCPZone != "europe-west2-b" || cfg.GCPNetwork != "crabbox-net" || cfg.GCPSubnet != "crabbox-subnet" || cfg.GCPRootGB != 900 || cfg.GCPServiceAccount != "runner@crabbox-project.iam.gserviceaccount.com" {
-		t.Fatalf("unexpected gcp env: project=%s zone=%s network=%s subnet=%s root=%d service=%s", cfg.GCPProject, cfg.GCPZone, cfg.GCPNetwork, cfg.GCPSubnet, cfg.GCPRootGB, cfg.GCPServiceAccount)
+	if cfg.GCP.Project != "crabbox-project" || cfg.GCP.Zone != "europe-west2-b" || cfg.GCP.Network != "crabbox-net" || cfg.GCP.Subnet != "crabbox-subnet" || cfg.GCP.RootGB != 900 || cfg.GCP.ServiceAccount != "runner@crabbox-project.iam.gserviceaccount.com" {
+		t.Fatalf("unexpected gcp env: project=%s zone=%s network=%s subnet=%s root=%d service=%s", cfg.GCP.Project, cfg.GCP.Zone, cfg.GCP.Network, cfg.GCP.Subnet, cfg.GCP.RootGB, cfg.GCP.ServiceAccount)
 	}
-	if len(cfg.GCPTags) != 2 || cfg.GCPTags[1] != "crabbox-ci" || len(cfg.GCPSSHCIDRs) != 2 || cfg.GCPSSHCIDRs[1] != "203.0.113.12/32" {
-		t.Fatalf("unexpected gcp tags/cidrs: tags=%v cidrs=%v", cfg.GCPTags, cfg.GCPSSHCIDRs)
+	if len(cfg.GCP.Tags) != 2 || cfg.GCP.Tags[1] != "crabbox-ci" || len(cfg.GCP.SSHCIDRs) != 2 || cfg.GCP.SSHCIDRs[1] != "203.0.113.12/32" {
+		t.Fatalf("unexpected gcp tags/cidrs: tags=%v cidrs=%v", cfg.GCP.Tags, cfg.GCP.SSHCIDRs)
 	}
 	if len(cfg.SSHFallbackPorts) != 0 {
 		t.Fatalf("SSHFallbackPorts=%v want disabled fallback", cfg.SSHFallbackPorts)
@@ -9694,8 +12293,8 @@ localContainer:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Image != "ubuntu-26.04" || cfg.AzureImage != defaultAzureLinuxImage || cfg.Islo.Image != "docker.io/library/ubuntu:26.04" || cfg.LocalContainer.Image != "ubuntu:26.04" {
-		t.Fatalf("explicit images were overwritten: hetzner=%q azure=%q islo=%q local=%q", cfg.Image, cfg.AzureImage, cfg.Islo.Image, cfg.LocalContainer.Image)
+	if cfg.Image != "ubuntu-26.04" || cfg.Azure.Image != defaultAzureLinuxImage || cfg.Islo.Image != "docker.io/library/ubuntu:26.04" || cfg.LocalContainer.Image != "ubuntu:26.04" {
+		t.Fatalf("explicit images were overwritten: hetzner=%q azure=%q islo=%q local=%q", cfg.Image, cfg.Azure.Image, cfg.Islo.Image, cfg.LocalContainer.Image)
 	}
 }
 
@@ -9803,8 +12402,8 @@ os: ubuntu:24.04
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TargetOS != targetLinux || cfg.Image != "ubuntu-24.04" || cfg.AzureImage != "Canonical:ubuntu-24_04-lts:server:latest" {
-		t.Fatalf("portable os defaults not applied through target alias: target=%q image=%q azure=%q", cfg.TargetOS, cfg.Image, cfg.AzureImage)
+	if cfg.TargetOS != targetLinux || cfg.Image != "ubuntu-24.04" || cfg.Azure.Image != "Canonical:ubuntu-24_04-lts:server:latest" {
+		t.Fatalf("portable os defaults not applied through target alias: target=%q image=%q azure=%q", cfg.TargetOS, cfg.Image, cfg.Azure.Image)
 	}
 }
 
@@ -10016,8 +12615,8 @@ os: ubuntu:24.04
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.OSImage != "ubuntu:26.04" || cfg.Image != "ubuntu-24.04" || cfg.AzureImage != defaultAzureLinuxImage {
-		t.Fatalf("higher precedence os did not override provider defaults: os=%q image=%q azure=%q", cfg.OSImage, cfg.Image, cfg.AzureImage)
+	if cfg.OSImage != "ubuntu:26.04" || cfg.Image != "ubuntu-24.04" || cfg.Azure.Image != defaultAzureLinuxImage {
+		t.Fatalf("higher precedence os did not override provider defaults: os=%q image=%q azure=%q", cfg.OSImage, cfg.Image, cfg.Azure.Image)
 	}
 }
 
@@ -10249,6 +12848,9 @@ func TestAccessAuthState(t *testing.T) {
 
 func TestRepoConfigIsYamlOnly(t *testing.T) {
 	clearConfigEnv(t)
+	dirs := isolateTestUserDirs(t)
+	selectedState := dirs.StateHome
+	repositorySelectedState := filepath.Join(dirs.Root, "repository-selected-state")
 	dir := t.TempDir()
 	oldwd, err := os.Getwd()
 	if err != nil {
@@ -10268,7 +12870,7 @@ func TestRepoConfigIsYamlOnly(t *testing.T) {
 	if err := os.WriteFile(".crabbox.json", []byte(`{"profile":"json-profile","provider":"aws"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(".crabbox.yaml", []byte("profile: yaml-profile\nprovider: aws\n"), 0o600); err != nil {
+	if err := os.WriteFile(".crabbox.yaml", []byte("profile: yaml-profile\nprovider: aws\nXDG_STATE_HOME: "+strconv.Quote(repositorySelectedState)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -10278,6 +12880,52 @@ func TestRepoConfigIsYamlOnly(t *testing.T) {
 	}
 	if cfg.Profile != "yaml-profile" || cfg.Provider != "aws" {
 		t.Fatalf("unexpected config: profile=%s provider=%s", cfg.Profile, cfg.Provider)
+	}
+	keyPath, err := TestboxKeyPath("cbx_1516")
+	wantKeyPath := filepath.Join(selectedState, "crabbox", "testboxes", "cbx_1516", "id_ed25519")
+	if err != nil || keyPath != wantKeyPath || os.Getenv("XDG_STATE_HOME") != selectedState {
+		t.Fatalf("repository YAML changed generated-key root: path=%q env=%q err=%v", keyPath, os.Getenv("XDG_STATE_HOME"), err)
+	}
+	if _, err := os.Lstat(repositorySelectedState); !os.IsNotExist(err) {
+		t.Fatalf("repository-selected root was materialized: %v", err)
+	}
+}
+
+func TestLeaseDurationErrorPolicies(t *testing.T) {
+	const prior = 17 * time.Second
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+		bad  bool
+	}{
+		{"", prior, false}, {" ", prior, true}, {"invalid", prior, true},
+		{"0", prior, true}, {"0s", prior, true}, {"-1ns", prior, true},
+		{" 2m ", prior, true}, {"999999999999999999h", prior, true},
+		{"2m", 2 * time.Minute, false}, {"125ms", 125 * time.Millisecond, false},
+		{"+1s", time.Second, false}, {"17s", prior, false},
+	} {
+		t.Run(fmt.Sprintf("%q", tc.raw), func(t *testing.T) {
+			strict, tolerant := prior, prior
+			err := ApplyLeaseDuration(&strict, tc.raw)
+			accepted := applyLeaseDuration(&tolerant, tc.raw)
+			if accepted != (tc.raw != "" && !tc.bad) {
+				t.Fatalf("accepted=%t raw=%q", accepted, tc.raw)
+			}
+			if strict != tc.want || tolerant != tc.want {
+				t.Fatalf("strict=%s tolerant=%s want=%s", strict, tolerant, tc.want)
+			}
+			if tc.bad {
+				if err == nil || err.Error() != fmt.Sprintf("invalid duration %q", tc.raw) {
+					t.Fatalf("error=%v", err)
+				}
+				var exitErr ExitError
+				if AsExitError(err, &exitErr) {
+					t.Fatalf("ordinary duration error changed to ExitError: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -10537,6 +13185,103 @@ func TestWindowsWSLWorkRoot(t *testing.T) {
 	}
 }
 
+func envIntegerCases() []struct {
+	name, value    string
+	want32, want64 int64
+	ok32, ok64     bool
+} {
+	return []struct {
+		name, value    string
+		want32, want64 int64
+		ok32, ok64     bool
+	}{
+		{"unset", "", 7, 7, false, false},
+		{"empty", "", 7, 7, false, false},
+		{"same as fallback", "7", 7, 7, true, true},
+		{"zero", "0", 0, 0, true, true},
+		{"plus zero", "+0", 0, 0, true, true},
+		{"negative zero", "-0", 0, 0, true, true},
+		{"negative", "-12", -12, -12, true, true},
+		{"positive sign", "+12", 12, 12, true, true},
+		{"decimal leading zero", "042", 42, 42, true, true},
+		{"padded", " 12 ", 7, 7, false, false},
+		{"newline", "12\n", 7, 7, false, false},
+		{"fractional", "1.5", 7, 7, false, false},
+		{"word", "invalid", 7, 7, false, false},
+		{"hex prefix", "0x10", 7, 7, false, false},
+		{"underscore", "1_000", 7, 7, false, false},
+		{"unicode digit", "１２", 7, 7, false, false},
+		{"only sign", "+", 7, 7, false, false},
+		{"int32 max", "2147483647", 2147483647, 2147483647, true, true},
+		{"int32 min", "-2147483648", -2147483648, -2147483648, true, true},
+		{"int32 positive overflow", "2147483648", 7, 2147483648, false, true},
+		{"int32 negative overflow", "-2147483649", 7, -2147483649, false, true},
+		{"int64 max", "9223372036854775807", 7, 9223372036854775807, false, true},
+		{"int64 min", "-9223372036854775808", 7, -9223372036854775808, false, true},
+		{"int64 positive overflow", "9223372036854775808", 7, 7, false, false},
+		{"int64 negative overflow", "-9223372036854775809", 7, 7, false, false},
+	}
+}
+
+func TestEnvIntegerFallbacks(t *testing.T) {
+	const name = "CRABBOX_TEST_INTEGER"
+	for _, helper := range []struct {
+		name string
+		bits int
+		read func(string) int64
+	}{
+		{"native", strconv.IntSize, func(name string) int64 { return int64(getenvInt(name, 7)) }},
+		{"int32", 32, func(name string) int64 { return int64(getenvInt32(name, 7)) }},
+		{"int64", 64, func(name string) int64 { return getenvInt64(name, 7) }},
+	} {
+		t.Run(helper.name, func(t *testing.T) {
+			for _, tc := range envIntegerCases() {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Setenv(name, tc.value)
+					if tc.name == "unset" {
+						if err := os.Unsetenv(name); err != nil {
+							t.Fatal(err)
+						}
+					}
+					want := tc.want64
+					if helper.bits == 32 {
+						want = tc.want32
+					}
+					if got := helper.read(name); got != want {
+						t.Fatalf("%q at %d bits: got %d, want %d", tc.value, helper.bits, got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLookupEnvIntegerAcceptance(t *testing.T) {
+	const name = "CRABBOX_TEST_INTEGER"
+	for _, bits := range []int{32, 64} {
+		t.Run(strconv.Itoa(bits), func(t *testing.T) {
+			for _, tc := range envIntegerCases() {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Setenv(name, tc.value)
+					if tc.name == "unset" {
+						if err := os.Unsetenv(name); err != nil {
+							t.Fatal(err)
+						}
+					}
+					want, accepted := tc.want64, tc.ok64
+					if bits == 32 {
+						want, accepted = tc.want32, tc.ok32
+					}
+					got, ok := lookupEnvInteger(name, bits)
+					if ok != accepted || (ok && got != want) {
+						t.Fatalf("%q: got (%d,%v), want (%d,%v)", tc.value, got, ok, want, accepted)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestEnvHelperBranches(t *testing.T) {
 	t.Setenv("CRABBOX_INT", "42")
 	t.Setenv("CRABBOX_BAD_INT", "oops")
@@ -10653,12 +13398,6 @@ func TestConfigServerTypeHelperBranches(t *testing.T) {
 	if got := incusServerTypeForConfig(Config{Incus: IncusConfig{InstanceType: "vm", Image: "images:ubuntu/24.04/cloud"}}); got != "vm:images:ubuntu/24.04/cloud" {
 		t.Fatalf("incus vm=%q", got)
 	}
-	if got := proxmoxServerTypeForConfig(Config{}); got != "template" {
-		t.Fatalf("proxmox default=%q", got)
-	}
-	if got := proxmoxServerTypeForConfig(Config{Proxmox: ProxmoxConfig{TemplateID: 9000}}); got != "template-9000" {
-		t.Fatalf("proxmox template=%q", got)
-	}
 	if got := firecrackerServerTypeForConfig(Config{}); got != "microvm" {
 		t.Fatalf("firecracker default=%q", got)
 	}
@@ -10734,13 +13473,13 @@ func TestApplyFileConfigCloudProviderBranches(t *testing.T) {
 	if cfg.Location != "fsn1" || cfg.ProviderKey != "hetzner-key" || cfg.HostID != "h-mac" || cfg.AWSRootGB != 123 {
 		t.Fatalf("hetzner/aws config not applied: location=%s key=%s host=%s root=%d", cfg.Location, cfg.ProviderKey, cfg.HostID, cfg.AWSRootGB)
 	}
-	if cfg.AzureOSDisk != "ephemeral" || !cfg.AzureOSDiskExplicit || cfg.AzureNetwork != "public" {
+	if cfg.Azure.OSDisk != "ephemeral" || !cfg.Azure.OSDiskExplicit || cfg.Azure.Network != "public" {
 		t.Fatalf("azure config not applied: %#v", cfg)
 	}
 	if cfg.AzureDynamicSessions.Pool != "pool" || cfg.AzureDynamicSessions.Workdir != "/workspace/file" || cfg.AzureDynamicSessions.TimeoutSecs != 120 {
 		t.Fatalf("azure dynamic sessions config not applied: %#v", cfg.AzureDynamicSessions)
 	}
-	if cfg.GCPProject != "project" || !cfg.gcpProjectExplicit || cfg.GCPRootGB != 456 || cfg.GCPServiceAccount == "" {
+	if cfg.GCP.Project != "project" || !cfg.GCP.projectExplicit || cfg.GCP.RootGB != 456 || cfg.GCP.ServiceAccount == "" {
 		t.Fatalf("gcp config not applied: %#v", cfg)
 	}
 }
@@ -11752,17 +14491,6 @@ func TestModalConfigEnvironmentContract(t *testing.T) {
 	}
 }
 
-func TestModalConfigServerTypeFallback(t *testing.T) {
-	for _, tc := range []struct{ raw, want string }{{"", "python:3.13-slim"}, {"  ", "  "}, {" custom-image ", " custom-image "}} {
-		cfg := baseConfig()
-		cfg.Provider = "modal"
-		cfg.Modal.Image = tc.raw
-		if got := serverTypeForConfig(cfg); got != tc.want {
-			t.Fatalf("serverType=%q want=%q", got, tc.want)
-		}
-	}
-}
-
 func TestMorphConfigFileContract(t *testing.T) {
 	wantDefaults := MorphConfig{APIURL: "https://cloud.morph.so", SSHGatewayHost: "ssh.cloud.morph.so", WorkRoot: "/tmp/crabbox", WakeOnSSH: true}
 	if got := baseConfig().Morph; got != wantDefaults {
@@ -12181,7 +14909,7 @@ func TestExeDevConfigEnvironmentContract(t *testing.T) {
 	}
 }
 
-func TestExeDevConfigCoreFallbackContract(t *testing.T) {
+func TestExeDevConfigWorkRootFallbackContract(t *testing.T) {
 	for _, tc := range []struct{ providerRoot, generic, want string }{{"", "/work/crabbox", "/tmp/crabbox"}, {"", "/custom/root", "/custom/root"}, {"/specific/root", "/custom/root", "/specific/root"}, {"  ", "/custom/root", "  "}} {
 		cfg := baseConfig()
 		cfg.Provider = "exe-dev"
@@ -12192,14 +14920,6 @@ func TestExeDevConfigCoreFallbackContract(t *testing.T) {
 		}
 		if cfg.WorkRoot != tc.want || cfg.ExeDev.WorkRoot != tc.want {
 			t.Fatalf("roots=%q/%q want=%q", cfg.WorkRoot, cfg.ExeDev.WorkRoot, tc.want)
-		}
-	}
-	for _, tc := range []struct{ raw, want string }{{"", "default"}, {"  ", "  "}, {" image ", " image "}} {
-		cfg := baseConfig()
-		cfg.Provider = "exe-dev"
-		cfg.ExeDev.Image = tc.raw
-		if got := serverTypeForConfig(cfg); got != tc.want {
-			t.Fatalf("display=%q want=%q", got, tc.want)
 		}
 	}
 }
@@ -12925,6 +15645,76 @@ func TestVastBindingCoreDefaultsAndMarkers(t *testing.T) {
 			t.Fatal("core explicit projection changed")
 		}
 	}
+	t.Run("restore saved connection values without changing intent", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Provider = "vast"
+		cfg.WorkRoot, cfg.SSHUser, cfg.SSHPort = "/saved/root", "saved-user", "2200"
+		MarkWorkRootExplicit(&cfg)
+		MarkSSHUserExplicit(&cfg)
+		MarkSSHPortExplicit(&cfg)
+		cfg.WorkRoot, cfg.SSHUser, cfg.SSHPort = "/current/root", "current-user", "2222"
+		cfg.Vast.WorkRoot = "/unmarked/provider/root"
+		cfg.SSHFallbackPorts = []string{"2223"}
+		before := cfg.credentialProvenance
+		if err := applyProviderConfigDefaults(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.WorkRoot != "/saved/root" || cfg.Vast.WorkRoot != "/saved/root" || cfg.SSHUser != "saved-user" || cfg.SSHPort != "2200" || len(cfg.SSHFallbackPorts) != 0 {
+			t.Fatal("saved connection restoration changed")
+		}
+		if !reflect.DeepEqual(cfg.credentialProvenance, before) || IsVastWorkRootExplicit(&cfg) || DeleteOnReleaseExplicit(cfg, "vast") || IsTargetExplicit(&cfg) {
+			t.Fatal("defaulting changed input intent")
+		}
+	})
+	for _, target := range []string{targetLinux, targetMacOS, targetWindows} {
+		t.Run("explicit target "+target, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Provider, cfg.TargetOS = "vast", target
+			MarkTargetExplicit(&cfg)
+			if err := applyProviderConfigDefaults(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.TargetOS != target || cfg.WorkRoot != defaultWorkRootForTarget(target, windowsModeNormal) || cfg.Vast.WorkRoot != VastConfigDefaultWorkRoot {
+				t.Fatal("target normalization phase changed")
+			}
+		})
+	}
+	t.Run("saved windows mode and inherited target", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Provider, cfg.TargetOS = "vast", targetWindows
+		cfg.WindowsMode = windowsModeWSL2
+		if err := applyProviderConfigDefaults(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.TargetOS != targetLinux || cfg.WindowsMode != windowsModeNormal {
+			t.Fatal("inherited target or mode was retained")
+		}
+		cfg.TargetOS = targetWindows
+		MarkTargetExplicit(&cfg)
+		cfg.explicitWindowsMode = windowsModeWSL2
+		cfg.WindowsMode = windowsModeNormal
+		if err := applyProviderConfigDefaults(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.TargetOS != targetWindows || cfg.WindowsMode != windowsModeWSL2 || cfg.WorkRoot != defaultPOSIXWorkRoot {
+			t.Fatal("saved windows mode restoration changed")
+		}
+	})
+
+	t.Run("raw field defaults and normalized instance type", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Provider = "vast"
+		cfg.Vast = VastConfig{APIURL: " ", InstanceType: " On_Demand ", Image: " ", Runtype: " ", DiskGB: -1, Order: " ", User: " ", WorkRoot: " ", ReleaseAction: " "}
+		want := cfg.Vast
+		want.InstanceType = "ondemand"
+		if err := applyProviderConfigDefaults(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Vast != want || cfg.WorkRoot != defaultPOSIXWorkRoot {
+			t.Fatal("raw-empty provider defaults or subsequent root normalization changed")
+		}
+	})
+
 }
 
 func TestVastBindingCentralURLPhase(t *testing.T) {
@@ -14421,5 +17211,3505 @@ func TestLambdaWithRuntimeDefaults(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.WithRuntimeDefaults(), got) {
 		t.Fatal("runtime defaults are not idempotent")
+	}
+}
+
+func TestLookupEnvFloatAcceptance(t *testing.T) {
+	const name = "CRABBOX_TEST_FLOAT_ACCEPTANCE"
+	const fallback = 17.25
+	for _, tc := range []struct {
+		name, raw        string
+		absent, accepted bool
+		want             float64
+	}{
+		{name: "absent", absent: true}, {name: "empty"}, {name: "space", raw: " "},
+		{name: "padded", raw: " 2.5 "}, {name: "invalid", raw: "invalid"}, {name: "range", raw: "1e400"},
+		{name: "zero", raw: "0", accepted: true}, {name: "negative-zero", raw: "-0", accepted: true, want: math.Copysign(0, -1)},
+		{name: "negative", raw: "-2.5", accepted: true, want: -2.5}, {name: "same", raw: "17.25", accepted: true, want: fallback},
+		{name: "hex", raw: "0x1.8p+1", accepted: true, want: 3}, {name: "nan", raw: "NaN", accepted: true, want: math.NaN()},
+		{name: "positive-inf", raw: "+Inf", accepted: true, want: math.Inf(1)}, {name: "negative-inf", raw: "-Inf", accepted: true, want: math.Inf(-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(name, tc.raw)
+			if tc.absent {
+				if err := os.Unsetenv(name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, accepted := lookupEnvFloat(name)
+			if accepted != tc.accepted {
+				t.Fatalf("accepted=%t want=%t", accepted, tc.accepted)
+			}
+			if math.IsNaN(tc.want) {
+				if !math.IsNaN(got) {
+					t.Fatalf("value=%v want NaN", got)
+				}
+			} else if got != tc.want || math.Signbit(got) != math.Signbit(tc.want) {
+				t.Fatalf("value=%v want=%v", got, tc.want)
+			}
+			wrapped := getenvFloat(name, fallback)
+			want := tc.want
+			if !tc.accepted {
+				want = fallback
+			}
+			if math.IsNaN(want) {
+				if !math.IsNaN(wrapped) {
+					t.Fatalf("wrapper=%v want NaN", wrapped)
+				}
+			} else if wrapped != want || math.Signbit(wrapped) != math.Signbit(want) {
+				t.Fatalf("wrapper=%v want=%v", wrapped, want)
+			}
+		})
+	}
+}
+
+func TestGetenvNonNegativeIntAcceptance(t *testing.T) {
+	const name = "CRABBOX_TEST_INT_ACCEPTANCE"
+	const fallback = 37
+	for _, tc := range []struct {
+		name, raw        string
+		absent, accepted bool
+		want             int
+		errorSuffix      string
+	}{
+		{name: "absent", absent: true, want: fallback}, {name: "empty", want: fallback},
+		{name: "zero", raw: "0", accepted: true}, {name: "negative-zero", raw: "-0", accepted: true},
+		{name: "same", raw: "37", accepted: true, want: fallback}, {name: "positive", raw: "+12", accepted: true, want: 12},
+		{name: "negative", raw: "-2", errorSuffix: " must be non-negative"},
+		{name: "space", raw: " ", errorSuffix: " must be an integer"}, {name: "padded", raw: " 12 ", errorSuffix: " must be an integer"},
+		{name: "fractional", raw: "1.5", errorSuffix: " must be an integer"}, {name: "invalid", raw: "invalid", errorSuffix: " must be an integer"},
+		{name: "range", raw: "999999999999999999999999999999", errorSuffix: " must be an integer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(name, tc.raw)
+			if tc.absent {
+				if err := os.Unsetenv(name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, accepted, err := getenvNonNegativeIntAccepted(name, fallback)
+			wrapped, wrappedErr := getenvNonNegativeInt(name, fallback)
+			if got != tc.want || wrapped != tc.want || accepted != tc.accepted {
+				t.Fatalf("value=%d wrapper=%d accepted=%t want=%d/%t", got, wrapped, accepted, tc.want, tc.accepted)
+			}
+			for _, result := range []error{err, wrappedErr} {
+				if tc.errorSuffix == "" {
+					if result != nil {
+						t.Fatal(result)
+					}
+				} else {
+					var exitErr ExitError
+					if result == nil || result.Error() != name+tc.errorSuffix || !AsExitError(result, &exitErr) || exitErr.Code != 2 {
+						t.Fatalf("error=%v want exit2 %q", result, name+tc.errorSuffix)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestConcreteConfigInputSourceAttribution(t *testing.T) {
+	for _, tc := range []struct {
+		root, key, env, raw string
+		value               any
+		owners              []configInputOwner
+	}{
+		{"appleContainer", "cliPath", "CRABBOX_APPLE_CONTAINER_CLI", "container", "container", []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleContainer", "image", "CRABBOX_APPLE_CONTAINER_IMAGE", "fixture", "fixture", []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleContainer", "user", "CRABBOX_APPLE_CONTAINER_USER", "crabbox", "crabbox", []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleContainer", "workRoot", "CRABBOX_APPLE_CONTAINER_WORK_ROOT", "/work/crabbox", "/work/crabbox", []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleContainer", "cpus", "CRABBOX_APPLE_CONTAINER_CPUS", "2", 2, []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleContainer", "memory", "CRABBOX_APPLE_CONTAINER_MEMORY", " ", " ", []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleContainer", "extraRunArgs", "CRABBOX_APPLE_CONTAINER_EXTRA_RUN_ARGS", "fixture", []string{"fixture"}, []configInputOwner{"apple-container", "apple-machine"}},
+		{"appleVM", "helperPath", "CRABBOX_APPLE_VM_HELPER", "helper", "helper", []configInputOwner{"apple-vm"}},
+		{"appleVM", "image", "CRABBOX_APPLE_VM_IMAGE", "fixture", "fixture", []configInputOwner{"apple-vm"}},
+		{"appleVM", "imageSHA256", "CRABBOX_APPLE_VM_IMAGE_SHA256", "fixture", "fixture", []configInputOwner{"apple-vm"}},
+		{"appleVM", "user", "CRABBOX_APPLE_VM_USER", "crabbox", "crabbox", []configInputOwner{"apple-vm"}},
+		{"appleVM", "workRoot", "CRABBOX_APPLE_VM_WORK_ROOT", "/work/crabbox", "/work/crabbox", []configInputOwner{"apple-vm"}},
+		{"appleVM", "cpus", "CRABBOX_APPLE_VM_CPUS", "0", 0, []configInputOwner{"apple-vm"}},
+		{"appleVM", "memoryMiB", "CRABBOX_APPLE_VM_MEMORY", "-1", -1, []configInputOwner{"apple-vm"}},
+		{"appleVM", "diskGiB", "CRABBOX_APPLE_VM_DISK", "30", 30, []configInputOwner{"apple-vm"}},
+		{"lambda", "region", "CRABBOX_LAMBDA_REGION", "us-west-1", "us-west-1", []configInputOwner{"lambda"}},
+		{"lambda", "type", "CRABBOX_LAMBDA_TYPE", "gpu_1x_a10", "gpu_1x_a10", []configInputOwner{"lambda"}},
+		{"lambda", "image", "CRABBOX_LAMBDA_IMAGE", "fixture", "fixture", []configInputOwner{"lambda"}},
+		{"lambda", "imageFamily", "CRABBOX_LAMBDA_IMAGE_FAMILY", "fixture", "fixture", []configInputOwner{"lambda"}},
+		{"lambda", "firewallRuleset", "CRABBOX_LAMBDA_FIREWALL_RULESET", " ", " ", []configInputOwner{"lambda"}},
+		{"lambda", "sshCIDRs", "CRABBOX_LAMBDA_SSH_CIDRS", " , ", []string{""}, []configInputOwner{"lambda"}},
+		{"lambda", "filesystemNames", "CRABBOX_LAMBDA_FILESYSTEM_NAMES", " , ", []string{""}, []configInputOwner{"lambda"}},
+		{"lambda", "filesystemMounts", "CRABBOX_LAMBDA_FILESYSTEM_MOUNTS", " , ", []LambdaFilesystemMount{{Name: "fixture", MountPath: "/mnt/fixture"}}, []configInputOwner{"lambda"}},
+		{"localContainer", "runtime", "CRABBOX_LOCAL_CONTAINER_RUNTIME", "docker", "docker", []configInputOwner{"local-container"}},
+		{"localContainer", "image", "CRABBOX_LOCAL_CONTAINER_IMAGE", "fixture", "fixture", []configInputOwner{"local-container"}},
+		{"localContainer", "user", "CRABBOX_LOCAL_CONTAINER_USER", "crabbox", "crabbox", []configInputOwner{"local-container"}},
+		{"localContainer", "workRoot", "CRABBOX_LOCAL_CONTAINER_WORK_ROOT", "/work/crabbox", "/work/crabbox", []configInputOwner{"local-container"}},
+		{"localContainer", "cpus", "CRABBOX_LOCAL_CONTAINER_CPUS", "2", 2, []configInputOwner{"local-container"}},
+		{"localContainer", "memory", "CRABBOX_LOCAL_CONTAINER_MEMORY", " ", " ", []configInputOwner{"local-container"}},
+		{"localContainer", "network", "CRABBOX_LOCAL_CONTAINER_NETWORK", "bridge", "bridge", []configInputOwner{"local-container"}},
+		{"localContainer", "dockerSocket", "CRABBOX_LOCAL_CONTAINER_DOCKER_SOCKET", "false", false, []configInputOwner{"local-container"}},
+		{"localContainer", "noHostname", "CRABBOX_LOCAL_CONTAINER_NO_HOSTNAME", "false", false, []configInputOwner{"local-container"}},
+	} {
+		for _, source := range []string{"user_config", "repo_config", "environment"} {
+			t.Run(tc.root+"/"+tc.key+"/"+source, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := baseConfig()
+				for repetition := 0; repetition < 2; repetition++ {
+					// Reapply equal values with an empty ledger: equality is not acceptance.
+					cfg.inputProvenance = nil
+					if source == "environment" {
+						t.Setenv(tc.env, tc.raw)
+						if err := applyEnv(&cfg); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						data, err := yaml.Marshal(map[string]any{tc.root: map[string]any{tc.key: tc.value}})
+						if err != nil {
+							t.Fatal(err)
+						}
+						var file fileConfig
+						if err := yaml.Unmarshal(data, &file); err != nil {
+							t.Fatal(err)
+						}
+						inputSource := providerSelectionRepoConfig
+						if source == "user_config" {
+							inputSource = providerSelectionUserConfig
+						}
+						if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, source == "user_config", inputSource); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if len(cfg.inputProvenance) != len(tc.owners) {
+						t.Fatalf("ledger=%#v", cfg.inputProvenance)
+					}
+					for _, owner := range tc.owners {
+						got := cfg.inputProvenance.summary(owner)
+						if got.state != "present" || got.complete || got.effects != configInputValue || !reflect.DeepEqual(got.sources, []string{source}) {
+							t.Fatalf("%s: %#v", owner, got)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestConcreteConfigInputIgnoredAndPartial(t *testing.T) {
+	for _, tc := range []struct{ env, value string }{
+		{"CRABBOX_APPLE_CONTAINER_CPUS", "not-an-int"},
+		{"CRABBOX_LOCAL_CONTAINER_CPUS", "not-an-int"},
+		{"CRABBOX_LOCAL_CONTAINER_NO_HOSTNAME", "not-a-bool"},
+		{"CRABBOX_APPLE_CONTAINER_EXTRA_RUN_ARGS", "  "},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			t.Setenv(tc.env, tc.value)
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.inputProvenance) != 0 {
+				t.Fatalf("ignored input counted: %#v", cfg.inputProvenance)
+			}
+		})
+	}
+	for _, earlier := range []bool{false, true} {
+		t.Run(fmt.Sprintf("partial-%t", earlier), func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			t.Setenv("CRABBOX_APPLE_VM_CPUS", "not-an-int")
+			if earlier {
+				t.Setenv("CRABBOX_APPLE_VZ_USER", "crabbox")
+			}
+			if err := applyEnv(&cfg); err == nil || !strings.Contains(err.Error(), "CRABBOX_APPLE_VM_CPUS must be an integer") {
+				t.Fatalf("error=%v", err)
+			}
+			got := cfg.inputProvenance.summary("apple-vm")
+			if (got.state == "present") != earlier || got.complete {
+				t.Fatalf("partial attribution=%#v", got)
+			}
+		})
+	}
+	clearConfigEnv(t)
+	cfg := baseConfig()
+	var file fileConfig
+	if err := yaml.Unmarshal([]byte("appleContainer: {cpus: 0, extraRunArgs: []}\nappleVM: {}\nlambda: {filesystemMounts: []}\nlocalContainer: {cpus: -1}\n"), &file); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.inputProvenance) != 0 {
+		t.Fatalf("ignored file/defaults counted: %#v", cfg.inputProvenance)
+	}
+}
+
+func TestConfigInputGenericFileGroups(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml    string
+		accepted, bad bool
+	}{
+		{"unknown", "unknownFixture: true", false, false},
+		{"selection-only", "provider: fixture", false, false},
+		{"broker-selection-only", "broker: {provider: fixture}", false, false},
+		{"empty-sections", "broker: {}\nssh: {}\nsync: {}\nrun: {}\nenv: {}\ncapacity: {}\nactions: {}\ntailscale: {}\nresults: {}\nshard: {}\ncache: {}", false, false},
+		{"host-id", "hostId: fixture", true, false},
+		{"coordinator", "coordinator: https://fixture.invalid", true, false},
+		{"broker-mode", "broker: {mode: managed}", true, false},
+		{"broker-bool", "broker: {autoWebVNC: false}", true, false},
+		{"broker-access", "broker: {access: {clientId: fixture}}", true, false},
+		{"ssh-port", "ssh: {port: '22'}", true, false},
+		{"ssh-clear", "ssh: {fallbackPorts: []}", true, false},
+		{"root", "workRoot: /work/fixture", true, false},
+		{"lease-invalid", "ttl: invalid\nlease: {idleTimeout: 0s}", false, false},
+		{"lease-valid", "lease: {ttl: 1s}", true, false},
+		{"sync-blank-addition", "sync: {include: [' '], excludes: ['']}", false, false},
+		{"sync-include", "sync: {include: [fixture], includes: [fixture]}", true, false},
+		{"sync-exclude", "sync: {exclude: [fixture], excludes: [fixture]}", true, false},
+		{"sync-false", "sync: {delete: false}", true, false},
+		{"sync-zero-timeout", "sync: {timeout: 0s}", true, false},
+		{"sync-negative-timeout", "sync: {timeout: '-1s'}", true, false},
+		{"sync-invalid-timeout", "sync: {timeout: invalid}", false, false},
+		{"sync-positive-size", "sync: {warnBytes: 1}", true, false},
+		{"sync-zero-size", "sync: {warnBytes: 0}", false, false},
+		{"preflight-clear", "run: {preflightTools: []}", true, false},
+		{"allow-clear", "env: {allow: []}", true, false},
+		{"capacity-replace-blank", "capacity: {regions: [' ']}", true, false},
+		{"capacity-false", "capacity: {hints: false}", true, false},
+		{"actions-replace-blank", "actions: {fields: [' ']}", true, false},
+		{"actions-false", "actions: {ephemeral: false}", true, false},
+		{"tailscale-false", "tailscale: {enabled: false}", true, false},
+		{"tailscale-clear", "tailscale: {exitNode: ' '}", true, false},
+		{"results-clear", "results: {junit: []}", true, false},
+		{"results-false", "results: {auto: false}", true, false},
+		{"shard-zero", "shard: {maxCount: 0}", true, false},
+		{"cache-false", "cache: {pnpm: false}", true, false},
+		{"cache-clear", "cache: {volumes: []}", true, false},
+		{"cache-invalid", "cache: {volumes: [{key: fixture}]}", false, true},
+		{"cache-partial", "cache: {pnpm: false, volumes: [{key: fixture}]}", true, true},
+	} {
+		for _, origin := range []providerSelectionSource{providerSelectionUserConfig, providerSelectionRepoConfig} {
+			t.Run(tc.name+"/"+string(origin), func(t *testing.T) {
+				var file fileConfig
+				if err := yaml.Unmarshal([]byte(tc.yaml), &file); err != nil {
+					t.Fatal(err)
+				}
+				cfg := baseConfig()
+				for repeat := 0; repeat < 2; repeat++ {
+					cfg.inputProvenance = nil
+					err := applyFileConfigWithTrustAndProviderSource(&cfg, file, origin == providerSelectionUserConfig, origin)
+					if (err != nil) != tc.bad {
+						t.Fatalf("error=%v, want error %t", err, tc.bad)
+					}
+					got := cfg.inputProvenance.summary(configInputGeneric)
+					if (got.effects&configInputValue != 0) != tc.accepted || got.complete {
+						t.Fatalf("accepted=%t summary=%#v", tc.accepted, got)
+					}
+					if tc.accepted && !reflect.DeepEqual(got.sources, []string{string(origin)}) {
+						t.Fatalf("sources=%v", got.sources)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestConfigInputGenericNamedDefinitions(t *testing.T) {
+	for _, group := range []string{"profiles", "presets", "proofTemplates", "jobs"} {
+		for _, name := range []string{" ", "fixture"} {
+			t.Run(group+"/"+name, func(t *testing.T) {
+				data, err := yaml.Marshal(map[string]any{group: map[string]any{name: map[string]any{}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var file fileConfig
+				if err := yaml.Unmarshal(data, &file); err != nil {
+					t.Fatal(err)
+				}
+				cfg := baseConfig()
+				if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+					t.Fatal(err)
+				}
+				got := cfg.inputProvenance.summary(configInputGeneric)
+				if (got.effects == configInputValue) != (name == "fixture") || got.complete {
+					t.Fatalf("named definition: %#v", got)
+				}
+			})
+		}
+	}
+	for _, raw := range []string{"0s", "-1s"} {
+		t.Run("job-hydrate/"+raw, func(t *testing.T) {
+			var file fileConfig
+			if err := yaml.Unmarshal([]byte("jobs: {fixture: {provider: fixture-provider, hydrate: {waitTimeout: '"+raw+"'}}}"), &file); err != nil {
+				t.Fatal(err)
+			}
+			cfg := baseConfig()
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+				t.Fatal(err)
+			}
+			want, _ := time.ParseDuration(raw)
+			if cfg.Jobs["fixture"].Hydrate.WaitTimeout != want || cfg.inputProvenance.summary(configInputGeneric).effects != configInputValue || len(cfg.inputProvenance) != 1 {
+				t.Fatal("job duration policy or generic attribution changed")
+			}
+		})
+	}
+}
+
+func TestConfigInputGenericEnvironmentGroups(t *testing.T) {
+	for _, tc := range []struct {
+		name, value   string
+		accepted, bad bool
+	}{
+		{"CRABBOX_HOST_ID", "fixture", true, false},
+		{"CRABBOX_COORDINATOR_MODE", "managed", true, false},
+		{"CRABBOX_COORDINATOR_AUTO_WEBVNC", "false", true, false},
+		{"CRABBOX_COORDINATOR_TOKEN_COMMAND", " ", false, false},
+		{"CRABBOX_COORDINATOR_TOKEN_COMMAND", "[]", false, true},
+		{"CRABBOX_COORDINATOR_TOKEN_COMMAND", "[\"fixture-tool\"]", true, false},
+		{"CRABBOX_ACCESS_CLIENT_ID", "fixture", true, false},
+		{"CRABBOX_SSH_PORT", "22", true, false},
+		{"CRABBOX_SSH_FALLBACK_PORTS", "", true, false},
+		{"CRABBOX_WORK_ROOT", "/work/fixture", true, false},
+		{"CRABBOX_TTL", "invalid", false, false},
+		{"CRABBOX_TTL", "1s", true, false},
+		{"CRABBOX_CAPACITY_HINTS", "false", true, false},
+		{"CRABBOX_CAPACITY_REGIONS", " , ", true, false},
+		{"CRABBOX_ACTIONS_JOB", "fixture", true, false},
+		{"CRABBOX_ACTIONS_EPHEMERAL", "false", true, false},
+		{"CRABBOX_TAILSCALE", "false", true, false},
+		{"CRABBOX_TAILSCALE_TAGS", " , ", true, false},
+		{"CRABBOX_RESULTS_JUNIT", " , ", true, false},
+		{"CRABBOX_RESULTS_AUTO", "invalid", false, false},
+		{"CRABBOX_RESULTS_AUTO", "false", true, false},
+		{"CRABBOX_CACHE_MAX_GB", "invalid", false, false},
+		{"CRABBOX_CACHE_MAX_GB", "-1", true, false},
+		{"CRABBOX_CACHE_VOLUMES", " , ", true, false},
+		{"CRABBOX_SYNC_TIMEOUT", "0s", true, false},
+		{"CRABBOX_SYNC_TIMEOUT", "-1s", true, false},
+		{"CRABBOX_SYNC_TIMEOUT", "invalid", false, false},
+		{"CRABBOX_SYNC_WARN_BYTES", "invalid", false, false},
+		{"CRABBOX_SYNC_WARN_BYTES", "0", true, false},
+		{"CRABBOX_SYNC_DELETE", "false", true, false},
+		{"CRABBOX_ENV_ALLOW", " , ", true, false},
+		{"CRABBOX_PREFLIGHT_TOOLS", " , ", true, false},
+	} {
+		t.Run(tc.name+"/"+tc.value, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("CRABBOX_SSH_FALLBACK_PORTS", "")
+			if err := os.Unsetenv("CRABBOX_SSH_FALLBACK_PORTS"); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(tc.name, tc.value)
+			cfg := baseConfig()
+			for repeat := 0; repeat < 2; repeat++ {
+				cfg.inputProvenance = nil
+				err := applyEnv(&cfg)
+				if (err != nil) != tc.bad {
+					t.Fatalf("error=%v want error %t", err, tc.bad)
+				}
+				got := cfg.inputProvenance.summary(configInputGeneric)
+				if (got.effects&configInputValue != 0) != tc.accepted || got.complete {
+					t.Fatalf("accepted=%t summary=%#v", tc.accepted, got)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigInputGenericAppendAcceptance(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		extra, unique, ordered []string
+		accepted               bool
+	}{
+		{"absent", nil, []string{"fixture"}, []string{"fixture"}, false},
+		{"blank", []string{" ", ""}, []string{"fixture"}, []string{"fixture"}, false},
+		{"equal", []string{"fixture"}, []string{"fixture"}, []string{"fixture", "fixture"}, true},
+		{"ordered", []string{" second ", "second"}, []string{"fixture", "second"}, []string{"fixture", "second", "second"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unique, accepted := appendUniqueStringsAccepted([]string{"fixture"}, tc.extra...)
+			if accepted != tc.accepted || !reflect.DeepEqual(unique, tc.unique) {
+				t.Fatalf("unique=%v accepted=%t", unique, accepted)
+			}
+			ordered, accepted := appendOrderedStringsAccepted([]string{"fixture"}, tc.extra...)
+			if accepted != tc.accepted || !reflect.DeepEqual(ordered, tc.ordered) {
+				t.Fatalf("ordered=%v accepted=%t", ordered, accepted)
+			}
+		})
+	}
+	if values, accepted := appendUniqueStringsAccepted([]string{" padded "}); accepted || !reflect.DeepEqual(values, []string{"padded"}) {
+		t.Fatal("normalizing inherited elements manufactured input")
+	}
+}
+
+func TestConfigInputGenericFinalBoundaries(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("broker-origins/%t", trusted), func(t *testing.T) {
+			cfg := baseConfig()
+			file := fileConfig{Broker: &fileBrokerConfig{LoginRedirectOrigins: []string{" "}}}
+			origin := providerSelectionRepoConfig
+			if trusted {
+				origin = providerSelectionUserConfig
+			}
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, trusted, origin); err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.inputProvenance.summary(configInputGeneric); (got.effects == configInputValue) != trusted {
+				t.Fatalf("trusted=%t summary=%#v", trusted, got)
+			}
+		})
+	}
+	t.Run("dynamic-environment", func(t *testing.T) {
+		clearConfigEnv(t)
+		t.Setenv("CRABBOX_SSH_FALLBACK_PORTS", "")
+		if err := os.Unsetenv("CRABBOX_SSH_FALLBACK_PORTS"); err != nil {
+			t.Fatal(err)
+		}
+		const name = "CRABBOX_TEST_GENERIC_DYNAMIC_VALUE"
+		for _, value := range []string{"", "fixture"} {
+			t.Setenv(name, value)
+			cfg := baseConfig()
+			cfg.Tailscale.AuthKeyEnv = name
+			cfg.Tailscale.AuthKey = "prior"
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.inputProvenance.summary(configInputGeneric); (got.effects == configInputValue) != (value != "") || cfg.Tailscale.AuthKey != value {
+				t.Fatal("dynamic fallback and acceptance diverged")
+			}
+		}
+	})
+}
+
+func TestConfigInputProvenanceGeneratedOwners(t *testing.T) {
+	// One ordinary scalar binding per generated owner proves attribution, not
+	// completeness of any provider's configuration or readiness.
+	for _, tc := range []struct {
+		owner, root, key, env, value string
+		ignoreEmpty, repo            bool
+	}{
+		{"aws-lambda-microvm", "awsLambdaMicroVM", "workdir", "CRABBOX_AWS_LAMBDA_MICROVM_WORKDIR", "/workspace/crabbox", true, true},
+		{"agent-sandbox", "agentSandbox", "workdir", "CRABBOX_AGENT_SANDBOX_WORKDIR", "/workspace/crabbox", true, false},
+		{"anthropic-sandbox-runtime", "anthropicSandboxRuntime", "cliPath", "CRABBOX_ANTHROPIC_SANDBOX_RUNTIME_CLI", "srt", true, true},
+		{"azure-dynamic-sessions", "azureDynamicSessions", "workdir", "CRABBOX_AZURE_DYNAMIC_SESSIONS_WORKDIR", "/workspace/crabbox", true, true},
+		{"blaxel", "blaxel", "region", "CRABBOX_BLAXEL_REGION", "fixture-region", true, true},
+		{"cloud-run-sandbox", "cloudRunSandbox", "workdir", "CRABBOX_CLOUD_RUN_SANDBOX_WORKDIR", "/tmp/crabbox", true, true},
+		{"cloudflare", "cloudflare", "workdir", "CRABBOX_CLOUDFLARE_WORKDIR", "/workspace/crabbox", true, true},
+		{"cloudflare-sandbox", "cloudflareSandbox", "workdir", "CRABBOX_CLOUDFLARE_SANDBOX_WORKDIR", "/workspace/crabbox", false, true},
+		{"codesandbox", "codeSandbox", "workdir", "CRABBOX_CODESANDBOX_WORKDIR", "/project/workspace", false, true},
+		{"coder", "coder", "cliPath", "CRABBOX_CODER_CLI", "coder", true, true},
+		{"cua", "cua", "region", "CRABBOX_CUA_REGION", "fixture-region", false, true},
+		{"digitalocean", "digitalocean", "region", "CRABBOX_DIGITALOCEAN_REGION", "fixture-region", true, true},
+		{"e2b", "e2b", "workdir", "CRABBOX_E2B_WORKDIR", "crabbox", true, true},
+		{"exe-dev", "exeDev", "image", "CRABBOX_EXE_DEV_IMAGE", "fixture-image", true, true},
+		{"fastapi-cloud", "fastapiCloud", "appId", "CRABBOX_FASTAPI_CLOUD_APP_ID", "fixture-app", true, true},
+		{"kubevirt", "kubevirt", "namespace", "CRABBOX_KUBEVIRT_NAMESPACE", "default", true, true},
+		{"linode", "linode", "region", "CRABBOX_LINODE_REGION", "us-ord", true, true},
+		{"lume", "lume", "cliPath", "CRABBOX_LUME_CLI", "lume", true, false},
+		{"machine0", "machine0", "region", "CRABBOX_MACHINE0_REGION", "eu", true, true},
+		{"modal", "modal", "workdir", "CRABBOX_MODAL_WORKDIR", "/workspace/crabbox", true, true},
+		{"morph", "morph", "snapshot", "CRABBOX_MORPH_SNAPSHOT", "fixture-snapshot", true, true},
+		{"multipass", "multipass", "cliPath", "CRABBOX_MULTIPASS_CLI", "multipass", true, true},
+		{"namespace-devbox", "namespace", "image", "CRABBOX_NAMESPACE_IMAGE", "builtin:base", true, true},
+		{"namespace-instance", "namespaceInstance", "region", "CRABBOX_NAMESPACE_INSTANCE_REGION", "fixture-region", true, false},
+		{"ovh", "ovh", "region", "CRABBOX_OVH_REGION", "fixture-region", true, true},
+		{"opencomputer", "openComputer", "workdir", "CRABBOX_OPENCOMPUTER_WORKDIR", "/workspace/crabbox", true, true},
+		{"opensandbox", "openSandbox", "workdir", "CRABBOX_OPENSANDBOX_WORKDIR", "/workspace/crabbox", false, true},
+		{"orgo", "orgo", "workspaceID", "CRABBOX_ORGO_WORKSPACE_ID", "fixture-workspace", true, true},
+		{"railway", "railway", "projectId", "CRABBOX_RAILWAY_PROJECT_ID", "fixture-project", true, true},
+		{"runpod", "runpod", "image", "CRABBOX_RUNPOD_IMAGE", "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04", true, true},
+		{"scaleway", "scaleway", "region", "CRABBOX_SCALEWAY_REGION", "fr-par", true, true},
+		{"sealos-devbox", "sealosDevbox", "image", "CRABBOX_SEALOS_DEVBOX_IMAGE", "fixture-image", true, false},
+		{"semaphore", "semaphore", "project", "CRABBOX_SEMAPHORE_PROJECT", "fixture-project", true, true},
+		{"smolvm", "smolvm", "workdir", "CRABBOX_SMOLVM_WORKDIR", "/workspace", true, true},
+		{"tencentcloud", "tencentcloud", "region", "CRABBOX_TENCENTCLOUD_REGION", "fixture-region", true, true},
+		{"tensorlake", "tensorlake", "workdir", "CRABBOX_TENSORLAKE_WORKDIR", "/workspace/crabbox", true, true},
+		{"upstash-box", "upstashBox", "workdir", "CRABBOX_UPSTASH_BOX_WORKDIR", "/workspace/home/crabbox", true, true},
+		{"vast", "vast", "image", "CRABBOX_VAST_IMAGE", "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04", true, true},
+		{"vercel-sandbox", "vercelSandbox", "workdir", "CRABBOX_VERCEL_SANDBOX_WORKDIR", "/vercel/sandbox/crabbox", false, true},
+		{"vultr", "vultr", "region", "CRABBOX_VULTR_REGION", "fixture-region", true, true},
+		{"wandb", "wandb", "defaultImage", "CRABBOX_WANDB_DEFAULT_IMAGE", "fixture-image", true, true},
+	} {
+		for _, source := range []string{"user_config", "repo_config", "environment"} {
+			for _, mode := range []string{"missing", "empty", "accepted"} {
+				t.Run(tc.owner+"/"+source+"/"+mode, func(t *testing.T) {
+					clearConfigEnv(t)
+					cfg := baseConfig()
+					value := tc.value
+					if mode != "accepted" {
+						value = ""
+					}
+					accepted := mode == "accepted"
+					if source == "environment" {
+						t.Setenv(tc.env, value)
+						if mode == "missing" {
+							if err := os.Unsetenv(tc.env); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if err := applyEnv(&cfg); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						fields := map[string]any{}
+						if mode != "missing" {
+							fields[tc.key] = value
+						}
+						data, err := yaml.Marshal(map[string]any{tc.root: fields})
+						if err != nil {
+							t.Fatal(err)
+						}
+						var file fileConfig
+						if err := yaml.Unmarshal(data, &file); err != nil {
+							t.Fatal(err)
+						}
+						trusted, providerSource := source == "user_config", providerSelectionRepoConfig
+						if trusted {
+							providerSource = providerSelectionUserConfig
+						}
+						accepted = (mode == "accepted" || (mode == "empty" && !tc.ignoreEmpty)) && (trusted || tc.repo)
+						if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, trusted, providerSource); err != nil {
+							t.Fatal(err)
+						}
+					}
+					got := cfg.inputProvenance.summary(configInputOwner(tc.owner))
+					wantState := "unknown"
+					wantSources := []string{}
+					wantEffects := configInputEffect(0)
+					wantOwners := 0
+					if accepted {
+						wantState = "present"
+						wantSources = []string{source}
+						wantEffects = configInputValue
+						wantOwners = 1
+					}
+					if got.state != wantState || !reflect.DeepEqual(got.sources, wantSources) || got.effects != wantEffects || got.complete || len(cfg.inputProvenance) != wantOwners {
+						t.Fatalf("summary=%#v ledger=%#v accepted=%t", got, cfg.inputProvenance, accepted)
+					}
+					if generic := cfg.inputProvenance.summary(configInputGeneric); generic.state != "unknown" || generic.complete {
+						t.Fatalf("provider scalar attributed to generic: %#v", generic)
+					}
+				})
+			}
+		}
+	}
+}
+
+func clearManualBatchAConfigEnv(t *testing.T) {
+	t.Helper()
+	clearConfigEnv(t)
+	// The common fixture sets empty strings; these actual presence-based inputs
+	// need absence when testing a different field's acceptance.
+	for _, name := range []string{"CRABBOX_BOXD_API_URL", "CRABBOX_BOXD_ORG", "CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_COMPATIBILITY_FLAGS", "CRABBOX_DOCKER_SANDBOX_EXTRA_WORKSPACES", "CRABBOX_DOCKER_SANDBOX_MCP", "CRABBOX_DOCKER_SANDBOX_KIT"} {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestConfigInputProvenanceManualBatchA(t *testing.T) {
+	for _, tc := range []struct {
+		owner, root, key, env, value      string
+		emptyFile, emptyEnv, repo, intent bool
+	}{
+		{"ascii-box", "asciiBox", "workdir", "CRABBOX_ASCII_BOX_WORKDIR", "/work/fixture", false, false, true, false},
+		{"blacksmith-testbox", "blacksmith", "org", "CRABBOX_BLACKSMITH_ORG", "fixture", false, false, true, false},
+		{"boxd", "boxd", "workRoot", "CRABBOX_BOXD_WORK_ROOT", "/work/fixture", false, false, true, true},
+		{"cloudflare-dynamic-workers", "cloudflareDynamicWorkers", "compatibilityDate", "CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_COMPATIBILITY_DATE", "2026-06-12", false, false, true, false},
+		{"crownest", "crownest", "projectId", "CRABBOX_CROWNEST_PROJECT_ID", "fixture", true, false, true, false},
+		{"cubesandbox", "cubeSandbox", "template", "CRABBOX_CUBESANDBOX_TEMPLATE", "fixture", false, false, true, false},
+		{"daytona", "daytona", "snapshot", "CRABBOX_DAYTONA_SNAPSHOT", "fixture", false, false, true, false},
+		{"docker-sandbox", "dockerSandbox", "template", "CRABBOX_DOCKER_SANDBOX_TEMPLATE", "fixture", true, false, true, false},
+		{"external", "external", "workRoot", "CRABBOX_EXTERNAL_WORK_ROOT", "/work/fixture", false, false, true, false},
+		{"firecracker", "firecracker", "user", "CRABBOX_FIRECRACKER_USER", "fixture", false, false, true, false},
+	} {
+		for _, source := range []string{"user_config", "repo_config", "environment"} {
+			for _, mode := range []string{"missing", "empty", "equal"} {
+				t.Run(tc.owner+"/"+source+"/"+mode, func(t *testing.T) {
+					clearManualBatchAConfigEnv(t)
+					cfg := baseConfig()
+					value := ""
+					if mode == "equal" {
+						value = tc.value
+					}
+					accepted := mode == "equal"
+					var apply func() error
+					if source == "environment" {
+						t.Setenv(tc.env, value)
+						if mode == "missing" {
+							if err := os.Unsetenv(tc.env); err != nil {
+								t.Fatal(err)
+							}
+						}
+						accepted = accepted || (mode == "empty" && tc.emptyEnv)
+						apply = func() error { return applyEnv(&cfg) }
+					} else {
+						fields := map[string]any{}
+						if mode != "missing" {
+							fields[tc.key] = value
+						}
+						data, err := yaml.Marshal(map[string]any{tc.root: fields})
+						if err != nil {
+							t.Fatal(err)
+						}
+						var file fileConfig
+						if err := yaml.Unmarshal(data, &file); err != nil {
+							t.Fatal(err)
+						}
+						trusted, origin := source == "user_config", providerSelectionRepoConfig
+						if trusted {
+							origin = providerSelectionUserConfig
+						}
+						accepted = (accepted || (mode == "empty" && tc.emptyFile)) && (trusted || tc.repo)
+						apply = func() error { return applyFileConfigWithTrustAndProviderSource(&cfg, file, trusted, origin) }
+					}
+					// Repeat against the same values with a fresh ledger: equality is still acceptance.
+					for repeat := 0; repeat < 2; repeat++ {
+						cfg.inputProvenance = nil
+						if err := apply(); err != nil {
+							t.Fatal(err)
+						}
+						got := cfg.inputProvenance.summary(configInputOwner(tc.owner))
+						want, effects := []string{}, configInputEffect(0)
+						if accepted {
+							want = []string{source}
+							effects = configInputValue
+							if tc.intent {
+								effects |= configInputIntent
+							}
+						}
+						if !reflect.DeepEqual(got.sources, want) || got.effects != effects || got.complete {
+							t.Fatalf("summary=%#v accepted=%t", got, accepted)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestConfigInputProvenanceManualBatchAParsers(t *testing.T) {
+	for _, tc := range []struct{ owner, env, invalid, accepted string }{
+		{"firecracker", "CRABBOX_FIRECRACKER_CPUS", "invalid", "0"},
+		{"daytona", "CRABBOX_DAYTONA_SSH_ACCESS_MINUTES", "invalid", "0"},
+		{"cloudflare-dynamic-workers", "CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_CPU_MS", "invalid", "0"},
+		{"blacksmith-testbox", "CRABBOX_BLACKSMITH_IDLE_TIMEOUT", "invalid", "1s"},
+		{"firecracker", "CRABBOX_FIRECRACKER_LAUNCH_TIMEOUT", "invalid", "1s"},
+	} {
+		t.Run(tc.owner+"/"+tc.env, func(t *testing.T) {
+			clearManualBatchAConfigEnv(t)
+			for _, raw := range []string{tc.invalid, tc.accepted} {
+				cfg := baseConfig()
+				t.Setenv(tc.env, raw)
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				got := cfg.inputProvenance.summary(configInputOwner(tc.owner))
+				if (got.effects&configInputValue != 0) != (raw == tc.accepted) || got.complete {
+					t.Fatalf("raw %q: %#v", raw, got)
+				}
+			}
+		})
+	}
+	for _, source := range []providerSelectionSource{providerSelectionUserConfig, providerSelectionRepoConfig} {
+		t.Run(string(source)+"/partial", func(t *testing.T) {
+			cfg := baseConfig()
+			project, invalid := "fixture", -1
+			file := fileConfig{Crownest: &fileCrownestConfig{ProjectID: &project, TimeoutSecs: &invalid}}
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, source == providerSelectionUserConfig, source); err == nil {
+				t.Fatal("expected existing negative timeout error")
+			}
+			if got := cfg.inputProvenance.summary("crownest"); got.effects != configInputValue || got.complete {
+				t.Fatalf("earlier accepted input lost: %#v", got)
+			}
+		})
+	}
+}
+
+func TestConfigInputProvenanceManualBatchAEdges(t *testing.T) {
+	for _, tc := range []struct{ name, owner, env, value string }{
+		{"boxd-clear", "boxd", "CRABBOX_BOXD_API_URL", ""},
+		{"docker-list-clear", "docker-sandbox", "CRABBOX_DOCKER_SANDBOX_MCP", ""},
+		{"workers-list-clear", "cloudflare-dynamic-workers", "CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_COMPATIBILITY_FLAGS", "none"},
+		{"crownest-false", "crownest", "CRABBOX_CROWNEST_FORGET_MISSING", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearManualBatchAConfigEnv(t)
+			t.Setenv(tc.env, tc.value)
+			cfg := baseConfig()
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.inputProvenance.summary(configInputOwner(tc.owner)); got.effects != configInputValue || !reflect.DeepEqual(got.sources, []string{"environment"}) || got.complete {
+				t.Fatalf("accepted clear: %#v", got)
+			}
+		})
+	}
+	t.Run("repository-cap", func(t *testing.T) {
+		for _, limit := range []int{-1, 0, 17} {
+			cfg := baseConfig()
+			cfg.CloudflareDynamicWorkers.repositoryCPUMsCap = 2
+			file := fileConfig{CloudflareDynamicWorkers: &fileCloudflareDynamicWorkersConfig{CPUMs: limit}}
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, false, providerSelectionRepoConfig); err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.inputProvenance.summary("cloudflare-dynamic-workers")
+			if (got.effects == configInputValue) != (limit > 0) || cfg.CloudflareDynamicWorkers.repositoryCPUMsCap != 2 {
+				t.Fatalf("cap acceptance %d: %#v", limit, got)
+			}
+		}
+	})
+	t.Run("untrusted-path-ignored", func(t *testing.T) {
+		cfg := baseConfig()
+		file := fileConfig{Firecracker: &fileFirecrackerConfig{Binary: "fixture-binary"}}
+		if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, false, providerSelectionRepoConfig); err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.inputProvenance.summary("firecracker"); got.effects != 0 {
+			t.Fatalf("ignored input recorded: %#v", got)
+		}
+	})
+	t.Run("external-empty-capabilities-assignment", func(t *testing.T) {
+		cfg := baseConfig()
+		file := fileConfig{External: &fileExternalConfig{Capabilities: &ExternalCapabilitiesConfig{}}}
+		if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.inputProvenance.summary("external"); got.effects != configInputValue || got.complete {
+			t.Fatalf("accepted nested assignment: %#v", got)
+		}
+	})
+}
+
+func TestConfigInputProvenancePartialGeneratedError(t *testing.T) {
+	for _, source := range []string{"user_config", "repo_config", "environment"} {
+		t.Run(source, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			var err error
+			if source == "environment" {
+				t.Setenv("CRABBOX_CODESANDBOX_TEMPLATE_ID", "fixture-template")
+				t.Setenv("CRABBOX_CODESANDBOX_HIBERNATION_TIMEOUT_SECS", "-1")
+				err = applyEnv(&cfg)
+			} else {
+				var file fileConfig
+				if decodeErr := yaml.Unmarshal([]byte("codeSandbox: {templateId: fixture-template, hibernationTimeoutSecs: -1}"), &file); decodeErr != nil {
+					t.Fatal(decodeErr)
+				}
+				trusted, ps := source == "user_config", providerSelectionRepoConfig
+				if trusted {
+					ps = providerSelectionUserConfig
+				}
+				err = applyFileConfigWithTrustAndProviderSource(&cfg, file, trusted, ps)
+			}
+			if err == nil || !strings.Contains(err.Error(), "must be non-negative") {
+				t.Fatalf("ordinary parse error=%v", err)
+			}
+			got := cfg.inputProvenance.summary("codesandbox")
+			if cfg.CodeSandbox.TemplateID != "fixture-template" || got.state != "present" || !reflect.DeepEqual(got.sources, []string{source}) || got.effects != configInputValue || got.complete || len(cfg.inputProvenance) != 1 {
+				t.Fatalf("partial input lost: cfg=%#v summary=%#v", cfg.CodeSandbox, got)
+			}
+		})
+	}
+}
+
+func TestManualBatchCFileInputLedger(t *testing.T) {
+	for _, tc := range []struct {
+		owner, root, key string
+		value            any
+	}{
+		{"parallels", "parallels", "template", "fixture"},
+		{"parallels", "parallels", "source", "fixture"},
+		{"parallels", "parallels", "sourceId", "fixture"},
+		{"parallels", "parallels", "sourceSnapshot", "fixture"},
+		{"parallels", "parallels", "sourceSnapshotId", "fixture"},
+		{"parallels", "parallels", "cloneMode", "fixture"},
+		{"parallels", "parallels", "host", "fixture"},
+		{"parallels", "parallels", "hostUser", "fixture"},
+		{"parallels", "parallels", "hostKey", "fixture"},
+		{"parallels", "parallels", "vmRoot", "fixture"},
+		{"parallels", "parallels", "user", "fixture"},
+		{"parallels", "parallels", "workRoot", "fixture"},
+		{"parallels", "parallels", "startupTimeout", "1s"},
+		{"parallels", "parallels", "templates", map[string]any{"fixture": map[string]any{"source": "fixture"}}},
+		{"parallels", "parallels", "hosts", []any{map[string]any{"host": "fixture.example.test"}}},
+		{"phala", "phala", "cli", "fixture"},
+		{"phala", "phala", "instanceType", "fixture"},
+		{"phala", "phala", "workRoot", "fixture"},
+		{"phala", "phala", "nodeId", "fixture"},
+		{"phala", "phala", "compose", "fixture"},
+		{"phala", "phala", "attest", true},
+		{"proxmox", "proxmox", "apiUrl", "https://fixture.example.test"},
+		{"proxmox", "proxmox", "tokenId", "fixture"},
+		{"proxmox", "proxmox", "tokenSecret", "fixture"},
+		{"proxmox", "proxmox", "node", "fixture"},
+		{"proxmox", "proxmox", "templateId", 1},
+		{"proxmox", "proxmox", "storage", "fixture"},
+		{"proxmox", "proxmox", "pool", "fixture"},
+		{"proxmox", "proxmox", "bridge", "fixture"},
+		{"proxmox", "proxmox", "user", "fixture"},
+		{"proxmox", "proxmox", "workRoot", "fixture"},
+		{"proxmox", "proxmox", "fullClone", true},
+		{"proxmox", "proxmox", "insecureTLS", true},
+		{"sprites", "sprites", "apiUrl", "https://fixture.example.test"},
+		{"sprites", "sprites", "workRoot", "fixture"},
+		{"ssh", "static", "id", "fixture"},
+		{"ssh", "static", "name", "fixture"},
+		{"ssh", "static", "host", "fixture"},
+		{"ssh", "static", "user", "fixture"},
+		{"ssh", "static", "port", "fixture"},
+		{"ssh", "static", "workRoot", "fixture"},
+		{"superserve", "superserve", "baseUrl", "https://fixture.example.test"},
+		{"superserve", "superserve", "template", "fixture"},
+		{"superserve", "superserve", "snapshot", "fixture"},
+		{"superserve", "superserve", "workdir", "fixture"},
+		{"superserve", "superserve", "timeoutSecs", 1},
+		{"superserve", "superserve", "execTimeoutSecs", 1},
+		{"superserve", "superserve", "networkAllowOut", []string{"fixture", "fixture"}},
+		{"superserve", "superserve", "networkDenyOut", []string{"fixture", "fixture"}},
+		{"superserve", "superserve", "forgetMissing", true},
+		{"tenki", "tenki", "cliPath", "fixture"},
+		{"tenki", "tenki", "endpoint", "https://fixture.example.test"},
+		{"tenki", "tenki", "gateway", "fixture"},
+		{"tenki", "tenki", "workspace", "fixture"},
+		{"tenki", "tenki", "project", "fixture"},
+		{"tenki", "tenki", "image", "fixture"},
+		{"tenki", "tenki", "snapshot", "fixture"},
+		{"tenki", "tenki", "workRoot", "fixture"},
+		{"tenki", "tenki", "cpus", 1},
+		{"tenki", "tenki", "memoryMB", 1},
+		{"tenki", "tenki", "diskGB", 1},
+		{"unikraft-cloud", "unikraftCloud", "apiKey", "fixture"},
+		{"unikraft-cloud", "unikraftCloud", "apiUrl", "https://fixture.example.test"},
+		{"unikraft-cloud", "unikraftCloud", "metro", "fixture"},
+		{"unikraft-cloud", "unikraftCloud", "image", "fixture"},
+		{"unikraft-cloud", "unikraftCloud", "memoryMB", 1},
+		{"windows-sandbox", "windowsSandbox", "workdir", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "tempRoot", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "networking", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "vgpu", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "clipboard", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "protectedClient", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "audioInput", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "videoInput", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "printerRedirection", "fixture"},
+		{"windows-sandbox", "windowsSandbox", "memoryMB", 1},
+		{"xcp-ng", "xcpNg", "apiUrl", "https://fixture.example.test"},
+		{"xcp-ng", "xcpNg", "username", "fixture"},
+		{"xcp-ng", "xcpNg", "password", "fixture"},
+		{"xcp-ng", "xcpNg", "template", "fixture"},
+		{"xcp-ng", "xcpNg", "templateUuid", "fixture"},
+		{"xcp-ng", "xcpNg", "sr", "fixture"},
+		{"xcp-ng", "xcpNg", "srUuid", "fixture"},
+		{"xcp-ng", "xcpNg", "network", "fixture"},
+		{"xcp-ng", "xcpNg", "networkUuid", "fixture"},
+		{"xcp-ng", "xcpNg", "host", "fixture"},
+		{"xcp-ng", "xcpNg", "user", "fixture"},
+		{"xcp-ng", "xcpNg", "workRoot", "fixture"},
+		{"xcp-ng", "xcpNg", "insecureTLS", true},
+	} {
+		t.Run(tc.owner+"/"+tc.key, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			data, err := yaml.Marshal(map[string]any{tc.root: map[string]any{tc.key: tc.value}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var file fileConfig
+			if err := yaml.Unmarshal(data, &file); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+				t.Fatalf("file overlay: %v", err)
+			}
+			// A repeated accepted layer still contributes when values already match.
+			cfg.inputProvenance = nil
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+				t.Fatalf("repeat file overlay: %v", err)
+			}
+			got := cfg.inputProvenance.summary(configInputOwner(tc.owner))
+			if got.state != "present" || !reflect.DeepEqual(got.sources, []string{"user_config"}) || got.effects != configInputValue || got.complete || len(cfg.inputProvenance) != 1 {
+				t.Fatalf("owner=%s summary=%#v", tc.owner, got)
+			}
+		})
+	}
+}
+
+func TestManualBatchCEnvInputLedger(t *testing.T) {
+	for _, tc := range []struct{ owner, key, value string }{
+		{"parallels", "CRABBOX_PARALLELS_CLONE_MODE", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_HOST", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_HOST_KEY", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_HOST_USER", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_SOURCE", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_SOURCE_ID", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_SOURCE_SNAPSHOT", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_SOURCE_SNAPSHOT_ID", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_STARTUP_TIMEOUT", "1s"},
+		{"parallels", "CRABBOX_PARALLELS_TEMPLATE", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_USER", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_VM_ROOT", "fixture"},
+		{"parallels", "CRABBOX_PARALLELS_WORK_ROOT", "fixture"},
+		{"phala", "CRABBOX_PHALA_ATTEST", "true"},
+		{"phala", "CRABBOX_PHALA_CLI", "fixture"},
+		{"phala", "CRABBOX_PHALA_COMPOSE", "fixture"},
+		{"phala", "CRABBOX_PHALA_INSTANCE_TYPE", "fixture"},
+		{"phala", "CRABBOX_PHALA_NODE_ID", "fixture"},
+		{"phala", "CRABBOX_PHALA_WORK_ROOT", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_API_URL", "https://fixture.example.test"},
+		{"proxmox", "CRABBOX_PROXMOX_BRIDGE", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_FULL_CLONE", "true"},
+		{"proxmox", "CRABBOX_PROXMOX_INSECURE_TLS", "true"},
+		{"proxmox", "CRABBOX_PROXMOX_NODE", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_POOL", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_STORAGE", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_TEMPLATE_ID", "1"},
+		{"proxmox", "CRABBOX_PROXMOX_TOKEN_ID", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_TOKEN_SECRET", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_USER", "fixture"},
+		{"proxmox", "CRABBOX_PROXMOX_WORK_ROOT", "fixture"},
+		{"sprites", "CRABBOX_SPRITES_API_URL", "https://fixture.example.test"},
+		{"sprites", "CRABBOX_SPRITES_TOKEN", "fixture"},
+		{"sprites", "CRABBOX_SPRITES_WORK_ROOT", "fixture"},
+		{"ssh", "CRABBOX_STATIC_HOST", "fixture"},
+		{"ssh", "CRABBOX_STATIC_ID", "fixture"},
+		{"ssh", "CRABBOX_STATIC_NAME", "fixture"},
+		{"ssh", "CRABBOX_STATIC_PORT", "fixture"},
+		{"ssh", "CRABBOX_STATIC_USER", "fixture"},
+		{"ssh", "CRABBOX_STATIC_WORK_ROOT", "fixture"},
+		{"superserve", "CRABBOX_SUPERSERVE_BASE_URL", "https://fixture.example.test"},
+		{"superserve", "CRABBOX_SUPERSERVE_EXEC_TIMEOUT_SECS", "1"},
+		{"superserve", "CRABBOX_SUPERSERVE_FORGET_MISSING", "true"},
+		{"superserve", "CRABBOX_SUPERSERVE_NETWORK_ALLOW_OUT", "fixture"},
+		{"superserve", "CRABBOX_SUPERSERVE_NETWORK_DENY_OUT", "fixture"},
+		{"superserve", "CRABBOX_SUPERSERVE_SNAPSHOT", "fixture"},
+		{"superserve", "CRABBOX_SUPERSERVE_TEMPLATE", "fixture"},
+		{"superserve", "CRABBOX_SUPERSERVE_TIMEOUT_SECS", "1"},
+		{"superserve", "CRABBOX_SUPERSERVE_WORKDIR", "fixture"},
+		{"tenki", "CRABBOX_TENKI_CLI", "fixture"},
+		{"tenki", "CRABBOX_TENKI_CPUS", "1"},
+		{"tenki", "CRABBOX_TENKI_DISK_GB", "1"},
+		{"tenki", "CRABBOX_TENKI_ENDPOINT", "https://fixture.example.test"},
+		{"tenki", "CRABBOX_TENKI_GATEWAY", "fixture"},
+		{"tenki", "CRABBOX_TENKI_IMAGE", "fixture"},
+		{"tenki", "CRABBOX_TENKI_MEMORY_MB", "1"},
+		{"tenki", "CRABBOX_TENKI_PROJECT", "fixture"},
+		{"tenki", "CRABBOX_TENKI_SNAPSHOT", "fixture"},
+		{"tenki", "CRABBOX_TENKI_WORKSPACE", "fixture"},
+		{"tenki", "CRABBOX_TENKI_WORK_ROOT", "fixture"},
+		{"unikraft-cloud", "CRABBOX_UNIKRAFT_CLOUD_API_KEY", "fixture"},
+		{"unikraft-cloud", "CRABBOX_UNIKRAFT_CLOUD_API_URL", "https://fixture.example.test"},
+		{"unikraft-cloud", "CRABBOX_UNIKRAFT_CLOUD_IMAGE", "fixture"},
+		{"unikraft-cloud", "CRABBOX_UNIKRAFT_CLOUD_METRO", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_AUDIO_INPUT", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_CLIPBOARD", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_MEMORY_MB", "1"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_NETWORKING", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_PRINTER_REDIRECTION", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_PROTECTED_CLIENT", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_TEMP_ROOT", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_VGPU", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_VIDEO_INPUT", "fixture"},
+		{"windows-sandbox", "CRABBOX_WINDOWS_SANDBOX_WORKDIR", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_API_URL", "https://fixture.example.test"},
+		{"xcp-ng", "CRABBOX_XCP_NG_HOST", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_INSECURE_TLS", "true"},
+		{"xcp-ng", "CRABBOX_XCP_NG_NETWORK", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_NETWORK_UUID", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_PASSWORD", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_SR", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_SR_UUID", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_TEMPLATE", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_TEMPLATE_UUID", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_USER", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_USERNAME", "fixture"},
+		{"xcp-ng", "CRABBOX_XCP_NG_WORK_ROOT", "fixture"},
+		{"sprites", "SETUP_SPRITE_TOKEN", "fixture"},
+		{"sprites", "SPRITES_API_URL", "https://fixture.example.test"},
+		{"sprites", "SPRITES_TOKEN", "fixture"},
+		{"sprites", "SPRITE_TOKEN", "fixture"},
+		{"superserve", "SUPERSERVE_BASE_URL", "https://fixture.example.test"},
+		{"tenki", "TENKI_CLI", "fixture"},
+		{"tenki", "TENKI_ENDPOINT", "https://fixture.example.test"},
+		{"tenki", "TENKI_GATEWAY", "fixture"},
+		{"unikraft-cloud", "UKC_API_KEY", "fixture"},
+		{"unikraft-cloud", "UKC_METRO", "fixture"},
+		{"unikraft-cloud", "UKC_TOKEN", "fixture"},
+		{"unikraft-cloud", "UNIKRAFT_CLOUD_API_KEY", "fixture"},
+		{"unikraft-cloud", "UNIKRAFT_CLOUD_API_URL", "https://fixture.example.test"},
+		{"unikraft-cloud", "UNIKRAFT_CLOUD_IMAGE", "fixture"},
+		{"unikraft-cloud", "UNIKRAFT_CLOUD_METRO", "fixture"},
+	} {
+		t.Run(tc.owner+"/"+tc.key, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv(tc.key, tc.value)
+			cfg := baseConfig()
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatalf("env overlay: %v", err)
+			}
+			cfg.inputProvenance = nil
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatalf("repeat env overlay: %v", err)
+			}
+			got := cfg.inputProvenance.summary(configInputOwner(tc.owner))
+			if got.state != "present" || !reflect.DeepEqual(got.sources, []string{"environment"}) || got.effects != configInputValue || got.complete || len(cfg.inputProvenance) != 1 {
+				t.Fatalf("owner=%s summary=%#v", tc.owner, got)
+			}
+		})
+	}
+}
+
+func TestManualBatchCIgnoredAndPartialInputs(t *testing.T) {
+	clearConfigEnv(t)
+	for _, tc := range []struct{ owner, root string }{{"parallels", "parallels"}, {"phala", "phala"}, {"proxmox", "proxmox"}, {"sprites", "sprites"}, {"ssh", "static"}, {"superserve", "superserve"}, {"tenki", "tenki"}, {"unikraft-cloud", "unikraftCloud"}, {"windows-sandbox", "windowsSandbox"}, {"xcp-ng", "xcpNg"}} {
+		var file fileConfig
+		if err := yaml.Unmarshal([]byte(tc.root+": {}"), &file); err != nil {
+			t.Fatal(err)
+		}
+		cfg := baseConfig()
+		if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, true, providerSelectionUserConfig); err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.inputProvenance.summary(configInputOwner(tc.owner)); got.state != "unknown" || got.complete {
+			t.Fatalf("empty owner=%s summary=%#v", tc.owner, got)
+		}
+	}
+	for _, key := range []string{"CRABBOX_TENKI_CPUS", "CRABBOX_PROXMOX_TEMPLATE_ID", "CRABBOX_WINDOWS_SANDBOX_MEMORY_MB", "CRABBOX_PARALLELS_STARTUP_TIMEOUT"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "invalid")
+			cfg := baseConfig()
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.inputProvenance) != 0 {
+				t.Fatal("invalid tolerant scalar recorded")
+			}
+		})
+	}
+	t.Run("partial superserve", func(t *testing.T) {
+		t.Setenv("CRABBOX_SUPERSERVE_TEMPLATE", "fixture")
+		t.Setenv("CRABBOX_SUPERSERVE_TIMEOUT_SECS", "-1")
+		cfg := baseConfig()
+		if err := applyEnv(&cfg); err == nil {
+			t.Fatal("missing ordinary numeric error")
+		}
+		got := cfg.inputProvenance.summary("superserve")
+		if got.state != "present" || !reflect.DeepEqual(got.sources, []string{"environment"}) || got.complete {
+			t.Fatalf("partial=%#v", got)
+		}
+	})
+}
+
+func TestManualBatchCRepoAndZeroInputs(t *testing.T) {
+	for _, tc := range []struct {
+		owner, root, key string
+		value            any
+	}{
+		{"parallels", "parallels", "source", "fixture"}, {"phala", "phala", "instanceType", "fixture"}, {"proxmox", "proxmox", "fullClone", false}, {"sprites", "sprites", "workRoot", "fixture"}, {"ssh", "static", "name", "fixture"}, {"superserve", "superserve", "timeoutSecs", 0}, {"tenki", "tenki", "project", "fixture"}, {"unikraft-cloud", "unikraftCloud", "metro", "fixture"}, {"windows-sandbox", "windowsSandbox", "workdir", "fixture"}, {"xcp-ng", "xcpNg", "template", "fixture"},
+	} {
+		t.Run(tc.owner, func(t *testing.T) {
+			clearConfigEnv(t)
+			var file fileConfig
+			data, err := yaml.Marshal(map[string]any{tc.root: map[string]any{tc.key: tc.value}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := yaml.Unmarshal(data, &file); err != nil {
+				t.Fatal(err)
+			}
+			cfg := baseConfig()
+			if err := applyFileConfigWithTrustAndProviderSource(&cfg, file, false, providerSelectionRepoConfig); err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.inputProvenance.summary(configInputOwner(tc.owner))
+			if got.state != "present" || !reflect.DeepEqual(got.sources, []string{"repo_config"}) || got.effects != configInputValue || got.complete {
+				t.Fatalf("repo summary=%#v", got)
+			}
+		})
+	}
+}
+
+func TestSyncSourceConfig(t *testing.T) {
+	clearConfigEnv(t)
+	cfg := baseConfig()
+	if effectiveSyncSource(cfg) != "git" {
+		t.Fatal("default source changed")
+	}
+	var file fileConfig
+	if err := yaml.Unmarshal([]byte("sync: {source: directory, include: [README.txt]}\n"), &file); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyFileConfig(&cfg, file); err != nil {
+		t.Fatal(err)
+	}
+	if effectiveSyncSource(cfg) != "directory" || len(syncIncludes(cfg)) != 1 {
+		t.Fatalf("sync=%+v", cfg.Sync)
+	}
+	if got := configShowView(cfg)["sync"].(map[string]any)["source"]; got != "directory" {
+		t.Fatalf("source projection=%v", got)
+	}
+	var text bytes.Buffer
+	if err := writeConfigShowText(&text, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "sync source=directory") {
+		t.Fatal("source missing from text configuration")
+	}
+	t.Setenv("CRABBOX_SYNC_SOURCE", "git")
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if effectiveSyncSource(cfg) != "git" {
+		t.Fatal("environment did not override YAML")
+	}
+	t.Setenv("CRABBOX_SYNC_SOURCE", "unsupported")
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal("inactive sync configuration blocked config loading", err)
+	}
+	if err := validateSyncSource(cfg); err == nil {
+		t.Fatal("active invalid source accepted")
+	}
+}
+
+func TestNomadBindingDefaultsOwnFreshDatacenters(t *testing.T) {
+	first, second := baseConfig().Nomad, baseConfig().Nomad
+	want := NomadConfig{TokenEnv: "NOMAD_TOKEN", Task: "crabbox", Driver: "docker", Image: "ubuntu:24.04", Workdir: "/workspace/crabbox", Datacenters: []string{"dc1"}, CPU: 1000, MemoryMB: 2048, DiskMB: 1024, AllocReadyTimeout: 5 * time.Minute, EvalTimeout: 5 * time.Minute, ExecTimeoutSecs: 600}
+	if !reflect.DeepEqual(first, want) || !reflect.DeepEqual(second, want) {
+		t.Fatal("compiled Nomad defaults changed")
+	}
+	first.Datacenters[0] = "changed"
+	if second.Datacenters[0] != "dc1" || baseConfig().Nomad.Datacenters[0] != "dc1" {
+		t.Fatal("Nomad datacenter defaults share storage")
+	}
+}
+
+func TestNomadBindingCentralFlagSource(t *testing.T) {
+	cfg := baseConfig()
+	cfg.credentialProvenance.nomadAddress = credentialSourceTrustedFile
+	cfg.credentialProvenance.nomadTokenEnv = credentialSourceTrustedFile
+	before := cfg
+	fs := flag.NewFlagSet("contract", flag.ContinueOnError)
+	fs.String("nomad-address", "", "")
+	fs.String("nomad-token-env", "", "")
+	markCredentialDestinationFlagSources(&cfg, fs)
+	if !reflect.DeepEqual(cfg, before) {
+		t.Fatal("unvisited Nomad flags changed source facts or values")
+	}
+	if err := fs.Parse([]string{"--nomad-address=", "--nomad-token-env="}); err != nil {
+		t.Fatal(err)
+	}
+	markCredentialDestinationFlagSources(&cfg, fs)
+	want := before
+	want.credentialProvenance.nomadAddress = credentialSourceFlag
+	want.credentialProvenance.nomadTokenEnv = credentialSourceFlag
+	if !reflect.DeepEqual(cfg, want) {
+		t.Fatal("raw empty visits must update only the existing source facts")
+	}
+}
+
+func TestNomadBindingFilePartialApplication(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, trusted := range []bool{false, true} {
+		cfg := baseConfig()
+		before := cfg.Nomad
+		var file fileConfig
+		if err := yaml.Unmarshal([]byte("nomad:\n  address: ' raw-address '\n  tokenEnv: FIXTURE_TOKEN_NAME\n  caCert: ~/fixture.pem\n  task: ''\n  datacenters: [' first ', '', first]\n  cpu: -1\n  memoryMB: 12\n"), &file); err != nil {
+			t.Fatal(err)
+		}
+		err := applyFileConfigWithTrust(&cfg, file, trusted)
+		if !trusted {
+			if err != nil || !reflect.DeepEqual(cfg.Nomad, before) {
+				t.Fatal("repository Nomad fields must remain unaccepted")
+			}
+			continue
+		}
+		if err == nil || err.Error() != "nomad cpu must be non-negative" {
+			t.Fatalf("file error=%v", err)
+		}
+		if cfg.Nomad.Address != " raw-address " || cfg.Nomad.TokenEnv != "FIXTURE_TOKEN_NAME" || cfg.Nomad.CACert != filepath.Join(home, "fixture.pem") || cfg.Nomad.Task != "" || !reflect.DeepEqual(cfg.Nomad.Datacenters, []string{"first", "first"}) || cfg.Nomad.CPU != before.CPU || cfg.Nomad.MemoryMB != before.MemoryMB {
+			t.Fatalf("partial Nomad file application changed: %#v", cfg.Nomad)
+		}
+		if cfg.credentialProvenance.nomadAddress != credentialSourceTrustedFile || cfg.credentialProvenance.nomadTokenEnv != credentialSourceTrustedFile || cfg.inputProvenance["nomad"].values == 0 {
+			t.Fatal("accepted inputs lost provenance before error")
+		}
+	}
+}
+
+func TestNomadBindingEnvironmentPartialApplication(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NOMAD_ADDR", "alias-address")
+	t.Setenv("CRABBOX_NOMAD_ADDR", " primary-address ")
+	t.Setenv("NOMAD_REGION", "alias-region")
+	t.Setenv("CRABBOX_NOMAD_SKIP_VERIFY", "false")
+	t.Setenv("NOMAD_SKIP_VERIFY", "true")
+	t.Setenv("CRABBOX_NOMAD_CPU", "-2")
+	t.Setenv("CRABBOX_NOMAD_ALLOC_READY_TIMEOUT", "invalid")
+	t.Setenv("CRABBOX_NOMAD_EVAL_TIMEOUT", "2m")
+	t.Setenv("CRABBOX_NOMAD_EXEC_TIMEOUT_SECS", "invalid")
+	cfg := baseConfig()
+	cfg.Nomad.CACert = "~/prior.pem"
+	err := applyEnv(&cfg)
+	if err == nil {
+		t.Fatal("expected strict final integer error")
+	}
+	if cfg.Nomad.Address != " primary-address " || cfg.Nomad.Region != "alias-region" || cfg.Nomad.SkipVerify || cfg.Nomad.CPU != -2 || cfg.Nomad.AllocReadyTimeout != 5*time.Minute || cfg.Nomad.EvalTimeout != 2*time.Minute || cfg.Nomad.ExecTimeoutSecs != 0 || cfg.Nomad.CACert != filepath.Join(home, "prior.pem") {
+		t.Fatalf("partial Nomad environment application changed: %#v", cfg.Nomad)
+	}
+	if cfg.credentialProvenance.nomadAddress != credentialSourceEnvironment || cfg.inputProvenance["nomad"].values == 0 {
+		t.Fatal("accepted environment inputs lost provenance before error")
+	}
+}
+
+func TestNomadBindingListSourcePresence(t *testing.T) {
+	clearConfigEnv(t)
+	for _, yamlText := range []string{"nomad: {}", "nomad:\n  datacenters: []\n", "nomad:\n  datacenters: null\n"} {
+		cfg := baseConfig()
+		cfg.Nomad.Datacenters = []string{" prior "}
+		var file fileConfig
+		if err := yaml.Unmarshal([]byte(yamlText), &file); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyFileConfig(&cfg, file); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cfg.Nomad.Datacenters, []string{" prior "}) {
+			t.Fatalf("empty/omitted file list changed inherited value: %v", cfg.Nomad.Datacenters)
+		}
+	}
+	for _, raw := range []string{"", "none", " first ,,first "} {
+		t.Setenv("CRABBOX_NOMAD_DATACENTERS", raw)
+		cfg := baseConfig()
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if raw == "" || raw == "none" {
+			if len(cfg.Nomad.Datacenters) != 0 {
+				t.Fatalf("present empty/none environment did not clear list: %v", cfg.Nomad.Datacenters)
+			}
+		} else if !reflect.DeepEqual(cfg.Nomad.Datacenters, []string{"first", "first"}) {
+			t.Fatalf("environment list changed: %v", cfg.Nomad.Datacenters)
+		}
+	}
+}
+
+func TestHostingerBindingDefaultsAndFileAdmission(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefaults := HostingerConfig{APIURL: "https://developers.hostinger.com", HostnamePrefix: "crabbox", User: "root", ReleaseAction: "stop"}
+	if got := baseConfig().Hostinger; !reflect.DeepEqual(got, wantDefaults) {
+		t.Fatalf("Hostinger defaults=%#v", got)
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, allowed := range []bool{false, true} {
+			for _, raw := range []string{"", "  ", " fixture "} {
+				cfg := baseConfig()
+				cfg.Hostinger.AllowPurchase = !allowed
+				priorSSHUser := cfg.SSHUser
+				value, originalValue := allowed, allowed
+				input := &fileHostingerConfig{APIURL: "https://hostinger.example.test", ItemID: "fixture-item", PaymentMethodID: "101", TemplateID: "202", DataCenterID: "303", User: raw, WorkRoot: raw, AllowPurchase: &value}
+				snapshot := *input
+				snapshot.AllowPurchase = new(bool)
+				*snapshot.AllowPurchase = allowed
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Hostinger: input}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(*input, snapshot) || input.AllowPurchase != &value || value != originalValue {
+					t.Fatal("file binding mutated its input DTO or bool pointer")
+				}
+				want := wantDefaults
+				want.AllowPurchase = !allowed
+				if trusted {
+					want.APIURL, want.ItemID, want.PaymentMethodID, want.TemplateID, want.DataCenterID = input.APIURL, input.ItemID, input.PaymentMethodID, input.TemplateID, input.DataCenterID
+				}
+				if raw != "" {
+					want.User, want.WorkRoot = raw, raw
+				}
+				if trusted || !allowed {
+					want.AllowPurchase = allowed
+				}
+				if !reflect.DeepEqual(cfg.Hostinger, want) || cfg.SSHUser != priorSSHUser {
+					t.Fatalf("trusted=%t bool=%t raw=%q bindings=%#v want=%#v", trusted, allowed, raw, cfg.Hostinger, want)
+				}
+				if IsHostingerUserExplicit(&cfg) != (raw != "") || IsHostingerWorkRootExplicit(&cfg) != (raw != "") {
+					t.Fatal("file explicit-field markers changed")
+				}
+				accepted := trusted || !allowed || raw != ""
+				if (cfg.inputProvenance["hostinger"].values != 0) != accepted {
+					t.Fatal("file input acceptance changed")
+				}
+			}
+		}
+	}
+}
+
+func TestHostingerBindingEnvironmentAliasesAndMarkers(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOSTINGER_API_URL", "https://alias.example.test")
+	for _, raw := range []string{"", "  ", " fixture "} {
+		t.Setenv("CRABBOX_HOSTINGER_API_URL", raw)
+		t.Setenv("CRABBOX_HOSTINGER_USER", raw)
+		t.Setenv("CRABBOX_HOSTINGER_WORK_ROOT", raw)
+		t.Setenv("CRABBOX_HOSTINGER_ALLOW_PURCHASE", "false")
+		cfg := baseConfig()
+		cfg.Hostinger.AllowPurchase = true
+		priorSSHUser := cfg.SSHUser
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		wantURL, wantUser := raw, raw
+		if raw == "" {
+			wantURL, wantUser = "https://alias.example.test", "root"
+		}
+		if cfg.Hostinger.APIURL != wantURL || cfg.Hostinger.User != wantUser || cfg.Hostinger.WorkRoot != raw || cfg.Hostinger.AllowPurchase || cfg.SSHUser != priorSSHUser {
+			t.Fatalf("raw=%q environment bindings=%#v", raw, cfg.Hostinger)
+		}
+		if IsHostingerUserExplicit(&cfg) != (raw != "") || IsHostingerWorkRootExplicit(&cfg) != (raw != "") || cfg.inputProvenance["hostinger"].values == 0 {
+			t.Fatal("environment markers/acceptance changed")
+		}
+	}
+}
+
+func TestTenkiBindingDefaultsAndFileValues(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefaults := TenkiConfig{CLIPath: "tenki", WorkRoot: "/home/tenki/crabbox"}
+	if got := baseConfig().Tenki; !reflect.DeepEqual(got, wantDefaults) {
+		t.Fatalf("Tenki defaults=%#v", got)
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", "  ", " fixture "} {
+			for _, number := range []int{-2, 0, 3} {
+				cfg := baseConfig()
+				cfg.Tenki.CPUs, cfg.Tenki.MemoryMB, cfg.Tenki.DiskGB = 7, 8, 9
+				input := &fileTenkiConfig{CLIPath: raw, Endpoint: raw, Gateway: raw, Workspace: raw, Project: raw, Image: raw, Snapshot: raw, WorkRoot: raw, CPUs: number, MemoryMB: number, DiskGB: number}
+				before := *input
+				want := cfg.Tenki
+				if raw != "" {
+					want.CLIPath, want.Endpoint, want.Gateway, want.Workspace, want.Project, want.Image, want.Snapshot, want.WorkRoot = raw, raw, raw, raw, raw, raw, raw, raw
+				}
+				if number > 0 {
+					want.CPUs, want.MemoryMB, want.DiskGB = number, number, number
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Tenki: input}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(cfg.Tenki, want) || !reflect.DeepEqual(*input, before) {
+					t.Fatalf("raw=%q number=%d file values or input changed", raw, number)
+				}
+				if (cfg.inputProvenance["tenki"].values != 0) != (raw != "" || number > 0) {
+					t.Fatal("file accepted-input fact changed")
+				}
+				if raw != "" {
+					wantSource := credentialSourceRepository
+					if trusted {
+						wantSource = credentialSourceTrustedFile
+					}
+					if cfg.credentialProvenance.tenkiEndpoint != wantSource || cfg.credentialProvenance.tenkiGateway != wantSource {
+						t.Fatal("accepted endpoint/gateway source changed")
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestTenkiBindingEnvironmentAliasesAndIntegers(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("TENKI_CLI", "alias-cli")
+	t.Setenv("TENKI_ENDPOINT", "alias-endpoint")
+	t.Setenv("TENKI_GATEWAY", "alias-gateway")
+	for _, raw := range []string{"", "  ", " fixture "} {
+		for _, number := range []string{"invalid", "-2", "0", "3"} {
+			t.Setenv("CRABBOX_TENKI_CLI", raw)
+			t.Setenv("CRABBOX_TENKI_ENDPOINT", raw)
+			t.Setenv("CRABBOX_TENKI_GATEWAY", raw)
+			t.Setenv("CRABBOX_TENKI_IMAGE", raw)
+			t.Setenv("CRABBOX_TENKI_SNAPSHOT", raw)
+			t.Setenv("CRABBOX_TENKI_CPUS", number)
+			t.Setenv("CRABBOX_TENKI_MEMORY_MB", number)
+			t.Setenv("CRABBOX_TENKI_DISK_GB", number)
+			cfg := baseConfig()
+			cfg.Tenki.CPUs, cfg.Tenki.MemoryMB, cfg.Tenki.DiskGB = 7, 7, 7
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			wantCLI, wantEndpoint, wantGateway := raw, raw, raw
+			if raw == "" {
+				wantCLI, wantEndpoint, wantGateway = "alias-cli", "alias-endpoint", "alias-gateway"
+			}
+			wantNumber := 7
+			if number != "invalid" {
+				wantNumber, _ = strconv.Atoi(number)
+			}
+			if cfg.Tenki.CLIPath != wantCLI || cfg.Tenki.Endpoint != wantEndpoint || cfg.Tenki.Gateway != wantGateway || cfg.Tenki.Image != raw || cfg.Tenki.Snapshot != raw || cfg.Tenki.CPUs != wantNumber || cfg.Tenki.MemoryMB != wantNumber || cfg.Tenki.DiskGB != wantNumber {
+				t.Fatalf("raw=%q number=%q environment values changed: %#v", raw, number, cfg.Tenki)
+			}
+			if cfg.credentialProvenance.tenkiEndpoint != credentialSourceEnvironment || cfg.credentialProvenance.tenkiGateway != credentialSourceEnvironment || cfg.inputProvenance["tenki"].values == 0 {
+				t.Fatal("environment source or accepted-input fact changed")
+			}
+		}
+	}
+}
+
+func TestDaytonaBindingDefaultsAndFileValues(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefaults := DaytonaConfig{APIURL: "https://app.daytona.io/api", User: "daytona", WorkRoot: "/home/daytona/crabbox", SSHGatewayHost: "ssh.app.daytona.io", SSHAccessMinutes: 30}
+	if !reflect.DeepEqual(baseConfig().Daytona, wantDefaults) || reflect.TypeOf(DaytonaConfig{}).NumField() != 10 || reflect.TypeOf(fileDaytonaConfig{}).NumField() != 7 {
+		t.Fatal("Daytona defaults or configured field surface changed")
+	}
+	for _, name := range []string{"APIKey", "JWTToken", "OrganizationID"} {
+		if _, present := reflect.TypeOf(fileDaytonaConfig{}).FieldByName(name); present {
+			t.Fatalf("environment-only %s acquired a file binding", name)
+		}
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", "  ", " fixture "} {
+			for _, minutes := range []int{-2, 0, 3} {
+				cfg := baseConfig()
+				input := &fileDaytonaConfig{APIURL: raw, Snapshot: raw, Target: raw, User: raw, WorkRoot: raw, SSHGatewayHost: raw, SSHAccessMinutes: minutes}
+				before := *input
+				want := wantDefaults
+				if raw != "" {
+					want.APIURL, want.Snapshot, want.Target, want.User, want.WorkRoot, want.SSHGatewayHost = raw, raw, raw, raw, raw, raw
+				}
+				if minutes > 0 {
+					want.SSHAccessMinutes = minutes
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Daytona: input}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(cfg.Daytona, want) || !reflect.DeepEqual(*input, before) {
+					t.Fatalf("file values or DTO changed for raw=%q minutes=%d", raw, minutes)
+				}
+				if (cfg.inputProvenance["daytona"].values != 0) != (raw != "" || minutes > 0) {
+					t.Fatal("file acceptance changed")
+				}
+				if raw != "" {
+					wantSource := credentialSourceRepository
+					if trusted {
+						wantSource = credentialSourceTrustedFile
+					}
+					if cfg.credentialProvenance.daytonaAPIURL != wantSource || cfg.credentialProvenance.daytonaSSHGateway != wantSource {
+						t.Fatal("file endpoint source changed")
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestDaytonaBindingOrdinaryEnvironmentAliases(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("DAYTONA_API_URL", "alias-url")
+	t.Setenv("DAYTONA_SNAPSHOT", "alias-snapshot")
+	t.Setenv("DAYTONA_TARGET", "alias-target")
+	t.Setenv("DAYTONA_ORGANIZATION_ID", "alias-organization")
+	for _, raw := range []string{"", "  ", " fixture "} {
+		for _, minutes := range []string{"invalid", "-2", "0", "3"} {
+			for _, suffix := range []string{"API_URL", "SNAPSHOT", "TARGET", "ORGANIZATION_ID", "USER", "WORK_ROOT", "SSH_GATEWAY_HOST"} {
+				t.Setenv("CRABBOX_DAYTONA_"+suffix, raw)
+			}
+			t.Setenv("CRABBOX_DAYTONA_SSH_ACCESS_MINUTES", minutes)
+			cfg := baseConfig()
+			want := cfg.Daytona
+			if raw != "" {
+				want.APIURL, want.Snapshot, want.Target, want.OrganizationID, want.User, want.WorkRoot, want.SSHGatewayHost = raw, raw, raw, raw, raw, raw, raw
+			} else {
+				want.APIURL, want.Snapshot, want.Target, want.OrganizationID = "alias-url", "alias-snapshot", "alias-target", "alias-organization"
+			}
+			if minutes != "invalid" {
+				want.SSHAccessMinutes, _ = strconv.Atoi(minutes)
+			}
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Daytona, want) || cfg.credentialProvenance.daytonaAPIURL != credentialSourceEnvironment || cfg.inputProvenance["daytona"].values == 0 {
+				t.Fatalf("ordinary environment bindings changed for raw=%q minutes=%q", raw, minutes)
+			}
+			if raw != "" && cfg.credentialProvenance.daytonaSSHGateway != credentialSourceEnvironment {
+				t.Fatal("gateway environment provenance missing")
+			}
+		}
+	}
+}
+
+func TestDaytonaBindingEnvironmentOnlyFields(t *testing.T) {
+	clearConfigEnv(t)
+	for _, tc := range []struct{ primary, alias, want string }{
+		{"", "", "fixture-prior"},
+		{"", "fixture-alias", "fixture-alias"},
+		{"fixture-primary", "fixture-alias", "fixture-primary"},
+		{"  ", "fixture-alias", "  "},
+	} {
+		for _, suffix := range []string{"API_KEY", "JWT_TOKEN", "ORGANIZATION_ID"} {
+			t.Setenv("CRABBOX_DAYTONA_"+suffix, tc.primary)
+			t.Setenv("DAYTONA_"+suffix, tc.alias)
+		}
+		cfg := baseConfig()
+		cfg.Daytona.APIKey, cfg.Daytona.JWTToken, cfg.Daytona.OrganizationID = "fixture-prior", "fixture-prior", "fixture-prior"
+		cfg.credentialProvenance.daytonaAPIKey, cfg.credentialProvenance.daytonaJWTToken = credentialSourceTrustedFile, credentialSourceTrustedFile
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Daytona.APIKey != tc.want || cfg.Daytona.JWTToken != tc.want || cfg.Daytona.OrganizationID != tc.want {
+			t.Fatal("environment-only primary/alias/previous precedence changed")
+		}
+		accepted := tc.primary != "" || tc.alias != ""
+		wantSource := credentialSourceTrustedFile
+		if accepted {
+			wantSource = credentialSourceEnvironment
+		}
+		if cfg.credentialProvenance.daytonaAPIKey != wantSource || cfg.credentialProvenance.daytonaJWTToken != wantSource || (cfg.inputProvenance["daytona"].values != 0) != accepted {
+			t.Fatal("environment-only provenance or acceptance changed")
+		}
+	}
+}
+
+func TestProxmoxBindingDefaultsAndFileValues(t *testing.T) {
+	clearConfigEnv(t)
+	if got, want := baseConfig().Proxmox, (ProxmoxConfig{User: "crabbox", WorkRoot: defaultPOSIXWorkRoot, FullClone: true}); got != want {
+		t.Fatalf("defaults=%#v, want %#v", got, want)
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", "  ", "fixture-file"} {
+			for _, number := range []int{-2, 0, 3} {
+				for _, boolean := range []*bool{nil, new(false), new(true)} {
+					cfg := baseConfig()
+					cfg.Proxmox = ProxmoxConfig{APIURL: "prior", TokenID: "fixture-prior", TokenSecret: "fixture-prior", Node: "prior", TemplateID: 7, Storage: "prior", Pool: "prior", Bridge: "prior", User: "prior", WorkRoot: "prior", FullClone: true, InsecureTLS: true}
+					cfg.SSHUser, cfg.WorkRoot = "generic-user", "/generic"
+					input := &fileProxmoxConfig{APIURL: raw, TokenID: raw, TokenSecret: raw, Node: raw, TemplateID: number, Storage: raw, Pool: raw, Bridge: raw, User: raw, WorkRoot: raw, FullClone: boolean, InsecureTLS: boolean}
+					before, err := yaml.Marshal(input)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := cfg.Proxmox
+					if raw != "" {
+						want.APIURL, want.TokenID, want.TokenSecret, want.Node, want.Storage, want.Pool, want.Bridge, want.User, want.WorkRoot = raw, raw, raw, raw, raw, raw, raw, raw, raw
+					}
+					if number > 0 {
+						want.TemplateID = number
+					}
+					if boolean != nil {
+						want.FullClone, want.InsecureTLS = *boolean, *boolean
+					}
+					if err := applyFileConfigWithTrust(&cfg, fileConfig{Proxmox: input}, trusted); err != nil {
+						t.Fatal(err)
+					}
+					after, err := yaml.Marshal(input)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if cfg.Proxmox != want || !bytes.Equal(before, after) {
+						t.Fatalf("trusted=%v raw=%q number=%d: file values or DTO changed", trusted, raw, number)
+					}
+					if cfg.SSHUser != "generic-user" || cfg.WorkRoot != "/generic" {
+						t.Fatal("file overlay gained generic connection effects")
+					}
+					wantSource := credentialSourceRepository
+					inputSource := configInputRepo
+					if trusted {
+						wantSource, inputSource = credentialSourceTrustedFile, configInputUser
+					}
+					wantLedger := Config{}
+					recordConfigInput(&wantLedger, "proxmox", inputSource, raw != "" || number > 0 || boolean != nil)
+					if cfg.inputProvenance["proxmox"] != wantLedger.inputProvenance["proxmox"] {
+						t.Fatal("file accepted-input source changed")
+					}
+					stringSource, boolSource := credentialSourceUnknown, credentialSourceUnknown
+					if raw != "" {
+						stringSource = wantSource
+					}
+					if boolean != nil {
+						boolSource = wantSource
+					}
+					p := cfg.credentialProvenance
+					if p.proxmoxAPIURL != stringSource || p.proxmoxTokenID != stringSource || p.proxmoxTokenSecret != stringSource || p.proxmoxInsecureTLS != boolSource {
+						t.Fatal("file provenance changed")
+					}
+				}
+			}
+		}
+	}
+	for _, raw := range []string{"{}", "{templateId: null}", "{templateId: invalid}"} {
+		var input fileProxmoxConfig
+		err := yaml.Unmarshal([]byte(raw), &input)
+		if (err != nil) != strings.Contains(raw, "invalid") {
+			t.Fatalf("file integer decoding %q: %v", raw, err)
+		}
+	}
+}
+
+func TestProxmoxBindingEnvironmentValues(t *testing.T) {
+	clearConfigEnv(t)
+	for _, raw := range []string{"", "  ", "fixture-primary"} {
+		for _, number := range []string{"", "invalid", "-2", "0", "3", " 3 "} {
+			for _, boolean := range []string{"", "invalid", "false", "true"} {
+				for _, suffix := range []string{"API_URL", "TOKEN_ID", "TOKEN_SECRET", "NODE", "STORAGE", "POOL", "BRIDGE", "USER", "WORK_ROOT"} {
+					t.Setenv("CRABBOX_PROXMOX_"+suffix, raw)
+				}
+				t.Setenv("CRABBOX_PROXMOX_TEMPLATE_ID", number)
+				t.Setenv("CRABBOX_PROXMOX_FULL_CLONE", boolean)
+				t.Setenv("CRABBOX_PROXMOX_INSECURE_TLS", boolean)
+				cfg := baseConfig()
+				cfg.Proxmox = ProxmoxConfig{APIURL: "prior", TokenID: "fixture-prior", TokenSecret: "fixture-prior", Node: "prior", TemplateID: 7, Storage: "prior", Pool: "prior", Bridge: "prior", User: "prior", WorkRoot: "prior", FullClone: true, InsecureTLS: true}
+				want := cfg.Proxmox
+				if raw != "" {
+					want.APIURL, want.TokenID, want.TokenSecret, want.Node, want.Storage, want.Pool, want.Bridge, want.User, want.WorkRoot = raw, raw, raw, raw, raw, raw, raw, raw, raw
+				}
+				parsed, numberErr := strconv.Atoi(number)
+				if numberErr == nil {
+					want.TemplateID = parsed
+				}
+				boolAccepted := boolean == "true" || boolean == "false"
+				if boolAccepted {
+					want.FullClone, want.InsecureTLS = boolean == "true", boolean == "true"
+				}
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				if cfg.Proxmox != want {
+					t.Fatalf("raw=%q number=%q bool=%q: environment values changed", raw, number, boolean)
+				}
+				wantLedger := Config{}
+				recordConfigInput(&wantLedger, "proxmox", configInputEnvironment, raw != "" || numberErr == nil || boolAccepted)
+				if cfg.inputProvenance["proxmox"] != wantLedger.inputProvenance["proxmox"] {
+					t.Fatal("environment accepted-input source changed")
+				}
+				stringSource, boolSource := credentialSourceUnknown, credentialSourceUnknown
+				if raw != "" {
+					stringSource = credentialSourceEnvironment
+				}
+				if boolAccepted {
+					boolSource = credentialSourceEnvironment
+				}
+				p := cfg.credentialProvenance
+				if p.proxmoxAPIURL != stringSource || p.proxmoxTokenID != stringSource || p.proxmoxTokenSecret != stringSource || p.proxmoxInsecureTLS != boolSource {
+					t.Fatal("environment provenance changed")
+				}
+			}
+		}
+	}
+}
+
+func TestSpritesUnikraftBindingFileValues(t *testing.T) {
+	clearConfigEnv(t)
+	defaults := baseConfig()
+	if defaults.Sprites != (SpritesConfig{APIURL: "https://api.sprites.dev", WorkRoot: "/home/sprite/crabbox"}) || defaults.UnikraftCloud != (UnikraftCloudConfig{Metro: "fra"}) {
+		t.Fatal("binding defaults changed")
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", "  ", "fixture-file"} {
+			for _, memory := range []int{-1, 0, 256} {
+				cfg := baseConfig()
+				cfg.Sprites = SpritesConfig{Token: "fixture-prior", APIURL: "prior-url", WorkRoot: "prior-root"}
+				cfg.UnikraftCloud = UnikraftCloudConfig{APIKey: "fixture-prior", APIURL: "prior-url", Metro: "prior-metro", Image: "prior-image", MemoryMB: 128}
+				cfg.credentialProvenance.spritesToken = credentialSourceTrustedFile
+				file := fileConfig{Sprites: &fileSpritesConfig{APIURL: raw, WorkRoot: raw}, UnikraftCloud: &fileUnikraftCloudConfig{APIKey: raw, APIURL: raw, Metro: raw, Image: raw, MemoryMB: memory}}
+				before, err := yaml.Marshal(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantSprites, wantUnikraft := cfg.Sprites, cfg.UnikraftCloud
+				if raw != "" {
+					wantSprites.APIURL, wantSprites.WorkRoot = raw, raw
+					wantUnikraft.APIKey, wantUnikraft.APIURL, wantUnikraft.Metro, wantUnikraft.Image = raw, raw, raw, raw
+				}
+				if memory > 0 {
+					wantUnikraft.MemoryMB = memory
+				}
+				if err := applyFileConfigWithTrust(&cfg, file, trusted); err != nil {
+					t.Fatal(err)
+				}
+				after, err := yaml.Marshal(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cfg.Sprites != wantSprites || cfg.UnikraftCloud != wantUnikraft || !bytes.Equal(before, after) {
+					t.Fatalf("trusted=%v raw=%q memory=%d: values or DTO changed", trusted, raw, memory)
+				}
+				inputSource, source := configInputRepo, credentialSourceRepository
+				if trusted {
+					inputSource, source = configInputUser, credentialSourceTrustedFile
+				}
+				wantLedger := Config{}
+				recordConfigInput(&wantLedger, "sprites", inputSource, raw != "")
+				recordConfigInput(&wantLedger, "unikraft-cloud", inputSource, raw != "" || memory > 0)
+				for _, name := range []configInputOwner{"sprites", "unikraft-cloud"} {
+					if cfg.inputProvenance[name] != wantLedger.inputProvenance[name] {
+						t.Fatal("file source acceptance changed")
+					}
+				}
+				if raw == "" {
+					source = credentialSourceUnknown
+				}
+				p := cfg.credentialProvenance
+				if p.spritesAPIURL != source || p.unikraftCloudAPIKey != source || p.unikraftCloudAPIURL != source || p.spritesToken != credentialSourceTrustedFile {
+					t.Fatal("file provenance changed")
+				}
+			}
+		}
+	}
+	var input fileSpritesConfig
+	if err := yaml.Unmarshal([]byte("token: fixture-file\n"), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input != (fileSpritesConfig{}) || reflect.TypeFor[fileSpritesConfig]().NumField() != 2 {
+		t.Fatal("Sprites token gained YAML input")
+	}
+	for _, raw := range []string{"{}", "{memoryMB: null}", "{memoryMB: invalid}"} {
+		var input fileUnikraftCloudConfig
+		err := yaml.Unmarshal([]byte(raw), &input)
+		if (err != nil) != strings.Contains(raw, "invalid") {
+			t.Fatalf("memory decoding %q: %v", raw, err)
+		}
+	}
+}
+
+func TestSpritesUnikraftBindingEnvironmentPrecedence(t *testing.T) {
+	clearConfigEnv(t)
+	for _, tc := range []struct {
+		name   configInputOwner
+		keys   []string
+		set    func(*Config, string)
+		get    func(Config) string
+		source func(*Config) *credentialValueSource
+	}{
+		{"sprites", []string{"CRABBOX_SPRITES_TOKEN", "SPRITES_TOKEN", "SPRITE_TOKEN", "SETUP_SPRITE_TOKEN"}, func(c *Config, s string) { c.Sprites.Token = s }, func(c Config) string { return c.Sprites.Token }, func(c *Config) *credentialValueSource { return &c.credentialProvenance.spritesToken }},
+		{"unikraft-cloud", []string{"CRABBOX_UNIKRAFT_CLOUD_API_KEY", "UNIKRAFT_CLOUD_API_KEY", "UKC_API_KEY", "UKC_TOKEN"}, func(c *Config, s string) { c.UnikraftCloud.APIKey = s }, func(c Config) string { return c.UnikraftCloud.APIKey }, func(c *Config) *credentialValueSource { return &c.credentialProvenance.unikraftCloudAPIKey }},
+		{"sprites", []string{"CRABBOX_SPRITES_API_URL", "SPRITES_API_URL"}, func(c *Config, s string) { c.Sprites.APIURL = s }, func(c Config) string { return c.Sprites.APIURL }, func(c *Config) *credentialValueSource { return &c.credentialProvenance.spritesAPIURL }},
+		{"sprites", []string{"CRABBOX_SPRITES_WORK_ROOT"}, func(c *Config, s string) { c.Sprites.WorkRoot = s }, func(c Config) string { return c.Sprites.WorkRoot }, nil},
+		{"unikraft-cloud", []string{"CRABBOX_UNIKRAFT_CLOUD_API_URL", "UNIKRAFT_CLOUD_API_URL"}, func(c *Config, s string) { c.UnikraftCloud.APIURL = s }, func(c Config) string { return c.UnikraftCloud.APIURL }, func(c *Config) *credentialValueSource { return &c.credentialProvenance.unikraftCloudAPIURL }},
+		{"unikraft-cloud", []string{"CRABBOX_UNIKRAFT_CLOUD_METRO", "UNIKRAFT_CLOUD_METRO", "UKC_METRO"}, func(c *Config, s string) { c.UnikraftCloud.Metro = s }, func(c Config) string { return c.UnikraftCloud.Metro }, nil},
+		{"unikraft-cloud", []string{"CRABBOX_UNIKRAFT_CLOUD_IMAGE", "UNIKRAFT_CLOUD_IMAGE"}, func(c *Config, s string) { c.UnikraftCloud.Image = s }, func(c Config) string { return c.UnikraftCloud.Image }, nil},
+	} {
+		t.Run(tc.keys[0], func(t *testing.T) {
+			for first := -2; first < len(tc.keys); first++ {
+				for _, raw := range []string{"  ", "fixture-primary", "fixture-prior"} {
+					for i, key := range tc.keys {
+						value := ""
+						if first >= 0 && i >= first {
+							value = "fixture-lower"
+						}
+						if i == first {
+							value = raw
+						}
+						t.Setenv(key, value)
+						if first == -2 {
+							if err := os.Unsetenv(key); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					cfg := baseConfig()
+					tc.set(&cfg, "fixture-prior")
+					if tc.source != nil {
+						*tc.source(&cfg) = credentialSourceTrustedFile
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+					want, wantSource := "fixture-prior", credentialSourceTrustedFile
+					if first >= 0 {
+						want, wantSource = raw, credentialSourceEnvironment
+					}
+					if tc.get(cfg) != want || (tc.source != nil && *tc.source(&cfg) != wantSource) {
+						t.Fatalf("first=%d raw=%q: value/source changed", first, raw)
+					}
+					wantLedger := Config{}
+					recordConfigInput(&wantLedger, tc.name, configInputEnvironment, first >= 0)
+					if cfg.inputProvenance[tc.name] != wantLedger.inputProvenance[tc.name] {
+						t.Fatal("environment acceptance changed")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestUnikraftBindingMemoryHasNoEnvironmentSource(t *testing.T) {
+	clearConfigEnv(t)
+	for _, raw := range []string{"", "invalid", "-1", "0", "256"} {
+		for _, key := range []string{"CRABBOX_UNIKRAFT_CLOUD_MEMORY_MB", "UNIKRAFT_CLOUD_MEMORY_MB", "UKC_MEMORY_MB"} {
+			t.Setenv(key, raw)
+		}
+		cfg := baseConfig()
+		cfg.UnikraftCloud.MemoryMB = 128
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.UnikraftCloud.MemoryMB != 128 || cfg.inputProvenance["unikraft-cloud"].values != 0 {
+			t.Fatal("memory gained environment input")
+		}
+	}
+}
+
+func TestSuperserveListSourceValueContract(t *testing.T) {
+	clearConfigEnv(t)
+	for _, trusted := range []bool{false, true} {
+		for _, tc := range []struct {
+			body string
+			want []string
+		}{
+			{"{}", []string{"prior"}},
+			{"networkAllowOut: null", []string{"prior"}},
+			{"networkAllowOut: []", []string{}},
+			{"networkAllowOut: [' a ', '', 'a', 'none', 'x,y']", []string{"a", "a", "none", "x,y"}},
+		} {
+			var file fileSuperserveConfig
+			if err := yaml.Unmarshal([]byte(tc.body), &file); err != nil {
+				t.Fatal(err)
+			}
+			before, err := yaml.Marshal(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := baseConfig()
+			cfg.Superserve.NetworkAllowOut = []string{"prior"}
+			if err := applyFileConfigWithTrust(&cfg, fileConfig{Superserve: &file}, trusted); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Superserve.NetworkAllowOut, tc.want) {
+				t.Fatalf("body=%s got=%#v", tc.body, cfg.Superserve.NetworkAllowOut)
+			}
+			after, err := yaml.Marshal(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(before) != string(after) {
+				t.Fatal("file DTO mutated")
+			}
+			if len(file.NetworkAllowOut) == 0 && strings.Contains(string(after), "networkAllowOut") {
+				t.Fatal("value-slice omitempty shape changed")
+			}
+		}
+	}
+	for _, tc := range []struct {
+		raw  string
+		want []string
+	}{
+		{"", []string{"prior"}}, {" , ", []string{}}, {" a, a,none ", []string{"a", "a", "none"}},
+	} {
+		t.Setenv("CRABBOX_SUPERSERVE_NETWORK_ALLOW_OUT", tc.raw)
+		cfg := baseConfig()
+		cfg.Superserve.NetworkAllowOut = []string{"prior"}
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cfg.Superserve.NetworkAllowOut, tc.want) {
+			t.Fatalf("raw=%q got=%#v", tc.raw, cfg.Superserve.NetworkAllowOut)
+		}
+	}
+}
+
+func TestXCPNgBindingOrdinarySources(t *testing.T) {
+	clearConfigEnv(t)
+	if got, want := baseConfig().XCPNg, (XCPNgConfig{User: "crabbox", WorkRoot: defaultPOSIXWorkRoot}); got != want {
+		t.Fatalf("defaults=%#v, want %#v", got, want)
+	}
+	for _, source := range []string{"user", "repo", "env"} {
+		for _, raw := range []string{"", "  ", "fixture", "fixture-prior"} {
+			for _, boolean := range []string{"", "invalid", "false", "true"} {
+				cfg := baseConfig()
+				cfg.Provider, cfg.ServerType, cfg.SSHUser, cfg.WorkRoot = "fixture-other", "prior-type", "generic-user", "/generic"
+				cfg.XCPNg = XCPNgConfig{APIURL: "fixture-prior", Username: "fixture-prior", Password: "fixture-prior", Host: "fixture-prior", User: "fixture-prior", WorkRoot: "fixture-prior", InsecureTLS: true}
+				want := cfg.XCPNg
+				trusted := source == "user"
+				boolAccepted := boolean == "true" || boolean == "false"
+				if raw != "" {
+					want.Host, want.User, want.WorkRoot = raw, raw, raw
+					if source != "repo" {
+						want.APIURL, want.Username, want.Password = raw, raw, raw
+					}
+				}
+				if boolAccepted && source != "repo" {
+					want.InsecureTLS = boolean == "true"
+				}
+				if source == "env" {
+					for _, key := range []string{"API_URL", "USERNAME", "PASSWORD", "HOST", "USER", "WORK_ROOT"} {
+						t.Setenv("CRABBOX_XCP_NG_"+key, raw)
+					}
+					t.Setenv("CRABBOX_XCP_NG_INSECURE_TLS", boolean)
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					file := &fileXCPNgConfig{APIURL: raw, Username: raw, Password: raw, Host: raw, User: raw, WorkRoot: raw}
+					if boolAccepted {
+						file.InsecureTLS = new(boolean == "true")
+					}
+					before, err := yaml.Marshal(file)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := applyFileConfigWithTrust(&cfg, fileConfig{XCPNg: file}, trusted); err != nil {
+						t.Fatal(err)
+					}
+					after, err := yaml.Marshal(file)
+					if err != nil || !bytes.Equal(before, after) {
+						t.Fatal("file DTO mutated")
+					}
+				}
+				if cfg.XCPNg != want || cfg.ServerType != "prior-type" || cfg.SSHUser != "generic-user" || cfg.WorkRoot != "/generic" {
+					t.Fatalf("source=%s raw=%q bool=%q: values or generic side effects changed", source, raw, boolean)
+				}
+				inputSource := configInputRepo
+				if source == "user" {
+					inputSource = configInputUser
+				}
+				if source == "env" {
+					inputSource = configInputEnvironment
+				}
+				wantLedger := Config{}
+				recordConfigInput(&wantLedger, "xcp-ng", inputSource, raw != "" || boolAccepted && source != "repo")
+				if cfg.inputProvenance["xcp-ng"] != wantLedger.inputProvenance["xcp-ng"] {
+					t.Fatal("ordinary accepted-input source changed")
+				}
+			}
+		}
+	}
+	for _, boolean := range []bool{false, true} {
+		cfg := baseConfig()
+		prior := cfg.XCPNg
+		if err := applyFileConfigWithTrust(&cfg, fileConfig{XCPNg: &fileXCPNgConfig{APIURL: "fixture-url", Username: "fixture-user", Password: "fixture-password", InsecureTLS: &boolean}}, false); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.XCPNg != prior || cfg.inputProvenance["xcp-ng"].values != 0 {
+			t.Fatal("repository-only restricted fields gained admission")
+		}
+	}
+}
+
+func TestSuperserveBindingOrdinarySources(t *testing.T) {
+	clearConfigEnv(t)
+	for _, source := range []string{"user", "repo", "env"} {
+		for _, raw := range []string{"", "  ", " fixture "} {
+			for _, number := range []int{0, 7} {
+				cfg := baseConfig()
+				cfg.Superserve.BaseURL, cfg.Superserve.Template, cfg.Superserve.Snapshot, cfg.Superserve.Workdir = "prior", "prior", "prior", "prior"
+				cfg.Superserve.TimeoutSecs, cfg.Superserve.ExecTimeoutSecs, cfg.Superserve.ForgetMissing = 19, 23, true
+				want := cfg.Superserve
+				want.TimeoutSecs, want.ExecTimeoutSecs, want.ForgetMissing = number, number, false
+				if source == "env" {
+					for _, suffix := range []string{"BASE_URL", "TEMPLATE", "SNAPSHOT", "WORKDIR"} {
+						t.Setenv("CRABBOX_SUPERSERVE_"+suffix, raw)
+					}
+					for _, suffix := range []string{"TIMEOUT_SECS", "EXEC_TIMEOUT_SECS"} {
+						t.Setenv("CRABBOX_SUPERSERVE_"+suffix, strconv.Itoa(number))
+					}
+					t.Setenv("CRABBOX_SUPERSERVE_FORGET_MISSING", "false")
+					if raw != "" {
+						want.BaseURL, want.Template, want.Snapshot, want.Workdir = raw, raw, raw, raw
+					}
+					if err := applyEnv(&cfg); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					input := &fileSuperserveConfig{BaseURL: raw, Template: &raw, Snapshot: &raw, Workdir: &raw, TimeoutSecs: &number, ExecTimeoutSecs: &number, ForgetMissing: new(false)}
+					before, err := yaml.Marshal(input)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want.Template, want.Snapshot, want.Workdir = raw, raw, raw
+					if source == "user" && strings.TrimSpace(raw) != "" {
+						want.BaseURL = raw
+					}
+					if err := applyFileConfigWithTrust(&cfg, fileConfig{Superserve: input}, source == "user"); err != nil {
+						t.Fatal(err)
+					}
+					after, err := yaml.Marshal(input)
+					if err != nil || !bytes.Equal(before, after) {
+						t.Fatal("file DTO mutated")
+					}
+				}
+				if !reflect.DeepEqual(cfg.Superserve, want) {
+					t.Fatalf("source=%s raw=%q number=%d: values changed", source, raw, number)
+				}
+				inputSource := configInputRepo
+				if source == "user" {
+					inputSource = configInputUser
+				}
+				if source == "env" {
+					inputSource = configInputEnvironment
+				}
+				ledger := Config{}
+				recordConfigInput(&ledger, "superserve", inputSource, true)
+				if cfg.inputProvenance["superserve"] != ledger.inputProvenance["superserve"] {
+					t.Fatal("accepted-source fact changed")
+				}
+			}
+		}
+	}
+}
+
+func TestSuperserveBindingAliasesAndIgnoredInputs(t *testing.T) {
+	clearConfigEnv(t)
+	for _, primary := range []string{"", "  ", "fixture-prior", "fixture-primary"} {
+		for _, alias := range []string{"", "fixture-alias"} {
+			t.Setenv("CRABBOX_SUPERSERVE_BASE_URL", primary)
+			t.Setenv("SUPERSERVE_BASE_URL", alias)
+			t.Setenv("CRABBOX_SUPERSERVE_FORGET_MISSING", "invalid")
+			cfg := baseConfig()
+			cfg.Superserve.BaseURL = "fixture-prior"
+			want := cfg.Superserve
+			accepted := primary != "" || alias != ""
+			if primary != "" {
+				want.BaseURL = primary
+			} else if alias != "" {
+				want.BaseURL = alias
+			}
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Superserve, want) || (cfg.inputProvenance["superserve"].values != 0) != accepted {
+				t.Fatal("alias precedence or ignored environment input changed")
+			}
+		}
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", "  ", " fixture "} {
+			cfg := baseConfig()
+			want := cfg.Superserve
+			if trusted && strings.TrimSpace(raw) != "" {
+				want.BaseURL = raw
+			}
+			if err := applyFileConfigWithTrust(&cfg, fileConfig{Superserve: &fileSuperserveConfig{BaseURL: raw}}, trusted); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Superserve, want) || (cfg.inputProvenance["superserve"].values != 0) != (trusted && strings.TrimSpace(raw) != "") {
+				t.Fatal("blank URL or omitted pointer admission changed")
+			}
+		}
+	}
+}
+
+func TestSuperserveBindingPartialIntegerErrors(t *testing.T) {
+	clearConfigEnv(t)
+	for _, source := range []string{"file", "env"} {
+		for _, second := range []bool{false, true} {
+			for _, earlier := range []bool{false, true} {
+				for _, raw := range []string{"-1", "invalid", " 7 "} {
+					if source == "file" && raw != "-1" {
+						continue
+					}
+					cfg := baseConfig()
+					cfg.Superserve.Template, cfg.Superserve.TimeoutSecs, cfg.Superserve.ExecTimeoutSecs = "prior", 19, 23
+					cfg.Superserve.NetworkAllowOut, cfg.Superserve.NetworkDenyOut = []string{"prior"}, []string{"prior"}
+					want := cfg.Superserve
+					if earlier {
+						want.Template = "fixture"
+					}
+					if second {
+						want.TimeoutSecs = 7
+					}
+					var err error
+					wantError := "superserve timeoutSecs must be non-negative"
+					if second {
+						wantError = "superserve execTimeoutSecs must be non-negative"
+					}
+					if source == "file" {
+						file := &fileSuperserveConfig{TimeoutSecs: new(-1), ExecTimeoutSecs: new(7), NetworkAllowOut: []string{"new"}, NetworkDenyOut: []string{"new"}, ForgetMissing: new(true)}
+						if earlier {
+							file.Template = new("fixture")
+						}
+						if second {
+							file.TimeoutSecs, file.ExecTimeoutSecs = new(7), new(-1)
+						}
+						err = applyFileConfigWithTrust(&cfg, fileConfig{Superserve: file}, false)
+					} else {
+						template := ""
+						if earlier {
+							template = "fixture"
+						}
+						t.Setenv("CRABBOX_SUPERSERVE_TEMPLATE", template)
+						t.Setenv("CRABBOX_SUPERSERVE_TIMEOUT_SECS", raw)
+						t.Setenv("CRABBOX_SUPERSERVE_EXEC_TIMEOUT_SECS", "7")
+						key := "CRABBOX_SUPERSERVE_TIMEOUT_SECS"
+						want.TimeoutSecs = 0
+						if second {
+							t.Setenv(key, "7")
+							key = "CRABBOX_SUPERSERVE_EXEC_TIMEOUT_SECS"
+							t.Setenv(key, raw)
+							want.TimeoutSecs, want.ExecTimeoutSecs = 7, 0
+						}
+						t.Setenv("CRABBOX_SUPERSERVE_NETWORK_ALLOW_OUT", "new")
+						t.Setenv("CRABBOX_SUPERSERVE_NETWORK_DENY_OUT", "new")
+						t.Setenv("CRABBOX_SUPERSERVE_FORGET_MISSING", "true")
+						wantError = key + " must be an integer"
+						if raw == "-1" {
+							wantError = key + " must be non-negative"
+						}
+						err = applyEnv(&cfg)
+					}
+					if err == nil || err.Error() != wantError || !reflect.DeepEqual(cfg.Superserve, want) {
+						t.Fatalf("source=%s second=%v earlier=%v raw=%q: partial state/error changed: %v", source, second, earlier, raw, err)
+					}
+					if (cfg.inputProvenance["superserve"].values != 0) != (earlier || second) {
+						t.Fatal("partial accepted-input facts changed")
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestSuperserveBindingListStorageAndFacts(t *testing.T) {
+	clearConfigEnv(t)
+	for _, trusted := range []bool{false, true} {
+		for _, prior := range [][]string{nil, {}, {"prior"}} {
+			for _, raw := range [][]string{nil, {}, {" "}, {" a ", "", "a", "none", "x,y"}} {
+				cfg := baseConfig()
+				cfg.Superserve.NetworkAllowOut, cfg.Superserve.NetworkDenyOut = prior, prior
+				file := &fileSuperserveConfig{NetworkAllowOut: raw, NetworkDenyOut: raw}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Superserve: file}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				want := prior
+				if raw != nil {
+					want = []string{}
+					if len(raw) > 1 {
+						want = []string{"a", "a", "none", "x,y"}
+					}
+				}
+				if !reflect.DeepEqual(cfg.Superserve.NetworkAllowOut, want) || !reflect.DeepEqual(cfg.Superserve.NetworkDenyOut, want) || (cfg.inputProvenance["superserve"].values != 0) != (raw != nil) {
+					t.Fatal("list presence, shape or acceptance changed")
+				}
+				if len(want) > 0 && raw != nil {
+					cfg.Superserve.NetworkAllowOut[0] = "changed"
+					if cfg.Superserve.NetworkDenyOut[0] != "a" || raw[0] != " a " {
+						t.Fatal("normalized lists share input or each other")
+					}
+				}
+				if raw == nil && len(prior) > 0 && &cfg.Superserve.NetworkAllowOut[0] != &prior[0] {
+					t.Fatal("ignored nil list lost inherited storage")
+				}
+			}
+		}
+	}
+}
+
+func TestMXCBindingDefaultsAndFile(t *testing.T) {
+	wantDefaults := MXCConfig{CLIPath: "wxc-exec.exe", Version: "0.6.0-alpha", Containment: "processcontainer", Network: "block"}
+	if !reflect.DeepEqual(baseConfig().MXC, wantDefaults) {
+		t.Fatalf("defaults=%#v", baseConfig().MXC)
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, field := range []string{"CLIPath", "Version", "Containment", "Network", "ReadOnlyPaths", "ReadWritePaths", "AllowedHosts", "BlockedHosts", "AllowDACLMutation", "AllowWindowsUI", "Experimental"} {
+			for _, variant := range []string{"absent", "empty", "value"} {
+				cfg := Config{MXC: MXCConfig{CLIPath: "prior", Version: "prior", Containment: "prior", Network: "prior", ReadOnlyPaths: []string{"prior"}, ReadWritePaths: []string{"prior"}, AllowedHosts: []string{"prior"}, BlockedHosts: []string{"prior"}, AllowDACLMutation: true, AllowWindowsUI: true, Experimental: true}}
+				file := fileMXCConfig{}
+				dst := reflect.ValueOf(&cfg.MXC).Elem().FieldByName(field)
+				src := reflect.ValueOf(&file).Elem().FieldByName(field)
+				want := dst.Interface()
+				accepted := false
+				if variant != "absent" {
+					switch dst.Kind() {
+					case reflect.String:
+						raw := ""
+						if variant == "value" {
+							raw = " fixture "
+						}
+						src.SetString(raw)
+						if raw != "" {
+							want = raw
+							accepted = true
+						}
+					case reflect.Slice:
+						raw := []string{}
+						if variant == "value" {
+							raw = []string{" a ", "", "a", "none", "x,y"}
+						}
+						src.Set(reflect.ValueOf(raw))
+						want = append([]string(nil), raw...)
+						accepted = true
+					case reflect.Bool:
+						raw := variant == "value"
+						src.Set(reflect.ValueOf(&raw))
+						want = raw
+						accepted = true
+					}
+				}
+				before, err := yaml.Marshal(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{MXC: &file}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(dst.Interface(), want) {
+					t.Fatalf("%s/%s got=%#v want=%#v", field, variant, dst.Interface(), want)
+				}
+				source := configInputRepo
+				if trusted {
+					source = configInputUser
+				}
+				var ledger configInputLedger
+				if accepted {
+					ledger = ledger.withInput("mxc", source, configInputValue)
+				}
+				if cfg.inputProvenance["mxc"] != ledger["mxc"] {
+					t.Fatalf("%s/%s accepted facts=%+v", field, variant, cfg.inputProvenance["mxc"])
+				}
+				if dst.Kind() == reflect.Slice && dst.Len() > 0 {
+					dst.Index(0).SetString("mutated-result")
+				}
+				after, err := yaml.Marshal(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, after) {
+					t.Fatal("file input storage mutated")
+				}
+			}
+		}
+	}
+}
+
+func TestMXCBindingEnvironment(t *testing.T) {
+	fields := map[string]string{"CLIPath": "CLI", "Version": "VERSION", "Containment": "CONTAINMENT", "Network": "NETWORK", "ReadOnlyPaths": "READONLY_PATHS", "ReadWritePaths": "READWRITE_PATHS", "AllowedHosts": "ALLOWED_HOSTS", "BlockedHosts": "BLOCKED_HOSTS", "AllowDACLMutation": "ALLOW_DACL_MUTATION", "AllowWindowsUI": "ALLOW_WINDOWS_UI", "Experimental": "EXPERIMENTAL"}
+	for field, suffix := range fields {
+		for _, raw := range []string{"", "  ", " a, ,a,none ", "false", "true"} {
+			t.Run(field+"/"+raw, func(t *testing.T) {
+				clearConfigEnv(t)
+				t.Setenv("CRABBOX_MXC_"+suffix, raw)
+				cfg := Config{}
+				dst := reflect.ValueOf(&cfg.MXC).Elem().FieldByName(field)
+				var want any
+				accepted := raw != ""
+				switch dst.Kind() {
+				case reflect.String:
+					dst.SetString("prior")
+					want = "prior"
+					if accepted {
+						want = raw
+					}
+				case reflect.Slice:
+					dst.Set(reflect.ValueOf([]string{"prior"}))
+					want = []string{"prior"}
+					switch raw {
+					case "":
+					case "  ":
+						want = []string{}
+					case " a, ,a,none ":
+						want = []string{"a", "a", "none"}
+					default:
+						want = []string{raw}
+					}
+				case reflect.Bool:
+					dst.SetBool(true)
+					want = true
+					accepted = raw == "false" || raw == "true"
+					if raw == "false" {
+						want = false
+					}
+				}
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(dst.Interface(), want) {
+					t.Fatalf("got=%#v want=%#v", dst.Interface(), want)
+				}
+				var ledger configInputLedger
+				if accepted {
+					ledger = ledger.withInput("mxc", configInputEnvironment, configInputValue)
+				}
+				if cfg.inputProvenance["mxc"] != ledger["mxc"] {
+					t.Fatalf("facts=%+v", cfg.inputProvenance["mxc"])
+				}
+			})
+		}
+	}
+}
+
+func assertDockerSandboxBindingEqual(t *testing.T, got, want DockerSandboxConfig) {
+	t.Helper()
+	if !(math.IsNaN(got.CPUs) && math.IsNaN(want.CPUs)) && math.Float64bits(got.CPUs) != math.Float64bits(want.CPUs) {
+		t.Fatalf("CPUs=%g, want %g", got.CPUs, want.CPUs)
+	}
+	got.CPUs, want.CPUs = 0, 0
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("config=%#v, want %#v", got, want)
+	}
+}
+
+func TestDockerSandboxBindingFileFloatAndPartialState(t *testing.T) {
+	clearConfigEnv(t)
+	for _, trusted := range []bool{false, true} {
+		for _, earlier := range []bool{false, true} {
+			for _, value := range []*float64{nil, new(0.0), new(math.Copysign(0, -1)), new(-1.0), new(1.5), new(2.0), new(math.NaN()), new(math.Inf(1)), new(math.Inf(-1))} {
+				cfg := baseConfig()
+				cfg.DockerSandbox.CPUs = 7
+				cfg.DockerSandbox.Memory, cfg.DockerSandbox.Workdir = "prior", "prior"
+				cfg.DockerSandbox.ExtraWorkspaces, cfg.DockerSandbox.MCP, cfg.DockerSandbox.Kit = []string{"prior"}, []string{"prior"}, []string{"prior"}
+				want := cfg.DockerSandbox
+				file := &fileDockerSandboxConfig{CPUs: value, Memory: new("later"), Clone: new(true), Workdir: new("later"), ExtraWorkspaces: new([]string{"later"}), MCP: new([]string{"later"}), Kit: new([]string{"later"})}
+				if earlier {
+					file.CLIPath, want.CLIPath = "fixture", "fixture"
+				}
+				bad := value != nil && *value < 0
+				if !bad {
+					if value != nil {
+						want.CPUs = *value
+					}
+					want.Memory, want.Clone, want.Workdir = "later", true, "later"
+					want.ExtraWorkspaces, want.MCP, want.Kit = []string{"later"}, []string{"later"}, []string{"later"}
+				}
+				before, err := yaml.Marshal(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = applyFileConfigWithTrust(&cfg, fileConfig{DockerSandbox: file}, trusted)
+				if (err != nil) != bad || bad && err.Error() != "docker-sandbox cpus must be non-negative" {
+					t.Fatalf("file float error=%v", err)
+				}
+				assertDockerSandboxBindingEqual(t, cfg.DockerSandbox, want)
+				after, marshalErr := yaml.Marshal(file)
+				if marshalErr != nil || !bytes.Equal(before, after) {
+					t.Fatal("DTO mutated")
+				}
+				ledger := Config{}
+				source := configInputRepo
+				if trusted {
+					source = configInputUser
+				}
+				recordConfigInput(&ledger, "docker-sandbox", source, earlier || !bad)
+				if cfg.inputProvenance["docker-sandbox"] != ledger.inputProvenance["docker-sandbox"] {
+					t.Fatal("file accepted facts changed")
+				}
+			}
+		}
+	}
+}
+
+func TestDockerSandboxBindingEnvironmentFloatAndPartialState(t *testing.T) {
+	clearConfigEnv(t)
+	for _, earlier := range []bool{false, true} {
+		for _, raw := range []string{"", " ", "invalid", "0", "-0", "-1", "1.5", "2", "NaN", "+Inf", "-Inf", "1e999"} {
+			cfg := baseConfig()
+			cfg.DockerSandbox.CPUs = 7
+			cfg.DockerSandbox.Memory, cfg.DockerSandbox.Workdir = "prior", "prior"
+			cfg.DockerSandbox.ExtraWorkspaces, cfg.DockerSandbox.MCP, cfg.DockerSandbox.Kit = []string{"prior"}, []string{"prior"}, []string{"prior"}
+			want := cfg.DockerSandbox
+			cli := ""
+			if earlier {
+				cli, want.CLIPath = "fixture", "fixture"
+			}
+			t.Setenv("CRABBOX_DOCKER_SANDBOX_CLI", cli)
+			t.Setenv("CRABBOX_DOCKER_SANDBOX_CPUS", raw)
+			for _, suffix := range []string{"MEMORY", "WORKDIR", "EXTRA_WORKSPACES", "MCP", "KIT"} {
+				t.Setenv("CRABBOX_DOCKER_SANDBOX_"+suffix, "later")
+			}
+			t.Setenv("CRABBOX_DOCKER_SANDBOX_CLONE", "true")
+			parsed, parseErr := strconv.ParseFloat(raw, 64)
+			bad := raw != "" && parseErr != nil
+			if !bad {
+				if raw != "" {
+					want.CPUs = parsed
+				}
+				want.Memory, want.Clone, want.Workdir = "later", true, "later"
+				want.ExtraWorkspaces, want.MCP, want.Kit = []string{"later"}, []string{"later"}, []string{"later"}
+			}
+			err := applyEnv(&cfg)
+			if (err != nil) != bad {
+				t.Fatalf("raw=%q error=%v", raw, err)
+			}
+			if bad && err.Error() != fmt.Sprintf("parse CRABBOX_DOCKER_SANDBOX_CPUS: %v", parseErr) {
+				t.Fatalf("raw float diagnostic changed: %v", err)
+			}
+			assertDockerSandboxBindingEqual(t, cfg.DockerSandbox, want)
+			if (cfg.inputProvenance["docker-sandbox"].values != 0) != (earlier || !bad) {
+				t.Fatal("environment partial acceptance changed")
+			}
+		}
+	}
+}
+
+func TestDockerSandboxBindingStringsAndLists(t *testing.T) {
+	clearConfigEnv(t)
+	assertDockerSandboxBindingEqual(t, baseConfig().DockerSandbox, DockerSandboxConfig{CLIPath: "sbx", Agent: "shell"})
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", "  ", "fixture"} {
+			for _, list := range []*[]string{nil, new([]string(nil)), new([]string{}), new([]string{" raw ", "", "a,b", "dup", "dup"})} {
+				cfg := baseConfig()
+				cfg.DockerSandbox = DockerSandboxConfig{CLIPath: "prior", Agent: "prior", Template: "prior", Memory: "prior", Clone: true, Workdir: "prior", ExtraWorkspaces: []string{"prior"}, MCP: []string{"prior"}, Kit: []string{"prior"}}
+				file := &fileDockerSandboxConfig{CLIPath: raw, Agent: raw, Template: &raw, Memory: &raw, Clone: new(false), Workdir: &raw, ExtraWorkspaces: list, MCP: list, Kit: list}
+				want := cfg.DockerSandbox
+				if raw != "" {
+					want.CLIPath, want.Agent = raw, raw
+				}
+				want.Template, want.Memory, want.Clone, want.Workdir = raw, raw, false, raw
+				if list != nil {
+					want.ExtraWorkspaces, want.MCP, want.Kit = append([]string(nil), (*list)...), append([]string(nil), (*list)...), append([]string(nil), (*list)...)
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{DockerSandbox: file}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				assertDockerSandboxBindingEqual(t, cfg.DockerSandbox, want)
+				if list != nil && len(*list) > 0 {
+					cfg.DockerSandbox.ExtraWorkspaces[0] = "changed"
+					if (*list)[0] != " raw " || cfg.DockerSandbox.MCP[0] != " raw " {
+						t.Fatal("raw file lists share input or each other")
+					}
+				}
+			}
+		}
+	}
+	for _, tc := range []struct {
+		raw  *string
+		want []string
+	}{{nil, []string{"prior"}}, {new(""), []string{}}, {new("  "), []string{}}, {new(" NoNe "), []string{}}, {new(" a, ,a,none "), []string{"a", "a", "none"}}} {
+		cfg := baseConfig()
+		cfg.DockerSandbox.ExtraWorkspaces, cfg.DockerSandbox.MCP, cfg.DockerSandbox.Kit = []string{"prior"}, []string{"prior"}, []string{"prior"}
+		for _, suffix := range []string{"EXTRA_WORKSPACES", "MCP", "KIT"} {
+			key := "CRABBOX_DOCKER_SANDBOX_" + suffix
+			t.Setenv(key, "")
+			if tc.raw == nil {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				t.Setenv(key, *tc.raw)
+			}
+		}
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		for _, got := range [][]string{cfg.DockerSandbox.ExtraWorkspaces, cfg.DockerSandbox.MCP, cfg.DockerSandbox.Kit} {
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("environment list=%#v want=%#v", got, tc.want)
+			}
+		}
+		if (cfg.inputProvenance["docker-sandbox"].values != 0) != (tc.raw != nil) {
+			t.Fatal("list environment presence changed")
+		}
+	}
+}
+
+func TestTartMechanicalBindingContract(t *testing.T) {
+	clearConfigEnv(t)
+	wantDefault := TartConfig{Image: DefaultTartImage, User: "admin", WorkRoot: "/Users/admin/crabbox", CPUs: 4, Memory: 8192}
+	if got := baseConfig().Tart; got != wantDefault {
+		t.Fatalf("compiled defaults=%#v", got)
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, n := range []int{-1, 0, 7} {
+			cfg := Config{}
+			input := fileTartConfig{Image: " ", User: "alice", Password: "synthetic-inert", WorkRoot: " /work ", CPUs: &n, Memory: &n, Disk: &n}
+			before := input
+			beforeNumber := n
+			if err := applyFileConfigWithTrust(&cfg, fileConfig{Tart: &input}, trusted); err != nil {
+				t.Fatal(err)
+			}
+			want := TartConfig{Image: " ", User: "alice", Password: "synthetic-inert", WorkRoot: " /work ", CPUs: n, Memory: n, Disk: n}
+			if cfg.Tart != want || !cfg.tartImageExplicit || !cfg.tartCPUsExplicit || !cfg.tartMemoryExplicit || !cfg.tartDiskExplicit {
+				t.Fatal("file values or presence markers changed")
+			}
+			if !reflect.DeepEqual(input, before) || *input.CPUs != beforeNumber || *input.Memory != beforeNumber || *input.Disk != beforeNumber {
+				t.Fatal("file DTO mutated")
+			}
+			source := configInputRepo
+			if trusted {
+				source = configInputUser
+			}
+			if cfg.inputProvenance["tart"].values != 1<<(source-1) || cfg.inputProvenance["tart"].intents != 0 {
+				t.Fatal("file accepted ledger changed")
+			}
+			prior := cfg
+			if err := applyFileConfigWithTrust(&cfg, fileConfig{Tart: &fileTartConfig{}}, trusted); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg, prior) {
+				t.Fatal("missing fields must inherit markers and values")
+			}
+		}
+	}
+	for _, raw := range []string{"", " ", "same"} {
+		t.Run("image/"+raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := Config{Tart: TartConfig{Image: "same"}}
+			t.Setenv("CRABBOX_TART_IMAGE", raw)
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			want := raw
+			if raw == "" {
+				want = "same"
+			}
+			if cfg.Tart.Image != want || cfg.tartImageExplicit != (raw != "") || (cfg.inputProvenance["tart"].values != 0) != (raw != "") {
+				t.Fatal("image acceptance or explicit marker changed")
+			}
+		})
+	}
+}
+
+func TestTartEnvironmentStrings(t *testing.T) {
+	for _, raw := range []string{"", " ", "synthetic-inert"} {
+		t.Run(raw, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := Config{Tart: TartConfig{User: "synthetic-inert", Password: "synthetic-inert", WorkRoot: "synthetic-inert"}}
+			for _, field := range []string{"USER", "PASSWORD", "WORK_ROOT"} {
+				t.Setenv("CRABBOX_TART_"+field, raw)
+			}
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			want := raw
+			if raw == "" {
+				want = "synthetic-inert"
+			}
+			if cfg.Tart.User != want || cfg.Tart.Password != want || cfg.Tart.WorkRoot != want {
+				t.Fatal("raw environment strings changed")
+			}
+			facts := cfg.inputProvenance["tart"]
+			if (facts.values != 0) != (raw != "") || facts.intents != 0 {
+				t.Fatal("environment string acceptance changed")
+			}
+		})
+	}
+}
+
+func TestTartPriorNumericMarkers(t *testing.T) {
+	for _, raw := range []string{"", "invalid", "0", "-1", "7"} {
+		for _, prior := range []int{0, 7} {
+			for _, marker := range []bool{false, true} {
+				clearConfigEnv(t)
+				cfg := Config{Tart: TartConfig{CPUs: prior, Memory: prior, Disk: prior}, tartCPUsExplicit: marker, tartMemoryExplicit: marker, tartDiskExplicit: marker}
+				for _, field := range []string{"CPUS", "MEMORY", "DISK"} {
+					t.Setenv("CRABBOX_TART_"+field, raw)
+				}
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				value, err := strconv.Atoi(raw)
+				if err != nil {
+					value = prior
+				}
+				cpuMarker, diskMarker := marker, marker
+				if raw != "" {
+					cpuMarker, diskMarker = true, value > 0
+				}
+				if cfg.Tart.CPUs != value || cfg.Tart.Memory != value || cfg.Tart.Disk != value || cfg.tartCPUsExplicit != cpuMarker || cfg.tartMemoryExplicit != cpuMarker || cfg.tartDiskExplicit != diskMarker {
+					t.Fatalf("raw=%q prior=%d marker=%v: numeric marker contract changed", raw, prior, marker)
+				}
+				facts := cfg.inputProvenance["tart"]
+				if (facts.values != 0) != (err == nil) || (facts.intents != 0) != (raw != "") {
+					t.Fatal("accepted value and raw intent differ")
+				}
+			}
+		}
+	}
+}
+
+func TestCodespacesBindingDurationSources(t *testing.T) {
+	clearConfigEnv(t)
+	for _, source := range []string{"user", "repo", "env"} {
+		for _, raw := range []string{"", "0", "0s", "-1s", "1ns", "30m", "168h", " 1h ", "bad", "999999999999999999h"} {
+			cfg := baseConfig()
+			before := cfg.GitHubCodespaces
+			file := &fileGitHubCodespacesConfig{IdleTimeout: raw, RetentionPeriod: raw}
+			if source == "env" {
+				t.Setenv("CRABBOX_GITHUB_CODESPACES_IDLE_TIMEOUT", raw)
+				t.Setenv("CRABBOX_GITHUB_CODESPACES_RETENTION_PERIOD", raw)
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := applyFileConfigWithTrust(&cfg, fileConfig{GitHubCodespaces: file}, source == "user"); err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := time.ParseDuration(raw)
+			retentionAccepted := source != "repo" && raw != "" && err == nil && parsed >= 0
+			idleAccepted := source != "repo" && raw != "" && err == nil && parsed > 0
+			want := before
+			if idleAccepted {
+				want.IdleTimeout = parsed
+			}
+			if retentionAccepted {
+				want.RetentionPeriod = parsed
+			}
+			if !reflect.DeepEqual(cfg.GitHubCodespaces, want) || GitHubCodespacesRetentionExplicit(cfg) != retentionAccepted {
+				t.Fatalf("%s %q: %+v retention=%v", source, raw, cfg.GitHubCodespaces, GitHubCodespacesRetentionExplicit(cfg))
+			}
+			if (cfg.inputProvenance["github-codespaces"].values != 0) != (retentionAccepted || idleAccepted) {
+				t.Fatalf("%s %q accepted facts", source, raw)
+			}
+			if file.IdleTimeout != raw || file.RetentionPeriod != raw {
+				t.Fatal("DTO mutated")
+			}
+		}
+		t.Setenv("CRABBOX_GITHUB_CODESPACES_IDLE_TIMEOUT", "")
+		t.Setenv("CRABBOX_GITHUB_CODESPACES_RETENTION_PERIOD", "")
+	}
+}
+
+func TestCodespacesBindingStringsAndMarkers(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaults := baseConfig().GitHubCodespaces
+	wantDefaults := GitHubCodespacesConfig{APIURL: "https://api.github.com", GHPath: "gh", Machine: "basicLinux32gb", IdleTimeout: 30 * time.Minute, RetentionPeriod: 168 * time.Hour, DeleteOnRelease: true, WorkRoot: "/workspaces/crabbox"}
+	if !reflect.DeepEqual(defaults, wantDefaults) {
+		t.Fatalf("defaults=%#v", defaults)
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", " raw ", "~/fixture"} {
+			for _, del := range []*bool{nil, new(false), new(true)} {
+				cfg := baseConfig()
+				cfg.GitHubCodespaces.GHPath = "~/prior"
+				want := cfg.GitHubCodespaces
+				file := &fileGitHubCodespacesConfig{APIURL: raw, GHPath: raw, Repo: raw, Ref: raw, Machine: raw, DevcontainerPath: raw, WorkingDirectory: raw, Geo: raw, WorkRoot: raw, DeleteOnRelease: del}
+				if raw != "" {
+					want.Ref, want.Machine, want.DevcontainerPath, want.WorkingDirectory, want.Geo, want.WorkRoot = raw, raw, raw, raw, raw, raw
+					if trusted {
+						want.APIURL, want.GHPath, want.Repo = raw, expandUserPath(raw), raw
+					}
+				}
+				if trusted && del != nil {
+					want.DeleteOnRelease = *del
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{GitHubCodespaces: file}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(cfg.GitHubCodespaces, want) || DeleteOnReleaseExplicit(cfg, "github-codespaces") != (trusted && del != nil) || GitHubCodespacesRetentionExplicit(cfg) {
+					t.Fatalf("file=%+v cfg=%+v", file, cfg.GitHubCodespaces)
+				}
+				if (cfg.inputProvenance["github-codespaces"].values != 0) != (raw != "" || trusted && del != nil) {
+					t.Fatal("file accepted facts")
+				}
+			}
+		}
+	}
+	for _, raw := range []string{"", "false", "true", "invalid"} {
+		cfg := baseConfig()
+		cfg.GitHubCodespaces.GHPath = "~/prior"
+		t.Setenv("CRABBOX_GITHUB_CODESPACES_DELETE_ON_RELEASE", raw)
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		valid := raw == "false" || raw == "true"
+		if cfg.GitHubCodespaces.GHPath != filepath.Join(home, "prior") || DeleteOnReleaseExplicit(cfg, "github-codespaces") != valid || cfg.GitHubCodespaces.DeleteOnRelease != (raw != "false") {
+			t.Fatal("unconditional env expansion or bool acceptance")
+		}
+		if (cfg.inputProvenance["github-codespaces"].values != 0) != valid {
+			t.Fatal("expansion invented input")
+		}
+	}
+	t.Setenv("CRABBOX_GITHUB_CODESPACES_DELETE_ON_RELEASE", "")
+	for _, raw := range []string{"", " raw ", "~/fixture"} {
+		cfg := baseConfig()
+		want := cfg.GitHubCodespaces
+		for _, key := range []string{"API_URL", "GH_PATH", "REPO", "REF", "MACHINE", "DEVCONTAINER_PATH", "WORKING_DIRECTORY", "GEO", "WORK_ROOT"} {
+			t.Setenv("CRABBOX_GITHUB_CODESPACES_"+key, raw)
+		}
+		if raw != "" {
+			want.APIURL, want.GHPath, want.Repo, want.Ref, want.Machine, want.DevcontainerPath, want.WorkingDirectory, want.Geo, want.WorkRoot = raw, expandUserPath(raw), raw, raw, raw, raw, raw, raw, raw
+		}
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cfg.GitHubCodespaces, want) {
+			t.Fatalf("env %q: %+v", raw, cfg.GitHubCodespaces)
+		}
+	}
+}
+
+func TestIsloIntegerAcceptanceAndMarkers(t *testing.T) {
+	for _, raw := range []string{"", " ", " 2 ", "invalid", "+", "-", "+0", "-0", "0", "+2", "-2", "2", "02", "0x2", "1_0", "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809"} {
+		for _, priorMarker := range []bool{false, true} {
+			clearConfigEnv(t)
+			cfg := Config{Islo: IsloConfig{VCPUs: 2, MemoryMB: 2, DiskGB: 2}, isloVCPUsExplicit: priorMarker, isloMemoryMBExplicit: priorMarker, isloDiskGBExplicit: priorMarker}
+			parsed, parseErr := strconv.Atoi(raw)
+			for _, name := range []string{"CRABBOX_ISLO_VCPUS", "CRABBOX_ISLO_MEMORY_MB", "CRABBOX_ISLO_DISK_GB"} {
+				t.Setenv(name, raw)
+				value, accepted := lookupEnvInteger(name, strconv.IntSize)
+				if accepted != (parseErr == nil) || (accepted && int(value) != parsed) {
+					t.Fatalf("raw=%q: Atoi and accepted native integer differ", raw)
+				}
+			}
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			want, marker := 2, priorMarker
+			if parseErr == nil {
+				want, marker = parsed, true
+			}
+			if cfg.Islo.VCPUs != want || cfg.Islo.MemoryMB != want || cfg.Islo.DiskGB != want || cfg.isloVCPUsExplicit != marker || cfg.isloMemoryMBExplicit != marker || cfg.isloDiskGBExplicit != marker {
+				t.Fatalf("raw=%q prior=%v: values or markers differ", raw, priorMarker)
+			}
+			facts := cfg.inputProvenance["islo"]
+			if (facts.values != 0) != (parseErr == nil) || facts.intents != 0 {
+				t.Fatalf("raw=%q: accepted/intent facts=%#v", raw, facts)
+			}
+		}
+	}
+}
+
+func TestIsloCompleteBindingContract(t *testing.T) {
+	clearConfigEnv(t)
+	base := baseConfig()
+	_, _, _, _, image, _, err := osImageDefaultProviderImages(base.OSImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.Islo != (IsloConfig{BaseURL: "https://api.islo.dev", Image: image, Workdir: "crabbox", VCPUs: 2, MemoryMB: 4096, DiskGB: 20}) {
+		t.Fatal("composed defaults differ")
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, number := range []int{-1, 0, 2} {
+			for _, oldMarker := range []bool{false, true} {
+				cfg := Config{Islo: IsloConfig{VCPUs: 2, MemoryMB: 2, DiskGB: 2, IdlePause: true}, isloVCPUsExplicit: oldMarker, isloMemoryMBExplicit: oldMarker, isloDiskGBExplicit: oldMarker}
+				off := false
+				input := fileIsloConfig{BaseURL: "https://synthetic.example.test", Image: " ", Workdir: " raw ", GatewayProfile: "gateway", SnapshotName: "snapshot", VCPUs: number, MemoryMB: number, DiskGB: number, IdlePause: &off}
+				before := input
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Islo: &input}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				marker := oldMarker || number > 0
+				if cfg.Islo != (IsloConfig{BaseURL: input.BaseURL, Image: " ", Workdir: " raw ", GatewayProfile: "gateway", SnapshotName: "snapshot", VCPUs: 2, MemoryMB: 2, DiskGB: 2}) || !cfg.isloImageExplicit || cfg.isloVCPUsExplicit != marker || cfg.isloMemoryMBExplicit != marker || cfg.isloDiskGBExplicit != marker {
+					t.Fatal("file values/markers differ")
+				}
+				if !reflect.DeepEqual(input, before) || off {
+					t.Fatal("DTO mutated")
+				}
+				wantSource, wantBit := credentialSourceRepository, uint8(1<<(configInputRepo-1))
+				if trusted {
+					wantSource, wantBit = credentialSourceTrustedFile, uint8(1<<(configInputUser-1))
+				}
+				if cfg.credentialProvenance.isloBaseURL != wantSource || cfg.inputProvenance["islo"].values != wantBit || cfg.inputProvenance["islo"].intents != 0 {
+					t.Fatal("source accounting differs")
+				}
+				prior := cfg
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Islo: &fileIsloConfig{}}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(cfg, prior) {
+					t.Fatal("empty file did not inherit")
+				}
+			}
+		}
+	}
+	for _, primary := range []string{"", " ", "synthetic-primary"} {
+		clearConfigEnv(t)
+		var cfg Config
+		t.Setenv("ISLO_API_KEY", "synthetic-alias")
+		t.Setenv("ISLO_BASE_URL", "synthetic-alias")
+		t.Setenv("CRABBOX_ISLO_API_KEY", primary)
+		t.Setenv("CRABBOX_ISLO_BASE_URL", primary)
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		want := primary
+		if want == "" {
+			want = "synthetic-alias"
+		}
+		if cfg.Islo.APIKey != want || cfg.Islo.BaseURL != want || cfg.credentialProvenance.isloAPIKey != credentialSourceEnvironment || cfg.credentialProvenance.isloBaseURL != credentialSourceEnvironment || cfg.inputProvenance["islo"].intents != 0 {
+			t.Fatal("alias source accounting differs")
+		}
+	}
+}
+
+func TestIsloAcceptedFieldIsolation(t *testing.T) {
+	for _, raw := range []string{"", " ", "invalid", "true", "false", " YES ", " OFF "} {
+		clearConfigEnv(t)
+		cfg := Config{Islo: IsloConfig{VCPUs: 2, MemoryMB: 4096, DiskGB: 20, IdlePause: true}}
+		for _, name := range []string{"CRABBOX_ISLO_VCPUS", "CRABBOX_ISLO_MEMORY_MB", "CRABBOX_ISLO_DISK_GB"} {
+			t.Setenv(name, "invalid")
+		}
+		for _, name := range []string{"CRABBOX_ISLO_IMAGE", "CRABBOX_ISLO_WORKDIR", "CRABBOX_ISLO_GATEWAY_PROFILE", "CRABBOX_ISLO_SNAPSHOT_NAME"} {
+			t.Setenv(name, " ")
+		}
+		t.Setenv("CRABBOX_ISLO_IDLE_PAUSE", raw)
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Islo.Image != " " || cfg.Islo.Workdir != " " || cfg.Islo.GatewayProfile != " " || cfg.Islo.SnapshotName != " " || !cfg.isloImageExplicit {
+			t.Fatal("raw strings changed")
+		}
+		if cfg.Islo.VCPUs != 2 || cfg.Islo.MemoryMB != 4096 || cfg.Islo.DiskGB != 20 || cfg.isloVCPUsExplicit || cfg.isloMemoryMBExplicit || cfg.isloDiskGBExplicit {
+			t.Fatal("unrelated acceptance manufactured resource intent")
+		}
+		want := raw != "false" && raw != " OFF "
+		if cfg.Islo.IdlePause != want || cfg.inputProvenance["islo"].values == 0 || cfg.inputProvenance["islo"].intents != 0 {
+			t.Fatal("bool or value/intent accounting changed")
+		}
+	}
+}
+
+func TestBoxdBindingFileFacts(t *testing.T) {
+	clearManualBatchAConfigEnv(t)
+	for _, trusted := range []bool{false, true} {
+		for _, field := range []string{"APIURL", "Org", "WorkRoot", "DeleteOnRelease"} {
+			for _, raw := range []string{"", " prior ", "fixture", "false", "true"} {
+				cfg := baseConfig()
+				cfg.Boxd = BoxdConfig{APIURL: "prior", Org: "prior", WorkRoot: "prior", DeleteOnRelease: true}
+				want := cfg.Boxd
+				file := &fileBoxdConfig{}
+				accepted := false
+				if field == "DeleteOnRelease" {
+					if raw == "false" || raw == "true" {
+						v := raw == "true"
+						file.DeleteOnRelease = &v
+						want.DeleteOnRelease = v
+						accepted = true
+					}
+				} else {
+					reflect.ValueOf(file).Elem().FieldByName(field).SetString(raw)
+					accepted = raw != "" && (trusted || field == "WorkRoot")
+					if accepted {
+						reflect.ValueOf(&want).Elem().FieldByName(field).SetString(raw)
+					}
+				}
+				before, err := yaml.Marshal(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Boxd: file}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				after, err := yaml.Marshal(file)
+				if err != nil || !bytes.Equal(before, after) {
+					t.Fatal("DTO changed")
+				}
+				if !reflect.DeepEqual(cfg.Boxd, want) || IsBoxdWorkRootExplicit(&cfg) != (field == "WorkRoot" && accepted) || DeleteOnReleaseExplicit(cfg, "boxd") != (field == "DeleteOnRelease" && accepted) {
+					t.Fatalf("file %s/%q trusted=%v: %+v", field, raw, trusted, cfg.Boxd)
+				}
+				ledger := Config{}
+				source := configInputRepo
+				if trusted {
+					source = configInputUser
+				}
+				recordConfigInput(&ledger, "boxd", source, accepted)
+				recordConfigInputIntent(&ledger, "boxd", source, accepted && (field == "WorkRoot" || field == "DeleteOnRelease"))
+				if cfg.inputProvenance["boxd"] != ledger.inputProvenance["boxd"] {
+					t.Fatal("file value/intent facts")
+				}
+			}
+		}
+	}
+}
+
+func TestBoxdBindingEnvironmentPresence(t *testing.T) {
+	clearManualBatchAConfigEnv(t)
+	keys := map[string]string{"APIURL": "CRABBOX_BOXD_API_URL", "Org": "CRABBOX_BOXD_ORG", "WorkRoot": "CRABBOX_BOXD_WORK_ROOT", "DeleteOnRelease": "CRABBOX_BOXD_DELETE_ON_RELEASE"}
+	for field, key := range keys {
+		for _, raw := range []*string{nil, new(""), new("prior"), new("  "), new("false"), new("true"), new("invalid")} {
+			for _, k := range keys {
+				t.Setenv(k, "")
+				if err := os.Unsetenv(k); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if raw != nil {
+				t.Setenv(key, *raw)
+			}
+			cfg := baseConfig()
+			cfg.Boxd = BoxdConfig{APIURL: "prior", Org: "prior", WorkRoot: "prior", DeleteOnRelease: true}
+			want := cfg.Boxd
+			accepted := false
+			if raw != nil {
+				switch field {
+				case "APIURL", "Org":
+					accepted = true
+				case "WorkRoot":
+					accepted = *raw != ""
+				case "DeleteOnRelease":
+					accepted = *raw == "true" || *raw == "false"
+				}
+			}
+			if accepted {
+				if field == "DeleteOnRelease" {
+					want.DeleteOnRelease = *raw == "true"
+				} else {
+					reflect.ValueOf(&want).Elem().FieldByName(field).SetString(*raw)
+				}
+			}
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Boxd, want) || IsBoxdWorkRootExplicit(&cfg) != (field == "WorkRoot" && accepted) || DeleteOnReleaseExplicit(cfg, "boxd") != (field == "DeleteOnRelease" && accepted) {
+				t.Fatalf("env %s: %+v want %+v", field, cfg.Boxd, want)
+			}
+			ledger := Config{}
+			recordConfigInput(&ledger, "boxd", configInputEnvironment, accepted)
+			recordConfigInputIntent(&ledger, "boxd", configInputEnvironment, accepted && (field == "WorkRoot" || field == "DeleteOnRelease"))
+			if cfg.inputProvenance["boxd"] != ledger.inputProvenance["boxd"] {
+				t.Fatal("env value/intent facts")
+			}
+		}
+	}
+}
+
+func TestStaticCompleteFileEnvironmentBindings(t *testing.T) {
+	clearConfigEnv(t)
+	if baseConfig().Static != (StaticConfig{}) {
+		t.Fatal("Static must have zero compiled defaults")
+	}
+	prior := StaticConfig{ID: "old-id", Name: "old-name", Host: "old-host", User: "old-user", Port: "old-port", WorkRoot: "old-root"}
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []string{"", " ", "replacement"} {
+			cfg := Config{Static: prior, SSHUser: "generic-user", SSHPort: "generic-port", SSHKey: "/synthetic/not-read", WorkRoot: "/generic"}
+			input := fileStaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}
+			before := input
+			if err := applyFileConfigWithTrust(&cfg, fileConfig{Static: &input}, trusted); err != nil {
+				t.Fatal(err)
+			}
+			want := prior
+			if raw != "" {
+				want = StaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}
+			}
+			if cfg.Static != want || input != before {
+				t.Fatal("file values or immutable DTO changed")
+			}
+			facts := cfg.inputProvenance["ssh"]
+			wantSource, bit := credentialSourceRepository, uint8(1<<(configInputRepo-1))
+			if trusted {
+				wantSource, bit = credentialSourceTrustedFile, uint8(1<<(configInputUser-1))
+			}
+			if raw == "" {
+				wantSource, bit = credentialSourceUnknown, 0
+			}
+			if facts.values != bit || facts.intents != 0 || cfg.credentialProvenance.staticHost != wantSource {
+				t.Fatal("file accepted-source accounting changed")
+			}
+			if cfg.SSHUser != "generic-user" || cfg.SSHPort != "generic-port" || cfg.SSHKey != "/synthetic/not-read" || cfg.WorkRoot != "/generic" || cfg.explicitSSHUser != "" || cfg.explicitSSHPort != "" || cfg.explicitSSHKey != "" || cfg.explicitWorkRoot != "" {
+				t.Fatal("Static overlay changed generic connection policy")
+			}
+		}
+	}
+	for _, raw := range []string{"", " ", "replacement"} {
+		clearConfigEnv(t)
+		cfg := Config{Static: prior}
+		for _, name := range []string{"ID", "NAME", "HOST", "USER", "PORT", "WORK_ROOT"} {
+			t.Setenv("CRABBOX_STATIC_"+name, raw)
+		}
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		want := prior
+		if raw != "" {
+			want = StaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}
+		}
+		if cfg.Static != want || (cfg.inputProvenance["ssh"].values != 0) != (raw != "") || cfg.inputProvenance["ssh"].intents != 0 {
+			t.Fatal("environment values/acceptance changed")
+		}
+		wantSource := credentialSourceUnknown
+		if raw != "" {
+			wantSource = credentialSourceEnvironment
+		}
+		if cfg.credentialProvenance.staticHost != wantSource {
+			t.Fatal("environment host source changed")
+		}
+	}
+}
+
+func TestStaticTargetFlagsEarlyFailureState(t *testing.T) {
+	for _, raw := range []string{"", " ", "synthetic"} {
+		for _, target := range []string{"invalid", "linux"} {
+			cfg := baseConfig()
+			cfg.Provider = "other"
+			cfg.Static = StaticConfig{ID: "retained-id", Name: "retained-name", Host: "old", User: "old", Port: "old", WorkRoot: "old"}
+			cfg.credentialProvenance.staticHost = credentialSourceTrustedFile
+			fs := newFlagSet("test", io.Discard)
+			values := registerTargetFlags(fs, cfg)
+			args := []string{"--target=" + target, "--static-host=" + raw, "--static-user=" + raw, "--static-port=" + raw, "--static-work-root=" + raw}
+			if target == "linux" {
+				args = append(args, "--windows-mode=wsl2")
+			}
+			if err := fs.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			err := applyTargetFlagOverrides(&cfg, fs, values)
+			wantError := "target must be"
+			if target == "linux" {
+				wantError = "windows.mode is only valid"
+			}
+			if err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("error=%v", err)
+			}
+			if cfg.Static != (StaticConfig{ID: "retained-id", Name: "retained-name", Host: raw, User: raw, Port: raw, WorkRoot: raw}) || cfg.credentialProvenance.staticHost != credentialSourceFlag || cfg.inputProvenance["ssh"].values != 1<<(configInputFlag-1) || cfg.inputProvenance["ssh"].intents != 0 {
+				t.Fatal("static acceptance/source must precede target validation failure")
+			}
+			if !cfg.targetExplicit || !cfg.targetFlagExplicit || cfg.Provider != "other" || cfg.explicitSSHUser != "" || cfg.explicitSSHPort != "" || cfg.explicitWorkRoot != "" {
+				t.Fatal("target or generic marker policy changed")
+			}
+		}
+	}
+}
+
+func TestStaticFlagRegistrationContract(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Static = StaticConfig{Host: "host.example.test", User: "alice", Port: "2022", WorkRoot: "/work/raw"}
+	fs := newFlagSet("test", io.Discard)
+	registerTargetFlags(fs, cfg)
+	for _, tc := range []struct{ name, value, help string }{
+		{"static-host", cfg.Static.Host, "static SSH host"}, {"static-user", cfg.Static.User, "static SSH user"}, {"static-port", cfg.Static.Port, "static SSH port"}, {"static-work-root", cfg.Static.WorkRoot, "static target work root"},
+	} {
+		f := fs.Lookup(tc.name)
+		if f == nil || f.DefValue != tc.value || f.Usage != tc.help {
+			t.Fatalf("registration changed for %s", tc.name)
+		}
+	}
+	for _, name := range []string{"static-id", "static-name", "static-key"} {
+		if fs.Lookup(name) != nil {
+			t.Fatalf("unexpected flag %s", name)
+		}
+	}
+}
+
+func TestHyperVBindingFileContract(t *testing.T) {
+	clearConfigEnv(t)
+	if baseConfig().HyperV != (HyperVConfig{User: "crabbox", WorkRoot: `C:\crabbox`, CPUs: 4, Memory: 8192, Switch: "Default Switch"}) {
+		t.Fatal("compiled defaults differ")
+	}
+	for _, trusted := range []bool{false, true} {
+		for _, field := range []string{"Image", "User", "WorkRoot", "CPUs", "Memory", "Switch", "GuestPassword", "InitPassword"} {
+			for _, raw := range []string{"", " ", "synthetic-inert", "-1", "0", "7", "13", "false", "true"} {
+				cfg := Config{HyperV: HyperVConfig{Image: "prior", User: "prior", WorkRoot: "prior", CPUs: 7, Memory: 7, Switch: "prior", GuestPassword: "synthetic-prior", InitPassword: true}}
+				want := cfg.HyperV
+				input := fileHyperVConfig{}
+				accepted := false
+				switch field {
+				case "CPUs", "Memory":
+					n, err := strconv.Atoi(raw)
+					if err != nil {
+						continue
+					}
+					reflect.ValueOf(&input).Elem().FieldByName(field).SetInt(int64(n))
+					accepted = n > 0
+					if accepted {
+						reflect.ValueOf(&want).Elem().FieldByName(field).SetInt(int64(n))
+					}
+				case "InitPassword":
+					if raw == "true" || raw == "false" {
+						v := raw == "true"
+						input.InitPassword = &v
+						want.InitPassword = v
+						accepted = true
+					} else if raw != "" {
+						continue
+					}
+				default:
+					reflect.ValueOf(&input).Elem().FieldByName(field).SetString(raw)
+					accepted = raw != ""
+					if accepted {
+						reflect.ValueOf(&want).Elem().FieldByName(field).SetString(raw)
+					}
+				}
+				before, _ := yaml.Marshal(input)
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{HyperV: &input}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				after, _ := yaml.Marshal(input)
+				facts := cfg.inputProvenance["hyperv"]
+				bit := uint8(1 << (configInputRepo - 1))
+				if trusted {
+					bit = 1 << (configInputUser - 1)
+				}
+				if !accepted {
+					bit = 0
+				}
+				if cfg.HyperV != want || !bytes.Equal(before, after) || facts.values != bit || facts.intents != 0 {
+					t.Fatalf("file contract field=%s raw=%q trusted=%v", field, raw, trusted)
+				}
+			}
+		}
+	}
+}
+
+func TestHyperVBindingEnvironmentContract(t *testing.T) {
+	for _, field := range []struct{ name, key string }{{"Image", "IMAGE"}, {"User", "USER"}, {"WorkRoot", "WORK_ROOT"}, {"CPUs", "CPUS"}, {"Memory", "MEMORY"}, {"Switch", "SWITCH"}, {"GuestPassword", "GUEST_PASSWORD"}, {"InitPassword", "INIT_PASSWORD"}} {
+		for _, raw := range []string{"", " ", "synthetic-inert", " 7 ", "7", "+7", "0", "-1", "9223372036854775808", "-9223372036854775809", "true", " OFF ", "invalid"} {
+			clearConfigEnv(t)
+			for _, key := range []string{"IMAGE", "USER", "WORK_ROOT", "CPUS", "MEMORY", "SWITCH", "GUEST_PASSWORD", "INIT_PASSWORD"} {
+				t.Setenv("CRABBOX_HYPERV_"+key, "")
+			}
+			cfg := Config{HyperV: HyperVConfig{Image: "prior", User: "prior", WorkRoot: "prior", CPUs: 7, Memory: 7, Switch: "prior", GuestPassword: "synthetic-prior", InitPassword: true}}
+			want := cfg.HyperV
+			accepted := false
+			switch field.name {
+			case "CPUs", "Memory":
+				n, err := strconv.Atoi(raw)
+				accepted = err == nil
+				if accepted {
+					reflect.ValueOf(&want).Elem().FieldByName(field.name).SetInt(int64(n))
+				}
+			case "InitPassword":
+				accepted = raw == "true" || raw == " OFF " || raw == "0"
+				if accepted {
+					want.InitPassword = raw == "true"
+				}
+			default:
+				accepted = raw != ""
+				if accepted {
+					reflect.ValueOf(&want).Elem().FieldByName(field.name).SetString(raw)
+				}
+			}
+			t.Setenv("CRABBOX_HYPERV_"+field.key, raw)
+			if err := applyEnv(&cfg); err != nil {
+				t.Fatal(err)
+			}
+			facts := cfg.inputProvenance["hyperv"]
+			if cfg.HyperV != want || (facts.values != 0) != accepted || facts.intents != 0 {
+				t.Fatalf("env contract field=%s raw=%q", field.name, raw)
+			}
+		}
+	}
+}
+
+func TestWindowsSandboxBindingFiles(t *testing.T) {
+	fields := []string{"Workdir", "TempRoot", "Networking", "VGPU", "Clipboard", "ProtectedClient", "AudioInput", "VideoInput", "PrinterRedirection", "MemoryMB"}
+	for _, trusted := range []bool{false, true} {
+		for _, field := range fields {
+			for _, raw := range []string{"", "  ", "prior", "~/fixture", "0", "-1", "8192"} {
+				cfg := baseConfig()
+				cfg.WindowsSandbox = WindowsSandboxConfig{Workdir: "prior", TempRoot: "prior", Networking: "prior", VGPU: "prior", Clipboard: "prior", ProtectedClient: "prior", AudioInput: "prior", VideoInput: "prior", PrinterRedirection: "prior", MemoryMB: 4096}
+				want := cfg.WindowsSandbox
+				file := &fileWindowsSandboxConfig{}
+				accepted := false
+				if field == "MemoryMB" {
+					n, _ := strconv.Atoi(raw)
+					file.MemoryMB = n
+					accepted = trusted && n > 0
+					if accepted {
+						want.MemoryMB = n
+					}
+				} else {
+					reflect.ValueOf(file).Elem().FieldByName(field).SetString(raw)
+					accepted = raw != "" && (trusted || field == "Workdir")
+					if accepted {
+						value := raw
+						if field == "TempRoot" {
+							value = expandUserPath(raw)
+						}
+						reflect.ValueOf(&want).Elem().FieldByName(field).SetString(value)
+					}
+				}
+				before := *file
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{WindowsSandbox: file}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				if *file != before || cfg.WindowsSandbox != want {
+					t.Fatalf("%s/%q trusted=%v got=%+v want=%+v", field, raw, trusted, cfg.WindowsSandbox, want)
+				}
+				source := configInputRepo
+				if trusted {
+					source = configInputUser
+				}
+				ledger := Config{}
+				recordConfigInput(&ledger, "windows-sandbox", source, accepted)
+				if cfg.inputProvenance["windows-sandbox"] != ledger.inputProvenance["windows-sandbox"] {
+					t.Fatal("file accepted facts")
+				}
+			}
+		}
+	}
+}
+
+func TestWindowsSandboxBindingEnvironment(t *testing.T) {
+	fields := []struct{ field, env string }{
+		{"Workdir", "WORKDIR"}, {"TempRoot", "TEMP_ROOT"}, {"Networking", "NETWORKING"}, {"VGPU", "VGPU"}, {"Clipboard", "CLIPBOARD"}, {"ProtectedClient", "PROTECTED_CLIENT"}, {"AudioInput", "AUDIO_INPUT"}, {"VideoInput", "VIDEO_INPUT"}, {"PrinterRedirection", "PRINTER_REDIRECTION"}, {"MemoryMB", "MEMORY_MB"},
+	}
+	for _, field := range fields {
+		for _, raw := range []string{"", "  ", "prior", "~/fixture", "0", "-1", "4096", "8192", " 12 ", "999999999999999999999999"} {
+			t.Run(field.field+"/"+raw, func(t *testing.T) {
+				clearConfigEnv(t)
+				cfg := baseConfig()
+				cfg.WindowsSandbox = WindowsSandboxConfig{Workdir: "prior", TempRoot: "~/retained-fixture", Networking: "prior", VGPU: "prior", Clipboard: "prior", ProtectedClient: "prior", AudioInput: "prior", VideoInput: "prior", PrinterRedirection: "prior", MemoryMB: 4096}
+				want := cfg.WindowsSandbox
+				want.TempRoot = expandUserPath(want.TempRoot)
+				accepted := raw != ""
+				if field.field == "MemoryMB" {
+					n, err := strconv.Atoi(raw)
+					accepted = err == nil
+					if accepted {
+						want.MemoryMB = n
+					}
+				} else if accepted {
+					value := raw
+					if field.field == "TempRoot" {
+						value = expandUserPath(raw)
+					}
+					reflect.ValueOf(&want).Elem().FieldByName(field.field).SetString(value)
+				}
+				t.Setenv("CRABBOX_WINDOWS_SANDBOX_"+field.env, raw)
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				if cfg.WindowsSandbox != want {
+					t.Fatalf("got=%+v want=%+v", cfg.WindowsSandbox, want)
+				}
+				facts := cfg.inputProvenance["windows-sandbox"]
+				if (facts.values != 0) != accepted || facts.intents != 0 {
+					t.Fatal("environment accepted facts")
+				}
+			})
+		}
+	}
+	t.Run("absent-path-expands-without-acceptance", func(t *testing.T) {
+		clearConfigEnv(t)
+		cfg := baseConfig()
+		cfg.WindowsSandbox.TempRoot = "~/retained-fixture"
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.WindowsSandbox.TempRoot != expandUserPath("~/retained-fixture") || cfg.inputProvenance["windows-sandbox"].values != 0 {
+			t.Fatal("absent path expansion")
+		}
+	})
+}
+
+func TestLocalContainerBindingInitializationAndOmissions(t *testing.T) {
+	for _, image := range []string{"", " resolved-image "} {
+		want := LocalContainerConfig{Runtime: "docker", Image: image, User: "crabbox", Network: "bridge"}
+		if !reflect.DeepEqual(initialLocalContainerConfig(image), want) {
+			t.Fatal("resolved image or configured defaults changed")
+		}
+	}
+	for _, trusted := range []bool{false, true} {
+		cfg := baseConfig()
+		volumes := []string{"kept"}
+		metadata := map[string]string{"kept": "value"}
+		cfg.LocalContainer.Volumes = volumes
+		cfg.LocalContainer.CheckpointMetadata = metadata
+		var file fileConfig
+		if err := yaml.Unmarshal([]byte("localContainer:\n  runtime: fixture\n  image: fixture\n  user: fixture\n  workRoot: fixture\n  cpus: 3\n  memory: fixture\n  network: fixture\n  dockerSocket: true\n  noHostname: true\n  volumes: [ignored]\n  checkpointMetadata: {ignored: ignored}\n"), &file); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyFileConfigWithTrust(&cfg, file, trusted); err != nil {
+			t.Fatal(err)
+		}
+		want := LocalContainerConfig{Runtime: "fixture", Image: "fixture", User: "fixture", WorkRoot: "fixture", CPUs: 3, Memory: "fixture", Network: "fixture", DockerSocket: true, NoHostname: true, Volumes: volumes, CheckpointMetadata: metadata}
+		if !reflect.DeepEqual(cfg.LocalContainer, want) {
+			t.Fatal("file sources widened/narrowed")
+		}
+		clearConfigEnv(t)
+		t.Setenv("CRABBOX_LOCAL_CONTAINER_VOLUMES", "ignored")
+		t.Setenv("CRABBOX_LOCAL_CONTAINER_CHECKPOINT_METADATA", "ignored")
+		if err := applyEnv(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cfg.LocalContainer, want) {
+			t.Fatal("runtime-only values gained environment source")
+		}
+		volumes[0] = "later"
+		metadata["kept"] = "later"
+		if cfg.LocalContainer.Volumes[0] != "later" || cfg.LocalContainer.CheckpointMetadata["kept"] != "later" {
+			t.Fatal("ordinary overlays changed runtime-state identity")
+		}
+	}
+}
+
+func TestActionsWorkflowOwnerFileAndCodec(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		for _, raw := range []*string{nil, new(""), new("prior"), new(" raw ")} {
+			for _, tc := range []struct {
+				input, want []string
+				accepted    bool
+			}{{nil, []string{"prior=1"}, false}, {[]string{}, []string{"prior=1"}, false}, {[]string{"", " "}, []string{}, true}, {[]string{" a=1 ", "a=1", "b=2", "a=2"}, []string{"a=1", "b=2", "a=2"}, true}} {
+				cfg := baseConfig()
+				job := JobConfig{}
+				for _, name := range []string{"Repo", "Workflow", "Job", "Ref"} {
+					reflect.ValueOf(&cfg.Actions).Elem().FieldByName(name).SetString("prior")
+					reflect.ValueOf(&job.Actions).Elem().FieldByName(name).SetString("prior")
+				}
+				cfg.Actions.Fields = []string{"prior=1"}
+				job.Actions.Fields = []string{"prior=1"}
+				input := map[string]any{"fields": tc.input}
+				for _, key := range []string{"repo", "workflow", "job", "ref"} {
+					if raw == nil {
+						input[key] = nil
+					} else {
+						input[key] = *raw
+					}
+				}
+				body, err := yaml.Marshal(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var global fileActionsConfig
+				var perJob fileJobActionsConfig
+				if err := yaml.Unmarshal(body, &global); err != nil {
+					t.Fatal(err)
+				}
+				if err := yaml.Unmarshal(body, &perJob); err != nil {
+					t.Fatal(err)
+				}
+				before, err := yaml.Marshal(global)
+				if err != nil {
+					t.Fatal(err)
+				}
+				jobBefore, err := yaml.Marshal(perJob)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, jobBefore) {
+					t.Fatal("global/job YAML field shape differs")
+				}
+				if err := applyFileConfigWithTrust(&cfg, fileConfig{Actions: &global}, trusted); err != nil {
+					t.Fatal(err)
+				}
+				job = applyFileJobConfig(job, fileJobConfig{Actions: &perJob})
+				wantText := "prior"
+				if raw != nil && *raw != "" {
+					wantText = *raw
+				}
+				for _, name := range []string{"Repo", "Workflow", "Job", "Ref"} {
+					if reflect.ValueOf(cfg.Actions).FieldByName(name).String() != wantText || reflect.ValueOf(job.Actions).FieldByName(name).String() != wantText {
+						t.Fatal("string overlay")
+					}
+				}
+				if !reflect.DeepEqual(cfg.Actions.Fields, tc.want) || !reflect.DeepEqual(job.Actions.Fields, tc.want) {
+					t.Fatalf("list cfg=%#v job=%#v want=%#v", cfg.Actions.Fields, job.Actions.Fields, tc.want)
+				}
+				ledger := Config{}
+				source := configInputRepo
+				if trusted {
+					source = configInputUser
+				}
+				recordConfigInput(&ledger, configInputGeneric, source, tc.accepted || raw != nil && *raw != "")
+				if cfg.inputProvenance[configInputGeneric] != ledger.inputProvenance[configInputGeneric] {
+					t.Fatal("accepted source facts")
+				}
+				after, _ := yaml.Marshal(global)
+				jobAfter, _ := yaml.Marshal(perJob)
+				if !bytes.Equal(before, after) || !bytes.Equal(jobBefore, jobAfter) {
+					t.Fatal("input DTO mutated")
+				}
+				if len(global.Fields) > 0 && len(cfg.Actions.Fields) > 0 {
+					cfg.Actions.Fields[0] = "changed"
+					if global.Fields[0] == "changed" || job.Actions.Fields[0] == "changed" {
+						t.Fatal("list copy sharing")
+					}
+				}
+			}
+		}
+	}
+	cfg := baseConfig()
+	cfg.Actions.Repo = "repo"
+	cfg.Actions.Workflow = "workflow"
+	cfg.Actions.Job = "job"
+	cfg.Actions.Ref = "ref"
+	cfg.Actions.Fields = []string{"a=1"}
+	cfg.Actions.RunnerLabels = []string{"runner"}
+	cfg.Actions.RunnerVersion = "v"
+	cfg.Actions.Ephemeral = false
+	raw, err := json.Marshal(cfg.Actions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"Repo":"repo","Workflow":"workflow","Job":"job","Ref":"ref","Fields":["a=1"],"RunnerLabels":["runner"],"RunnerVersion":"v","Ephemeral":false}` {
+		t.Fatalf("raw JSON=%s", raw)
+	}
+	view := configShowView(cfg)["actions"].(map[string]any)
+	if _, ok := view["fields"]; ok {
+		t.Fatal("global view gained fields")
+	}
+	if view["repo"] != "repo" || view["ephemeral"] != false {
+		t.Fatal("global view")
+	}
+	var file fileConfig
+	if err := yaml.Unmarshal([]byte("actions:\n  repo: example/app\n  fields: [a=1]\n  runnerLabels: [one]\n  runnerVersion: latest\n  ephemeral: false\njobs:\n  demo:\n    actions:\n      repo: example/job\n      fields: [b=2]\n"), &file); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := yaml.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape map[string]any
+	if err := yaml.Unmarshal(encoded, &shape); err != nil {
+		t.Fatal(err)
+	}
+	actions := shape["actions"].(map[string]any)
+	if len(actions) != 5 || actions["ephemeral"] != false || actions["repo"] != "example/app" {
+		t.Fatalf("flat writer shape=%#v", actions)
+	}
+	jobs := shape["jobs"].(map[string]any)
+	j := jobs["demo"].(map[string]any)["actions"].(map[string]any)
+	if len(j) != 2 || j["repo"] != "example/job" {
+		t.Fatal("job writer shape")
+	}
+	var empty fileActionsConfig
+	out, err := yaml.Marshal(&empty)
+	if err != nil || string(out) != "{}\n" {
+		t.Fatalf("empty file=%q %v", out, err)
+	}
+}
+
+func TestActionsWorkflowOwnerEnvironmentPhases(t *testing.T) {
+	clearConfigEnv(t)
+	for _, failure := range []bool{false, true} {
+		cfg := baseConfig()
+		cfg.Actions.RunnerLabels = []string{"prior"}
+		cfg.Actions.Ephemeral = true
+		cfg.Actions.Fields = []string{"kept=1"}
+		for _, key := range []string{"REPO", "WORKFLOW", "JOB", "REF", "RUNNER_VERSION"} {
+			t.Setenv("CRABBOX_ACTIONS_"+key, " raw ")
+		}
+		t.Setenv("CRABBOX_ACTIONS_RUNNER_LABELS", " a, a, ,b ")
+		t.Setenv("CRABBOX_ACTIONS_EPHEMERAL", "false")
+		t.Setenv("CRABBOX_CLOUDFLARE_SANDBOX_EXEC_TIMEOUT_SECS", "")
+		if failure {
+			t.Setenv("CRABBOX_CLOUDFLARE_SANDBOX_EXEC_TIMEOUT_SECS", "invalid")
+		}
+		err := applyEnv(&cfg)
+		if (err != nil) != failure {
+			t.Fatal(err)
+		}
+		if cfg.Actions.Repo != " raw " || cfg.Actions.Workflow != " raw " || cfg.Actions.Job != " raw " || cfg.Actions.Ref != " raw " || cfg.Actions.RunnerVersion != " raw " {
+			t.Fatal("early values")
+		}
+		want := []string{"a", "a", "b"}
+		if failure {
+			want = []string{"prior"}
+		}
+		if !reflect.DeepEqual(cfg.Actions.RunnerLabels, want) || cfg.Actions.Ephemeral != failure || !reflect.DeepEqual(cfg.Actions.Fields, []string{"kept=1"}) {
+			t.Fatal("late source moved or fields changed")
+		}
+	}
+}
+
+func TestActionsWorkflowOwnerJobArguments(t *testing.T) {
+	job := JobConfig{}
+	job.Actions.Repo = "example/app"
+	job.Actions.Workflow = "workflow"
+	job.Actions.Job = "job"
+	job.Actions.Ref = "ref"
+	job.Actions.Fields = []string{"a=1", "a=2", " raw=3 "}
+	want := []string{"--id", "inert-id", "--repo", "example/app", "--workflow", "workflow", "--ref", "ref", "--job", "job", "--field", "a=1", "--field", "a=2", "--field", " raw=3 "}
+	if got := jobActionsHydrateArgs(job, "inert-id", false); !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv=%#v", got)
+	}
+	raw, err := json.Marshal(job.Actions)
+	if err != nil || string(raw) != `{"Repo":"example/app","Workflow":"workflow","Job":"job","Ref":"ref","Fields":["a=1","a=2"," raw=3 "]}` {
+		t.Fatalf("job JSON=%s %v", raw, err)
+	}
+	views := jobConfigViews(map[string]JobConfig{"demo": job})
+	fields := views["demo"].(map[string]any)["actions"].(map[string]any)["fields"]
+	if !reflect.DeepEqual(fields, job.Actions.Fields) {
+		t.Fatal("job fields view")
+	}
+}
+
+func TestNvidiaBrevExplicitDefaultTargetSources(t *testing.T) {
+	for _, source := range []string{"file", "env"} {
+		t.Run(source, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := baseConfig()
+			if IsNvidiaBrevTargetExplicit(&cfg) {
+				t.Fatal("default marked explicit")
+			}
+			if source == "file" {
+				if err := applyFileConfig(&cfg, fileConfig{NvidiaBrev: &fileNvidiaBrevConfig{Target: "container"}}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				t.Setenv("CRABBOX_NVIDIA_BREV_TARGET", "container")
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !IsNvidiaBrevTargetExplicit(&cfg) || cfg.NvidiaBrev.Target != "container" {
+				t.Fatalf("explicit default lost: %#v", cfg.NvidiaBrev)
+			}
+		})
 	}
 }

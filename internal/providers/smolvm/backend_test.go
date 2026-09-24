@@ -25,6 +25,7 @@ import (
 
 	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 func TestSmolvmFlagPresenceAndValidationOrder(t *testing.T) {
@@ -52,6 +53,7 @@ func TestSmolvmFlagPresenceAndValidationOrder(t *testing.T) {
 	if err := ApplySmolvmProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
+	core.RecordProviderFlagInputs(&before, true, "smolvm")
 	if !reflect.DeepEqual(cfg, before) {
 		t.Fatal("positive fields/central provenance changed")
 	}
@@ -66,7 +68,7 @@ func TestSmolvmFlagPresenceAndValidationOrder(t *testing.T) {
 		t.Fatal("explicit false/empty/zero flags changed")
 	}
 	for _, name := range []string{"smolvm", "smol", "smolmachines", "smolfleet", "SMOL", " smolvm "} {
-		cfg := Config{Provider: name}
+		cfg := core.Config{Provider: name}
 		fs := flag.NewFlagSet("guard", flag.ContinueOnError)
 		fs.String("class", "", "")
 		fs.String("type", "", "")
@@ -93,7 +95,7 @@ func TestSmolvmFlagPresenceAndValidationOrder(t *testing.T) {
 			}
 		}
 	}
-	cfg = Config{Smolvm: core.SmolvmConfig{Network: "other", CPUs: -1, MemoryMB: -1, Workdir: "relative"}}
+	cfg = core.Config{Smolvm: core.SmolvmConfig{Network: "other", CPUs: -1, MemoryMB: -1, Workdir: "relative"}}
 	if err := ApplySmolvmProviderFlags(&cfg, flag.NewFlagSet("foreign", flag.ContinueOnError), struct{}{}); err != nil {
 		t.Fatal("foreign values reached validation")
 	}
@@ -116,13 +118,13 @@ func TestSmolvmFlagPresenceAndValidationOrder(t *testing.T) {
 
 func TestSmolvmSixDefaultConsumersAndSeparateNetworkRoot(t *testing.T) {
 	for _, tc := range []struct{ base, image, dir, wantBase, wantImage, wantDir, wantHost string }{{"", "", "", "https://api.smolmachines.com", "alpine", "/workspace", "api.smolmachines.com"}, {"  ", "  ", "  ", "https://api.smolmachines.com", "alpine", "/workspace", "api.smolmachines.com"}, {" http://127.0.0.1:8787/api/ ", " ubuntu ", " /workspace/app ", "http://127.0.0.1:8787/api", "ubuntu", "/workspace/app", "127.0.0.1:8787"}} {
-		cfg := Config{Smolvm: core.SmolvmConfig{APIKey: "inert", BaseURL: tc.base, Image: tc.image, Workdir: tc.dir}}
+		cfg := core.Config{Smolvm: core.SmolvmConfig{APIKey: "inert", BaseURL: tc.base, Image: tc.image, Workdir: tc.dir}}
 		before := cfg.Smolvm
 		endpoint, err := smolvmEndpoint(cfg)
 		if err != nil || endpoint != tc.wantBase {
 			t.Fatalf("endpoint=%q err=%v", endpoint, err)
 		}
-		api, err := newAPI(cfg, Runtime{HTTP: &http.Client{}})
+		api, err := newAPI(cfg, core.Runtime{HTTP: &http.Client{}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,7 +136,7 @@ func TestSmolvmSixDefaultConsumersAndSeparateNetworkRoot(t *testing.T) {
 		}
 	}
 	for _, raw := range []int{-1, 0, 7} {
-		cfg := Config{Smolvm: core.SmolvmConfig{CPUs: raw, MemoryMB: raw}}
+		cfg := core.Config{Smolvm: core.SmolvmConfig{CPUs: raw, MemoryMB: raw}}
 		cpu, memory := 2, 2048
 		if raw > 0 {
 			cpu, memory = raw, raw
@@ -143,11 +145,11 @@ func TestSmolvmSixDefaultConsumersAndSeparateNetworkRoot(t *testing.T) {
 			t.Fatal("numeric default changed")
 		}
 	}
-	if networkMode(Config{}) != "blocked" || networkMode(core.BaseConfig()) != "open" {
+	if networkMode(core.Config{}) != "blocked" || networkMode(core.BaseConfig()) != "open" {
 		t.Fatal("raw empty network and compiled open default conflated")
 	}
 	for raw, want := range map[string]string{"  ": "blocked", " PUBLIC ": "open", "private": "blocked"} {
-		if got := networkMode(Config{Smolvm: core.SmolvmConfig{Network: raw}}); got != want {
+		if got := networkMode(core.Config{Smolvm: core.SmolvmConfig{Network: raw}}); got != want {
 			t.Fatalf("network raw=%q got=%q", raw, got)
 		}
 	}
@@ -163,16 +165,16 @@ func TestSmolvmSixDefaultConsumersAndSeparateNetworkRoot(t *testing.T) {
 
 func TestProviderSpecAndAliases(t *testing.T) {
 	p := Provider{}
-	if p.Name() != providerName {
-		t.Fatalf("Name=%q want %s", p.Name(), providerName)
+	if p.Spec().Name != providerName {
+		t.Fatalf("Name=%q want %s", p.Spec().Name, providerName)
 	}
 	for _, alias := range []string{"smol", "smolmachines", "smolfleet"} {
 		got, err := core.ProviderFor(alias)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", alias, err)
 		}
-		if got.Name() != providerName {
-			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Name())
+		if got.Spec().Name != providerName {
+			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Spec().Name)
 		}
 	}
 	spec := p.Spec()
@@ -306,10 +308,10 @@ func TestClientUsesSmolvmRESTShape(t *testing.T) {
 }
 
 func TestNewAPIRejectsBareHTTPBaseURL(t *testing.T) {
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Smolvm.APIKey = "smk_key"
 	cfg.Smolvm.BaseURL = "http://api.smolmachines.com"
-	if _, err := newAPI(cfg, Runtime{}); err == nil {
+	if _, err := newAPI(cfg, core.Runtime{}); err == nil {
 		t.Fatal("newAPI accepted plaintext http URL")
 	}
 }
@@ -320,48 +322,48 @@ func TestNewAPIRejectsUserinfoQueryAndFragment(t *testing.T) {
 		"https://api.smolmachines.com?key=value",
 		"https://api.smolmachines.com#fragment",
 	} {
-		cfg := Config{}
+		cfg := core.Config{}
 		cfg.Smolvm.APIKey = "smk_key"
 		cfg.Smolvm.BaseURL = base
-		if _, err := newAPI(cfg, Runtime{}); err == nil {
+		if _, err := newAPI(cfg, core.Runtime{}); err == nil {
 			t.Fatalf("newAPI accepted %q", base)
 		}
 	}
 }
 
 func TestNewAPIAllowsLoopbackHTTPBaseURL(t *testing.T) {
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Smolvm.APIKey = "smk_key"
 	cfg.Smolvm.BaseURL = "http://127.0.0.1:8080"
-	if _, err := newAPI(cfg, Runtime{}); err != nil {
+	if _, err := newAPI(cfg, core.Runtime{}); err != nil {
 		t.Fatalf("loopback http rejected: %v", err)
 	}
 }
 
 func TestNewAPIRejectsUntrustedHTTPSBaseURLByDefault(t *testing.T) {
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Smolvm.APIKey = "smk_key"
 	cfg.Smolvm.BaseURL = "https://smolvm.attacker.example"
-	if _, err := newAPI(cfg, Runtime{}); err == nil || !strings.Contains(err.Error(), "ALLOW_CUSTOM_BASE_URL") {
+	if _, err := newAPI(cfg, core.Runtime{}); err == nil || !strings.Contains(err.Error(), "ALLOW_CUSTOM_BASE_URL") {
 		t.Fatalf("newAPI error=%v, want custom endpoint opt-in requirement", err)
 	}
 }
 
 func TestNewAPIAllowsExplicitCustomHTTPSBaseURL(t *testing.T) {
 	t.Setenv("CRABBOX_SMOLVM_ALLOW_CUSTOM_BASE_URL", "1")
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Smolvm.APIKey = "smk_key"
 	cfg.Smolvm.BaseURL = "https://smolvm.example.test"
-	if _, err := newAPI(cfg, Runtime{}); err != nil {
+	if _, err := newAPI(cfg, core.Runtime{}); err != nil {
 		t.Fatalf("explicit custom endpoint rejected: %v", err)
 	}
 }
 
 func TestNewAPINormalizesBaseURL(t *testing.T) {
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Smolvm.APIKey = "smk_key"
 	cfg.Smolvm.BaseURL = " https://eu.smolmachines.com/base/ "
-	apiClient, err := newAPI(cfg, Runtime{})
+	apiClient, err := newAPI(cfg, core.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,60 +383,63 @@ func TestNewAPINormalizesBaseURL(t *testing.T) {
 }
 
 func TestSmolVMFallbackBoundsControlAndPreservesCommand(t *testing.T) {
-	const controlTimeout = 30 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/machines/mach_1":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"id":`)
-			w.(http.Flusher).Flush()
-			<-r.Context().Done()
-		case "/v1/machines/mach_1/exec":
-			time.Sleep(3 * controlTimeout)
-			_ = json.NewEncoder(w).Encode(map[string]any{"stdout": "ok", "exitCode": 0})
-		default:
-			http.NotFound(w, r)
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/machines/mach_1":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"id":`)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			case "/v1/machines/mach_1/exec":
+				time.Sleep(3 * controlTimeout)
+				_ = json.NewEncoder(w).Encode(map[string]any{"stdout": "ok", "exitCode": 0})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		control.Transport, data.Transport = server.Client().Transport, server.Client().Transport
+		trusted, _ := url.Parse(server.URL)
+		client := &client{
+			apiKey:   "smk_key",
+			base:     server.URL,
+			http:     shared.SecureHTTPClient(control, trusted, smolvmRedirectError),
+			dataHTTP: shared.SecureHTTPClient(data, trusted, smolvmRedirectError),
 		}
-	}))
-	defer server.Close()
-	control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	trusted, _ := url.Parse(server.URL)
-	client := &client{
-		apiKey:   "smk_key",
-		base:     server.URL,
-		http:     shared.SecureHTTPClient(control, trusted, smolvmRedirectError),
-		dataHTTP: shared.SecureHTTPClient(data, trusted, smolvmRedirectError),
-	}
-	started := time.Now()
-	_, err := client.GetMachine(context.Background(), "mach_1")
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("GetMachine error=%v, want whole-request deadline", err)
-	}
-	controlElapsed := time.Since(started)
-	if controlElapsed >= time.Second {
-		t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
-	}
+		started := time.Now()
+		_, err := client.GetMachine(context.Background(), "mach_1")
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetMachine error=%v, want whole-request deadline", err)
+		}
+		controlElapsed := time.Since(started)
+		if controlElapsed >= time.Second {
+			t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
+		}
 
-	started = time.Now()
-	result, err := client.Exec(context.Background(), "mach_1", "true", "/workspace")
-	if err != nil || result.ExitCode != 0 {
-		t.Fatalf("Exec result=%#v err=%v", result, err)
-	}
-	dataElapsed := time.Since(started)
-	if dataElapsed <= controlTimeout {
-		t.Fatalf("command completed in %s, want beyond %s", dataElapsed, controlTimeout)
-	}
-	t.Logf("SmolVM control body bounded in %s; synchronous command completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+		started = time.Now()
+		result, err := client.Exec(context.Background(), "mach_1", "true", "/workspace")
+		if err != nil || result.ExitCode != 0 {
+			t.Fatalf("Exec result=%#v err=%v", result, err)
+		}
+		dataElapsed := time.Since(started)
+		if dataElapsed <= controlTimeout {
+			t.Fatalf("command completed in %s, want beyond %s", dataElapsed, controlTimeout)
+		}
+		t.Logf("SmolVM control body bounded in %s; synchronous command completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestSmolVMInjectedHTTPSettingsArePreservedForBothPlanes(t *testing.T) {
 	transport := &http.Transport{DisableKeepAlives: true}
 	injected := &http.Client{Transport: transport, Timeout: 17 * time.Second}
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Smolvm.APIKey = "smk_key"
 	cfg.Smolvm.BaseURL = "http://127.0.0.1:8787"
-	api, err := newAPI(cfg, Runtime{HTTP: injected})
+	api, err := newAPI(cfg, core.Runtime{HTTP: injected})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,8 +466,8 @@ func TestSmolvmClientRefusesCrossOriginRedirectBeforeReplay(t *testing.T) {
 	}))
 	defer trusted.Close()
 
-	cfg := Config{Smolvm: SmolvmConfig{APIKey: "smk_key", BaseURL: trusted.URL}}
-	apiClient, err := newAPI(cfg, Runtime{HTTP: trusted.Client()})
+	cfg := core.Config{Smolvm: core.SmolvmConfig{APIKey: "smk_key", BaseURL: trusted.URL}}
+	apiClient, err := newAPI(cfg, core.Runtime{HTTP: trusted.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -490,8 +495,8 @@ func TestSmolvmClientFollowsSameOriginRedirect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := Config{Smolvm: SmolvmConfig{APIKey: "smk_key", BaseURL: server.URL}}
-	apiClient, err := newAPI(cfg, Runtime{HTTP: server.Client()})
+	cfg := core.Config{Smolvm: core.SmolvmConfig{APIKey: "smk_key", BaseURL: server.URL}}
+	apiClient, err := newAPI(cfg, core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,10 +521,7 @@ func TestSmolvmClientPreservesCallerRedirectPolicy(t *testing.T) {
 		callerChecks++
 		return callerErr
 	}
-	apiClient, err := newAPI(
-		Config{Smolvm: SmolvmConfig{APIKey: "smk_key", BaseURL: server.URL}},
-		Runtime{HTTP: httpClient},
-	)
+	apiClient, err := newAPI(core.Config{Smolvm: core.SmolvmConfig{APIKey: "smk_key", BaseURL: server.URL}}, core.Runtime{HTTP: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,8 +554,8 @@ func TestSameSmolvmOrigin(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := shared.SameOrigin(base, redirected); got != tc.want {
-				t.Fatalf("shared.SameOrigin(%q) = %v, want %v", tc.url, got, tc.want)
+			if got := core.SameHTTPOrigin(base, redirected); got != tc.want {
+				t.Fatalf("core.SameHTTPOrigin(%q) = %v, want %v", tc.url, got, tc.want)
 			}
 		})
 	}
@@ -611,7 +613,7 @@ func TestCleanWorkdirAndCommand(t *testing.T) {
 
 func TestWarmupRejectsActionsRunner(t *testing.T) {
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	err := backend.Warmup(context.Background(), WarmupRequest{ActionsRunner: true})
+	err := backend.Warmup(context.Background(), core.WarmupRequest{ActionsRunner: true})
 	if err == nil || !strings.Contains(err.Error(), "--actions-runner is not supported") {
 		t.Fatalf("err=%v, want actions-runner rejection", err)
 	}
@@ -622,8 +624,8 @@ func TestRunCreatesExecsAndDeletesOneShotMachine(t *testing.T) {
 	fake := &fakeAPI{}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "repo", Root: t.TempDir()},
 		Command: []string{"echo", "hello"},
 		NoSync:  true,
 	})
@@ -639,7 +641,7 @@ func TestRunCreatesExecsAndDeletesOneShotMachine(t *testing.T) {
 	if result.Session.Provider != providerName || result.Session.LeaseID != result.LeaseID || result.Session.Slug != result.Slug || result.Session.Reused || result.Session.Kept {
 		t.Fatalf("session=%#v result=%#v", result.Session, result)
 	}
-	if result.Session.CleanupCommand != "crabbox stop --provider smolvm --id "+shellQuote(result.LeaseID) {
+	if result.Session.CleanupCommand != "crabbox stop --provider smolvm --id "+core.ShellQuote(result.LeaseID) {
 		t.Fatalf("cleanup command=%q", result.Session.CleanupCommand)
 	}
 	if fake.createReq.Name == "" || !strings.HasPrefix(fake.createReq.Name, "crabbox-") {
@@ -666,8 +668,8 @@ func TestRunHonorsProviderKeepConfig(t *testing.T) {
 	cfg := testConfig()
 	cfg.Smolvm.Keep = true
 	backend := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "repo", Root: t.TempDir()},
 		Command: []string{"echo", "hello"},
 		NoSync:  true,
 	})
@@ -693,9 +695,9 @@ func TestRunReturnsReusedMachineSession(t *testing.T) {
 	fake := &fakeAPI{machine: machineData{ID: "mach_1", Name: "crabbox-blue-123456789abc", State: "running", CreatedAt: "2026-08-30T00:00:00Z"}}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
+	result, err := backend.Run(context.Background(), core.RunRequest{
 		ID:      leaseID,
-		Repo:    Repo{Name: "repo", Root: repo},
+		Repo:    core.Repo{Name: "repo", Root: repo},
 		Command: []string{"echo", "hello"},
 		NoSync:  true,
 	})
@@ -718,13 +720,13 @@ func TestRunPreservesSessionAfterDeleteFailure(t *testing.T) {
 	rt := testRuntime()
 	rt.Stderr = &stderr
 	backend := NewBackend(Provider{}.Spec(), testConfig(), rt).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:       Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:       core.Repo{Name: "repo", Root: t.TempDir()},
 		Command:    []string{"echo", "hello"},
 		NoSync:     true,
 		TimingJSON: true,
 	})
-	var public ExitError
+	var public core.ExitError
 	if !errors.Is(err, fake.deleteErr) || !errors.As(err, &public) || public.Code != 1 || result.ExitCode != 1 || result.Status != core.RunStatusFailed || result.ErrorKind != core.RunErrorProvider {
 		t.Errorf("cleanup failure result=%+v err=%v", result, err)
 	}
@@ -740,7 +742,7 @@ func TestRunPreservesSessionAfterDeleteFailure(t *testing.T) {
 	assertLifecycleTiming(t, stderr.String(), result, err)
 }
 
-func assertLifecycleTiming(t *testing.T, stderr string, result RunResult, err error) {
+func assertLifecycleTiming(t *testing.T, stderr string, result core.RunResult, err error) {
 	t.Helper()
 	result = core.FinalizeRunResult(result, err)
 	var reports []core.TimingReport
@@ -811,8 +813,8 @@ func TestRunFinalizationPreservesPrimaryOutcome(t *testing.T) {
 				rt.Stderr = &lifecycleTimingWriter{cause: writerErr}
 			}
 			b := NewBackend(Provider{}.Spec(), testConfig(), rt).(*backend)
-			result, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, KeepOnFailure: tc.keepFailure, TimingJSON: true, Command: []string{"true"}})
-			var public ExitError
+			result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, KeepOnFailure: tc.keepFailure, TimingJSON: true, Command: []string{"true"}})
+			var public core.ExitError
 			if !errors.As(err, &public) || public.Code != tc.wantCode || result.ExitCode != tc.wantCode || result.Status != tc.wantStatus || result.ErrorKind != tc.wantKind {
 				t.Errorf("primary outcome: result=%+v err=%v public=%+v", result, err, public)
 			}
@@ -876,7 +878,7 @@ func TestRunEffectiveKeepAndReuseControls(t *testing.T) {
 			var stderr bytes.Buffer
 			rt.Stderr = &stderr
 			b := NewBackend(Provider{}.Spec(), cfg, rt).(*backend)
-			req := RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, Keep: tc.keep, KeepOnFailure: tc.keepFailure, SyncOnly: tc.syncOnly, NoSync: true, TimingJSON: true, Command: []string{"true"}}
+			req := core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, Keep: tc.keep, KeepOnFailure: tc.keepFailure, SyncOnly: tc.syncOnly, NoSync: true, TimingJSON: true, Command: []string{"true"}}
 			if tc.reuse {
 				req.ID = "cbx_123456789abc"
 				seedSmolvmClaim(t, req.ID, "blue", "mach_1", req.Repo.Root, nil)
@@ -941,7 +943,7 @@ func TestRunCleanupBudgetsRemainIndependent(t *testing.T) {
 			}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			result, err := b.Run(ctx, RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+			result, err := b.Run(ctx, core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 			if partial && !errors.Is(err, context.Canceled) || !partial && err != nil {
 				t.Errorf("result=%+v err=%v", result, err)
 			}
@@ -957,7 +959,7 @@ func TestWarmupCreatesRetainedMachine(t *testing.T) {
 	fake := &fakeAPI{}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	if err := backend.Warmup(context.Background(), WarmupRequest{Repo: Repo{Name: "repo", Root: t.TempDir()}}); err != nil {
+	if err := backend.Warmup(context.Background(), core.WarmupRequest{Repo: core.Repo{Name: "repo", Root: t.TempDir()}}); err != nil {
 		t.Fatal(err)
 	}
 	if fake.createReq.Ephemeral || fake.createReq.TTLSeconds != 0 {
@@ -972,8 +974,8 @@ func TestRunKeepsWorkspaceSubdirectoryConsistent(t *testing.T) {
 	cfg := testConfig()
 	cfg.Smolvm.Workdir = "/workspace/repo"
 	backend := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
-	if _, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: newGitRepo(t)},
+	if _, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "repo", Root: newGitRepo(t)},
 		Command: []string{"pwd"},
 		Env:     map[string]string{"A": "1"},
 	}); err != nil {
@@ -996,8 +998,8 @@ func TestRunKeepsWorkspaceSubdirectoryConsistent(t *testing.T) {
 func TestSyncWorkspaceUsesInject(t *testing.T) {
 	fake := &fakeAPI{}
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, _, err := backend.syncWorkspace(context.Background(), fake, "mach_1", RunRequest{
-		Repo: Repo{Name: "repo", Root: newGitRepo(t)},
+	_, _, err := backend.syncWorkspace(context.Background(), fake, "mach_1", core.RunRequest{
+		Repo: core.Repo{Name: "repo", Root: newGitRepo(t)},
 	}, "/workspace", nil)
 	if err != nil {
 		t.Fatalf("sync err=%v", err)
@@ -1073,7 +1075,7 @@ func TestRunArchivePreparationPrecedesMutation(t *testing.T) {
 						return time.Unix(0, int64(calls)*int64(time.Millisecond))
 					})
 				}
-				req := RunRequest{Repo: Repo{Root: repo, Name: "fixture"}, SyncOnly: true}
+				req := core.RunRequest{Repo: core.Repo{Root: repo, Name: "fixture"}, SyncOnly: true}
 				if reused {
 					req.ID = "cbx_123456789abc"
 					seedSmolvmClaim(t, req.ID, "blue", "mach_1", repo, nil)
@@ -1147,7 +1149,7 @@ func TestRunUploadsPreparedSnapshotAndClosesIt(t *testing.T) {
 	rt := testRuntime()
 	rt.Stderr = &stderr
 	b := NewBackend(Provider{}.Spec(), testConfig(), rt).(*backend)
-	if _, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: repo}, SyncOnly: true}); err != nil {
+	if _, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: repo}, SyncOnly: true}); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Count(stderr.String(), "sync candidate:") != 1 || archivePath == "" {
@@ -1169,7 +1171,7 @@ func TestSyncArchivePreparationTiming(t *testing.T) {
 				return time.Unix(0, int64(calls)*int64(7*time.Millisecond))
 			})
 			b := NewBackend(Provider{}.Spec(), testConfig(), rt).(*backend)
-			req := RunRequest{Repo: Repo{Root: repo}}
+			req := core.RunRequest{Repo: core.Repo{Root: repo}}
 			var prepared *core.PreparedArchive
 			if external {
 				var err error
@@ -1210,7 +1212,7 @@ func TestSyncPreparedArchiveSharesRemainingBudget(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			prepared, err := b.prepareArchive(t.Context(), RunRequest{Repo: Repo{Root: repo}})
+			prepared, err := b.prepareArchive(t.Context(), core.RunRequest{Repo: core.Repo{Root: repo}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1244,7 +1246,7 @@ func TestSyncPreparedArchiveSharesRemainingBudget(t *testing.T) {
 					}
 					return ctx.Err()
 				}
-				_, _, err := b.syncWorkspace(ctx, fake, "mach_1", RunRequest{}, "/workspace", prepared)
+				_, _, err := b.syncWorkspace(ctx, fake, "mach_1", core.RunRequest{}, "/workspace", prepared)
 				bounded := test.timeout > 0 || test.parent > 0
 				if (bounded && !errors.Is(err, context.DeadlineExceeded)) || (!bounded && err != nil) {
 					t.Fatalf("sync err=%v", err)
@@ -1264,7 +1266,7 @@ func TestStatusMapsMachineName(t *testing.T) {
 	cfg := testConfig()
 	cfg.Smolvm.BaseURL = "https://eu.smolmachines.com"
 	backend := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
-	view, err := backend.Status(context.Background(), StatusRequest{ID: "mach_1"})
+	view, err := backend.Status(context.Background(), core.StatusRequest{ID: "mach_1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1284,7 +1286,7 @@ func TestStatusRejectsNonCrabboxRawMachine(t *testing.T) {
 	fake := &fakeAPI{machine: machineData{ID: "mach_1", Name: "external-machine", State: "running"}}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	if _, err := backend.Status(context.Background(), StatusRequest{ID: "mach_1"}); err == nil {
+	if _, err := backend.Status(context.Background(), core.StatusRequest{ID: "mach_1"}); err == nil {
 		t.Fatal("expected non-Crabbox raw machine id to be rejected")
 	}
 }
@@ -1298,9 +1300,9 @@ func TestRunRawMachineIDEnforcesRepositoryClaim(t *testing.T) {
 	fake := &fakeAPI{machine: machineData{ID: "mach_1", Name: "crabbox-blue-123456789abc", State: "running", CreatedAt: "2026-08-30T00:00:00Z"}}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, err := backend.Run(context.Background(), RunRequest{
+	_, err := backend.Run(context.Background(), core.RunRequest{
 		ID:      "mach_1",
-		Repo:    Repo{Name: "repo-b", Root: repoB},
+		Repo:    core.Repo{Name: "repo-b", Root: repoB},
 		Command: []string{"echo", "hello"},
 		NoSync:  true,
 	})
@@ -1321,10 +1323,10 @@ func hasFeature(features core.FeatureSet, want core.Feature) bool {
 	return false
 }
 
-func testConfig() Config {
-	return Config{
+func testConfig() core.Config {
+	return core.Config{
 		Provider: providerName,
-		Smolvm: SmolvmConfig{
+		Smolvm: core.SmolvmConfig{
 			APIKey:   "smk_key",
 			BaseURL:  "https://api.smolmachines.com",
 			Image:    "ubuntu:24.04",
@@ -1336,14 +1338,14 @@ func testConfig() Config {
 	}
 }
 
-func testRuntime() Runtime {
-	return Runtime{Stdout: io.Discard, Stderr: io.Discard}
+func testRuntime() core.Runtime {
+	return core.Runtime{Stdout: io.Discard, Stderr: io.Discard}
 }
 
 func withFakeAPI(t *testing.T, fake *fakeAPI) {
 	t.Helper()
 	original := newAPI
-	newAPI = func(Config, Runtime) (api, error) { return fake, nil }
+	newAPI = func(core.Config, core.Runtime) (api, error) { return fake, nil }
 	t.Cleanup(func() { newAPI = original })
 }
 
@@ -1558,11 +1560,11 @@ func TestClientNativeUploadFailureAndPublication(t *testing.T) {
 				t.Fatal(err)
 			}
 			const content = "literal quote'\n$(must-not-execute)\x00bytes"
-			scriptPrefix := "base64() { " + shellQuote(decoder) + " \"$@\"; };\n"
+			scriptPrefix := "base64() { " + core.ShellQuote(decoder) + " \"$@\"; };\n"
 			if tc.failure == "decode" || tc.failure == "decode-cleanup" {
 				scriptPrefix = "base64() { printf partial; return 23; };\n"
 			} else if tc.failure == "decode-after-output" {
-				scriptPrefix = "base64() { " + shellQuote(decoder) + " \"$@\"; return 23; };\n"
+				scriptPrefix = "base64() { " + core.ShellQuote(decoder) + " \"$@\"; return 23; };\n"
 			}
 			if strings.Contains(tc.failure, "cleanup") {
 				scriptPrefix += "rm() { return 17; };\n"
@@ -1580,7 +1582,7 @@ func TestClientNativeUploadFailureAndPublication(t *testing.T) {
 					return
 				}
 				// Isolate the old fixed staging name when demonstrating the regression.
-				script := strings.ReplaceAll(request.Command, "/tmp/crabbox-sync.tgz", shellQuote(filepath.Join(root, "baseline-sync.tgz")))
+				script := strings.ReplaceAll(request.Command, "/tmp/crabbox-sync.tgz", core.ShellQuote(filepath.Join(root, "baseline-sync.tgz")))
 				script = strings.ReplaceAll(script, "/tmp/crabbox-write-", filepath.Join(root, "baseline-write-"))
 				cmd := exec.Command("sh", "-c", "umask 022\n"+scriptPrefix+script)
 				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "TMPDIR=" + root}
@@ -1606,7 +1608,7 @@ func TestClientNativeUploadFailureAndPublication(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(repo, "uploaded"), []byte(content), 0o755); err != nil {
 					t.Fatal(err)
 				}
-				archive, err := core.CreateSyncArchive(t.Context(), Repo{Root: repo}, core.SyncManifest{Files: []string{"uploaded"}}, "crabbox-smolvm-native-*.tgz")
+				archive, err := core.CreateSyncArchive(t.Context(), core.Repo{Root: repo}, core.SyncManifest{Files: []string{"uploaded"}}, "crabbox-smolvm-native-*.tgz")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1625,7 +1627,7 @@ func TestClientNativeUploadFailureAndPublication(t *testing.T) {
 				t.Fatalf("upload error=%v, wantError=%v", uploadErr, tc.wantError)
 			}
 			if strings.HasPrefix(tc.failure, "decode") {
-				var exitErr ExitError
+				var exitErr core.ExitError
 				if !errors.As(uploadErr, &exitErr) || exitErr.Code != 23 {
 					t.Fatalf("decoder status lost: %v", uploadErr)
 				}
@@ -1683,8 +1685,8 @@ func TestRunPreservesStreamErrorCause(t *testing.T) {
 			fake := &fakeAPI{streamErr: fmt.Errorf("stream: %w", cause)}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			result, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}})
-			var exitErr ExitError
+			result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}})
+			var exitErr core.ExitError
 			if !errors.Is(err, cause) || !errors.As(err, &exitErr) || exitErr.Code != 1 || len(fake.streamCommands) != 1 || t.Context().Err() != nil {
 				t.Fatalf("stream cause lost: err=%v stream calls=%d parent=%v", err, len(fake.streamCommands), t.Context().Err())
 			}
@@ -1712,7 +1714,7 @@ func TestRunSkipsStreamAfterCanceledSuccessfulEnvUpload(t *testing.T) {
 	}
 	withFakeAPI(t, fake)
 	b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, err := b.Run(ctx, RunRequest{Repo: Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+	_, err := b.Run(ctx, core.RunRequest{Repo: core.Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 	if !errors.Is(err, context.Canceled) || len(fake.streamCommands) != 0 || cleanups != 1 || fake.deleted {
 		t.Fatalf("canceled successful upload: err=%v streams=%v cleanups=%d deleted=%t", err, fake.streamCommands, cleanups, fake.deleted)
 	}
@@ -1758,16 +1760,16 @@ func TestRunCleansPartialEnvironmentProfile(t *testing.T) {
 				if _, ok := cleanupCtx.Deadline(); !ok {
 					t.Fatal("cleanup is unbounded")
 				}
-				if !strings.Contains(command, shellQuote(remote)) {
+				if !strings.Contains(command, core.ShellQuote(remote)) {
 					t.Fatal("wrong cleanup target")
 				}
-				cmd := exec.CommandContext(cleanupCtx, "sh", "-c", strings.ReplaceAll(command, shellQuote(remote), shellQuote(mapped)))
+				cmd := exec.CommandContext(cleanupCtx, "sh", "-c", strings.ReplaceAll(command, core.ShellQuote(remote), core.ShellQuote(mapped)))
 				out, err := cmd.CombinedOutput()
 				return execResult{Output: string(out)}, err
 			}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			_, err := b.Run(ctx, RunRequest{Repo: Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+			_, err := b.Run(ctx, core.RunRequest{Repo: core.Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 			want := primary
 			if canceled {
 				want = context.Canceled
@@ -1810,7 +1812,7 @@ func TestEnvironmentProfileCleanupRejectsChangedOwnership(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			_, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+			_, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1857,7 +1859,7 @@ func TestRunSourceIntentSurvivesNativeShell(t *testing.T) {
 			fake := &fakeAPI{}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			_, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: tc.command, CommandLiteralArgs: tc.literal})
+			_, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: tc.command, CommandLiteralArgs: tc.literal})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1882,6 +1884,79 @@ func TestRunSourceIntentSurvivesNativeShell(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(root, "sentinel")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("literal created sentinel: %v", err)
 			}
+		})
+	}
+}
+
+type compactRequestTransport func(*http.Request) (*http.Response, error)
+
+func (f compactRequestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestCompactJSONRequestOrdinaryBodyContract(t *testing.T) {
+	type contextKey struct{}
+	type observedRequest struct {
+		method, target, body, contentType string
+		readErr                           error
+	}
+	ctx := context.WithValue(context.Background(), contextKey{}, "request-context")
+	var typedNil *struct{ Value string }
+	for _, tc := range []struct {
+		name   string
+		body   any
+		want   string
+		absent bool
+	}{
+		{name: "absent", absent: true},
+		{name: "typed nil", body: typedNil, want: "null"},
+		{name: "compact JSON", body: map[string]string{"value": "plain"}, want: `{"value":"plain"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan observedRequest, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				body, err := io.ReadAll(req.Body)
+				received <- observedRequest{req.Method, req.RequestURI, string(body), req.Header.Get("Content-Type"), err}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(server.Close)
+			httpClient := server.Client()
+			httpClient.Timeout = 10 * time.Second
+			wireTransport := httpClient.Transport
+			calls := 0
+			httpClient.Transport = compactRequestTransport(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Method != http.MethodPost || req.URL.String() != server.URL+"/ordinary?label=a+b" || req.Context().Value(contextKey{}) != "request-context" {
+					t.Fatalf("request method/URL/context changed: %s %s", req.Method, req.URL)
+				}
+				if (req.Body == nil) != tc.absent {
+					t.Fatal("absent body distinction changed")
+				}
+				return wireTransport.RoundTrip(req)
+			})
+			c := &client{base: server.URL, http: httpClient}
+			err := c.doJSON(ctx, http.MethodPost, "/ordinary", url.Values{"label": {"a b"}}, tc.body, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 {
+				t.Fatalf("transport calls=%d, want 1", calls)
+			}
+			seen := <-received
+			if seen.readErr != nil {
+				t.Fatal(seen.readErr)
+			}
+			if seen.method != http.MethodPost || seen.target != "/ordinary?label=a+b" || seen.body != tc.want {
+				t.Fatalf("HTTP request=%s %s body=%q, want POST /ordinary?label=a+b body=%q", seen.method, seen.target, seen.body, tc.want)
+			}
+			contentType := "application/json"
+			if tc.absent {
+				contentType = ""
+			}
+			if seen.contentType != contentType {
+				t.Fatalf("HTTP content type=%q, want %q", seen.contentType, contentType)
+			}
+			t.Logf("localhost HTTP %s %s body=%q content_type=%q", seen.method, seen.target, seen.body, seen.contentType)
 		})
 	}
 }

@@ -25,8 +25,24 @@ func TestProviderSpec(t *testing.T) {
 }
 
 func TestProviderServerTypeDefaults(t *testing.T) {
-	if got := (Provider{}).ServerTypeForClass("standard"); got != "s-1vcpu-1gb" {
-		t.Fatalf("ServerTypeForClass standard=%q", got)
+	for _, test := range []struct {
+		name string
+		cfg  core.Config
+		want string
+	}{
+		{name: "unsupported target", cfg: core.Config{Class: "standard", TargetOS: core.TargetWindows}},
+		{name: "unsupported architecture", cfg: core.Config{Class: "standard", TargetOS: core.TargetLinux, Architecture: core.ArchitectureARM64}},
+		{name: "legacy input", cfg: core.Config{Class: " STANDARD "}, want: "s-1vcpu-1gb"},
+		{name: "explicit type preserves spelling", cfg: core.Config{Class: "standard", TargetOS: core.TargetWindows, ServerTypeExplicit: true, ServerType: " custom-type "}, want: " custom-type "},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := (Provider{}).ServerTypeForConfig(test.cfg); got != test.want {
+				t.Fatalf("type=%q want=%q", got, test.want)
+			}
+		})
+	}
+	if got := (Provider{}).ServerTypeForConfig(core.Config{Class: "standard"}); got != "s-1vcpu-1gb" {
+		t.Fatalf("ServerTypeForConfig standard=%q", got)
 	}
 	if got := (Provider{}).ServerTypeForConfig(core.Config{ServerType: "s-2vcpu-2gb", ServerTypeExplicit: true}); got != "s-2vcpu-2gb" {
 		t.Fatalf("explicit ServerTypeForConfig=%q", got)

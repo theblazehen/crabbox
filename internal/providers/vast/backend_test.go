@@ -8,9 +8,11 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -22,9 +24,11 @@ type fakeVastAPI struct {
 	offers                  []vastOffer
 	instances               []vastInstance
 	authErr                 error
+	authFn                  func()
 	listErr                 error
 	createErr               error
 	getErr                  error
+	getFn                   func(context.Context, int) (vastInstance, error)
 	manageErr               error
 	destroyErr              error
 	destroyFn               func()
@@ -58,6 +62,9 @@ type fakeVastAPI struct {
 }
 
 func (f *fakeVastAPI) CheckAuth(context.Context) (vastUser, error) {
+	if f.authFn != nil {
+		f.authFn()
+	}
 	if f.authErr != nil {
 		return vastUser{}, f.authErr
 	}
@@ -104,7 +111,10 @@ func (f *fakeVastAPI) CreateInstance(_ context.Context, offerID int, input vastC
 	return vastCreateInstanceResponse{Success: true, NewContract: item.ID, Instance: item}, nil
 }
 
-func (f *fakeVastAPI) GetInstance(_ context.Context, id int) (vastInstance, error) {
+func (f *fakeVastAPI) GetInstance(ctx context.Context, id int) (vastInstance, error) {
+	if f.getFn != nil {
+		return f.getFn(ctx, id)
+	}
 	if f.getErr != nil {
 		return vastInstance{}, f.getErr
 	}
@@ -201,7 +211,7 @@ func (f *fakeVastAPI) DetachInstanceSSHKey(_ context.Context, id int, keyID stri
 	return f.detachErr
 }
 
-func newTestBackend(t *testing.T, api *fakeVastAPI) *backend {
+func newTestBackend(t *testing.T, api vastAPI) *backend {
 	t.Helper()
 	testutil.IsolateUserDirs(t)
 	cfg := core.BaseConfig()
@@ -225,6 +235,131 @@ func newTestBackend(t *testing.T, api *fakeVastAPI) *backend {
 	b.runSSH = func(context.Context, core.SSHTarget, string) error { return nil }
 	b.sleep = func(context.Context, time.Duration) error { return nil }
 	return b
+}
+
+func TestWaitForInstanceReadyStopsBeforeCanceledRead(t *testing.T) {
+	cause := errors.New("caller stopped")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+	api := &fakeVastAPI{getFn: func(context.Context, int) (vastInstance, error) {
+		t.Fatal("canceled readiness initiated a read")
+		return vastInstance{}, nil
+	}}
+	b := newTestBackend(t, api)
+	_, err := b.waitForInstanceReady(ctx, api, 100)
+	if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want caller cause and cancellation", err)
+	}
+}
+
+func TestWaitForInstanceReadyBoundsObservationsAndSleep(t *testing.T) {
+	for _, phase := range []string{"read Err", "read Cause", "sleep"} {
+		t.Run(phase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				api := &fakeVastAPI{getFn: func(ctx context.Context, _ int) (vastInstance, error) {
+					if phase == "sleep" {
+						return vastInstance{Status: "loading"}, nil
+					}
+					<-ctx.Done()
+					if phase == "read Cause" {
+						return vastInstance{}, context.Cause(ctx)
+					}
+					return vastInstance{}, ctx.Err()
+				}}
+				b := newTestBackend(t, api)
+				b.pollTimeout = 20 * time.Millisecond
+				b.rt.Clock = &lifecycleClock{current: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+				b.sleep = func(ctx context.Context, _ time.Duration) error {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				_, err := b.waitForInstanceReady(ctx, api, 100)
+				var exit core.ExitError
+				if !core.AsExitError(err, &exit) || exit.Code != 5 || !strings.Contains(err.Error(), "timed out waiting for Vast instance 100 to expose SSH") || !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("err=%v, want bounded readiness timeout with deadline identity", err)
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("parent guard expired before readiness budget: %v", ctx.Err())
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForInstanceReadyPreservesCallerCause(t *testing.T) {
+	for _, phase := range []string{"read", "sleep"} {
+		t.Run(phase, func(t *testing.T) {
+			cause := errors.New("private caller cancellation")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			api := &fakeVastAPI{getFn: func(ctx context.Context, _ int) (vastInstance, error) {
+				if phase == "read" {
+					cancel(cause)
+					return vastInstance{}, ctx.Err()
+				}
+				return vastInstance{Status: "loading"}, nil
+			}}
+			b := newTestBackend(t, api)
+			b.sleep = func(ctx context.Context, _ time.Duration) error {
+				cancel(cause)
+				return ctx.Err()
+			}
+			_, err := b.waitForInstanceReady(ctx, api, 100)
+			if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) {
+				t.Fatalf("err=%v, want custom cause and context cancellation", err)
+			}
+			if strings.Contains(err.Error(), cause.Error()) {
+				t.Fatalf("diagnostic exposed private context cause: %v", err)
+			}
+		})
+	}
+}
+
+func TestWaitForInstanceReadyPreservesCompletedObservation(t *testing.T) {
+	for _, outcome := range []string{"ready", "terminal", "API failure", "client deadline"} {
+		t.Run(outcome, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			apiErr := &vastAPIError{StatusCode: 403, Status: "403 Forbidden"}
+			api := &fakeVastAPI{getFn: func(context.Context, int) (vastInstance, error) {
+				if outcome != "client deadline" {
+					cancel()
+				}
+				switch outcome {
+				case "ready":
+					return vastInstance{ID: 100, Status: "running", SSHHost: "203.0.113.1", SSHPort: 2222}, nil
+				case "terminal":
+					return vastInstance{ID: 100, Status: "exited"}, nil
+				case "API failure":
+					return vastInstance{}, apiErr
+				default:
+					return vastInstance{}, context.DeadlineExceeded
+				}
+			}}
+			b := newTestBackend(t, api)
+			got, err := b.waitForInstanceReady(ctx, api, 100)
+			switch outcome {
+			case "ready":
+				if err != nil || got.ID != 100 {
+					t.Fatalf("got=%+v err=%v", got, err)
+				}
+			case "terminal":
+				if err == nil || !strings.Contains(err.Error(), "reached terminal status exited") {
+					t.Fatalf("err=%v", err)
+				}
+			case "API failure":
+				if err != apiErr {
+					t.Fatalf("err=%v, want original API response", err)
+				}
+			case "client deadline":
+				if err != context.DeadlineExceeded {
+					t.Fatalf("err=%v, want independent client deadline", err)
+				}
+			}
+		})
+	}
 }
 
 func TestNewBackendPreservesExplicitGenericSSHUser(t *testing.T) {
@@ -649,6 +784,9 @@ func TestResolveNumericIDReclaimCreatesClaimForProviderLabel(t *testing.T) {
 		SSHPort: 22,
 	}}}
 	b := newTestBackend(t, api)
+	clock := &lifecycleClock{current: time.Now().UTC().Truncate(time.Second)}
+	b.rt.Clock = clock
+	b.cfg.IdleTimeout, b.cfg.TTL = 5*time.Minute, time.Hour
 
 	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "8", Repo: core.Repo{Root: t.TempDir()}, Reclaim: true})
 	if err != nil {
@@ -660,6 +798,13 @@ func TestResolveNumericIDReclaimCreatesClaimForProviderLabel(t *testing.T) {
 	claim, exists, readErr := core.ReadLeaseClaimWithPresence("cbx_orphan")
 	if readErr != nil || !exists || claim.Provider != providerName || claim.CloudID != "8" || claim.Slug != "orphan" || claim.Labels[vastAccountIDLabel] != "7" || claim.Labels[vastAPIURLLabel] != "https://console.vast.ai/api/v0" {
 		t.Fatalf("claim=%#v exists=%v err=%v", claim, exists, readErr)
+	}
+	if claim.IdleTimeoutSeconds != 300 || claim.Labels["created_at"] != core.LeaseLabelTime(clock.current) || claim.Labels["ttl_secs"] != "3600" || claim.Labels["keep"] != "false" {
+		t.Fatalf("adoption did not initialize policy: %+v", claim)
+	}
+	snapshot, present, set := core.ServerLeaseClaimSnapshot(lease.Server)
+	if !set || !present || !reflect.DeepEqual(snapshot, claim) {
+		t.Fatal("adoption did not return committed snapshot")
 	}
 }
 
@@ -686,19 +831,38 @@ func TestResolveRejectsTerminalStatusForRunButAllowsRelease(t *testing.T) {
 }
 
 func TestResolveStatusOnlyAllowsInstanceWithoutSSHEndpoint(t *testing.T) {
-	api := &fakeVastAPI{instances: []vastInstance{{ID: 10, Label: encodeVastOwnershipLabel("cbx_status", "status-me", "stopped"), Status: "stopped"}}}
-	b := newTestBackend(t, api)
-
-	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-me", StatusOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease.LeaseID != "cbx_status" || lease.SSH.Host != "" {
-		t.Fatalf("lease=%#v", lease)
+	for _, tc := range []struct {
+		name, host string
+		port       int
+	}{
+		{"absent", "", 0},
+		{"host only", "203.0.113.10", 0},
+		{"port only", "", 2201},
+		{"blank host", " \t", 2201},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeVastAPI{instances: []vastInstance{{ID: 10, Label: encodeVastOwnershipLabel("cbx_status", "status-me", "stopped"), Status: "stopped", SSHHost: tc.host, SSHPort: tc.port}}}
+			b := newTestBackend(t, api)
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-me", StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lease.LeaseID != "cbx_status" || lease.SSH.Host != "" {
+				t.Fatalf("lease=%#v", lease)
+			}
+			for _, key := range []string{"created_at", "last_touched_at", "expires_at", "idle_timeout", "idle_timeout_secs", "ttl_secs", "keep"} {
+				if _, exists := lease.Server.Labels[key]; exists {
+					t.Errorf("unclaimed observation invented %s", key)
+				}
+			}
+			if _, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID); err != nil || exists {
+				t.Fatalf("observation wrote claim: exists=%v err=%v", exists, err)
+			}
+		})
 	}
 }
 
-func TestResolveStatusOnlyReadyProbeIncludesSSHTarget(t *testing.T) {
+func TestResolveStatusOnlyIncludesSSHTarget(t *testing.T) {
 	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
 	b := newTestBackend(t, api)
 	acquired, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "status-wait", Keep: true})
@@ -706,15 +870,27 @@ func TestResolveStatusOnlyReadyProbeIncludesSSHTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-wait", StatusOnly: true, ReadyProbe: true})
+	before, err := core.ReadLeaseClaim(acquired.LeaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.LeaseID != acquired.LeaseID || lease.SSH.Host != acquired.SSH.Host || lease.SSH.Key != acquired.SSH.Key {
-		t.Fatalf("lease=%#v acquired=%#v", lease, acquired)
-	}
-	if lease.SSH.ReadyCheck != vastReadyCheck {
-		t.Fatalf("ready check=%q", lease.SSH.ReadyCheck)
+	for _, readyProbe := range []bool{false, true} {
+		t.Run(strconv.FormatBool(readyProbe), func(t *testing.T) {
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-wait", StatusOnly: true, ReadyProbe: readyProbe, NoLocalStateMutations: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lease.LeaseID != acquired.LeaseID || lease.SSH.Host != acquired.SSH.Host || lease.SSH.Port != acquired.SSH.Port || lease.SSH.User != acquired.SSH.User || lease.SSH.Key != acquired.SSH.Key {
+				t.Fatalf("status target differs from acquired target: leaseMatches=%t host=%q port=%q user=%q keyMatches=%t", lease.LeaseID == acquired.LeaseID, lease.SSH.Host, lease.SSH.Port, lease.SSH.User, lease.SSH.Key == acquired.SSH.Key)
+			}
+			if lease.SSH.ReadyCheck != vastReadyCheck {
+				t.Fatalf("ready check=%q", lease.SSH.ReadyCheck)
+			}
+			after, err := core.ReadLeaseClaim(acquired.LeaseID)
+			if err != nil || !reflect.DeepEqual(after, before) {
+				t.Fatalf("status observation changed claim: %v", err)
+			}
+		})
 	}
 }
 
@@ -982,6 +1158,10 @@ func TestReleaseStopIsExplicitAndTested(t *testing.T) {
 
 	b.cfg.Vast.ReleaseAction = "destroy"
 	core.MarkDeleteOnReleaseExplicit(&b.cfg, providerName)
+	lease, err = b.Resolve(context.Background(), core.ResolveRequest{ID: "stop-me", ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil || !outcome.Terminal {
 		t.Fatalf("destroy outcome=%+v err=%v", outcome, err)
 	}
@@ -1067,6 +1247,321 @@ func TestManualUnownedCleanupIsRejected(t *testing.T) {
 	}
 	if len(api.destroyed) != 0 {
 		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+}
+
+type lifecycleClock struct{ current time.Time }
+
+func (c *lifecycleClock) Now() time.Time { return c.current }
+
+func TestHeartbeatLifecycleSurvivesFreshReads(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(strconv.FormatBool(legacy), func(t *testing.T) {
+			api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+			b := newTestBackend(t, api)
+			clock := &lifecycleClock{current: time.Now().UTC().Truncate(time.Second)}
+			b.rt.Clock = clock
+			b.cfg.IdleTimeout, b.cfg.TTL = 5*time.Minute, time.Hour
+			repo := core.Repo{Root: t.TempDir()}
+			lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: repo, RequestedSlug: "policy", Keep: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, exists, set := core.ServerLeaseClaimSnapshot(lease.Server)
+			if !set || !exists || !reflect.DeepEqual(snapshot, initial) {
+				t.Error("acquisition did not return its committed snapshot")
+			}
+			wantIdle := 300
+			if legacy {
+				// Reproduce v0.63.0 Resolve -> label-only Touch persistence.
+				oldConfig := b.cfg
+				oldConfig.IdleTimeout = 2 * time.Hour
+				old := core.Server{Labels: vastLeaseLabels(oldConfig, lease.LeaseID, "policy", "ready", false, clock.current)}
+				old.Labels = preserveVastClaimMetadata(old.Labels, initial.Labels)
+				clock.current = clock.current.Add(10 * time.Minute)
+				old.Labels = core.TouchDirectLeaseLabels(old.Labels, oldConfig, "busy", clock.current)
+				initial, err = core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, initial, old.Labels)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if initial.IdleTimeoutSeconds != 300 || initial.Labels["idle_timeout_secs"] != "7200" {
+					t.Fatal("released writer fixture is not the expected mixed-format record")
+				}
+				wantIdle = 7200
+			}
+			freshConfig := b.cfg
+			freshConfig.IdleTimeout, freshConfig.TTL = time.Minute, 15*time.Minute
+			fresh := newBackend(Provider{}.Spec(), freshConfig, b.rt)
+			fresh.apiFactory = b.apiFactory
+			assertPolicy := func(labels map[string]string, idle int) {
+				t.Helper()
+				if labels["idle_timeout_secs"] != strconv.Itoa(idle) || labels["idle_timeout"] != strconv.Itoa(idle) {
+					t.Errorf("idle policy=%q/%q want%d", labels["idle_timeout_secs"], labels["idle_timeout"], idle)
+				}
+				for _, key := range []string{"created_at", "ttl_secs", "keep", vastAccountIDLabel, vastAPIURLLabel, vastKeyIDLabel, vastKeyOwnedLabel, vastOfferIDLabel, vastReleaseActionLabel} {
+					if labels[key] != initial.Labels[key] {
+						t.Errorf("%s changed from %q to %q", key, initial.Labels[key], labels[key])
+					}
+				}
+			}
+			for _, req := range []core.ResolveRequest{
+				{Repo: repo, StatusOnly: true, NoLocalStateMutations: true},
+				{Repo: repo, StatusOnly: true, ReadyProbe: true, NoLocalStateMutations: true},
+				{Repo: repo, StatusOnly: true},
+				{Repo: repo, NoLocalStateMutations: true},
+				{Repo: repo, ReleaseOnly: true, NoLocalStateMutations: true},
+				{Repo: repo, ReleaseOnly: true},
+				{},
+			} {
+				req.ID = lease.LeaseID
+				observed, resolveErr := fresh.Resolve(t.Context(), req)
+				if resolveErr != nil {
+					t.Fatal(resolveErr)
+				}
+				assertPolicy(observed.Server.Labels, wantIdle)
+				if observed.Server.Labels["last_touched_at"] != initial.Labels["last_touched_at"] || observed.Server.Labels["expires_at"] != initial.Labels["expires_at"] {
+					t.Error("observation reset stored activity or expiry")
+				}
+				after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+				if readErr != nil || !reflect.DeepEqual(after, initial) {
+					t.Fatal("observation changed the durable claim")
+				}
+			}
+			views, err := fresh.List(context.Background(), core.ListRequest{})
+			if err != nil || len(views) != 1 {
+				t.Fatalf("list: err=%v count=%d", err, len(views))
+			}
+			assertPolicy(views[0].Labels, wantIdle)
+			reused, err := fresh.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPolicy(reused.Server.Labels, wantIdle)
+			admitted, readErr := core.ReadLeaseClaim(lease.LeaseID)
+			snapshot, exists, set = core.ServerLeaseClaimSnapshot(reused.Server)
+			if readErr != nil || admitted.IdleTimeoutSeconds != wantIdle || !exists || !set || !reflect.DeepEqual(snapshot, admitted) {
+				t.Fatal("admission did not return committed legacy-aware idle policy")
+			}
+			for _, explicit := range []bool{false, true, false} {
+				clock.current = clock.current.Add(time.Minute)
+				req := core.TouchRequest{Lease: reused, State: "busy", IdleTimeout: time.Minute}
+				if explicit {
+					override := 90 * time.Minute
+					req.IdleTimeoutOverride, wantIdle = &override, 5400
+				}
+				reused.Server, err = fresh.Touch(context.Background(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				assertPolicy(after.Labels, wantIdle)
+				if after.IdleTimeoutSeconds != wantIdle || after.LastUsedAt != clock.current.Format(time.RFC3339) || after.Labels["last_touched_at"] != core.LeaseLabelTime(clock.current) {
+					t.Error("touch did not atomically commit activity and idle policy")
+				}
+				created, _ := strconv.ParseInt(initial.Labels["created_at"], 10, 64)
+				expires := min(created+3600, clock.current.Unix()+int64(wantIdle))
+				if after.Labels["expires_at"] != strconv.FormatInt(expires, 10) {
+					t.Error("touch lost creation-based TTL cap")
+				}
+				snapshot, exists, set = core.ServerLeaseClaimSnapshot(reused.Server)
+				if !exists || !set || !reflect.DeepEqual(snapshot, after) {
+					t.Error("touch did not return the committed snapshot")
+				}
+			}
+			api.instances[0].Status = "stopped"
+			stopped, err := fresh.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil || stopped.Server.Labels["state"] != "stopped" {
+				t.Fatalf("stored activity hid physical stopped state: err=%v state=%s", err, stopped.Server.Labels["state"])
+			}
+		})
+	}
+}
+
+func TestRunningObservationClearsOnlyStoredRuntimeState(t *testing.T) {
+	for _, tc := range []struct{ state, want string }{
+		{"provisioning", "ready"}, {"stopped", "ready"}, {"failed", "ready"}, {"exited", "ready"},
+		{"busy", "busy"}, {"ready", "ready"}, {"deleting", "deleting"}, {"expired", "expired"},
+		{"FAILED", "ready"}, {" FAILED ", "ready"}, {"PROVISIONING", "PROVISIONING"},
+		{"stopped_with_code", "stopped_with_code"}, {"error", "ready"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+			b := newTestBackend(t, api)
+			lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "restart-policy", Keep: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels := make(map[string]string, len(claim.Labels))
+			for key, value := range claim.Labels {
+				labels[key] = value
+			}
+			labels["state"] = tc.state
+			stored, err := core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, claim, labels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if observed.Server.Labels["state"] != tc.want {
+				t.Errorf("native running projected as %q, want %q", observed.Server.Labels["state"], tc.want)
+			}
+			after, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil || !reflect.DeepEqual(after, stored) {
+				t.Errorf("read-only observation changed claim: %v", err)
+			}
+		})
+	}
+}
+
+func TestClaimObservationPreservesAbsentActivity(t *testing.T) {
+	for _, state := range []string{"", "unknown", "ready"} {
+		t.Run(state, func(t *testing.T) {
+			claim := core.LeaseClaim{LeaseID: "cbx_abcdef123456", Provider: providerName}
+			observed := projectVastClaim(core.Server{Status: state}, claim)
+			if _, exists := observed.Labels["state"]; exists {
+				t.Fatalf("observation invented recorded activity: %v", observed.Labels)
+			}
+		})
+	}
+}
+
+func TestLogicalActivityHoldsSurviveNativeTransitions(t *testing.T) {
+	for _, nativeState := range []string{"running", "loading", "stopped"} {
+		for _, hold := range []string{"cleanup", "deleting", "expired", "released"} {
+			t.Run(nativeState+"/"+hold, func(t *testing.T) {
+				api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+				b := newTestBackend(t, api)
+				repo := core.Repo{Root: t.TempDir()}
+				lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: repo, RequestedSlug: "held", Keep: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				claim, err := core.ReadLeaseClaim(lease.LeaseID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				labels := make(map[string]string, len(claim.Labels))
+				for key, value := range claim.Labels {
+					labels[key] = value
+				}
+				labels["state"] = hold
+				stored, err := core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, claim, labels)
+				if err != nil {
+					t.Fatal(err)
+				}
+				api.instances[0].Status = nativeState
+				observed, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if observed.Server.Labels["state"] != hold {
+					t.Errorf("native %s erased %s hold", nativeState, hold)
+				}
+				if updated, err := b.Touch(t.Context(), core.TouchRequest{Lease: observed, State: "busy"}); err == nil || !reflect.DeepEqual(updated, core.Server{}) {
+					t.Errorf("held claim accepted activity: err=%v", err)
+				}
+				if _, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo}); err == nil {
+					t.Error("held claim accepted repository admission")
+				}
+				after, err := core.ReadLeaseClaim(lease.LeaseID)
+				if err != nil || !reflect.DeepEqual(after, stored) {
+					t.Errorf("held claim changed: err=%v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestResolveRejectsClaimChangedDuringAuth(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	repo := core.Repo{Root: t.TempDir()}
+	lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: repo, RequestedSlug: "admission-policy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := core.ReadLeaseClaim(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacement core.LeaseClaim
+	api.authFn = func() {
+		api.authFn = nil
+		labels := maps.Clone(before.Labels)
+		labels["profile"] = "newer"
+		var updateErr error
+		replacement, updateErr = core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, before, labels)
+		if updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	}
+	got, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo})
+	after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+	if err == nil || !reflect.DeepEqual(got, core.LeaseTarget{}) || readErr != nil || !reflect.DeepEqual(after, replacement) {
+		t.Fatalf("stale admission published success or changed claim: resolve=%v read=%v", err, readErr)
+	}
+}
+
+func TestTouchRefusesUncommittableClaim(t *testing.T) {
+	for _, scenario := range []string{"missing snapshot", "stale", "canceled", "invalid override", "account", "endpoint", "during auth"} {
+		t.Run(scenario, func(t *testing.T) {
+			api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+			b := newTestBackend(t, api)
+			lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "touch-policy"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req := core.TouchRequest{Lease: lease, State: "busy"}
+			changeClaim := func() {
+				labels := maps.Clone(before.Labels)
+				labels["profile"] = "newer"
+				before, err = core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, before, labels)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch scenario {
+			case "missing snapshot":
+				core.SetServerLeaseClaimSnapshot(&req.Lease.Server, core.LeaseClaim{}, false)
+			case "stale":
+				changeClaim()
+			case "canceled":
+				cancel()
+			case "invalid override":
+				zero := time.Duration(0)
+				req.IdleTimeoutOverride = &zero
+			case "account":
+				api.user.ID = 8
+			case "endpoint":
+				b.cfg.Vast.APIURL = "https://other.example.test/api/v0"
+			case "during auth":
+				api.authFn = changeClaim
+			}
+			got, touchErr := b.Touch(ctx, req)
+			after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+			if touchErr == nil || !reflect.DeepEqual(got, core.Server{}) || readErr != nil || !reflect.DeepEqual(after, before) {
+				t.Fatal("uncommittable touch published success or changed the claim")
+			}
+		})
 	}
 }
 

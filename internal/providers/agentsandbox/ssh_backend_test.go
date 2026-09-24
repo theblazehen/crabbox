@@ -21,9 +21,9 @@ func testSSHBackend(t *testing.T) (*sshLeaseBackend, *fakeKubernetesClient) {
 	return &sshLeaseBackend{lifecycle: lifecycle}, fake
 }
 
-func createSSHTestClaim(t *testing.T, b *sshLeaseBackend, fake *fakeKubernetesClient) LeaseClaim {
+func createSSHTestClaim(t *testing.T, b *sshLeaseBackend, fake *fakeKubernetesClient) core.LeaseClaim {
 	t.Helper()
-	_, _, _, _, claim, unlock, err := b.lifecycle.createClaim(context.Background(), fake, "ssh-lifecycle", Repo{Root: t.TempDir()}, false, nil)
+	_, _, _, _, claim, unlock, err := b.lifecycle.createClaim(context.Background(), fake, "ssh-lifecycle", core.Repo{Root: t.TempDir()}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestSSHAcquireObserverRunsBeforeReadinessAndClaimPublication(t *testing.T) 
 		if lease.Server.ImmutableID == "" || lease.Server.CloudID == "" {
 			t.Fatalf("unbound acquisition: %#v", lease)
 		}
-		claim, err := readLeaseClaim(lease.LeaseID)
+		claim, err := core.ReadLeaseClaim(lease.LeaseID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func TestSSHReadOnlyResolveNeverBootstrapsOrPublishes(t *testing.T) {
 	if lease.LeaseID != claim.LeaseID || len(fake.execs) != 0 {
 		t.Fatalf("lease=%#v execs=%d", lease, len(fake.execs))
 	}
-	current, err := readLeaseClaim(claim.LeaseID)
+	current, err := core.ReadLeaseClaim(claim.LeaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestSSHReleaseRetentionDoesNotDeleteOrClaimTerminalOutcome(t *testing.T) {
 	if err != nil || outcome.Terminal || fake.deletes != 0 {
 		t.Fatalf("outcome=%#v err=%v deletes=%d", outcome, err, fake.deletes)
 	}
-	current, err := readLeaseClaim(claim.LeaseID)
+	current, err := core.ReadLeaseClaim(claim.LeaseID)
 	if err != nil || !reflect.DeepEqual(current, claim) {
 		t.Fatalf("claim=%#v err=%v", current, err)
 	}
@@ -183,7 +183,7 @@ func TestSSHRunActivityRejectsChangedTransportBeforeKubernetes(t *testing.T) {
 	labels[claimLabelSSHSandboxUID] = "sandbox-uid"
 	labels[claimLabelSSHPodUID] = "pod-uid"
 	labels[claimLabelSSHContainerID] = "containerd://container-a"
-	claim, err := updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+	claim, err := core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestSSHRunActivityRejectsChangedTransportBeforeKubernetes(t *testing.T) {
 	}
 	core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
 	lease.SSH.ControlScope = "stale-runtime"
-	b.lifecycle.newClient = func(context.Context, Config, Runtime) (kubernetesClient, error) {
+	b.lifecycle.newClient = func(context.Context, core.Config, core.Runtime) (kubernetesClient, error) {
 		t.Fatal("changed transport reached Kubernetes admission")
 		return nil, errors.New("unexpected Kubernetes client")
 	}
@@ -207,7 +207,7 @@ func TestSSHReleaseReportsTerminalDespiteLocalFinalizationFailure(t *testing.T) 
 	b, fake := testSSHBackend(t)
 	claim := createSSHTestClaim(t, b, fake)
 	want := errors.New("local claim removal denied")
-	b.lifecycle.removeClaim = func(string, LeaseClaim) error { return want }
+	b.lifecycle.removeClaim = func(string, core.LeaseClaim) error { return want }
 	outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{Lease: sshLeaseFromClaim(claim)})
 	if !outcome.Terminal || !errors.Is(err, want) || fake.deletes != 1 {
 		t.Fatalf("outcome=%#v err=%v deletes=%d", outcome, err, fake.deletes)
@@ -223,7 +223,7 @@ func TestSSHReleaseDeleteFailureIsNotTerminal(t *testing.T) {
 	if outcome.Terminal || !errors.Is(err, want) {
 		t.Fatalf("outcome=%#v err=%v", outcome, err)
 	}
-	current, readErr := readLeaseClaim(claim.LeaseID)
+	current, readErr := core.ReadLeaseClaim(claim.LeaseID)
 	if readErr != nil || !reflect.DeepEqual(current, claim) {
 		t.Fatalf("retained claim=%#v err=%v", current, readErr)
 	}
@@ -232,7 +232,7 @@ func TestSSHReleaseDeleteFailureIsNotTerminal(t *testing.T) {
 func TestSSHReleaseMessageDescribesRetention(t *testing.T) {
 	b, _ := testSSHBackend(t)
 	b.lifecycle.cfg.AgentSandbox.DeleteOnRelease = false
-	message := b.ReleaseLeaseMessage(core.LeaseTarget{LeaseID: "asbx_retained", Server: Server{Name: "claim-retained"}})
+	message := b.ReleaseLeaseMessage(core.LeaseTarget{LeaseID: "asbx_retained", Server: core.Server{Name: "claim-retained"}})
 	if !strings.Contains(message, "retained lease=asbx_retained") || !strings.Contains(message, "deleteOnRelease=false") || strings.Contains(message, "deleted") {
 		t.Fatalf("misleading retention message: %s", message)
 	}
@@ -258,11 +258,11 @@ func TestSSHReleaseRejectsReclaimedRepository(t *testing.T) {
 func TestSSHDoctorRequiresPortForwardRBAC(t *testing.T) {
 	b, fake := testSSHBackend(t)
 	rule := rbacRule{Resource: podResource, Subresource: "portforward", Namespace: b.lifecycle.cfg.AgentSandbox.Namespace, Verbs: []string{"create"}}
-	if _, err := b.Doctor(context.Background(), DoctorRequest{}); err == nil || !strings.Contains(err.Error(), "portforward") {
+	if _, err := b.Doctor(context.Background(), core.DoctorRequest{}); err == nil || !strings.Contains(err.Error(), "portforward") {
 		t.Fatalf("err=%v", err)
 	}
 	fake.rbac[rule.String()] = true
-	if _, err := b.Doctor(context.Background(), DoctorRequest{}); err != nil {
+	if _, err := b.Doctor(context.Background(), core.DoctorRequest{}); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -49,16 +49,7 @@ func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) *backe
 		return core.WaitForSSHReady(ctx, target, b.stderr(), phase, timeout)
 	}
 	b.runSSH = core.RunSSHQuiet
-	b.sleep = func(ctx context.Context, d time.Duration) error {
-		timer := time.NewTimer(d)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return nil
-		}
-	}
+	b.sleep = shared.SleepContext
 	return b
 }
 
@@ -84,18 +75,7 @@ func applyVastDefaults(cfg *core.Config) {
 	if cfg.SSHPort == "" {
 		cfg.SSHPort = "22"
 	}
-	if cfg.Vast.InstanceType == "" {
-		cfg.Vast.InstanceType = core.VastConfigDefaultInstanceType
-	}
-	if cfg.Vast.Runtype == "" {
-		cfg.Vast.Runtype = core.VastConfigDefaultRuntype
-	}
-	if cfg.Vast.Order == "" {
-		cfg.Vast.Order = core.VastConfigDefaultOrder
-	}
-	if cfg.Vast.ReleaseAction == "" {
-		cfg.Vast.ReleaseAction = core.VastConfigDefaultReleaseAction
-	}
+	applyVastProviderFieldDefaults(&cfg.Vast)
 }
 
 func (b *backend) stderr() io.Writer {
@@ -150,7 +130,7 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 
 func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (target core.LeaseTarget, err error) {
 	if b.cfg.TargetOS != "" && b.cfg.TargetOS != core.TargetLinux {
-		return core.LeaseTarget{}, exit(2, "provider=%s supports target=linux only", providerName)
+		return core.LeaseTarget{}, core.Exit(2, "provider=%s supports target=linux only", providerName)
 	}
 	client, err := b.api()
 	if err != nil {
@@ -161,7 +141,7 @@ func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 		return core.LeaseTarget{}, err
 	}
 	if user.ID == 0 {
-		return core.LeaseTarget{}, exit(5, "vast auth returned no account id")
+		return core.LeaseTarget{}, core.Exit(5, "vast auth returned no account id")
 	}
 	accountID := strconv.Itoa(user.ID)
 	apiURL := vastAPIEndpointIdentity(b.cfg.Vast.APIURL)
@@ -245,7 +225,7 @@ func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 	instanceID = firstNonZero(created.Instance.ID, created.NewContract)
 	if instanceID == 0 {
 		ambiguousCreate = true
-		err = exit(5, "vast create returned no instance id")
+		err = core.Exit(5, "vast create returned no instance id")
 		return core.LeaseTarget{}, err
 	}
 	if attach, attachErr := client.AttachInstanceSSHKey(ctx, instanceID, publicKey); attachErr != nil {
@@ -262,7 +242,7 @@ func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 		}
 		keyID = vastMatchingSSHKeyID(keys, publicKey)
 		if keyID == "" {
-			err = exit(5, "vast attach SSH key returned no removable key id")
+			err = core.Exit(5, "vast attach SSH key returned no removable key id")
 			return core.LeaseTarget{}, err
 		}
 	}
@@ -306,8 +286,12 @@ func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 			return core.LeaseTarget{}, err
 		}
 	}
-	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
+	claim, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, slug, cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, core.LeaseClaim{}, false)
+	if err != nil {
 		return core.LeaseTarget{}, err
+	}
+	if claim.LeaseID != "" {
+		core.SetServerLeaseClaimSnapshot(&target.Server, claim, true)
 	}
 	committed = true
 	fmt.Fprintf(b.stderr(), "provisioned lease=%s vast=%d gpu=%s state=ready\n", leaseID, instanceID, server.ServerType.Name)
@@ -317,7 +301,7 @@ func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 func (b *backend) bootstrapVastTools(ctx context.Context, target core.SSHTarget) error {
 	fmt.Fprintln(b.stderr(), "bootstrapping vast instance tools")
 	if err := b.runSSH(ctx, target, vastBootstrapToolsCommand()); err != nil {
-		return exit(1, "vast instance tool bootstrap failed: %v", err)
+		return core.Exit(1, "vast instance tool bootstrap failed: %v", err)
 	}
 	return nil
 }
@@ -352,7 +336,7 @@ func selectVastOffer(offers []vastOffer) (vastOffer, error) {
 	if len(offers) > 0 && vastOfferAskID(offers[0]) != 0 {
 		return offers[0], nil
 	}
-	return vastOffer{}, exit(4, "vast found no eligible offers")
+	return vastOffer{}, core.Exit(4, "vast found no eligible offers")
 }
 
 func vastOfferAskID(offer vastOffer) int {
@@ -384,11 +368,13 @@ func vastMatchingSSHKeyID(keys []vastInstanceSSHKey, publicKey string) string {
 }
 
 func (b *backend) waitForInstanceReady(ctx context.Context, client vastAPI, id int) (vastInstance, error) {
-	deadline := b.now().Add(b.pollTimeout)
-	result, err := shared.Poll(context.WithoutCancel(ctx), 0, vastPollInterval,
-		func(context.Context, time.Duration) error { return b.sleep(ctx, vastPollInterval) },
-		func(context.Context) (vastInstance, error) { return client.GetInstance(ctx, id) },
-		func(_ context.Context, instance vastInstance, fetchErr error) (bool, error) {
+	return shared.PollReadiness(ctx, shared.ReadinessOptions[vastInstance]{
+		Timeout: b.pollTimeout, Interval: vastPollInterval, Sleep: b.sleep,
+		IsResponseError: func(err error) bool {
+			var apiErr *vastAPIError
+			return errors.As(err, &apiErr)
+		},
+		Check: func(instance vastInstance, fetchErr error) (bool, error) {
 			if fetchErr != nil {
 				return false, fetchErr
 			}
@@ -396,17 +382,17 @@ func (b *backend) waitForInstanceReady(ctx context.Context, client vastAPI, id i
 				return true, nil
 			}
 			if isTerminalVastStatus(instance.Status) {
-				return false, exit(5, "vast instance %d reached terminal status %s", id, instance.Status)
-			}
-			if b.now().After(deadline) {
-				return false, exit(5, "timed out waiting for Vast instance %d to expose SSH", id)
+				return false, core.Exit(5, "vast instance %d reached terminal status %s", id, instance.Status)
 			}
 			return false, nil
-		}, nil)
-	if err != nil {
-		return vastInstance{}, err
-	}
-	return result.Value, nil
+		},
+		Diagnostic: func(stop shared.ReadinessStop) error {
+			if stop.BudgetExpired {
+				return core.Exit(5, "timed out waiting for Vast instance %d to expose SSH", id)
+			}
+			return stop.Err
+		},
+	}, func(ctx context.Context) (vastInstance, error) { return client.GetInstance(ctx, id) })
 }
 
 func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
@@ -450,12 +436,12 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 				return b.targetFromInstance(ctx, client, item, req)
 			}
 			if req.ReleaseOnly {
-				return claimTarget(claim), nil
+				return claimTarget(claim)
 			}
 			return core.LeaseTarget{}, getErr
 		}
 		if req.ReleaseOnly {
-			return claimTarget(claim), nil
+			return claimTarget(claim)
 		}
 	}
 	if id, ok := parseVastInstanceID(req.ID); ok {
@@ -468,7 +454,7 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 		}
 		return b.targetFromInstance(ctx, client, item, req)
 	}
-	return core.LeaseTarget{}, exit(4, "lease/instance not found: %s", req.ID)
+	return core.LeaseTarget{}, core.Exit(4, "lease/instance not found: %s", req.ID)
 }
 
 func (b *backend) resolveAmbiguousVastCreate(ctx context.Context, client vastAPI, instances []vastInstance, claim core.LeaseClaim, req core.ResolveRequest) (core.LeaseTarget, error) {
@@ -489,13 +475,13 @@ func (b *backend) resolveAmbiguousVastCreate(ctx context.Context, client vastAPI
 		matches++
 	}
 	if matches > 1 {
-		return core.LeaseTarget{}, exit(2, "refusing to recover ambiguous Vast create for lease=%s slug=%s: matched %d instances", claim.LeaseID, claim.Slug, matches)
+		return core.LeaseTarget{}, core.Exit(2, "refusing to recover ambiguous Vast create for lease=%s slug=%s: matched %d instances", claim.LeaseID, claim.Slug, matches)
 	}
 	if matches == 0 {
-		return core.LeaseTarget{}, exit(4, "vast ambiguous instance create remains indeterminate for lease=%s; credentials and recovery claim retained", claim.LeaseID)
+		return core.LeaseTarget{}, core.Exit(4, "vast ambiguous instance create remains indeterminate for lease=%s; credentials and recovery claim retained", claim.LeaseID)
 	}
 	if req.NoLocalStateMutations {
-		return core.LeaseTarget{}, exit(2, "vast ambiguous-create recovery for lease=%s requires a durable instance claim", claim.LeaseID)
+		return core.LeaseTarget{}, core.Exit(2, "vast ambiguous-create recovery for lease=%s requires a durable instance claim", claim.LeaseID)
 	}
 	replacement := claim
 	replacement.CloudID = strconv.Itoa(recovered.ID)
@@ -516,18 +502,17 @@ func (b *backend) releaseTargetFromClaim(id string, cause error, releaseOnly boo
 		}
 		return core.LeaseTarget{}, cause
 	}
-	return claimTarget(claim), nil
+	return claimTarget(claim)
 }
 
 func (b *backend) targetFromInstance(ctx context.Context, client vastAPI, item vastInstance, req core.ResolveRequest) (core.LeaseTarget, error) {
 	if !isOwnedVastInstance(item) {
-		return core.LeaseTarget{}, exit(2, "refusing to operate on non-Crabbox Vast instance %d", item.ID)
+		return core.LeaseTarget{}, core.Exit(2, "refusing to operate on non-Crabbox Vast instance %d", item.ID)
 	}
 	if isTerminalVastStatus(item.Status) && !req.ReleaseOnly && !req.StatusOnly {
-		return core.LeaseTarget{}, exit(5, "vast instance %d reached terminal status %s", item.ID, item.Status)
+		return core.LeaseTarget{}, core.Exit(5, "vast instance %d reached terminal status %s", item.ID, item.Status)
 	}
 	server := serverFromInstance(item, b.cfg)
-	server = mergeVastClaimMetadata(server)
 	leaseID := server.Labels["lease"]
 	claim, claimExists, err := core.ReadLeaseClaimWithPresence(leaseID)
 	if err != nil {
@@ -540,32 +525,43 @@ func (b *backend) targetFromInstance(ctx context.Context, client vastAPI, item v
 		if err := b.validateVastClaimProviderIdentity(ctx, client, claim, "resolve"); err != nil {
 			return core.LeaseTarget{}, err
 		}
+		server = projectVastClaim(server, claim)
 	} else if req.ReleaseOnly {
-		return core.LeaseTarget{}, exit(2, "vast lease=%s has no exact local claim; refusing release", leaseID)
+		return core.LeaseTarget{}, core.Exit(2, "vast lease=%s has no exact local claim; refusing release", leaseID)
 	} else if !req.NoLocalStateMutations && !req.StatusOnly {
 		if !req.Reclaim {
-			return core.LeaseTarget{}, exit(2, "vast lease=%s is unclaimed; use --reclaim to adopt it explicitly", leaseID)
+			return core.LeaseTarget{}, core.Exit(2, "vast lease=%s is unclaimed; use --reclaim to adopt it explicitly", leaseID)
 		}
 		if req.Repo.Root == "" {
-			return core.LeaseTarget{}, exit(2, "vast lease=%s cannot be reclaimed without a repository root", leaseID)
+			return core.LeaseTarget{}, core.Exit(2, "vast lease=%s cannot be reclaimed without a repository root", leaseID)
 		}
+		server.Labels = vastLeaseLabels(b.cfg, leaseID, server.Labels["slug"], server.Labels["state"], false, b.now())
+		server.Labels["provider_key"] = core.ProviderKeyForLease(leaseID)
 		if err := b.populateVastClaimProviderIdentity(ctx, client, server.Labels); err != nil {
 			return core.LeaseTarget{}, err
 		}
 	}
+	if !claimExists {
+		core.SetServerLeaseClaimSnapshot(&server, core.LeaseClaim{}, false)
+	}
 	target := core.LeaseTarget{Server: server, LeaseID: leaseID}
-	if !req.ReleaseOnly && (!req.StatusOnly || req.ReadyProbe) {
+	hasSSHEndpoint := strings.TrimSpace(item.SSHHost) != "" && item.SSHPort > 0
+	if !req.ReleaseOnly && (!req.StatusOnly || req.ReadyProbe || hasSSHEndpoint) {
 		ssh, err := sshTargetFromInstance(b.cfg, item)
 		if err != nil {
 			return core.LeaseTarget{}, err
 		}
-		core.UseStoredTestboxKey(&ssh, leaseID)
-		target.SSH = ssh
-	}
-	if req.Repo.Root != "" && !req.NoLocalStateMutations {
-		if _, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, server.Labels["slug"], b.cfg, target.Server, target.SSH, req.Repo.Root, b.cfg.IdleTimeout, req.Reclaim, claim, claimExists); err != nil {
+		if err := core.UseStoredTestboxKey(&ssh, leaseID); err != nil {
 			return core.LeaseTarget{}, err
 		}
+		target.SSH = ssh
+	}
+	if req.Repo.Root != "" && !req.NoLocalStateMutations && !req.StatusOnly && !req.ReleaseOnly {
+		updated, err := shared.AdmitResolvedLease(b.cfg, req, target, server.Labels["slug"], claim, claimExists, shared.LegacyLabelIdleTimeout(claim))
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		target.Server = projectVastClaim(target.Server, updated)
 	}
 	return target, nil
 }
@@ -604,21 +600,59 @@ func (b *backend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
 	return fmt.Sprintf("destroyed lease=%s vast=%s name=%s", lease.LeaseID, lease.Server.DisplayID(), lease.Server.Name)
 }
 
-func (b *backend) Touch(_ context.Context, req core.TouchRequest) (core.Server, error) {
-	server := req.Lease.Server
+func (b *backend) AuthorizeStatusTouchClaim(ctx context.Context, lease core.LeaseTarget, claim core.LeaseClaim) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	server := lease.Server
 	if err := validateVastServer(server); err != nil {
-		return core.Server{}, err
+		return err
 	}
-	cfg := b.cfg
-	if req.IdleTimeout > 0 {
-		cfg.IdleTimeout = req.IdleTimeout
+	if _, ok := parseVastInstanceID(server.CloudID); !ok || lease.LeaseID != server.Labels["lease"] {
+		return core.Exit(4, "vast lease=%s target identity does not match the claim", lease.LeaseID)
 	}
-	server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, req.State, b.now())
-	if claim, ok, err := core.ReadLeaseClaimWithPresence(req.Lease.LeaseID); err == nil && ok {
-		if _, err := core.UpdateLeaseClaimLabelsIfUnchanged(req.Lease.LeaseID, claim, server.Labels); err != nil {
-			return core.Server{}, err
+	if err := validateVastClaimIdentity(claim, lease.LeaseID, server.Labels["slug"], server.CloudID); err != nil {
+		return err
+	}
+	if err := shared.ValidateClaimBinding(claim, b.vastClaimBinding(server)); err != nil {
+		return err
+	}
+	return shared.AuthorizeClaimActivity(claim)
+}
+
+func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	if req.IdleTimeoutOverride == nil {
+		if expected, exists, set := core.ServerLeaseClaimSnapshot(req.Lease.Server); exists && set {
+			req.IdleTimeoutOverride = shared.LegacyLabelIdleTimeout(expected)
 		}
 	}
+	updated, err := shared.CommitClaimTouch(ctx, req, shared.ClaimTouchPolicy{
+		Provider: providerName,
+		Authorize: func(ctx context.Context, lease core.LeaseTarget, expected core.LeaseClaim) error {
+			if err := b.AuthorizeStatusTouchClaim(ctx, lease, expected); err != nil {
+				return err
+			}
+			client, err := b.api()
+			if err != nil {
+				return err
+			}
+			return b.validateVastClaimProviderIdentity(ctx, client, expected, "touch")
+		},
+		Prepare: func(expected core.LeaseClaim) (map[string]string, time.Time) {
+			cfg := b.cfg
+			if req.IdleTimeout > 0 {
+				cfg.IdleTimeout = req.IdleTimeout
+			}
+			now := b.now()
+			return core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(shared.LegacyLabelLifecycleLabels(expected), cfg, req.State, now, req.IdleTimeoutOverride), now
+		},
+	})
+	if err != nil {
+		return core.Server{}, err
+	}
+	server := req.Lease.Server
+	server.Labels = shared.CloneLabels(updated.Labels)
+	core.SetServerLeaseClaimSnapshot(&server, updated, true)
 	return server, nil
 }
 
@@ -685,9 +719,9 @@ func (b *backend) deleteServerWithOutcome(ctx context.Context, server core.Serve
 		claim = snapshot
 	}
 	leaseID := binding.LeaseID
-	instanceID, ok := parseVastInstanceID(firstNonBlank(server.CloudID, claim.CloudID))
+	instanceID, ok := parseVastInstanceID(shared.FirstNonBlankTrimmed(server.CloudID, claim.CloudID))
 	if !ok {
-		return exit(2, "provider=%s release requires a Vast instance id", providerName)
+		return core.Exit(2, "provider=%s release requires a Vast instance id", providerName)
 	}
 	action := effectiveVastReleaseAction(b.cfg, claim.Labels)
 	switch action {
@@ -711,7 +745,7 @@ func (b *backend) deleteServerWithOutcome(ctx context.Context, server core.Serve
 			return fmt.Errorf("finalize vast stop claim: %w", err)
 		}
 	default:
-		if err := shared.RemoveExactClaimAfter(claim, binding, func() error {
+		if err := shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
 			client, err := b.api()
 			if err != nil {
 				return err
@@ -793,28 +827,24 @@ func mergeVastClaimLabels(server core.Server) core.Server {
 	if err != nil || !ok || claim.Provider != providerName {
 		return server
 	}
-	if claim.CloudID != "" && claim.CloudID != server.CloudID {
+	cloudID := server.CloudID
+	if claim.CloudID == "" {
+		cloudID = "" // Recovery claims may not have bound the instance yet.
+	}
+	if validateVastClaimIdentity(claim, leaseID, server.Labels["slug"], cloudID) != nil {
 		return server
 	}
-	if len(claim.Labels) > 0 {
-		server.Labels = claim.Labels
-	}
-	return server
+	return projectVastClaim(server, claim)
 }
 
-func mergeVastClaimMetadata(server core.Server) core.Server {
-	leaseID := strings.TrimSpace(server.Labels["lease"])
-	if leaseID == "" {
-		return server
+func projectVastClaim(server core.Server, claim core.LeaseClaim) core.Server {
+	server.Labels = shared.LegacyLabelLifecycleLabels(claim)
+	recorded := server.Labels["state"]
+	recordedObsolete := recorded == "provisioning" || recorded == "stopped" || isTerminalVastStatus(recorded)
+	if state := shared.ObservedClaimActivityState(claim, recorded, server.Status, server.Status == "ready", recordedObsolete); state != recorded {
+		server.Labels["state"] = state
 	}
-	claim, ok, err := core.ReadLeaseClaimWithPresence(leaseID)
-	if err != nil || !ok || claim.Provider != providerName {
-		return server
-	}
-	if claim.CloudID != "" && server.CloudID != "" && claim.CloudID != server.CloudID {
-		return server
-	}
-	server.Labels = preserveVastClaimMetadata(server.Labels, claim.Labels)
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
 	return server
 }
 
@@ -823,18 +853,21 @@ func serverFromInstance(item vastInstance, cfg core.Config) core.Server {
 	server := core.Server{
 		CloudID:  strconv.Itoa(item.ID),
 		Provider: providerName,
-		Name:     firstNonBlank(labels["slug"], item.Label, strconv.Itoa(item.ID)),
+		Name:     shared.FirstNonBlankTrimmed(labels["slug"], item.Label, strconv.Itoa(item.ID)),
 		Status:   normalizeVastStatus(item.Status),
 		Labels:   labels,
 	}
 	server.PublicNet.IPv4.IP = strings.TrimSpace(item.SSHHost)
-	server.ServerType.Name = firstNonBlank(item.GPUName, cfg.ServerType)
+	server.ServerType.Name = shared.FirstNonBlankTrimmed(item.GPUName, cfg.ServerType)
 	return server
 }
 
 func labelsFromVastInstance(item vastInstance, cfg core.Config) map[string]string {
 	if owner, ok := decodeVastOwnershipLabel(item.Label); ok {
-		labels := vastLeaseLabels(cfg, owner.LeaseID, owner.Slug, owner.State, false, time.Now().UTC())
+		labels := map[string]string{"crabbox": "true", "created_by": "crabbox", "provider": providerName, "lease": owner.LeaseID, "slug": owner.Slug, "state": owner.State}
+		if state := normalizeVastStatus(item.Status); state != "ready" && state != "unknown" {
+			labels["state"] = state
+		}
 		labels["provider_key"] = core.ProviderKeyForLease(owner.LeaseID)
 		labels[vastReleaseActionLabel] = normalizeVastReleaseAction(cfg.Vast.ReleaseAction)
 		return labels
@@ -874,24 +907,24 @@ func isOwnedVastInstance(item vastInstance) bool {
 
 func validateVastServer(server core.Server) error {
 	if server.Provider != "" && server.Provider != providerName {
-		return exit(2, "refusing to operate on provider=%s server as Vast", server.Provider)
+		return core.Exit(2, "refusing to operate on provider=%s server as Vast", server.Provider)
 	}
 	leaseID := strings.TrimSpace(server.Labels["lease"])
 	if leaseID == "" || strings.TrimSpace(server.Labels["slug"]) == "" {
-		return exit(2, "refusing to operate on non-Crabbox Vast instance %s", server.DisplayID())
+		return core.Exit(2, "refusing to operate on non-Crabbox Vast instance %s", server.DisplayID())
 	}
 	return nil
 }
 
 func validateLiveVastInstance(item vastInstance, expected core.Server) error {
 	if !isOwnedVastInstance(item) {
-		return exit(2, "refusing to operate on non-Crabbox Vast instance %d", item.ID)
+		return core.Exit(2, "refusing to operate on non-Crabbox Vast instance %d", item.ID)
 	}
 	owner, _ := decodeVastOwnershipLabel(item.Label)
 	if strconv.Itoa(item.ID) != expected.CloudID ||
 		owner.LeaseID != expected.Labels["lease"] ||
 		owner.Slug != expected.Labels["slug"] {
-		return exit(2, "refusing to operate on changed Vast instance %s", expected.CloudID)
+		return core.Exit(2, "refusing to operate on changed Vast instance %s", expected.CloudID)
 	}
 	return nil
 }
@@ -899,14 +932,14 @@ func validateLiveVastInstance(item vastInstance, expected core.Server) error {
 func validateVastClaimIdentity(claim core.LeaseClaim, leaseID, slug, cloudID string) error {
 	binding := shared.ClaimBinding{Provider: providerName, LeaseID: leaseID, Slug: slug}
 	if claim.Slug == "" || shared.ValidateClaimBinding(claim, binding) != nil {
-		return exit(2, "vast lease claim identity does not match lease=%s slug=%s", leaseID, slug)
+		return core.Exit(2, "vast lease claim identity does not match lease=%s slug=%s", leaseID, slug)
 	}
 	if cloudID != "" {
 		if claim.CloudID == "" {
-			return exit(2, "vast lease=%s claim has no instance identity", leaseID)
+			return core.Exit(2, "vast lease=%s claim has no instance identity", leaseID)
 		}
 		if claim.CloudID != cloudID {
-			return exit(2, "refusing to resolve Vast instance %s from stale local claim", cloudID)
+			return core.Exit(2, "refusing to resolve Vast instance %s from stale local claim", cloudID)
 		}
 	}
 	return nil
@@ -915,11 +948,11 @@ func validateVastClaimIdentity(claim core.LeaseClaim, leaseID, slug, cloudID str
 func sshTargetFromInstance(cfg core.Config, item vastInstance) (core.SSHTarget, error) {
 	host := strings.TrimSpace(item.SSHHost)
 	if host == "" || item.SSHPort <= 0 {
-		return core.SSHTarget{}, exit(5, "vast instance %d is missing SSH endpoint", item.ID)
+		return core.SSHTarget{}, core.Exit(5, "vast instance %d is missing SSH endpoint", item.ID)
 	}
 	ssh := core.SSHTargetFromConfig(cfg, host)
 	ssh.Port = strconv.Itoa(item.SSHPort)
-	ssh.User = firstNonBlank(cfg.SSHUser, cfg.Vast.User, "root")
+	ssh.User = shared.FirstNonBlankTrimmed(cfg.SSHUser, cfg.Vast.User, "root")
 	ssh.TargetOS = core.TargetLinux
 	ssh.ReadyCheck = vastReadyCheck
 	return ssh, nil
@@ -968,7 +1001,7 @@ func effectiveVastReleaseAction(cfg core.Config, labels map[string]string) strin
 	if core.DeleteOnReleaseExplicit(cfg, providerName) {
 		return normalizeVastReleaseAction(cfg.Vast.ReleaseAction)
 	}
-	return normalizeVastReleaseAction(firstNonBlank(labels[vastReleaseActionLabel], cfg.Vast.ReleaseAction))
+	return normalizeVastReleaseAction(shared.FirstNonBlankTrimmed(labels[vastReleaseActionLabel], cfg.Vast.ReleaseAction))
 }
 
 func parseVastInstanceID(value string) (int, bool) {
@@ -976,22 +1009,18 @@ func parseVastInstanceID(value string) (int, bool) {
 	return id, err == nil && id > 0
 }
 
-func firstNonBlank(values ...string) string {
-	return shared.FirstNonBlankTrimmed(values...)
-}
-
-func claimTarget(claim core.LeaseClaim) core.LeaseTarget {
+func claimTarget(claim core.LeaseClaim) (core.LeaseTarget, error) {
 	server := core.Server{
 		CloudID:  claim.CloudID,
 		Provider: providerName,
 		Name:     claim.Slug,
 		Status:   claim.Labels["state"],
-		Labels:   claim.Labels,
+		Labels:   shared.LegacyLabelLifecycleLabels(claim),
 	}
+	core.SetServerLeaseClaimSnapshot(&server, claim, true)
 	server.PublicNet.IPv4.IP = claim.SSHHost
 	target := core.SSHTarget{Host: claim.SSHHost, Port: strconv.Itoa(claim.SSHPort), TargetOS: core.TargetLinux}
-	core.UseStoredTestboxKey(&target, claim.LeaseID)
-	return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server, SSH: target}
+	return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server, SSH: target}, nil
 }
 
 func (b *backend) persistRecoveryClaim(leaseID, slug string, cfg core.Config, repoRoot string, instanceID int, keyID, accountID, apiURL, reason string, keep bool, now time.Time) error {
@@ -1021,21 +1050,21 @@ func (b *backend) validateVastCleanupIdentity(ctx context.Context, client vastAP
 func (b *backend) validateVastClaimProviderIdentity(ctx context.Context, client vastAPI, claim core.LeaseClaim, action string) error {
 	expectedAPIURL := strings.TrimSpace(claim.Labels[vastAPIURLLabel])
 	if expectedAPIURL == "" {
-		return exit(2, "lease=%s has no stored Vast API endpoint identity; refusing %s", claim.LeaseID, action)
+		return core.Exit(2, "lease=%s has no stored Vast API endpoint identity; refusing %s", claim.LeaseID, action)
 	}
 	if vastAPIEndpointIdentity(b.cfg.Vast.APIURL) != expectedAPIURL {
-		return exit(2, "lease=%s Vast API endpoint identity does not match current configuration; refusing %s", claim.LeaseID, action)
+		return core.Exit(2, "lease=%s Vast API endpoint identity does not match current configuration; refusing %s", claim.LeaseID, action)
 	}
 	expectedAccountID := strings.TrimSpace(claim.Labels[vastAccountIDLabel])
 	if expectedAccountID == "" {
-		return exit(2, "lease=%s has no stored Vast account identity; refusing %s", claim.LeaseID, action)
+		return core.Exit(2, "lease=%s has no stored Vast account identity; refusing %s", claim.LeaseID, action)
 	}
 	user, err := client.CheckAuth(ctx)
 	if err != nil {
 		return err
 	}
 	if strconv.Itoa(user.ID) != expectedAccountID {
-		return exit(2, "lease=%s Vast account identity does not match current credentials; refusing %s", claim.LeaseID, action)
+		return core.Exit(2, "lease=%s Vast account identity does not match current credentials; refusing %s", claim.LeaseID, action)
 	}
 	return nil
 }

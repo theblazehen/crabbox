@@ -13,89 +13,77 @@ import (
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-type Config = core.Config
-type Runtime = core.Runtime
-type ProviderSpec = core.ProviderSpec
-type Backend = core.Backend
-type AcquireRequest = core.AcquireRequest
-type ResolveRequest = core.ResolveRequest
-type ListRequest = core.ListRequest
-type LeaseView = core.LeaseView
-type ReleaseLeaseRequest = core.ReleaseLeaseRequest
-type TouchRequest = core.TouchRequest
-type CleanupRequest = core.CleanupRequest
-type LeaseTarget = core.LeaseTarget
-type Server = core.Server
-type SSHTarget = core.SSHTarget
-
 type azureLeaseBackend struct{ shared.DirectSSHBackend }
 
 const azureAcquireRollbackTimeout = 20 * time.Minute
 
 type azureClient interface {
 	LeaseClaimScope() string
-	ListCrabboxServers(context.Context) ([]Server, error)
-	CreateServerWithFallback(context.Context, Config, string, string, string, bool, func(string, ...any)) (Server, Config, error)
-	WaitForServerIP(context.Context, string) (Server, error)
-	GetServer(context.Context, string) (Server, error)
+	ListCrabboxServers(context.Context) ([]core.Server, error)
+	CreateServerWithFallback(context.Context, core.Config, string, string, string, bool, func(string, ...any)) (core.Server, core.Config, error)
+	WaitForServerIP(context.Context, string) (core.Server, error)
+	GetServer(context.Context, string) (core.Server, error)
 	DeleteServer(context.Context, string) error
-	PrepareOwnedServer(context.Context, Server) (Server, error)
-	PrepareCleanupServer(context.Context, Server, time.Time) (Server, error)
-	DeleteOwnedServer(context.Context, Server) error
-	DeleteCleanupServer(context.Context, Server, time.Time) error
+	PrepareOwnedServer(context.Context, core.Server) (core.Server, error)
+	PrepareCleanupServer(context.Context, core.Server, time.Time) (core.Server, error)
+	DeleteOwnedServer(context.Context, core.Server) error
+	DeleteCleanupServer(context.Context, core.Server, time.Time) error
 	SetTags(context.Context, string, map[string]string) error
 }
 
-func NewAzureLeaseBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func NewAzureLeaseBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	cfg.Provider = "azure"
 	return &azureLeaseBackend{DirectSSHBackend: shared.DirectSSHBackend{SpecValue: spec, Cfg: cfg, RT: rt, Delete: deleteServer, StoredLeaseKeys: true}}
 }
 
-func (b *azureLeaseBackend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
-	return acquireAttemptsRetry(b.RT, req.Keep, func() (LeaseTarget, error) {
+func (b *azureLeaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	if req.RequestedLeaseID != "" {
+		return b.acquireFixed(ctx, req)
+	}
+	return shared.AcquireAttemptsRetry(b.RT, req.Keep, func() (core.LeaseTarget, error) {
 		return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
 	})
 }
 
-func (b *azureLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug string) (result LeaseTarget, retErr error) {
+func (b *azureLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug string) (result core.LeaseTarget, retErr error) {
 	cfg := b.Cfg
 	if cfg.Tailscale.Enabled && cfg.Tailscale.AuthKey == "" {
-		return LeaseTarget{}, exit(2, "direct --tailscale requires %s to contain a Tailscale auth key; brokered mode uses coordinator OAuth secrets", cfg.Tailscale.AuthKeyEnv)
+		return core.LeaseTarget{}, core.Exit(2, "direct --tailscale requires %s to contain a Tailscale auth key; brokered mode uses coordinator OAuth secrets", cfg.Tailscale.AuthKeyEnv)
 	}
 	if err := validateAzureSSHCIDRsForAcquire(ctx, cfg); err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	client, err := newAzureClient(ctx, cfg)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	leaseID := newLeaseID()
+	leaseID := core.NewLeaseID()
 	servers, err := client.ListCrabboxServers(ctx)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	slug, err := allocateDirectLeaseSlug(leaseID, requestedSlug, servers)
+	slug, err := core.AllocateDirectLeaseSlug(leaseID, requestedSlug, servers)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	keyPath, publicKey, err := ensureTestboxKeyForConfig(cfg, leaseID)
+	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(cfg, leaseID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	cfg.SSHKey = keyPath
-	cfg.ProviderKey = providerKeyForLease(leaseID)
-	expected := Server{CloudID: core.LeaseProviderName(leaseID, slug), Labels: core.DirectLeaseLabels(cfg, leaseID, slug, "azure", "on-demand", keep, time.Now())}
+	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
+	expected := core.Server{CloudID: core.LeaseProviderName(leaseID, slug), Labels: core.DirectLeaseLabels(cfg, leaseID, slug, "azure", "on-demand", keep, time.Now())}
 	fmt.Fprintf(b.RT.Stderr, "provisioning provider=azure lease=%s slug=%s class=%s preferred_type=%s location=%s rg=%s keep=%v\n",
-		leaseID, slug, cfg.Class, cfg.ServerType, cfg.AzureLocation, cfg.AzureResourceGroup, keep)
+		leaseID, slug, cfg.Class, cfg.ServerType, cfg.Azure.Location, cfg.Azure.ResourceGroup, keep)
 	server, cfg, err := client.CreateServerWithFallback(ctx, cfg, publicKey, leaseID, slug, keep, func(format string, args ...any) {
 		fmt.Fprintf(b.RT.Stderr, format, args...)
 	})
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	expected.ImmutableID = server.ImmutableID
 	if err := validateAzureAcquiredVM(expected, server); err != nil {
-		return LeaseTarget{}, shared.JoinAcquireCleanupError(fmt.Errorf("azure creation rejected: %w", err), errors.New("Azure cleanup withheld: created VM binding is incomplete or inconsistent"))
+		return core.LeaseTarget{}, shared.JoinAcquireCleanupError(fmt.Errorf("azure creation rejected: %w", err), errors.New("Azure cleanup withheld: created VM binding is incomplete or inconsistent"))
 	}
 	created := server
 	created.Labels = maps.Clone(server.Labels)
@@ -113,6 +101,11 @@ func (b *azureLeaseBackend) acquireOnce(ctx context.Context, keep bool, requeste
 		if err == nil {
 			err = client.DeleteOwnedServer(cleanupCtx, prepared)
 		}
+		if err == nil {
+			if cleanupErr := core.RemoveStoredTestboxConnectionArtifacts(leaseID); cleanupErr != nil {
+				err = fmt.Errorf("remove SSH connection artifacts for lease %s after azure rollback: %w", leaseID, cleanupErr)
+			}
+		}
 		if err != nil {
 			fmt.Fprintf(b.RT.Stderr, "warning: cleanup azure server %s after acquire failure: %v\n", created.CloudID, err)
 			retErr = shared.JoinAcquireCleanupError(retErr, fmt.Errorf("cleanup azure server %s after acquire failure: %w", created.CloudID, err))
@@ -121,34 +114,37 @@ func (b *azureLeaseBackend) acquireOnce(ctx context.Context, keep bool, requeste
 	fmt.Fprintf(b.RT.Stderr, "provisioned lease=%s server=%s type=%s\n", leaseID, server.DisplayID(), cfg.ServerType)
 	server, err = client.WaitForServerIP(ctx, server.CloudID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if err := validateAzureAcquiredVM(created, server); err != nil {
 		// A later matching read must not erase an observed replacement.
 		rollback = false
-		return LeaseTarget{}, shared.JoinAcquireCleanupError(fmt.Errorf("azure readiness rejected: %w", err), errors.New("Azure cleanup withheld after readiness identity loss"))
+		return core.LeaseTarget{}, shared.JoinAcquireCleanupError(fmt.Errorf("azure readiness rejected: %w", err), errors.New("Azure cleanup withheld after readiness identity loss"))
 	}
-	target := sshTargetFromConfig(cfg, azureServerHost(server, cfg.AzureNetwork))
+	target := core.SSHTargetFromConfig(cfg, core.AzureServerHost(server, cfg.Azure.Network))
 	if err := bootstrapManagedWindowsDesktop(ctx, cfg, &target, publicKey, b.RT.Stderr); err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	server.Labels["state"] = "ready"
 	if err := client.SetTags(ctx, server.CloudID, server.Labels); err != nil {
 		fmt.Fprintf(b.RT.Stderr, "warning: set tags: %v\n", err)
 	}
 	if err := core.ClaimLeaseTargetForConfig(leaseID, slug, cfg, server, target, cfg.IdleTimeout); err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	b.Cfg.AzureSubscription = cfg.AzureSubscription
-	b.Cfg.AzureResourceGroup = cfg.AzureResourceGroup
+	b.Cfg.Azure.Subscription = cfg.Azure.Subscription
+	b.Cfg.Azure.ResourceGroup = cfg.Azure.ResourceGroup
 	rollback = false
-	return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 }
 
-func (b *azureLeaseBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error) {
+func (b *azureLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
 	client, err := newAzureClient(ctx, b.Cfg)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
+	}
+	if lease, handled, err := b.resolveFixed(ctx, client, req); handled {
+		return lease, err
 	}
 	if strings.HasPrefix(req.ID, "crabbox-") {
 		server, err := client.GetServer(ctx, req.ID)
@@ -156,55 +152,53 @@ func (b *azureLeaseBackend) Resolve(ctx context.Context, req ResolveRequest) (Le
 			if req.ReleaseOnly && isAzureCleanupNotFound(err) {
 				return resolveMissingAzureReleaseClaim(req.ID, client.LeaseClaimScope())
 			}
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		if !isCrabboxAzureLease(server) {
-			return LeaseTarget{}, exit(4, "lease/server not found: %s (vm exists but is not Crabbox-managed)", req.ID)
+			return core.LeaseTarget{}, core.Exit(4, "lease/server not found: %s (vm exists but is not Crabbox-managed)", req.ID)
 		}
 		leaseID := server.Labels["lease"]
-		target := sshTargetFromConfig(b.Cfg, azureServerHost(server, b.Cfg.AzureNetwork))
-		useStoredTestboxKey(&target, leaseID)
-		return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+		target := core.SSHTargetFromConfig(b.Cfg, core.AzureServerHost(server, b.Cfg.Azure.Network))
+		return b.resolvedAzureLease(server, target, leaseID, req.ReleaseOnly)
 	}
 	servers, err := listOwnedAzureServers(ctx, client)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	if server, leaseID, err := findServerByAlias(servers, req.ID); err != nil {
-		return LeaseTarget{}, err
+	if server, leaseID, err := core.FindServerByAlias(servers, req.ID); err != nil {
+		return core.LeaseTarget{}, err
 	} else if leaseID != "" {
-		target := sshTargetFromConfig(b.Cfg, azureServerHost(server, b.Cfg.AzureNetwork))
-		useStoredTestboxKey(&target, leaseID)
-		return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+		target := core.SSHTargetFromConfig(b.Cfg, core.AzureServerHost(server, b.Cfg.Azure.Network))
+		return b.resolvedAzureLease(server, target, leaseID, req.ReleaseOnly)
 	}
 	if req.ReleaseOnly {
 		return resolveMissingAzureReleaseClaim(req.ID, client.LeaseClaimScope())
 	}
-	return LeaseTarget{}, exit(4, "lease/server not found: %s", req.ID)
+	return core.LeaseTarget{}, core.Exit(4, "lease/server not found: %s", req.ID)
 }
 
-func resolveMissingAzureReleaseClaim(identifier, providerScope string) (LeaseTarget, error) {
+func resolveMissingAzureReleaseClaim(identifier, providerScope string) (core.LeaseTarget, error) {
 	claim, exists, err := core.ResolveLeaseClaimForProvider(identifier, "azure")
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if !exists {
 		claim, exists, err = core.ResolveLeaseClaimForProviderCloudID(identifier, "azure")
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 	}
 	if !exists || !core.LeaseClaimMatchesIdentifier(claim, identifier) {
-		return LeaseTarget{}, exit(4, "lease/server not found: %s", identifier)
+		return core.LeaseTarget{}, core.Exit(4, "lease/server not found: %s", identifier)
 	}
 	server := azureServerFromClaim(claim)
 	if err := validateExactAzureClaim(claim, server, claim.LeaseID, providerScope); err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	return LeaseTarget{Server: server, LeaseID: claim.LeaseID}, nil
+	return core.LeaseTarget{Server: server, LeaseID: claim.LeaseID}, nil
 }
 
-func isCrabboxAzureLease(server Server) bool {
+func isCrabboxAzureLease(server core.Server) bool {
 	labels := server.Labels
 	return labels != nil &&
 		labels["crabbox"] == "true" &&
@@ -214,7 +208,7 @@ func isCrabboxAzureLease(server Server) bool {
 		strings.TrimSpace(labels["slug"]) != ""
 }
 
-func (b *azureLeaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseView, error) {
+func (b *azureLeaseBackend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
 	_ = req
 	client, err := newAzureClient(ctx, b.Cfg)
 	if err != nil {
@@ -224,22 +218,47 @@ func (b *azureLeaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseV
 }
 
 func (b *azureLeaseBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
-	servers, err := b.List(ctx, ListRequest{})
+	servers, err := b.List(ctx, core.ListRequest{})
 	if err != nil {
 		return core.DoctorResult{}, err
 	}
 	result := core.InventoryDoctorResult("azure", len(servers))
-	result.Message += fmt.Sprintf(" location=%s default_type=%s", b.Cfg.AzureLocation, b.Cfg.ServerType)
+	result.Message += fmt.Sprintf(" location=%s default_type=%s", b.Cfg.Azure.Location, b.Cfg.ServerType)
 	return result, nil
 }
 
-func (b *azureLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error {
+func (b *azureLeaseBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	if handled, err := b.releaseFixedTerminal(req.Lease); handled {
+		return err
+	}
 	client, err := newAzureClient(ctx, b.Cfg)
 	if err != nil {
 		return err
 	}
 	claim, err := requireExactAzureClaim(req.Lease.Server, req.Lease.LeaseID, client.LeaseClaimScope())
 	if err != nil {
+		return err
+	}
+	if fixedAzureLeaseKind.IsFixedClaim(claim) {
+		err := core.DeleteFixedResource(ctx, fixedAzureLeaseKind, claim, core.FixedLeaseOperations[core.Server]{
+			Release: &core.FixedReleasePolicy{PersistBinding: true},
+			ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[core.Server], error) {
+				prepared, err := client.PrepareOwnedServer(ctx, req.Lease.Server)
+				if err != nil {
+					return core.FixedObservation[core.Server]{}, err
+				}
+				if err := validateExactAzureClaim(*tx.Claim, prepared, req.Lease.LeaseID, client.LeaseClaimScope()); err != nil {
+					return core.FixedObservation[core.Server]{}, err
+				}
+				return core.FixedObservation[core.Server]{Candidates: []core.Server{prepared}, Binding: &core.FixedResourceBinding{Labels: prepared.Labels}}, nil
+			},
+			DeleteExact: func(ctx context.Context, _ *core.FixedTransaction, prepared core.Server) error {
+				return client.DeleteOwnedServer(ctx, prepared)
+			},
+		})
+		if err == nil {
+			core.RemoveStoredTestboxKey(req.Lease.LeaseID)
+		}
 		return err
 	}
 	prepared, err := client.PrepareOwnedServer(ctx, req.Lease.Server)
@@ -253,7 +272,7 @@ func (b *azureLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRe
 	if err != nil {
 		return err
 	}
-	if err := core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, func() error {
+	if err := fixedAzureLeaseKind.FinalizeAfterCleanup(claim, func() error {
 		return client.DeleteOwnedServer(ctx, prepared)
 	}); err != nil {
 		return err
@@ -262,15 +281,25 @@ func (b *azureLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRe
 	return nil
 }
 
-func (b *azureLeaseBackend) ReleaseLeaseMessage(lease LeaseTarget) string {
+func (b *azureLeaseBackend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
 	return fmt.Sprintf("deleted lease=%s server=%s name=%s", lease.LeaseID, lease.Server.DisplayID(), lease.Server.Name)
 }
 
-func (b *azureLeaseBackend) Touch(ctx context.Context, req TouchRequest) (Server, error) {
-	return b.DirectSSHBackend.Touch(ctx, req.Lease.Server, req.State), nil
+func (b *azureLeaseBackend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	return b.DirectSSHBackend.Touch(ctx, req, func(ctx context.Context, server core.Server) error {
+		client, err := newAzureClient(ctx, b.Cfg)
+		if err != nil {
+			return err
+		}
+		name := server.CloudID
+		if name == "" {
+			name = server.Name
+		}
+		return client.SetTags(ctx, name, server.Labels)
+	}), nil
 }
 
-func (b *azureLeaseBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
+func (b *azureLeaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	client, err := newAzureClient(ctx, b.Cfg)
 	if err != nil {
 		return err
@@ -321,36 +350,16 @@ func (b *azureLeaseBackend) Cleanup(ctx context.Context, req CleanupRequest) err
 			fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=live VM %s\n", server.DisplayID(), server.Name, reason)
 			continue
 		}
-		fmt.Fprintf(b.RT.Stderr, "delete server id=%s name=%s\n", live.DisplayID(), live.Name)
-		if req.DryRun {
-			continue
+		decision := shared.DirectCleanupDecision{
+			Action: shared.DeleteCleanupServer,
+			Server: live,
+			Mutate: func(ctx context.Context) error {
+				return b.applyAzureCleanup(ctx, client, live, claim, now, azureCleanupLive)
+			},
 		}
-		prepared, err := client.PrepareCleanupServer(ctx, live, now)
-		if err != nil {
-			if core.IsAzureCleanupSkipError(err) {
-				fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%v\n", live.DisplayID(), live.Name, err)
-				continue
-			}
+		if err := decision.Apply(ctx, req, b.RT); err != nil {
 			return err
 		}
-		claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, prepared.Labels)
-		if err != nil {
-			return err
-		}
-		if err := core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, func() error {
-			return client.DeleteCleanupServer(ctx, prepared, now)
-		}); err != nil {
-			if core.IsAzureCleanupSkipError(err) {
-				fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%v\n", live.DisplayID(), live.Name, err)
-				continue
-			}
-			if isAzureCleanupNotFound(err) {
-				fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=live VM no longer exists at delete boundary\n", live.DisplayID(), live.Name)
-				continue
-			}
-			return err
-		}
-		core.RemoveStoredTestboxKey(claim.LeaseID)
 	}
 	return b.resumeAzureCleanupClaims(ctx, client, seen, now, req.DryRun)
 }
@@ -369,38 +378,65 @@ func (b *azureLeaseBackend) resumeAzureCleanupClaims(ctx context.Context, client
 			fmt.Fprintf(b.RT.Stderr, "skip recovery server id=%s reason=exact local claim missing or stale\n", claim.CloudID)
 			continue
 		}
-		fmt.Fprintf(b.RT.Stderr, "resume cleanup server id=%s name=%s\n", server.DisplayID(), server.Name)
-		if dryRun {
-			continue
+		decision := shared.DirectCleanupDecision{
+			Action: shared.ResumeCleanupServer,
+			Server: server,
+			Mutate: func(ctx context.Context) error {
+				return b.applyAzureCleanup(ctx, client, server, claim, now, azureCleanupRecovery)
+			},
 		}
-		prepared, err := client.PrepareCleanupServer(ctx, server, now)
-		if err != nil {
-			if core.IsAzureCleanupSkipError(err) {
-				fmt.Fprintf(b.RT.Stderr, "skip recovery server id=%s reason=%v\n", server.DisplayID(), err)
-				continue
-			}
+		if err := decision.Apply(ctx, core.CleanupRequest{DryRun: dryRun}, b.RT); err != nil {
 			return err
 		}
-		claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, prepared.Labels)
-		if err != nil {
-			return err
-		}
-		if err := core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, func() error {
-			return client.DeleteCleanupServer(ctx, prepared, now)
-		}); err != nil {
-			if core.IsAzureCleanupSkipError(err) {
-				fmt.Fprintf(b.RT.Stderr, "skip recovery server id=%s reason=%v\n", server.DisplayID(), err)
-				continue
-			}
-			return err
-		}
-		core.RemoveStoredTestboxKey(claim.LeaseID)
 	}
 	return nil
 }
 
-func azureServerFromClaim(claim core.LeaseClaim) Server {
-	return Server{
+type azureCleanupMode uint8
+
+const (
+	azureCleanupLive azureCleanupMode = iota
+	azureCleanupRecovery
+)
+
+// The decision owner calls this only after the dry-run gate. Recovery retains
+// missing-resource errors; only live cleanup tolerates a delete-boundary miss.
+func (b *azureLeaseBackend) applyAzureCleanup(ctx context.Context, client azureClient, server core.Server, claim core.LeaseClaim, now time.Time, mode azureCleanupMode) error {
+	description := fmt.Sprintf("server id=%s name=%s", server.DisplayID(), server.Name)
+	if mode == azureCleanupRecovery {
+		description = fmt.Sprintf("recovery server id=%s", server.DisplayID())
+	}
+	prepared, err := client.PrepareCleanupServer(ctx, server, now)
+	if err != nil {
+		if core.IsAzureCleanupSkipError(err) {
+			fmt.Fprintf(b.RT.Stderr, "skip %s reason=%v\n", description, err)
+			return nil
+		}
+		return err
+	}
+	claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, prepared.Labels)
+	if err != nil {
+		return err
+	}
+	if err := fixedAzureLeaseKind.FinalizeAfterCleanup(claim, func() error {
+		return client.DeleteCleanupServer(ctx, prepared, now)
+	}); err != nil {
+		if core.IsAzureCleanupSkipError(err) {
+			fmt.Fprintf(b.RT.Stderr, "skip %s reason=%v\n", description, err)
+			return nil
+		}
+		if mode == azureCleanupLive && isAzureCleanupNotFound(err) {
+			fmt.Fprintf(b.RT.Stderr, "skip %s reason=live VM no longer exists at delete boundary\n", description)
+			return nil
+		}
+		return err
+	}
+	core.RemoveStoredTestboxKey(claim.LeaseID)
+	return nil
+}
+
+func azureServerFromClaim(claim core.LeaseClaim) core.Server {
+	return core.Server{
 		CloudID:     claim.CloudID,
 		Name:        claim.CloudID,
 		Provider:    "azure",
@@ -409,12 +445,12 @@ func azureServerFromClaim(claim core.LeaseClaim) Server {
 	}
 }
 
-func listOwnedAzureServers(ctx context.Context, client azureClient) ([]Server, error) {
+func listOwnedAzureServers(ctx context.Context, client azureClient) ([]core.Server, error) {
 	servers, err := client.ListCrabboxServers(ctx)
 	if err != nil {
 		return nil, err
 	}
-	owned := make([]Server, 0, len(servers))
+	owned := make([]core.Server, 0, len(servers))
 	for _, server := range servers {
 		if isCrabboxAzureLease(server) {
 			owned = append(owned, server)
@@ -423,37 +459,17 @@ func listOwnedAzureServers(ctx context.Context, client azureClient) ([]Server, e
 	return owned, nil
 }
 
-func acquireAttemptsRetry(rt Runtime, keep bool, acquire func() (LeaseTarget, error)) (LeaseTarget, error) {
-	return shared.AcquireAttemptsRetry(rt, keep, acquire)
-}
-
-func exit(code int, format string, args ...any) core.ExitError {
-	return core.Exit(code, format, args...)
-}
-
-var newAzureClient = func(ctx context.Context, cfg Config) (azureClient, error) {
+var newAzureClient = func(ctx context.Context, cfg core.Config) (azureClient, error) {
 	return core.NewAzureClient(ctx, cfg)
 }
 
 var validateAzureSSHCIDRsForAcquire = core.ValidateAzureSSHCIDRsForAcquire
 
-func newLeaseID() string { return core.NewLeaseID() }
-func allocateDirectLeaseSlug(id, requested string, servers []Server) (string, error) {
-	return core.AllocateDirectLeaseSlug(id, requested, servers)
-}
-func ensureTestboxKeyForConfig(cfg Config, leaseID string) (string, string, error) {
-	return core.EnsureTestboxKeyForConfig(cfg, leaseID)
-}
-func providerKeyForLease(leaseID string) string { return core.ProviderKeyForLease(leaseID) }
-func sshTargetFromConfig(cfg Config, host string) SSHTarget {
-	return core.SSHTargetFromConfig(cfg, host)
-}
-
 var bootstrapManagedWindowsDesktop = core.BootstrapManagedWindowsDesktop
 
-func deleteServer(ctx context.Context, cfg Config, server Server) error {
+func deleteServer(ctx context.Context, cfg core.Config, server core.Server) error {
 	if !isCrabboxAzureLease(server) {
-		return exit(4, "refusing to delete Azure VM %s without canonical Crabbox ownership tags", server.DisplayID())
+		return core.Exit(4, "refusing to delete Azure VM %s without canonical Crabbox ownership tags", server.DisplayID())
 	}
 	client, err := newAzureClient(ctx, cfg)
 	if err != nil {
@@ -462,7 +478,7 @@ func deleteServer(ctx context.Context, cfg Config, server Server) error {
 	return deleteAzureServerWithClient(ctx, client, server)
 }
 
-func deleteAzureServerWithClient(ctx context.Context, client azureClient, server Server) error {
+func deleteAzureServerWithClient(ctx context.Context, client azureClient, server core.Server) error {
 	name := server.CloudID
 	if name == "" {
 		name = server.Name
@@ -470,13 +486,13 @@ func deleteAzureServerWithClient(ctx context.Context, client azureClient, server
 	return client.DeleteServer(ctx, name)
 }
 
-func requireExactAzureClaim(server Server, expectedLeaseID, providerScope string) (core.LeaseClaim, error) {
+func requireExactAzureClaim(server core.Server, expectedLeaseID, providerScope string) (core.LeaseClaim, error) {
 	claim, exists, err := core.ReadLeaseClaimWithPresence(expectedLeaseID)
 	if err != nil {
 		return core.LeaseClaim{}, err
 	}
 	if !exists {
-		return core.LeaseClaim{}, exit(2, "azure lease=%s has no exact local claim; refusing destructive operation", expectedLeaseID)
+		return core.LeaseClaim{}, core.Exit(2, "azure lease=%s has no exact local claim; refusing destructive operation", expectedLeaseID)
 	}
 	if err := validateExactAzureClaim(claim, server, expectedLeaseID, providerScope); err != nil {
 		return core.LeaseClaim{}, err
@@ -484,7 +500,12 @@ func requireExactAzureClaim(server Server, expectedLeaseID, providerScope string
 	return claim, nil
 }
 
-func validateExactAzureClaim(claim core.LeaseClaim, server Server, expectedLeaseID, providerScope string) error {
+func validateExactAzureClaim(claim core.LeaseClaim, server core.Server, expectedLeaseID, providerScope string) error {
+	if claim.FixedCreateIntent != nil {
+		if err := validateFixedAzureServer(claim, server); err != nil {
+			return err
+		}
+	}
 	serverSlug := strings.TrimSpace(server.Labels["slug"])
 	serverProviderKey := strings.TrimSpace(server.Labels["provider_key"])
 	if strings.TrimSpace(providerScope) == "" ||
@@ -504,12 +525,12 @@ func validateExactAzureClaim(claim core.LeaseClaim, server Server, expectedLease
 		strings.TrimSpace(claim.Labels["provider"]) != "azure" ||
 		serverProviderKey == "" ||
 		strings.TrimSpace(claim.Labels["provider_key"]) != serverProviderKey {
-		return exit(2, "refusing to operate on Azure VM %s from a missing or stale exact local claim", server.DisplayID())
+		return core.Exit(2, "refusing to operate on Azure VM %s from a missing or stale exact local claim", server.DisplayID())
 	}
 	return nil
 }
 
-func validateAzureAcquiredVM(expected, live Server) error {
+func validateAzureAcquiredVM(expected, live core.Server) error {
 	if live.Name != expected.CloudID {
 		return fmt.Errorf("Azure VM name %q does not match allocation %q", live.Name, expected.CloudID)
 	}
@@ -527,14 +548,4 @@ func isAzureCleanupNotFound(err error) bool {
 	}
 	message := err.Error()
 	return strings.Contains(message, "ResourceNotFound") || strings.Contains(message, "NotFound")
-}
-
-func useStoredTestboxKey(target *SSHTarget, leaseID string) {
-	shared.UseStoredTestboxKey(target, leaseID)
-}
-func findServerByAlias(servers []Server, id string) (Server, string, error) {
-	return core.FindServerByAlias(servers, id)
-}
-func azureServerHost(server Server, network string) string {
-	return core.AzureServerHost(server, network)
 }

@@ -4,6 +4,7 @@ package cli
 
 var benchmarkProviderCategories = map[string]string{
 	"agent-sandbox":              "delegated-sandbox",
+	"agent-sandbox-ssh":          "delegated-sandbox",
 	"anthropic-sandbox-runtime":  "local-sandbox",
 	"apple-container":            "local-runtime",
 	"apple-machine":              "local-vm",

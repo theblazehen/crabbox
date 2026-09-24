@@ -31,9 +31,13 @@ func lockFixedLeaseAcquisition(ctx context.Context, leaseID string) (func(), err
 }
 
 type FixedLeaseBinding struct {
-	ProviderScope string
-	Fingerprint   string
-	Slug          string
+	AllocateSlug        bool
+	RejectExistingLease bool
+	RequestedSlug       string
+	Inventory           []Server
+	ProviderScope       string
+	Fingerprint         string
+	Slug                string
 }
 
 type FixedAcquireOptions struct {
@@ -47,6 +51,7 @@ type FixedAcquireOptions struct {
 	TTL          time.Duration
 	IdleTimeout  time.Duration
 	Now          func() time.Time
+	journal      bool
 }
 
 func AcquireFixedLease(
@@ -55,34 +60,82 @@ func AcquireFixedLease(
 	acquire func(context.Context, *LeaseClaim, *FixedCreateIntent, func() error) (LeaseTarget, error),
 	ctx context.Context,
 ) (LeaseTarget, error) {
+	var acquired LeaseTarget
+	claim, err := AcquireFixedIntent(opts, prepare, func(ctx context.Context, claim *LeaseClaim, intent *FixedCreateIntent, persist func() error) error {
+		var err error
+		acquired, err = acquire(ctx, claim, intent, persist)
+		if err != nil {
+			return err
+		}
+		SetLeaseClaimResourceIdentity(claim, acquired.Server.CloudID, claim.CloudNumericID, acquired.Server.ImmutableID, acquired.Server.ImageEvidence)
+		claim.Slug = intent.Slug
+		claim.Provider = opts.Kind.ClaimProvider
+		claim.Labels = maps.Clone(acquired.Server.Labels)
+		claim.SSHHost = acquired.SSH.Host
+		if port, parseErr := strconv.Atoi(strings.TrimSpace(acquired.SSH.Port)); parseErr == nil {
+			claim.SSHPort = port
+		}
+		return nil
+	}, ctx)
+	if err != nil {
+		return LeaseTarget{}, err
+	}
+	SetServerLeaseClaimSnapshot(&acquired.Server, claim, true)
+	return acquired, nil
+}
+
+// AcquireFixedIntent owns durable fixed acquisition independently of transport.
+// Callbacks publish provider facts through persist and must not reenter claim locks.
+func AcquireFixedIntent(
+	opts FixedAcquireOptions,
+	prepare func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error),
+	acquire func(context.Context, *LeaseClaim, *FixedCreateIntent, func() error) error,
+	ctx context.Context,
+) (LeaseClaim, error) {
 	now := opts.Now
 	if now == nil {
 		now = time.Now
 	}
-	var acquired LeaseTarget
-	err := WithDurableLeaseClaimLock(opts.LeaseID, func(claim *LeaseClaim, exists bool, persist func() error) error {
+	var completed LeaseClaim
+	err := WithDurableLeaseClaimLockContext(ctx, opts.LeaseID, func(claim *LeaseClaim, exists bool, persist func() error) error {
 		if exists && opts.Kind.IsFixedClaim(*claim) && claim.FixedCreateIntent.State == "released" {
-			return exit(4, "lease_id_conflict: fixed lease %s is terminal and cannot be replayed", opts.LeaseID)
+			return Exit(4, "lease_id_conflict: fixed lease %s is terminal and cannot be replayed", opts.LeaseID)
 		}
 		if exists && claim.FixedCreateIntent != nil && claim.FixedCreateIntent.CheckpointID != opts.CheckpointID {
-			return exit(4, "lease_id_conflict: lease %s is bound to checkpoint %s, not checkpoint %s", opts.LeaseID, blank(claim.FixedCreateIntent.CheckpointID, "<none>"), blank(opts.CheckpointID, "<none>"))
+			return Exit(4, "lease_id_conflict: lease %s is bound to checkpoint %s, not checkpoint %s", opts.LeaseID, blank(claim.FixedCreateIntent.CheckpointID, "<none>"), blank(opts.CheckpointID, "<none>"))
+		}
+		if exists && claim.Provider != opts.Kind.ClaimProvider {
+			return Exit(4, "lease_id_conflict: lease %s is bound to provider=%s; it already has another owner", opts.LeaseID, claim.Provider)
 		}
 		binding, err := prepare(ctx, claim, exists)
 		if err != nil {
 			return err
+		}
+		if !exists && binding.AllocateSlug {
+			if binding.RejectExistingLease {
+				for _, server := range binding.Inventory {
+					if server.Labels["lease"] == opts.LeaseID {
+						return Exit(4, "lease_id_conflict: resource exists without its create intent")
+					}
+				}
+			}
+			binding.Slug, err = AllocateDirectLeaseSlug(opts.LeaseID, binding.RequestedSlug, binding.Inventory)
+			if err != nil {
+				return err
+			}
 		}
 		if exists {
 			if claim.FixedCreateIntent == nil ||
 				claim.FixedCreateIntent.Version != opts.Kind.IntentVersion ||
 				claim.FixedCreateIntent.Fingerprint != binding.Fingerprint ||
 				claim.FixedCreateIntent.ProviderScope != binding.ProviderScope {
-				return exit(4, "lease_id_conflict: lease %s is bound to another create intent", opts.LeaseID)
+				return Exit(4, "lease_id_conflict: lease %s is bound to another create intent", opts.LeaseID)
 			}
 			if claim.Provider != opts.Kind.ClaimProvider {
-				return exit(4, "lease_id_conflict: lease %s is bound to provider=%s", opts.LeaseID, claim.Provider)
+				return Exit(4, "lease_id_conflict: lease %s is bound to provider=%s", opts.LeaseID, claim.Provider)
 			}
 			if claim.RepoRoot != "" && claim.RepoRoot != opts.RepoRoot && !opts.Reclaim {
-				return exit(4, "lease_id_conflict: lease %s is bound to another repository", opts.LeaseID)
+				return Exit(4, "lease_id_conflict: lease %s is bound to another repository", opts.LeaseID)
 			}
 		} else {
 			current := now().UTC()
@@ -105,6 +158,9 @@ func AcquireFixedLease(
 				CreatedAt:     current.Format(time.RFC3339Nano),
 				State:         "prepared",
 			}
+			if opts.journal {
+				claim.FixedCreateIntent.Journal = &FixedLeaseJournal{Version: 1, Phase: "prepared", Revision: 1}
+			}
 			if err := persist(); err != nil {
 				return err
 			}
@@ -112,39 +168,32 @@ func AcquireFixedLease(
 
 		intent := claim.FixedCreateIntent
 		if intent.State != "prepared" && intent.State != "acquired" {
-			return exit(4, "lease_id_conflict: fixed lease %s has invalid create state %q", opts.LeaseID, intent.State)
+			return Exit(4, "lease_id_conflict: fixed lease %s has invalid create state %q", opts.LeaseID, intent.State)
 		}
 		createdAt, err := time.Parse(time.RFC3339Nano, intent.CreatedAt)
 		if err != nil {
-			return exit(4, "lease_id_conflict: lease %s has invalid fixed create timestamp", opts.LeaseID)
+			return Exit(4, "lease_id_conflict: lease %s has invalid fixed create timestamp", opts.LeaseID)
 		}
 		if opts.TTL > 0 && now().UTC().After(createdAt.Add(opts.TTL)) {
-			return exit(4, "lease_id_conflict: fixed create intent for lease %s has expired", opts.LeaseID)
+			return Exit(4, "lease_id_conflict: fixed create intent for lease %s has expired", opts.LeaseID)
 		}
 
-		acquired, err = acquire(ctx, claim, intent, persist)
-		if err != nil {
+		if err := acquire(ctx, claim, intent, persist); err != nil {
 			return err
 		}
-		claim.CloudID = acquired.Server.CloudID
-		claim.CloudImmutableID = acquired.Server.ImmutableID
-		claim.Slug = intent.Slug
-		claim.Provider = opts.Kind.ClaimProvider
-		claim.Labels = maps.Clone(acquired.Server.Labels)
-		claim.SSHHost = acquired.SSH.Host
 		claim.LastUsedAt = now().UTC().Format(time.RFC3339)
-		if port, parseErr := strconv.Atoi(strings.TrimSpace(acquired.SSH.Port)); parseErr == nil {
-			claim.SSHPort = port
-		}
 		intent.State = "acquired"
+		if intent.Journal != nil && intent.Journal.Phase != "acquired" {
+			intent.Journal = &FixedLeaseJournal{Version: 1, Phase: "acquired", Revision: intent.Journal.Revision + 1, Submission: intent.Journal.Submission}
+		}
 		if err := persist(); err != nil {
 			return err
 		}
-		SetServerLeaseClaimSnapshot(&acquired.Server, *claim, true)
+		completed = *claim
 		return nil
 	})
 	if err != nil {
-		return LeaseTarget{}, err
+		return LeaseClaim{}, err
 	}
-	return acquired, nil
+	return completed, nil
 }

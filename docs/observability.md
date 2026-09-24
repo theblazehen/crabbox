@@ -87,6 +87,24 @@ updated; the CLI does not fall back to anonymous record creation. Run IDs are
 single-invocation identities, and recovery relies on the existing record's
 retention. A new CLI invocation always uses a new ID.
 
+If this invocation abandons admission before any workload can start, the CLI
+separately reports a failed admission to the original authenticated coordinator.
+The first admission's effective authentication, owner, and organization headers
+are retained only in memory for this admission and its terminal bookkeeping;
+normal token refresh outside that invocation binding is unchanged.
+This bookkeeping may add up to 60 seconds and three attempts after the existing
+10-second admission allowance; it does not extend admission or replay the command.
+The coordinator checks the original owner, organization, and request, and refuses
+to change a record whose lifecycle has advanced. A matching absent admission can
+be recorded as failed atomically, so a late original admission cannot reopen it.
+This is failed pre-work history, not a signed workload receipt.
+
+The initiating command error remains the result. If terminal bookkeeping cannot
+be confirmed, the CLI explicitly reports unresolved history and the original run
+ID. Inspect that history without replaying the workload: there is no persistent
+retry queue or automatic repair of older stranded records. Acknowledged workload
+completion still uses the separate signed-receipt finish path.
+
 - **`history`** lists recorded runs. Filter with `--lease`, `--owner`, `--org`,
   `--state`, and `--limit` (default 50). It is intended for command debugging,
   not unbounded log archival.
@@ -353,21 +371,30 @@ selected provider/target supports hydration.
 
 Preflight is a probe layer, not an installer. Missing tools print
 `tool=missing`; Crabbox does not run `apt install`, `corepack prepare`,
-`bun install`, or any other setup. Install toolchains through Actions hydration,
+`bun install`, or host toolchain setup. Install toolchains through Actions hydration,
 a prebaked image, a devcontainer/Nix/mise/asdf setup, or the uploaded
 script/command itself.
 
-The built-in probes cover common toolchains — `git`, `tar`, `node`, `npm`,
-`corepack`, `pnpm`, `yarn`, `bun`, and `docker`; opt-in `go`, `cargo`, `cmake`,
-`uv`, `python`, and `python3` on POSIX, WSL2, and native Windows; and opt-in
-`make` on POSIX and WSL2 — plus target-specific probes such as `sudo`, `apt`,
-`bubblewrap`, `powershell`, `execution_policy`, `longpaths`, `temp`, and `pwsh`.
-Linux and WSL2 also support an opt-in `raw_socket` capability probe. Override
+For `npm`, `pnpm`, and `yarn`, probe-local Corepack controls disable networking,
+latest-version lookup, automatic project pinning, and download prompts. Cached
+project versions remain selectable; unavailable versions must be hydrated
+separately. The workload keeps its original environment. This is not a universal
+network sandbox or a guarantee that external tools never touch cache files.
+The pnpm probe additionally uses `PNPM_CONFIG_PM_ON_FAIL=ignore` to suppress
+secondary version/environment-lockfile management on versions supporting that
+setting. Corepack's project-version selection is retained; the workload keeps
+its original pnpm policy. Standalone legacy wrappers may have other behavior.
+
+The built-in probes cover common toolchains and target-specific capabilities.
+Use [`crabbox preflight-tools [--json]`](commands/preflight-tools.md) for the
+complete names, selector aliases, default membership, and target support in the
+installed binary. This inspection is offline and executes no probes. Override
 the probe list per run:
 
 ```sh
 crabbox run --preflight --preflight-tools python,python3 -- python3 -m pytest
 crabbox run --preflight --preflight-tools default,cmake -- cmake --build build
+crabbox run --preflight --preflight-tools default,python3-venv -- python3 -m pytest
 crabbox run --preflight --preflight-tools raw_socket -- ./packet-tests
 ```
 
@@ -375,6 +402,41 @@ The opt-in CMake probe invokes the literal `cmake --version` command on POSIX,
 WSL2, and native Windows targets. It reports only the first output line or
 `cmake=missing`; the result is diagnostic only, so missing CMake does not block
 the workload or trigger installation or upgrades.
+
+The opt-in `bash` probe (`--preflight --preflight-tools bash`, or
+`--preflight --preflight-tools default,bash`) invokes literal `bash --version`
+on Linux, macOS and WSL2, retaining at most 4096 bytes and displaying the first
+line as `remote preflight bash=<version>`. If Bash is unavailable, it prints
+`remote preflight bash=missing`; native Windows skips it. The defaults remain
+unchanged. Missing Bash is diagnostic only for an independent workload, not an
+installation request or a guarantee that Bash scripts can run. Linux SSH
+managed execution without Bash requires the complete companion runtime pack;
+see [run](commands/run.md) for readiness and CLI-only installation constraints.
+
+The opt-in `python3-venv` probe checks a real disposable environment on Linux,
+macOS and WSL2, not merely the interpreter version or whether `venv` imports.
+It reports `remote preflight python3-venv=<state> cleanup=<confirmed|unconfirmed>`.
+`ready` means the fresh environment's Python and pip succeeded, the probe owner
+confirmed process quiescence and scratch removal, and the caller confirmed exact
+transport-stage retirement. Capability results distinguish `missing-python3`,
+`venv-unavailable` and `pip-unavailable`; other states are `worker-failed`,
+`timed-out`, `canceled` and `unavailable`. `unavailable` means no reliable capability
+result. Cleanup is independent: an operational transport, setup or envelope error
+may remain after confirmed cleanup, yielding `unavailable cleanup=confirmed`.
+Unknown quiescence, scratch removal or stage retirement instead reports
+`cleanup=unconfirmed`; uncertainty is never successful cleanup.
+
+Capability absence, broken capability, worker failure or probe timeout does not
+block the workload when cleanup is confirmed. Operational transport, setup,
+envelope, ownership or cleanup errors prevent the later workload regardless of
+the cleanup flag. `unavailable cleanup=unconfirmed` also fails the run rather than
+continuing with unresolved ownership. Caller cancellation prevents continuation.
+The 90-second probe allowance and
+independent 30-second cleanup reserve exclude separately bounded transport setup,
+so they are not a total-command deadline. No host packages are installed or
+upgraded, and no project environment is activated or reused; pip is seeded only
+inside the disposable environment. See [run preflight](commands/run.md#preflight)
+for selection and target support.
 
 `raw_socket` reports `direct` when the execution user can open and immediately
 close `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)`, `sudo` when only the same

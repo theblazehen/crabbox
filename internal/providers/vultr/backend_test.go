@@ -8,8 +8,10 @@ import (
 	"maps"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -216,73 +218,85 @@ func newTestBackend(t *testing.T, api *fakeVultrAPI) *backend {
 func TestWaitForInstanceReady(t *testing.T) {
 	const instanceID = "11111111-1111-4111-8111-111111111111"
 	t.Run("pending to ready", func(t *testing.T) {
-		calls := 0
-		api := &fakeVultrAPI{getFn: func(context.Context, string) (vultrInstance, error) {
-			calls++
-			if calls == 1 {
-				return vultrInstance{ID: instanceID, Status: "pending", MainIP: "0.0.0.0"}, nil
+		synctest.Test(t, func(t *testing.T) {
+			calls := 0
+			api := &fakeVultrAPI{getFn: func(context.Context, string) (vultrInstance, error) {
+				calls++
+				if calls == 1 {
+					return vultrInstance{ID: instanceID, Status: "pending", MainIP: "0.0.0.0"}, nil
+				}
+				return vultrInstance{ID: instanceID, Status: "active", PowerStatus: "running", ServerStatus: "ok", MainIP: "203.0.113.20"}, nil
+			}}
+			got, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, time.Minute)
+			if err != nil || got.ID != instanceID || calls != 2 {
+				t.Fatalf("instance=%#v err=%v calls=%d", got, err, calls)
 			}
-			return vultrInstance{ID: instanceID, Status: "active", PowerStatus: "running", ServerStatus: "ok", MainIP: "203.0.113.20"}, nil
-		}}
-		got, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, time.Minute)
-		if err != nil || got.ID != instanceID || calls != 2 {
-			t.Fatalf("instance=%#v err=%v calls=%d", got, err, calls)
-		}
+		})
 	})
 
 	t.Run("read error", func(t *testing.T) {
-		wantErr := errors.New("read denied")
-		calls := 0
-		api := &fakeVultrAPI{getFn: func(context.Context, string) (vultrInstance, error) {
-			calls++
-			return vultrInstance{}, wantErr
-		}}
-		_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, time.Minute)
-		if !errors.Is(err, wantErr) || calls != 1 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			wantErr := errors.New("read denied")
+			calls := 0
+			api := &fakeVultrAPI{getFn: func(context.Context, string) (vultrInstance, error) {
+				calls++
+				return vultrInstance{}, wantErr
+			}}
+			_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, time.Minute)
+			if !errors.Is(err, wantErr) || calls != 1 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
 	})
 
 	t.Run("client deadline", func(t *testing.T) {
-		api := &fakeVultrAPI{getErr: context.DeadlineExceeded}
-		_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, time.Minute)
-		if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out waiting") {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeVultrAPI{getErr: context.DeadlineExceeded}
+			_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, time.Minute)
+			if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out waiting") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("read error at deadline", func(t *testing.T) {
-		wantErr := errors.New("late read denied")
-		api := &fakeVultrAPI{getFn: func(ctx context.Context, _ string) (vultrInstance, error) {
-			<-ctx.Done()
-			return vultrInstance{}, wantErr
-		}}
-		_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, 10*time.Millisecond)
-		if !errors.Is(err, wantErr) || strings.Contains(err.Error(), "timed out") {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			wantErr := errors.New("late read denied")
+			api := &fakeVultrAPI{getFn: func(ctx context.Context, _ string) (vultrInstance, error) {
+				<-ctx.Done()
+				return vultrInstance{}, wantErr
+			}}
+			_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, 10*time.Millisecond)
+			if !errors.Is(err, wantErr) || strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("cancellation during delay", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		calls := 0
-		api := &fakeVultrAPI{getFn: func(context.Context, string) (vultrInstance, error) {
-			calls++
-			time.AfterFunc(time.Millisecond, cancel)
-			return vultrInstance{ID: instanceID, Status: "pending", MainIP: "0.0.0.0"}, nil
-		}}
-		_, err := newTestBackend(t, api).waitForInstanceReady(ctx, api, instanceID, time.Minute)
-		if !errors.Is(err, context.Canceled) || calls != 1 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			calls := 0
+			api := &fakeVultrAPI{getFn: func(context.Context, string) (vultrInstance, error) {
+				calls++
+				time.AfterFunc(time.Millisecond, cancel)
+				return vultrInstance{ID: instanceID, Status: "pending", MainIP: "0.0.0.0"}, nil
+			}}
+			_, err := newTestBackend(t, api).waitForInstanceReady(ctx, api, instanceID, time.Minute)
+			if !errors.Is(err, context.Canceled) || calls != 1 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		api := &fakeVultrAPI{instances: []vultrInstance{{ID: instanceID, Status: "pending", MainIP: "0.0.0.0"}}}
-		_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, 10*time.Millisecond)
-		if err == nil || err.Error() != "timed out waiting for Vultr instance IP" {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeVultrAPI{instances: []vultrInstance{{ID: instanceID, Status: "pending", MainIP: "0.0.0.0"}}}
+			_, err := newTestBackend(t, api).waitForInstanceReady(context.Background(), api, instanceID, 10*time.Millisecond)
+			if err == nil || err.Error() != "timed out waiting for Vultr instance IP" {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 }
 
@@ -1771,4 +1785,60 @@ func attachCurrentVultrClaim(t *testing.T, server *core.Server, leaseID string) 
 	}
 	core.SetServerLeaseClaimSnapshot(server, claim, true)
 	return claim
+}
+
+func TestVultrConfigShowCompletePassiveSection(t *testing.T) {
+	projector, ok := any(Provider{}).(core.ProviderConfigShowProjector)
+	if !ok {
+		t.Fatal("actual provider has no passive config-show projector")
+	}
+	for _, tc := range []struct {
+		name  string
+		input core.VultrConfig
+		want  map[string]any
+		text  string
+	}{
+		{name: "nil", input: core.VultrConfig{}, want: map[string]any{"region": "", "os": "", "image": "", "snapshot": "", "firewallGroup": "", "vpcIds": []string(nil), "sshCIDRs": []string(nil), "userScheme": ""}, text: "vultr region= os=- image=- snapshot=- firewall_group=- vpc_ids=- ssh_cidrs=- user_scheme=-\n"},
+		{name: "empty", input: core.VultrConfig{VPCIDs: []string{}, SSHCIDRs: []string{}}, want: map[string]any{"region": "", "os": "", "image": "", "snapshot": "", "firewallGroup": "", "vpcIds": []string{}, "sshCIDRs": []string{}, "userScheme": ""}, text: "vultr region= os=- image=- snapshot=- firewall_group=- vpc_ids=- ssh_cidrs=- user_scheme=-\n"},
+		{name: "simultaneous-raw-boot-strings", input: core.VultrConfig{Region: "raw-region", OS: "002284", Image: "image reference", Snapshot: "snapshot reference", FirewallGroup: "firewall reference", VPCIDs: []string{"last", "first", "last", " "}, SSHCIDRs: []string{"second", "first", "second", " "}, UserScheme: "raw-scheme"}, want: map[string]any{"region": "raw-region", "os": "002284", "image": "image reference", "snapshot": "snapshot reference", "firewallGroup": "firewall reference", "vpcIds": []string{"last", "first", "last", " "}, "sshCIDRs": []string{"second", "first", "second", " "}, "userScheme": "raw-scheme"}, text: "vultr region=raw-region os=002284 image=image reference snapshot=snapshot reference firewall_group=firewall reference vpc_ids=last,first,last,  ssh_cidrs=second,first,second,  user_scheme=raw-scheme\n"},
+		{name: "whitespace-empty-elements", input: core.VultrConfig{Region: " ", OS: " ", Image: " ", Snapshot: " ", FirewallGroup: " ", VPCIDs: []string{"", ""}, SSHCIDRs: []string{"", ""}, UserScheme: " "}, want: map[string]any{"region": " ", "os": " ", "image": " ", "snapshot": " ", "firewallGroup": " ", "vpcIds": []string{"", ""}, "sshCIDRs": []string{"", ""}, "userScheme": " "}, text: "vultr region=  os=  image=  snapshot=  firewall_group=  vpc_ids=, ssh_cidrs=, user_scheme= \n"},
+	} {
+		for _, selected := range []string{"vultr", "static"} {
+			t.Run(tc.name+"/"+selected, func(t *testing.T) {
+				cfg := core.Config{Provider: selected, Vultr: tc.input}
+				before := cfg.Vultr
+				before.VPCIDs = slices.Clone(cfg.Vultr.VPCIDs)
+				before.SSHCIDRs = slices.Clone(cfg.Vultr.SSHCIDRs)
+				section := projector.ConfigShowSection(cfg)
+				if section.JSONKey != "vultr" || section.TextLabel != "vultr" || !reflect.DeepEqual(section.Providers, []string{"vultr"}) {
+					t.Fatalf("section metadata=%#v", section)
+				}
+				wantOrder := []string{"region", "os", "image", "snapshot", "firewallGroup", "vpcIds", "sshCIDRs", "userScheme"}
+				if len(section.Fields) != len(wantOrder) {
+					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
+				}
+				got := map[string]any{}
+				line := section.TextLabel
+				for i, field := range section.Fields {
+					if field.JSONName != wantOrder[i] {
+						t.Fatalf("field %d name=%q want %q", i, field.JSONName, wantOrder[i])
+					}
+					got[field.JSONName] = field.JSONValue
+					if field.TextName != "" {
+						line += " " + field.TextName + "=" + field.TextValue
+					}
+				}
+				line += "\n"
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("public fields=%#v want %#v", got, tc.want)
+				}
+				if line != tc.text {
+					t.Fatalf("text=%q want %q", line, tc.text)
+				}
+				if !reflect.DeepEqual(cfg.Vultr, before) {
+					t.Fatal("projection mutated supplied configuration")
+				}
+			})
+		}
+	}
 }

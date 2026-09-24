@@ -101,8 +101,16 @@ workspace lookup read every `DescribeInstances` page, retaining duplicate
 matches for ambiguity checks. A repeated pagination token, more than 100 pages,
 or a later-page failure makes the inventory incomplete and rejects the entire
 lookup. Incomplete inventory retains cleanup debt and cannot confirm absence,
-even after the existing 30-minute absence confirmation window. A complete empty
-inventory remains subject to that window and the existing ownership checks.
+even after the existing 30-minute absence confirmation window. Cleanup resolves
+one direct-provider credential snapshot, verifies its account through STS, and
+uses that same snapshot for instance observation, termination confirmation, and
+owned SSH-key deletion. The separate image-qualification transport instead
+enforces its enrolled account and Region policy with immediate STS checks around
+protected operations; it does not claim one immutable credential object.
+Absence is accepted only when the lease persisted the same exact account scope
+and Region. A complete empty inventory for a historical lease without account
+scope remains unresolved; a still-present historical instance may proceed only
+when its exact lease ownership labels match.
 
 For an exact Azure lease whose provisioning stops before VM creation, ordinary
 owned-resource release can clean the observed creation prefix: an unattached
@@ -173,7 +181,10 @@ visibility or termination retains cleanup debt rather than reporting deletion.
 Managed public AWS release uses the same confirmed termination path as private
 workspaces: `TerminateInstances` must acknowledge the exact instance, followed
 by a terminal `terminated` read or exact `InvalidInstanceID.NotFound`.
-Allocation claims carry the prepared account scope for AWS Mac instances.
+New AWS allocation claims carry the prepared account scope and explicit Region.
+The coordinator persists each selected fallback Region before that regional
+provider path can mutate AWS, so interrupted recovery reads the same Region.
+Historical records missing either value are not upgraded during cleanup.
 Storage failures while publishing or checking an allocation preserve its cleanup
 claim without retrying creation.
 The CLI removes its local per-lease SSH connection directory only after final
@@ -417,6 +428,13 @@ Without a coordinator, the CLI talks to the provider API directly and owns
 cleanup itself. Releasing a direct lease (`crabbox stop` / `crabbox release`)
 deletes the backing machine immediately.
 
+OpenSandbox, Vercel Sandbox, Crownest, and SuperServe honor cancellation while
+their explicit forget-missing cleanup waits to retire a local claim, releasing
+the provider operation lock and preserving that claim. Each adapter's existing
+missing-or-inaccessible classification and forget-missing opt-in remain in force;
+this is not stronger evidence of remote deletion. After a successful provider
+delete, claim retirement still completes despite caller cancellation.
+
 Ordinary direct AWS, Azure, GCP, and Hetzner acquisition can retry a bootstrap
 timeout with a fresh lease. If rollback reports a cleanup failure, acquisition
 stops instead: the original failure and cleanup diagnostics remain available,
@@ -487,7 +505,8 @@ So an expired GCP box can reclaim itself even if the operator's machine is gone.
 Independent of provider cleanup, the CLI keeps a local **claim** file per lease
 so repo-local wrappers do not need their own ledger. Commands that reuse a lease
 validate that the current repo matches the claim; deleting a lease removes its
-claim. Move a claim to a different repo deliberately with `--reclaim`. See
+claim, except provider-owned fixed terminal receipts that prevent ID reuse.
+Move a claim to a different repo deliberately with `--reclaim`. See
 [Identifiers](identifiers.md) for the claim file format and location.
 
 Providers may durably publish an exact-resource claim with the generic
@@ -498,6 +517,15 @@ Provider adapters own the immutable resource identity and routing scope needed
 to inspect or delete that pending resource. Cleanup must compare the unchanged
 claim under its lifecycle fence before mutation so an old readiness or cleanup
 attempt cannot overwrite or delete a newer claim.
+
+Runtime-adapter confirmed-absence cleanup normally removes the matching local
+claim after coordinator deregistration. A provider can instead validate and retain
+a fixed terminal receipt through the explicit terminal-receipt capability. Core
+requires the full expected lease, attempt, slug, resource and scope, checks the
+unchanged receipt under its durable claim lock before and after deregistration,
+and preserves its bytes and revision. A terminal-looking label alone is not
+completion evidence; missing required receipts and unsupported fixed claim kinds
+fail closed.
 
 ## Related docs
 

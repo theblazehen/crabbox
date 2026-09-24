@@ -2,7 +2,6 @@ package machine0
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	shared "github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const (
@@ -35,12 +35,13 @@ type machine0CreateAttempt struct {
 	CreatedAt    string `json:"createdAt"`
 }
 
-func (b *backend) acquireFixed(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
+func (b *backend) acquireFixed(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	leaseID := strings.TrimSpace(req.RequestedLeaseID)
 	cfg := b.configForRun()
 	var fingerprint string
-	var freshClaim bool
-	acquired, err := core.AcquireFixedLease(core.FixedAcquireOptions{
+	var replay bool
+	var retainedIntent *core.FixedCreateIntent
+	acquired, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
 		Kind:         fixedMachine0LeaseKind,
 		LeaseID:      leaseID,
 		CheckpointID: req.RequestedCheckpointID,
@@ -51,8 +52,7 @@ func (b *backend) acquireFixed(ctx context.Context, req AcquireRequest) (LeaseTa
 		TTL:          cfg.TTL,
 		IdleTimeout:  cfg.IdleTimeout,
 		Now:          func() time.Time { return core.ClockNow(b.rt.Clock).UTC() },
-	}, func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
-		freshClaim = !exists
+	}, core.FixedLeaseOperations[machine]{Admission: &core.FixedAdmission{FreshOnly: true}, DescribeIntent: func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
 		var err error
 		fingerprint, err = core.FixedMachine0CreateIntentFingerprint(cfg, core.FixedMachine0CreateIntentRequest{
 			RequestedSlug: core.NormalizeLeaseSlug(req.RequestedSlug),
@@ -75,11 +75,11 @@ func (b *backend) acquireFixed(ctx context.Context, req AcquireRequest) (LeaseTa
 			if err != nil {
 				return core.FixedLeaseBinding{}, err
 			}
-			servers := make([]Server, 0, len(machines))
+			servers := make([]core.Server, 0, len(machines))
 			for _, item := range machines {
 				servers = append(servers, b.serverFromMachine(item, claims[item.ID], cfg))
 			}
-			slug, err := allocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
+			slug, err := core.AllocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
 			if err != nil {
 				return core.FixedLeaseBinding{}, err
 			}
@@ -88,95 +88,90 @@ func (b *backend) acquireFixed(ctx context.Context, req AcquireRequest) (LeaseTa
 			binding.Slug = slug
 		}
 		return binding, nil
-	}, func(ctx context.Context, claim *core.LeaseClaim, intent *core.FixedCreateIntent, persist func() error) (_ LeaseTarget, acquireErr error) {
-		if err := core.AuthorizeCheckpointRelease(*claim, ""); err != nil {
-			return LeaseTarget{}, err
+	}, ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[machine], error) {
+		retainedIntent = tx.Claim.FixedCreateIntent
+		var result core.FixedObservation[machine]
+		if err := core.AuthorizeCheckpointRelease(*tx.Claim, ""); err != nil {
+			return result, err
 		}
-		name := machine0MachineName(leaseID, intent.Slug)
-		defer func() {
-			if acquireErr != nil && len(intent.Attempt) != 0 {
-				fmt.Fprintf(b.rt.Stderr, "machine0 fixed create attempt for %s is retained; inspect or stop lease %s after provider inventory converges with `crabbox stop --provider machine0 --id %s`\n", name, leaseID, leaseID)
-			}
-		}()
-		item, err := b.resolveFixedMachine0(ctx, *claim)
+		item, err := b.resolveFixedMachine0(ctx, *tx.Claim)
 		if err != nil {
-			return LeaseTarget{}, err
+			return result, err
 		}
-		replay := item.ID != ""
-		if !replay {
-			if claim.CloudID != "" {
-				return LeaseTarget{}, exit(4, "lease_id_conflict: acquired fixed lease %s is missing its bound Machine0 machine", leaseID)
+		replay = item.ID != ""
+		if replay {
+			result.Candidates = []machine{item}
+		} else {
+			if tx.Claim.CloudID != "" {
+				return result, core.Exit(4, "lease_id_conflict: acquired fixed lease %s is missing its bound Machine0 machine", leaseID)
 			}
-			// Older clients could erase an ambiguous attempt. Only this invocation
-			// can prove it created the empty claim while holding the create lock.
-			if !freshClaim {
-				return LeaseTarget{}, exit(4, "lease_id_conflict: fixed Machine0 lease %s has no observed resource or provably unsubmitted attempt; retain its claim", leaseID)
-			}
-			// Capacity gates new creation, never replay of an attested VM.
-			if err := b.validateCatalogSelection(ctx, cfg.Machine0.Size, cfg.Machine0.Region); err != nil {
-				return LeaseTarget{}, err
-			}
-			if err := b.preflightSSHKey(ctx, cfg.Machine0.Key); err != nil {
-				return LeaseTarget{}, err
-			}
-			image := cfg.Machine0.Image
-			if req.Options.Desktop && strings.TrimSpace(cfg.Machine0.DesktopImage) != "" {
-				image = cfg.Machine0.DesktopImage
-			}
-			attempt := machine0CreateAttempt{
-				Name: name, Size: cfg.Machine0.Size, Region: cfg.Machine0.Region,
-				Image: image, ImageVersion: cfg.Machine0.ImageVersion, Key: cfg.Machine0.Key,
-				CreatedAt: core.ClockNow(b.rt.Clock).UTC().Format(time.RFC3339Nano),
-			}
-			data, err := json.Marshal(attempt)
+			result.CanSubmit = true
+		}
+		return result, nil
+	}, Plan: func(ctx context.Context, claim core.LeaseClaim) (core.FixedAttemptPlan, error) {
+		intent := claim.FixedCreateIntent
+		name := machine0MachineName(leaseID, intent.Slug)
+		// Capacity gates new creation, never replay of an attested VM.
+		if err := b.validateCatalogSelection(ctx, cfg.Machine0.Size, cfg.Machine0.Region); err != nil {
+			return core.FixedAttemptPlan{}, err
+		}
+		if err := b.preflightSSHKey(ctx, cfg.Machine0.Key); err != nil {
+			return core.FixedAttemptPlan{}, err
+		}
+		image := cfg.Machine0.Image
+		if req.Options.Desktop && strings.TrimSpace(cfg.Machine0.DesktopImage) != "" {
+			image = cfg.Machine0.DesktopImage
+		}
+		attempt := machine0CreateAttempt{
+			Name: name, Size: cfg.Machine0.Size, Region: cfg.Machine0.Region,
+			Image: image, ImageVersion: cfg.Machine0.ImageVersion, Key: cfg.Machine0.Key,
+			CreatedAt: core.ClockNow(b.rt.Clock).UTC().Format(time.RFC3339Nano),
+		}
+		return core.FixedAttemptPlan{JSONKey: "machine0", Payload: attempt}, nil
+	}, Submit: func(ctx context.Context, tx *core.FixedTransaction) (machine, error) {
+		intent := tx.Claim.FixedCreateIntent
+		attempt, err := fixedMachine0ClaimAttempt(*tx.Claim)
+		if err != nil {
+			return machine{}, err
+		}
+		fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s name=%s size=%s region=%s image=%s keep=%v fixed=true\n", providerName, leaseID, intent.Slug, attempt.Name, attempt.Size, attempt.Region, attempt.Image, req.Keep)
+		if createErr := b.api.Create(ctx, createMachineRequest{Name: attempt.Name, Size: attempt.Size, Region: attempt.Region, Image: attempt.Image, ImageVersion: attempt.ImageVersion, Key: attempt.Key}); createErr != nil {
+			item, err := b.resolveFixedMachine0(ctx, *tx.Claim)
 			if err != nil {
-				return LeaseTarget{}, err
+				return machine{}, errors.Join(createErr, err)
 			}
-			intent.Attempt = map[string]string{"machine0": string(data)}
-			if err := persist(); err != nil {
-				return LeaseTarget{}, err
-			}
-			fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s name=%s size=%s region=%s image=%s keep=%v fixed=true\n", providerName, leaseID, intent.Slug, name, cfg.Machine0.Size, cfg.Machine0.Region, image, req.Keep)
-			if createErr := b.api.Create(ctx, createMachineRequest{Name: name, Size: attempt.Size, Region: attempt.Region, Image: image, ImageVersion: attempt.ImageVersion, Key: attempt.Key}); createErr != nil {
-				// An empty inventory cannot prove a failed request will never create a VM.
-				item, err = b.resolveFixedMachine0(ctx, *claim)
-				if err != nil {
-					return LeaseTarget{}, errors.Join(createErr, err)
-				}
-			} else {
-				// Native new prints no UUID; the bounded poll attests the first get.
-				item = machine{Name: name}
-			}
+			return item, nil
 		}
+		return machine{Name: attempt.Name}, nil
+	}, PrepareAccess: func(ctx context.Context, tx *core.FixedTransaction, item machine) (core.LeaseTarget, error) {
+		claim, intent := tx.Claim, tx.Claim.FixedCreateIntent
 		if item.ID != "" {
-			if err := b.bindFixedMachine0(claim, item, req.Keep, persist); err != nil {
-				return LeaseTarget{}, err
+			if err := b.bindFixedMachine0(claim, item, req.Keep, func() error { return tx.Record("bound") }); err != nil {
+				return core.LeaseTarget{}, err
 			}
 		}
-		item, err = b.waitForResolveRunning(ctx, item, cfg.Machine0.CreateTimeout, replay, func(previous, observed machine) (machine, error) {
+		item, err := b.waitForResolveRunning(ctx, item, cfg.Machine0.CreateTimeout, replay, func(previous, observed machine) (machine, error) {
 			item, err := attestFixedMachine0Detail(*claim, previous, observed)
 			if err != nil {
 				return machine{}, err
 			}
-			return item, b.bindFixedMachine0(claim, item, req.Keep, persist)
+			return item, b.bindFixedMachine0(claim, item, req.Keep, func() error { return tx.Record("bound") })
 		})
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		server := b.serverFromMachine(item, *claim, cfg)
 		server.Labels = machineLabels(cfg, item, leaseID, intent.Slug, req.Keep, core.ClockNow(b.rt.Clock).UTC())
 		return b.prepareLease(ctx, item, server, leaseID, true)
-	}, ctx)
+	}})
 	if err != nil {
-		return LeaseTarget{}, err
+		if retainedIntent != nil && len(retainedIntent.Attempt) != 0 {
+			fmt.Fprintf(b.rt.Stderr, "machine0 fixed create attempt for %s is retained; inspect or stop lease %s after provider inventory converges with `crabbox stop --provider machine0 --id %s`\n", machine0MachineName(leaseID, retainedIntent.Slug), leaseID, leaseID)
+		}
+		return core.LeaseTarget{}, err
 	}
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s machine=%s resource=%s state=ready\n", leaseID, acquired.Server.Name, acquired.Server.CloudID)
-	if req.OnAcquired != nil {
-		if err := req.OnAcquired(acquired); err != nil {
-			return LeaseTarget{}, fmt.Errorf("acknowledge fixed Machine0 acquisition: %w", err)
-		}
-	}
-	return acquired, nil
+	return core.CompleteFixedAcquisition(acquired, nil, req)
 }
 
 func machine0NameScope(name string) string {
@@ -185,134 +180,127 @@ func machine0NameScope(name string) string {
 
 // Fixed ownership comes from the durable attempt and, once observed, the UUID.
 // Resolution never starts a machine or needs a usable SSH endpoint.
-func (b *backend) resolveFixedMachine0(ctx context.Context, claim LeaseClaim) (machine, error) {
-	if claim.FixedCreateIntent != nil && claim.FixedCreateIntent.State == fixedMachine0IntentReleased {
-		return machine{}, fixedMachine0LeaseKind.ValidateTerminalClaim(claim, LeaseClaim{}, claim.LeaseID, validateFixedMachine0TerminalClaimExtra)
-	}
-	attempt, err := fixedMachine0ClaimAttempt(claim)
-	if err != nil {
-		return machine{}, err
-	}
-	machines, err := b.api.List(ctx)
-	if err != nil {
-		return machine{}, err
-	}
-	name := machine0MachineName(claim.LeaseID, claim.Slug)
-	seen := make(map[string]bool, len(machines))
-	var found *machine
-	for _, item := range machines {
-		if item.ID != "" && seen[item.ID] {
-			return machine{}, exit(4, "lease_id_conflict: Machine0 inventory contains duplicate resource ID %s", item.ID)
+func (b *backend) resolveFixedMachine0(ctx context.Context, claim core.LeaseClaim) (machine, error) {
+	observed, err := core.InspectFixedResource(ctx, fixedMachine0LeaseKind, claim, core.FixedLeaseOperations[machine]{ObserveExact: func(ctx context.Context, _ *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[machine], error) {
+		if claim.FixedCreateIntent != nil && claim.FixedCreateIntent.State == fixedMachine0IntentReleased {
+			return core.FixedObservation[machine]{}, fixedMachine0LeaseKind.ValidateTerminalClaim(claim, core.LeaseClaim{}, claim.LeaseID, validateFixedMachine0TerminalClaimExtra)
 		}
-		seen[item.ID] = true
-		if item.Name == name {
-			if found != nil {
-				return machine{}, exit(4, "lease_id_conflict: multiple Machine0 machines match fixed lease %s", claim.LeaseID)
-			}
-			found = &item
-		} else if item.ID == claim.CloudID && claim.CloudID != "" {
-			return machine{}, exit(4, "lease_id_conflict: fixed Machine0 lease %s resource name changed", claim.LeaseID)
-		}
-	}
-	if found != nil {
-		if attempt == nil {
-			return machine{}, exit(4, "lease_id_conflict: Machine0 machine %s has no durable create attempt", name)
-		}
-		if strings.TrimSpace(found.ID) == "" {
-			return machine{}, exit(4, "lease_id_conflict: Machine0 machine %s has no resource ID", name)
-		}
-		// Inventory discovers identity; only full detail can attest pinned fields.
-		detail, err := b.api.Get(ctx, name)
+		attempt, err := fixedMachine0ClaimAttempt(claim)
 		if err != nil {
-			return machine{}, err
+			return core.FixedObservation[machine]{}, err
 		}
-		return attestFixedMachine0Detail(claim, *found, detail)
+		machines, err := b.api.List(ctx)
+		if err != nil {
+			return core.FixedObservation[machine]{}, err
+		}
+		name := machine0MachineName(claim.LeaseID, claim.Slug)
+		seen := make(map[string]bool, len(machines))
+		var found *machine
+		for _, item := range machines {
+			if item.ID != "" && seen[item.ID] {
+				return core.FixedObservation[machine]{}, core.Exit(4, "lease_id_conflict: Machine0 inventory contains duplicate resource ID %s", item.ID)
+			}
+			seen[item.ID] = true
+			if item.Name == name {
+				if found != nil {
+					return core.FixedObservation[machine]{}, core.Exit(4, "lease_id_conflict: multiple Machine0 machines match fixed lease %s", claim.LeaseID)
+				}
+				found = &item
+			} else if item.ID == claim.CloudID && claim.CloudID != "" {
+				return core.FixedObservation[machine]{}, core.Exit(4, "lease_id_conflict: fixed Machine0 lease %s resource name changed", claim.LeaseID)
+			}
+		}
+		if found != nil {
+			if attempt == nil {
+				return core.FixedObservation[machine]{}, core.Exit(4, "lease_id_conflict: Machine0 machine %s has no durable create attempt", name)
+			}
+			if strings.TrimSpace(found.ID) == "" {
+				return core.FixedObservation[machine]{}, core.Exit(4, "lease_id_conflict: Machine0 machine %s has no resource ID", name)
+			}
+			// Inventory discovers identity; only full detail can attest pinned fields.
+			detail, err := b.api.Get(ctx, name)
+			if err != nil {
+				return core.FixedObservation[machine]{}, err
+			}
+			attested, err := attestFixedMachine0Detail(claim, *found, detail)
+			if err != nil {
+				return core.FixedObservation[machine]{}, err
+			}
+			return core.FixedObservation[machine]{Candidates: []machine{attested}}, nil
+		}
+		if claim.FixedCreateIntent.State == fixedMachine0IntentPrepared && len(claim.FixedCreateIntent.Attempt) != 0 {
+			return core.FixedObservation[machine]{}, core.Exit(4, "lease_id_conflict: fixed Machine0 lease %s has an unresolved create attempt; retain the claim and retry inspection or stop after provider inventory converges", claim.LeaseID)
+		}
+		return core.FixedObservation[machine]{}, nil
+	}})
+	if err != nil {
+		return machine{}, err
 	}
-	if claim.FixedCreateIntent.State == fixedMachine0IntentPrepared && len(claim.FixedCreateIntent.Attempt) != 0 {
-		return machine{}, exit(4, "lease_id_conflict: fixed Machine0 lease %s has an unresolved create attempt; retain the claim and retry inspection or stop after provider inventory converges", claim.LeaseID)
+	if len(observed.Candidates) == 0 {
+		return machine{}, nil
 	}
-	return machine{}, nil
+	return observed.Candidates[0], nil
 }
 
-func fixedMachine0ClaimAttempt(claim LeaseClaim) (*machine0CreateAttempt, error) {
-	intent := claim.FixedCreateIntent
+func fixedMachine0ClaimAttempt(claim core.LeaseClaim) (*machine0CreateAttempt, error) {
 	name := machine0MachineName(claim.LeaseID, claim.Slug)
-	if !core.IsCanonicalLeaseID(claim.LeaseID) || !fixedMachine0LeaseKind.IsFixedClaim(claim) ||
-		intent.Version != fixedMachine0CreateIntentVersion || intent.Fingerprint == "" || intent.Slug != claim.Slug ||
-		intent.ProviderScope != machine0NameScope(name) ||
-		(intent.State != fixedMachine0IntentPrepared && intent.State != fixedMachine0IntentAcquired) {
-		return nil, exit(4, "lease_id_conflict: invalid fixed Machine0 create intent for lease %s", claim.LeaseID)
+	scope := machine0NameScope(name)
+	if claim.CloudID != "" {
+		scope = machineScope(claim.CloudID)
 	}
-	if claim.CloudNumericID != 0 || claim.CloudImmutableID != claim.CloudID ||
-		(claim.CloudID == "" && (claim.ProviderScope != intent.ProviderScope || intent.State == fixedMachine0IntentAcquired)) ||
-		(claim.CloudID != "" && claim.ProviderScope != machineScope(claim.CloudID)) {
-		return nil, exit(4, "lease_id_conflict: fixed Machine0 lease %s has inconsistent immutable identity or provider scope", claim.LeaseID)
+	if err := core.ValidateFixedClaim(claim, core.FixedClaimRules{Kind: fixedMachine0LeaseKind,
+		States: []string{fixedMachine0IntentPrepared, fixedMachine0IntentAcquired}, Scope: scope, IntentScope: machine0NameScope(name),
+		RequireCanonicalID: true, RequireTimestamp: true, NoNumericID: true, SameImmutableID: true,
+		NoFailedAttempts: true, EmptyAttemptMustBePristine: true, GenerationAfterPrepared: true,
+	}); err != nil {
+		return nil, err
 	}
-	if _, err := time.Parse(time.RFC3339Nano, intent.CreatedAt); err != nil || len(intent.FailedAttempts) != 0 {
-		return nil, exit(4, "lease_id_conflict: invalid fixed Machine0 attempt history for lease %s", claim.LeaseID)
-	}
-	if len(intent.Attempt) == 0 {
-		if claim.CloudID != "" || len(claim.Labels) != 0 || claim.SSHHost != "" || claim.SSHPort != 0 {
-			return nil, exit(4, "lease_id_conflict: fixed Machine0 lease %s has no durable create attempt", claim.LeaseID)
-		}
-		return nil, nil
-	}
-	var attempt machine0CreateAttempt
-	if err := json.Unmarshal([]byte(intent.Attempt["machine0"]), &attempt); err != nil ||
-		attempt.Name != name || attempt.Size == "" || attempt.Region == "" || attempt.Image == "" {
-		return nil, exit(4, "lease_id_conflict: invalid fixed Machine0 attempt for lease %s", claim.LeaseID)
-	}
-	return &attempt, nil
+	return core.ReadFixedAttempt[machine0CreateAttempt](claim.FixedCreateIntent, core.FixedAttemptFormat{
+		JSONKey: "machine0", Equal: map[string]string{"name": name}, Required: []string{"size", "region", "image"},
+	})
 }
 
-func validateFixedMachine0Ownership(claim LeaseClaim, item machine) error {
+func validateFixedMachine0Ownership(claim core.LeaseClaim, item machine) error {
 	attempt, err := fixedMachine0ClaimAttempt(claim)
 	if err != nil {
 		return err
 	}
 	if attempt == nil {
-		return exit(4, "lease_id_conflict: Machine0 machine %s has no durable create attempt", item.Name)
+		return core.Exit(4, "lease_id_conflict: Machine0 machine %s has no durable create attempt", item.Name)
 	}
 	if strings.TrimSpace(item.ID) == "" || (claim.CloudID != "" && item.ID != claim.CloudID) {
-		return exit(4, "lease_id_conflict: fixed lease %s machine %s does not match acquired CloudID %s", claim.LeaseID, blank(item.ID, "<empty>"), blank(claim.CloudID, "<empty>"))
+		return core.Exit(4, "lease_id_conflict: fixed lease %s machine %s does not match acquired CloudID %s", claim.LeaseID, core.Blank(item.ID, "<empty>"), core.Blank(claim.CloudID, "<empty>"))
 	}
 	if strings.TrimSpace(attempt.Key) != "" && (item.Key == nil || strings.TrimSpace(item.Key.Name) != strings.TrimSpace(attempt.Key)) {
-		return exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its durable selected SSH key %q", claim.LeaseID, attempt.Key)
+		return core.Exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its durable selected SSH key %q", claim.LeaseID, attempt.Key)
 	}
 	if mismatch := validateFixedMachine0Attempt(item, *attempt); mismatch != "" {
-		return exit(4, "lease_id_conflict: Machine0 machine for lease %s does not match its durable create attempt: %s", claim.LeaseID, mismatch)
+		return core.Exit(4, "lease_id_conflict: Machine0 machine for lease %s does not match its durable create attempt: %s", claim.LeaseID, mismatch)
 	}
 	return nil
 }
 
-func (b *backend) bindFixedMachine0(claim *LeaseClaim, item machine, keep bool, persist func() error) error {
+func (b *backend) bindFixedMachine0(claim *core.LeaseClaim, item machine, keep bool, persist func() error) error {
 	if err := validateFixedMachine0Ownership(*claim, item); err != nil {
 		return err
 	}
-	if claim.CloudID != "" {
-		return nil
-	}
-	claim.CloudID, claim.CloudImmutableID = item.ID, item.ID
-	claim.ProviderScope = machineScope(item.ID)
-	claim.Labels = machineLabels(b.configForRun(), item, claim.LeaseID, claim.Slug, keep, core.ClockNow(b.rt.Clock).UTC())
-	return persist()
+	return core.BindFixedClaim(claim, core.FixedResourceBinding{OnlyUnbound: true,
+		CloudID: item.ID, ImmutableID: item.ID, ProviderScope: machineScope(item.ID),
+		Labels: machineLabels(b.configForRun(), item, claim.LeaseID, claim.Slug, keep, core.ClockNow(b.rt.Clock).UTC()),
+	}, persist)
 }
 
-func (b *backend) bindFixedMachine0Claim(claim LeaseClaim, item machine) (LeaseClaim, error) {
-	expected := claim
-	err := b.bindFixedMachine0(&claim, item, false, func() error {
-		var err error
-		claim, err = core.ReplaceLeaseClaimIfUnchangedDurableReturning(claim.LeaseID, expected, claim)
-		return err
+func (b *backend) bindFixedMachine0Claim(claim core.LeaseClaim, item machine) (core.LeaseClaim, error) {
+	return core.CompareAndBindFixedClaim(claim, func(next *core.LeaseClaim, persist func() error) error {
+		return b.bindFixedMachine0(next, item, false, persist)
 	})
-	return claim, err
 }
 
-func (b *backend) destroyClaimedMachine(ctx context.Context, expected LeaseClaim, lease LeaseTarget) error {
+func (b *backend) destroyClaimedMachine(ctx context.Context, expected core.LeaseClaim, lease core.LeaseTarget) error {
 	return b.destroyClaimedMachineWithOutcome(ctx, expected, lease, &core.ReleaseLeaseOutcome{})
 }
 
-func (b *backend) destroyClaimedMachineWithOutcome(ctx context.Context, expected LeaseClaim, lease LeaseTarget, outcome *core.ReleaseLeaseOutcome) error {
+func (b *backend) destroyClaimedMachineWithOutcome(ctx context.Context, expected core.LeaseClaim, lease core.LeaseTarget, outcome *core.ReleaseLeaseOutcome) error {
 	if expected.Provider != core.FixedMachine0ClaimProvider && expected.FixedCreateIntent == nil {
 		return fixedMachine0LeaseKind.FinalizeAfterCleanup(expected, func() error {
 			// Reservation holds the source before it changes the claim revision.
@@ -329,47 +317,48 @@ func (b *backend) destroyClaimedMachineWithOutcome(ctx context.Context, expected
 		})
 	}
 	if snapshot, exists, set := core.ServerLeaseClaimSnapshot(lease.Server); set && (!exists || !reflect.DeepEqual(snapshot, expected)) {
-		return exit(4, "fixed Machine0 lease %s claim changed after resolution; retry", expected.LeaseID)
+		return core.Exit(4, "fixed Machine0 lease %s claim changed after resolution; retry", expected.LeaseID)
 	}
-	return core.WithDurableLeaseClaimLock(expected.LeaseID, func(claim *LeaseClaim, exists bool, persist func() error) error {
-		if !exists || !reflect.DeepEqual(*claim, expected) {
-			return exit(4, "fixed Machine0 lease %s claim changed before release; retry", expected.LeaseID)
-		}
-		if err := core.AuthorizeCheckpointRelease(*claim, ""); err != nil {
-			return err
-		}
-		item, err := b.resolveFixedMachine0(ctx, *claim)
-		if err != nil || claim.FixedCreateIntent.State == fixedMachine0IntentReleased {
-			outcome.Terminal = err == nil
-			return err
-		}
-		resourceID := firstNonBlank(item.ID, claim.CloudID)
-		if (lease.Server.CloudID != "" && lease.Server.CloudID != resourceID) || (lease.Server.ImmutableID != "" && lease.Server.ImmutableID != resourceID) {
-			return exit(4, "lease_id_conflict: fixed Machine0 resource changed before release")
-		}
-		if item.ID != "" {
-			if err := b.bindFixedMachine0(claim, item, false, persist); err != nil {
+	return core.DeleteFixedResource(ctx, fixedMachine0LeaseKind, expected, core.FixedLeaseOperations[machine]{
+		ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[machine], error) {
+			claim := tx.Claim
+			var result core.FixedObservation[machine]
+			if err := core.AuthorizeCheckpointRelease(*claim, ""); err != nil {
+				return result, err
+			}
+			item, err := b.resolveFixedMachine0(ctx, *claim)
+			if err != nil || claim.FixedCreateIntent.State == fixedMachine0IntentReleased {
+				outcome.Terminal = err == nil
+				result.AbsenceProven = err == nil
+				return result, err
+			}
+			resourceID := shared.FirstNonBlankTrimmed(item.ID, claim.CloudID)
+			if (lease.Server.CloudID != "" && lease.Server.CloudID != resourceID) || (lease.Server.ImmutableID != "" && lease.Server.ImmutableID != resourceID) {
+				return result, core.Exit(4, "lease_id_conflict: fixed Machine0 resource changed before release")
+			}
+			if item.ID == "" {
+				return result, core.Exit(4, "fixed Machine0 lease %s is not visible in the current account; absence is unverified, retain its claim and inspect the original account", claim.LeaseID)
+			}
+			return core.FixedObservation[machine]{Candidates: []machine{item}}, nil
+		},
+		DeleteExact: func(ctx context.Context, tx *core.FixedTransaction, item machine) error {
+			if err := b.bindFixedMachine0(tx.Claim, item, false, func() error { return tx.Record("bound") }); err != nil {
 				return err
 			}
-			// Native rm resolves by name. Re-attest that name under the claim lock
-			// immediately before deletion; never pass a Crabbox ID to the native CLI.
 			detail, err := b.api.Get(ctx, item.Name)
 			if err != nil {
 				return err
 			}
-			if _, err := attestFixedMachine0Detail(*claim, item, detail); err != nil {
+			if _, err := attestFixedMachine0Detail(*tx.Claim, item, detail); err != nil {
 				return err
 			}
 			if err := b.api.Remove(ctx, item.Name); err != nil {
 				return err
 			}
 			outcome.Terminal = true
-		} else {
-			return exit(4, "fixed Machine0 lease %s is not visible in the current account; absence is unverified, retain its claim and inspect the original account", claim.LeaseID)
-		}
-		*claim = fixedMachine0LeaseKind.TerminalClaim(*claim, core.ClockNow(b.rt.Clock).UTC())
-		return persist()
-	})
+			return nil
+		},
+	}, func() time.Time { return core.ClockNow(b.rt.Clock).UTC() })
 }
 
 func validateFixedMachine0Attempt(item machine, attempt machine0CreateAttempt) string {
@@ -397,12 +386,12 @@ func validateFixedMachine0TerminalClaimExtra(claim core.LeaseClaim) error {
 	intent := claim.FixedCreateIntent
 	if intent.ProviderScope != machine0NameScope(machine0MachineName(claim.LeaseID, intent.Slug)) ||
 		claim.CloudNumericID != 0 || claim.CloudImmutableID != "" {
-		return exit(4, "lease_id_conflict: fixed Machine0 lease %s has an invalid terminal tombstone", claim.LeaseID)
+		return core.Exit(4, "lease_id_conflict: fixed Machine0 lease %s has an invalid terminal tombstone", claim.LeaseID)
 	}
 	return nil
 }
 
-func (b *backend) retainLeaseClaimAfterRelease(lease LeaseTarget, previous core.LeaseClaim) (bool, error) {
+func (b *backend) retainLeaseClaimAfterRelease(lease core.LeaseTarget, previous core.LeaseClaim) (bool, error) {
 	claim, exists, err := resolveClaim(lease.LeaseID)
 	if err != nil {
 		return false, err
@@ -414,19 +403,19 @@ func (b *backend) retainLeaseClaimAfterRelease(lease LeaseTarget, previous core.
 	return fixedMachine0LeaseKind.RetainClaimAfterRelease(lease.LeaseID, previous, fixedMachine0LeaseKind.IsFixedClaim(claim), validateFixedMachine0TerminalClaimExtra, nil)
 }
 
-func attestFixedMachine0Detail(claim LeaseClaim, previous, detail machine) (machine, error) {
+func attestFixedMachine0Detail(claim core.LeaseClaim, previous, detail machine) (machine, error) {
 	if previous.ID != "" && (detail.ID != previous.ID || detail.Name != previous.Name) {
-		return machine{}, exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its inventory resource identity", claim.LeaseID)
+		return machine{}, core.Exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its inventory resource identity", claim.LeaseID)
 	}
 	if err := validateFixedMachine0Ownership(claim, detail); err != nil {
 		return machine{}, err
 	}
 	if previous.Key != nil && detail.Key != nil {
 		if strings.TrimSpace(previous.Key.Name) != "" && strings.TrimSpace(previous.Key.Name) != strings.TrimSpace(detail.Key.Name) {
-			return machine{}, exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its inventory SSH key name", claim.LeaseID)
+			return machine{}, core.Exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its inventory SSH key name", claim.LeaseID)
 		}
 		if strings.TrimSpace(previous.Key.Type) != "" && strings.TrimSpace(detail.Key.Type) != "" && !strings.EqualFold(strings.TrimSpace(previous.Key.Type), strings.TrimSpace(detail.Key.Type)) {
-			return machine{}, exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its inventory SSH key type", claim.LeaseID)
+			return machine{}, core.Exit(4, "lease_id_conflict: Machine0 machine detail for fixed lease %s does not match its inventory SSH key type", claim.LeaseID)
 		}
 		if strings.TrimSpace(detail.Key.Type) == "" {
 			key := *detail.Key

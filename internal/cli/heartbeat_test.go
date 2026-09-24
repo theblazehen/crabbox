@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -66,7 +68,7 @@ func TestHeartbeatIdentifierSyntax(t *testing.T) {
 				}
 				cfg := defaultConfig()
 				cfg.Provider = heartbeatDirectProviderName
-				if err := claimLeaseTargetForRepoConfig(backend.lease.LeaseID, serverSlug(backend.lease.Server), cfg, backend.lease.Server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
+				if err := ClaimLeaseTargetForRepoConfig(backend.lease.LeaseID, ServerSlug(backend.lease.Server), cfg, backend.lease.Server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
 					t.Fatal(err)
 				}
 			} else if err := os.Mkdir(configPath, 0o700); err != nil {
@@ -186,6 +188,51 @@ func TestHeartbeatCoordinatorOmitsIdleTimeoutWithoutOverride(t *testing.T) {
 	}
 }
 
+func TestHeartbeatCoordinatorWaitsForAccessRefresh(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases/cbx_heartbeat/heartbeat" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		// Changed SSH sources can keep the broker's refresh attempt open beyond a read's deadline.
+		timer := time.NewTimer(31 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+			ID: "cbx_heartbeat", Provider: "aws", State: "active", ExpiresAt: "2026-09-18T12:00:00Z",
+		}})
+	}))
+	defer server.Close()
+
+	configureHeartbeatCoordinatorTest(t, server.URL)
+	t.Setenv("CRABBOX_OWNER", "alice@example.com")
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	err := (App{Stdout: &stdout, Stderr: &stderr}).Run(ctx, []string{
+		"heartbeat", "--provider", "aws", "--id", "cbx_heartbeat", "--json",
+	})
+	if err != nil {
+		t.Fatalf("heartbeat error=%v requests=%d stderr=%q", err, requests.Load(), stderr.String())
+	}
+	var got leaseHeartbeatView
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 || got.ID != "cbx_heartbeat" || got.State != "active" || got.ExpiresAt != "2026-09-18T12:00:00Z" {
+		t.Fatalf("requests=%d heartbeat=%#v, want one completed heartbeat", requests.Load(), got)
+	}
+	t.Logf("one heartbeat POST completed after %s", time.Since(started))
+}
+
 func TestHeartbeatCoordinatorFailsClosed(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -261,7 +308,7 @@ func TestHeartbeatRegisteredModeUsesCoordinator(t *testing.T) {
 	t.Cleanup(func() { heartbeatDirectBackendForTest = nil })
 	cfg := defaultConfig()
 	cfg.Provider = heartbeatDirectProviderName
-	if err := claimLeaseTargetForRepoConfig(backend.lease.LeaseID, serverSlug(backend.lease.Server), cfg, backend.lease.Server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(backend.lease.LeaseID, ServerSlug(backend.lease.Server), cfg, backend.lease.Server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,10 +335,10 @@ func TestHeartbeatRegisteredClaimReplacementPreventsProviderMutation(t *testing.
 	t.Cleanup(func() { heartbeatDirectBackendForTest = nil })
 	cfg := defaultConfig()
 	cfg.Provider = heartbeatDirectProviderName
-	if err := claimLeaseTargetForRepoConfig(backend.lease.LeaseID, serverSlug(backend.lease.Server), cfg, backend.lease.Server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(backend.lease.LeaseID, ServerSlug(backend.lease.Server), cfg, backend.lease.Server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	initial, err := readLeaseClaim(backend.lease.LeaseID)
+	initial, err := ReadLeaseClaim(backend.lease.LeaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +347,7 @@ func TestHeartbeatRegisteredClaimReplacementPreventsProviderMutation(t *testing.
 		coordinatorRequests.Add(1)
 		labels := cloneStringMap(initial.Labels)
 		labels["owner"] = "replacement-owner"
-		if _, err := updateLeaseClaimLabelsIfUnchanged(backend.lease.LeaseID, initial, labels); err != nil {
+		if _, err := UpdateLeaseClaimLabelsIfUnchanged(backend.lease.LeaseID, initial, labels); err != nil {
 			t.Errorf("replace claim during coordinator heartbeat: %v", err)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
@@ -361,8 +408,6 @@ func init() {
 
 type heartbeatDirectProvider struct{}
 
-func (heartbeatDirectProvider) Name() string      { return heartbeatDirectProviderName }
-func (heartbeatDirectProvider) Aliases() []string { return nil }
 func (heartbeatDirectProvider) Spec() ProviderSpec {
 	return ProviderSpec{
 		Name:        heartbeatDirectProviderName,
@@ -391,6 +436,7 @@ type heartbeatDirectBackend struct {
 	requests   []ResolveRequest
 	touches    []TouchRequest
 	touchFn    func(TouchRequest) (Server, error)
+	resolveFn  func() (LeaseTarget, error)
 }
 
 func (*heartbeatDirectBackend) Spec() ProviderSpec { return heartbeatDirectProvider{}.Spec() }
@@ -400,8 +446,11 @@ func (b *heartbeatDirectBackend) Acquire(context.Context, AcquireRequest) (Lease
 func (b *heartbeatDirectBackend) Resolve(_ context.Context, req ResolveRequest) (LeaseTarget, error) {
 	b.resolves++
 	b.requests = append(b.requests, req)
-	if req.ID != b.lease.LeaseID && req.ID != serverSlug(b.lease.Server) {
+	if req.ID != b.lease.LeaseID && req.ID != ServerSlug(b.lease.Server) {
 		return LeaseTarget{}, fmt.Errorf("lease %s not found", req.ID)
+	}
+	if b.resolveFn != nil {
+		return b.resolveFn()
 	}
 	return b.lease, nil
 }
@@ -455,7 +504,7 @@ func TestHeartbeatDirectProviderOmitsIdleTimeoutOverrideIntent(t *testing.T) {
 		t.Fatalf("omitted timeout carried replacement intent: %#v", backend.touches)
 	}
 	snapshot, exists, set := ServerLeaseClaimSnapshot(backend.touches[0].Lease.Server)
-	persisted, err := readLeaseClaim(backend.lease.LeaseID)
+	persisted, err := ReadLeaseClaim(backend.lease.LeaseID)
 	if err != nil || !set || !exists || snapshot.Revision != persisted.Revision || backend.configures < 2 {
 		t.Fatalf("snapshot=%#v exists=%t set=%t persisted=%#v configures=%d err=%v", snapshot, exists, set, persisted, backend.configures, err)
 	}
@@ -471,6 +520,64 @@ func TestHeartbeatDirectProviderRejectsClaimlessLease(t *testing.T) {
 	}
 	if len(backend.touches) != 0 {
 		t.Fatalf("claimless heartbeat touched lease: %#v", backend.touches)
+	}
+}
+
+func TestHeartbeatAndStatusKeepResolvedClaimSnapshot(t *testing.T) {
+	for _, command := range []string{"heartbeat", "status wait"} {
+		t.Run(command, func(t *testing.T) {
+			backend := configureHeartbeatDirectTest(t, true)
+			observed, err := ReadLeaseClaim(backend.lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			SetServerLeaseClaimSnapshot(&backend.lease.Server, observed, true)
+			var replacement LeaseClaim
+			backend.resolveFn = func() (LeaseTarget, error) {
+				labels := cloneStringMap(observed.Labels)
+				labels["state"] = "busy"
+				var err error
+				replacement, err = UpdateLeaseClaimLabelsIfUnchanged(observed.LeaseID, observed, labels)
+				return backend.lease, err
+			}
+			var stderr bytes.Buffer
+			app := App{Stdout: io.Discard, Stderr: &stderr}
+			args := []string{"--provider", heartbeatDirectProviderName, "--id", "direct-heartbeat"}
+			if command == "heartbeat" {
+				err = app.heartbeat(t.Context(), args)
+			} else {
+				err = app.status(t.Context(), append(args, "--wait", "--wait-timeout", "1ns"))
+			}
+			if err == nil || !strings.Contains(err.Error()+stderr.String(), "claim changed") || len(backend.touches) != 0 {
+				t.Fatalf("stale CLI observation touched lease: err=%v stderr=%q touches=%d", err, stderr.String(), len(backend.touches))
+			}
+			persisted, readErr := ReadLeaseClaim(observed.LeaseID)
+			if readErr != nil || !reflect.DeepEqual(persisted, replacement) {
+				t.Fatalf("CLI changed replacement claim: err=%v", readErr)
+			}
+		})
+	}
+}
+
+func TestStatusLeaseExactClaimPreservesObservedPresence(t *testing.T) {
+	for _, observedExists := range []bool{false, true} {
+		t.Run(strconv.FormatBool(observedExists), func(t *testing.T) {
+			backend := configureHeartbeatDirectTest(t, true)
+			observed, err := ReadLeaseClaim(backend.lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			SetServerLeaseClaimSnapshot(&backend.lease.Server, observed, observedExists)
+			labels := cloneStringMap(observed.Labels)
+			labels["state"] = "busy"
+			if _, err := UpdateLeaseClaimLabelsIfUnchanged(observed.LeaseID, observed, labels); err != nil {
+				t.Fatal(err)
+			}
+			authorizer := &statusTouchClaimAuthorizingBackend{}
+			if _, claimed, err := statusLeaseExactClaim(t.Context(), authorizer, backend.lease, heartbeatDirectProviderName, ""); err == nil || claimed || authorizer.calls != 0 {
+				t.Fatalf("observed snapshot replaced before provider authorization: err=%v claimed=%v calls=%d", err, claimed, authorizer.calls)
+			}
+		})
 	}
 }
 
@@ -491,7 +598,7 @@ func configureHeartbeatDirectTest(t *testing.T, claim bool) *heartbeatDirectBack
 	if claim {
 		cfg := defaultConfig()
 		cfg.Provider = heartbeatDirectProviderName
-		if err := claimLeaseTargetForRepoConfig(backend.lease.LeaseID, serverSlug(server), cfg, server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
+		if err := ClaimLeaseTargetForRepoConfig(backend.lease.LeaseID, ServerSlug(server), cfg, server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -511,4 +618,271 @@ func heartbeatDirectTestLease(leaseID, slug string) LeaseTarget {
 			"idle_timeout_secs": "1800",
 		},
 	}}
+}
+
+const (
+	heartbeatDelegatedProviderName            = "heartbeat-delegated-test"
+	heartbeatDelegatedUnsupportedProviderName = "heartbeat-delegated-unsupported-test"
+)
+
+// heartbeatDelegatedIdleTimeout is what the fake capability reports back by
+// default. It is deliberately unlike any Crabbox config default so an assertion
+// on the rendered value cannot pass by echoing config.
+const heartbeatDelegatedIdleTimeout = 7 * time.Minute
+
+// heartbeatDelegatedFixture holds the fake capability's observable state. The
+// provider registry is process-wide, so this is guarded rather than left as
+// plain package variables: a future t.Parallel() would otherwise race silently.
+type heartbeatDelegatedFixture struct {
+	mu          sync.Mutex
+	requests    []LeaseHeartbeatRequest
+	idleTimeout time.Duration
+}
+
+var heartbeatDelegated = &heartbeatDelegatedFixture{idleTimeout: heartbeatDelegatedIdleTimeout}
+
+// arm sets what the capability reports for one test and restores the default.
+func (f *heartbeatDelegatedFixture) arm(t *testing.T, idleTimeout time.Duration) {
+	t.Helper()
+	f.set(nil, idleTimeout)
+	t.Cleanup(func() { f.set(nil, heartbeatDelegatedIdleTimeout) })
+}
+
+func (f *heartbeatDelegatedFixture) set(requests []LeaseHeartbeatRequest, idleTimeout time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = requests
+	f.idleTimeout = idleTimeout
+}
+
+// record logs one call and returns the idle window to report for it.
+func (f *heartbeatDelegatedFixture) record(req LeaseHeartbeatRequest) time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = append(f.requests, req)
+	return f.idleTimeout
+}
+
+func (f *heartbeatDelegatedFixture) recorded() []LeaseHeartbeatRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]LeaseHeartbeatRequest(nil), f.requests...)
+}
+
+func init() {
+	RegisterProvider(heartbeatDelegatedProvider{})
+	RegisterProvider(heartbeatDelegatedUnsupportedProvider{})
+}
+
+type heartbeatDelegatedProvider struct{}
+
+func (heartbeatDelegatedProvider) Name() string      { return heartbeatDelegatedProviderName }
+func (heartbeatDelegatedProvider) Aliases() []string { return nil }
+func (heartbeatDelegatedProvider) Spec() ProviderSpec {
+	return ProviderSpec{
+		Name:        heartbeatDelegatedProviderName,
+		Family:      "heartbeat-test",
+		Kind:        ProviderKindDelegatedRun,
+		Targets:     []TargetSpec{{OS: targetLinux}},
+		Features:    FeatureSet{FeatureLeaseHeartbeat},
+		Coordinator: CoordinatorNever,
+	}
+}
+func (heartbeatDelegatedProvider) RegisterFlags(*flag.FlagSet, Config) any { return noProviderFlags{} }
+func (heartbeatDelegatedProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
+	return nil
+}
+func (p heartbeatDelegatedProvider) Configure(Config, Runtime) (Backend, error) {
+	return heartbeatDelegatedBackend{spec: p.Spec()}, nil
+}
+
+type heartbeatDelegatedBackend struct {
+	spec ProviderSpec
+}
+
+func (b heartbeatDelegatedBackend) Spec() ProviderSpec { return b.spec }
+
+func (b heartbeatDelegatedBackend) Heartbeat(_ context.Context, req LeaseHeartbeatRequest) (LeaseHeartbeatResult, error) {
+	return LeaseHeartbeatResult{
+		LeaseID:       req.ID,
+		Slug:          "delegated-heartbeat",
+		State:         "running",
+		LastTouchedAt: time.Date(2026, 8, 16, 20, 0, 0, 0, time.UTC),
+		IdleTimeout:   heartbeatDelegated.record(req),
+	}, nil
+}
+
+// heartbeatDelegatedUnsupportedProvider is the same shape without the optional
+// capability, so the negative direction stays pinned to today's behaviour.
+type heartbeatDelegatedUnsupportedProvider struct{}
+
+func (heartbeatDelegatedUnsupportedProvider) Name() string {
+	return heartbeatDelegatedUnsupportedProviderName
+}
+func (heartbeatDelegatedUnsupportedProvider) Aliases() []string { return nil }
+func (heartbeatDelegatedUnsupportedProvider) Spec() ProviderSpec {
+	return ProviderSpec{
+		Name:        heartbeatDelegatedUnsupportedProviderName,
+		Family:      "heartbeat-test",
+		Kind:        ProviderKindDelegatedRun,
+		Targets:     []TargetSpec{{OS: targetLinux}},
+		Coordinator: CoordinatorNever,
+	}
+}
+func (heartbeatDelegatedUnsupportedProvider) RegisterFlags(*flag.FlagSet, Config) any {
+	return noProviderFlags{}
+}
+func (heartbeatDelegatedUnsupportedProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
+	return nil
+}
+func (p heartbeatDelegatedUnsupportedProvider) Configure(Config, Runtime) (Backend, error) {
+	return heartbeatUnsupportedBackend{spec: p.Spec()}, nil
+}
+
+type heartbeatUnsupportedBackend struct {
+	spec ProviderSpec
+}
+
+func (b heartbeatUnsupportedBackend) Spec() ProviderSpec { return b.spec }
+
+func TestHeartbeatDelegatedCapability(t *testing.T) {
+	tests := []struct {
+		name string
+		// registeredBroker configures broker.mode=registered plus a
+		// coordinator URL, the shape that used to disable the capability
+		// wholesale.
+		registeredBroker bool
+		provider         string
+		args             []string
+		wantErrCode      int
+		wantErr          string
+	}{
+		{
+			name:     "capability keeps a delegated lease alive",
+			provider: heartbeatDelegatedProviderName,
+		},
+		{
+			// A CoordinatorNever provider can never hold a
+			// coordinator-registered lease, so a team-wide registered broker
+			// config must not disable the capability for it.
+			name:             "registered broker does not disable a coordinator-never provider",
+			registeredBroker: true,
+			provider:         heartbeatDelegatedProviderName,
+		},
+		{
+			name:        "provider without the capability still fails",
+			provider:    heartbeatDelegatedUnsupportedProviderName,
+			wantErrCode: 2,
+			wantErr:     "provider=" + heartbeatDelegatedUnsupportedProviderName + " does not support lease heartbeat",
+		},
+		{
+			// The delegated path reports the provider's idle window and has no
+			// way to replace one, so the flag is refused instead of silently
+			// doing nothing.
+			name:        "idle timeout replacement is refused, not ignored",
+			provider:    heartbeatDelegatedProviderName,
+			args:        []string{"--idle-timeout", "20m"},
+			wantErrCode: 2,
+			wantErr:     "provider=" + heartbeatDelegatedProviderName + " does not support replacing the lease idle timeout while heartbeating",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+			if test.registeredBroker {
+				t.Setenv("CRABBOX_COORDINATOR", "https://coordinator.example.test")
+				t.Setenv("CRABBOX_COORDINATOR_MODE", string(BrokerModeRegistered))
+				t.Setenv("CRABBOX_COORDINATOR_TOKEN", "test-token")
+			}
+			heartbeatDelegated.arm(t, heartbeatDelegatedIdleTimeout)
+
+			args := append([]string{"--provider", test.provider, "--id", "cbx_delegated", "--json"}, test.args...)
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).heartbeat(context.Background(), args)
+
+			if test.wantErr != "" {
+				var exitErr ExitError
+				if !AsExitError(err, &exitErr) || exitErr.Code != test.wantErrCode || exitErr.Message != test.wantErr {
+					t.Fatalf("error=%v, want exit %d %q", err, test.wantErrCode, test.wantErr)
+				}
+				if stdout.Len() != 0 {
+					t.Fatalf("refused heartbeat wrote stdout=%q", stdout.String())
+				}
+				if calls := heartbeatDelegated.recorded(); len(calls) != 0 {
+					t.Fatalf("refused heartbeat still reached the capability: %#v", calls)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("heartbeat error=%v stderr=%q", err, stderr.String())
+			}
+			calls := heartbeatDelegated.recorded()
+			if len(calls) != 1 {
+				t.Fatalf("capability calls=%#v", calls)
+			}
+			if calls[0].ID != "cbx_delegated" {
+				t.Fatalf("heartbeat request=%#v", calls[0])
+			}
+			var view leaseHeartbeatView
+			if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+				t.Fatal(err)
+			}
+			if view.ID != "cbx_delegated" || view.Provider != heartbeatDelegatedProviderName || view.State != "running" ||
+				view.LastTouchedAt != "2026-08-16T20:00:00Z" {
+				t.Fatalf("heartbeat view=%#v", view)
+			}
+			// The rendered idle window is the provider's reported value, not
+			// Crabbox's configured default.
+			if view.IdleTimeout != heartbeatDelegatedIdleTimeout.String() {
+				t.Fatalf("heartbeat view idleTimeout=%q, want the provider-reported %q", view.IdleTimeout, heartbeatDelegatedIdleTimeout)
+			}
+			if view.IdleTimeout == defaultConfig().IdleTimeout.String() {
+				t.Fatalf("fixture is tautological: provider value equals the config default %q", view.IdleTimeout)
+			}
+			// LeaseHeartbeatResult carries no deadline field at all, so the
+			// rendered view structurally cannot claim an expiry here.
+			if view.ExpiresAt != "" {
+				t.Fatalf("heartbeat view invented an absolute deadline: %#v", view)
+			}
+		})
+	}
+}
+
+// TestHeartbeatDelegatedOmitsUnreportedIdleTimeout pins the other half of the
+// honest-reporting rule: a provider that reports no idle window renders none,
+// rather than falling back to the local config default.
+func TestHeartbeatDelegatedOmitsUnreportedIdleTimeout(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	heartbeatDelegated.arm(t, 0)
+
+	var stdout, stderr bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).heartbeat(context.Background(), []string{
+		"--provider", heartbeatDelegatedProviderName, "--id", "cbx_delegated", "--json",
+	}); err != nil {
+		t.Fatalf("heartbeat error=%v stderr=%q", err, stderr.String())
+	}
+	var view leaseHeartbeatView
+	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.IdleTimeout != "" {
+		t.Fatalf("unreported idle window rendered as %q", view.IdleTimeout)
+	}
+
+	// The text view marks it absent rather than printing a number.
+	stdout.Reset()
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).heartbeat(context.Background(), []string{
+		"--provider", heartbeatDelegatedProviderName, "--id", "cbx_delegated",
+	}); err != nil {
+		t.Fatalf("heartbeat error=%v stderr=%q", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "idle_timeout=-") {
+		t.Fatalf("text view=%q, want idle_timeout=-", stdout.String())
+	}
 }

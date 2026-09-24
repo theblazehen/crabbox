@@ -27,17 +27,17 @@ func parseFreshPRSpec(value string, local Repo) (FreshPRSpec, error) {
 	if n, err := strconv.Atoi(value); err == nil && n > 0 {
 		owner, repo := githubOwnerRepoFromRemote(local.RemoteURL)
 		if owner == "" || repo == "" {
-			return FreshPRSpec{}, exit(2, "--fresh-pr <number> requires a GitHub origin remote")
+			return FreshPRSpec{}, Exit(2, "--fresh-pr <number> requires a GitHub origin remote")
 		}
 		return FreshPRSpec{Owner: owner, Repo: repo, Number: n}, nil
 	}
 	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
 		u, err := url.Parse(value)
 		if err != nil {
-			return FreshPRSpec{}, exit(2, "invalid --fresh-pr URL: %v", err)
+			return FreshPRSpec{}, Exit(2, "invalid --fresh-pr URL: %v", err)
 		}
 		if !isGitHubHost(u.Hostname()) {
-			return FreshPRSpec{}, exit(2, "--fresh-pr URL host must be github.com")
+			return FreshPRSpec{}, Exit(2, "--fresh-pr URL host must be github.com")
 		}
 		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 		if len(parts) >= 4 && parts[2] == "pull" {
@@ -46,16 +46,16 @@ func parseFreshPRSpec(value string, local Repo) (FreshPRSpec, error) {
 				return FreshPRSpec{Owner: parts[0], Repo: parts[1], Number: n}, nil
 			}
 		}
-		return FreshPRSpec{}, exit(2, "--fresh-pr URL must look like https://github.com/owner/repo/pull/123")
+		return FreshPRSpec{}, Exit(2, "--fresh-pr URL must look like https://github.com/owner/repo/pull/123")
 	}
 	re := regexp.MustCompile(`^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([0-9]+)$`)
 	match := re.FindStringSubmatch(value)
 	if match == nil {
-		return FreshPRSpec{}, exit(2, "--fresh-pr expects owner/repo#123, GitHub PR URL, or PR number")
+		return FreshPRSpec{}, Exit(2, "--fresh-pr expects owner/repo#123, GitHub PR URL, or PR number")
 	}
 	n, _ := strconv.Atoi(match[3])
 	if n <= 0 {
-		return FreshPRSpec{}, exit(2, "--fresh-pr number must be positive")
+		return FreshPRSpec{}, Exit(2, "--fresh-pr number must be positive")
 	}
 	return FreshPRSpec{Owner: match[1], Repo: match[2], Number: n}, nil
 }
@@ -110,10 +110,10 @@ func remoteFreshPRCheckoutCommand(workdir string, spec FreshPRSpec) string {
 	branch := fmt.Sprintf("crabbox-pr-%d", spec.Number)
 	ref := fmt.Sprintf("pull/%d/head:%s", spec.Number, branch)
 	script := "set -eu\n" +
-		"rm -rf " + shellQuote(workdir) + "\n" +
-		"mkdir -p " + shellQuote(parent) + "\n" +
-		"git clone --quiet --filter=blob:none " + shellQuote(repoURL) + " " + shellQuote(workdir) + "\n" +
-		"cd " + shellQuote(workdir) + "\n" +
+		"rm -rf " + shellPathQuote(workdir) + "\n" +
+		"mkdir -p " + shellPathQuote(parent) + "\n" +
+		"git clone --quiet --filter=blob:none " + shellQuote(repoURL) + " " + shellPathQuote(workdir) + "\n" +
+		"cd " + shellPathQuote(workdir) + "\n" +
 		"git fetch --quiet origin " + shellQuote(ref) + "\n" +
 		"git checkout --quiet " + shellQuote(branch) + "\n"
 	return "bash -lc " + shellQuote(script)
@@ -130,7 +130,7 @@ func windowsRemoteFreshPRCheckoutCommand(workdir string, spec FreshPRSpec) strin
 	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", spec.Owner, spec.Repo)
 	branch := fmt.Sprintf("crabbox-pr-%d", spec.Number)
 	ref := fmt.Sprintf("pull/%d/head:%s", spec.Number, branch)
-	return powershellCommand(`$ErrorActionPreference = "Stop"
+	return PowershellCommand(`$ErrorActionPreference = "Stop"
 $workdir = ` + psQuote(workdir) + `
 $parent = Split-Path -Parent $workdir
 if (Test-Path -LiteralPath $workdir) {
@@ -155,13 +155,13 @@ func localGitBinaryDiff(root string) ([]byte, error) {
 }
 
 func remoteApplyLocalPatchCommand(workdir string) string {
-	script := "set -eu\ncd " + shellQuote(workdir) + "\ngit apply --whitespace=nowarn -\n"
+	script := "set -eu\ncd " + shellPathQuote(workdir) + "\ngit apply --whitespace=nowarn -\n"
 	return "bash -lc " + shellQuote(script)
 }
 
 func remoteApplyLocalPatchCommandForTarget(workdir string, target SSHTarget) string {
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$ErrorActionPreference = "Stop"
+		return PowershellCommand(`$ErrorActionPreference = "Stop"
 Set-Location -LiteralPath ` + psQuote(workdir) + `
 git apply --whitespace=nowarn -
 if ($LASTEXITCODE -ne 0) { throw "git apply failed with exit $LASTEXITCODE" }
@@ -173,13 +173,13 @@ if ($LASTEXITCODE -ne 0) { throw "git apply failed with exit $LASTEXITCODE" }
 func applyLocalPatchToFreshPR(ctx context.Context, target SSHTarget, workdir string, repo Repo) (bool, error) {
 	diff, err := localGitBinaryDiff(repo.Root)
 	if err != nil {
-		return false, exit(2, "create local patch: %v", err)
+		return false, Exit(2, "create local patch: %v", err)
 	}
 	if len(diff) == 0 {
 		return false, nil
 	}
 	if err := runSSHInput(ctx, target, remoteApplyLocalPatchCommandForTarget(workdir, target), bytes.NewReader(diff), io.Discard, io.Discard); err != nil {
-		return false, exit(7, "apply local patch: %v", err)
+		return false, Exit(7, "apply local patch: %v", err)
 	}
 	return true, nil
 }

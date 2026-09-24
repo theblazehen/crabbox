@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -23,9 +25,6 @@ import (
 // the argv at Start() and blocks Wait() on the signal channel so the orchestration
 // loop can be terminated deterministically without real ssh processes.
 type pondMeshRecordingHandle struct {
-	name      string
-	args      []string
-	pid       int
 	started   bool
 	signal    chan struct{}
 	ctx       context.Context
@@ -63,37 +62,10 @@ func (h *pondMeshRecordingHandle) Wait() error {
 	return nil
 }
 
-func (h *pondMeshRecordingHandle) String() string {
-	return h.name + " " + strings.Join(h.args, " ")
-}
-
-func (h *pondMeshRecordingHandle) PID() int { return h.pid }
-
-func (h *pondMeshRecordingHandle) Process() processSignaler { return testProcessSignaler{h.signal} }
-
 // WasTerminatedByOurCancel mirrors the production classifier for the recording
 // double: this stub's Wait() only returns nil (a healthy tunnel torn down by
 // the connect loop), so a set cancelled flag always denotes our teardown.
 func (h *pondMeshRecordingHandle) WasTerminatedByOurCancel() bool { return h.cancelled.Load() }
-
-// testProcessSignaler closes the underlying channel on the first signal so
-// the handle's Wait() returns.
-type testProcessSignaler struct {
-	signal chan struct{}
-}
-
-func (p testProcessSignaler) Signal(_ os.Signal) error {
-	select {
-	case <-p.signal:
-	default:
-		close(p.signal)
-	}
-	return nil
-}
-
-func (p testProcessSignaler) Kill() error {
-	return p.Signal(nil)
-}
 
 // pondMeshRecordingRunner mirrors the exedev backend's pattern: it captures
 // every (name, args) invocation it sees so tests can assert on the full SSH
@@ -106,12 +78,12 @@ type pondMeshRecordingRunner struct {
 	waitErrs  map[int]error
 }
 
-func (r *pondMeshRecordingRunner) Command(ctx context.Context, name string, args ...string) pondMeshHandle {
+func (r *pondMeshRecordingRunner) Command(ctx context.Context, _ SSHTarget, name string, args ...string) pondMeshHandle {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, append([]string{name}, args...))
 	index := len(r.handles)
-	h := &pondMeshRecordingHandle{name: name, args: append([]string{}, args...), pid: 1000 + index, signal: make(chan struct{}), ctx: ctx}
+	h := &pondMeshRecordingHandle{signal: make(chan struct{}), ctx: ctx}
 	if r.startHook != nil {
 		h.startHook = func() error { return r.startHook(index, ctx) }
 	}
@@ -125,21 +97,26 @@ func (r *pondMeshRecordingRunner) Command(ctx context.Context, name string, args
 func TestPondMeshProductionRunnersScrubTargetEnvironment(t *testing.T) {
 	t.Setenv("TEST_ARD_PASSWORD", "must-not-reach-pond-ssh")
 	t.Setenv("CRABBOX_TEST_KEEP", "preserved")
-	target := SSHTarget{ChildEnvDenylist: []string{"TEST_ARD_PASSWORD"}}
-	for name, runner := range map[string]pondMeshRunner{
-		"foreground": pondMeshExecRunner{},
-		"daemon":     pondMeshDaemonRunner{},
+	t.Setenv("CRABBOX_TEST_OVERRIDE", "old")
+	target := SSHTarget{
+		ChildEnvDenylist: []string{"TEST_ARD_PASSWORD"},
+		ChildEnv:         map[string]string{"CRABBOX_TEST_OVERRIDE": "new"},
+	}
+	foreground := pondMeshExecRunner{}.Command(context.Background(), target, "ssh", "example.test").(*pondMeshExecHandle)
+	for name, cmd := range map[string]*exec.Cmd{
+		"foreground": foreground.cmd,
+		"daemon":     pondMeshDaemonCommand(target, "ssh", "example.test"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			handle := pondMeshRunnerCommand(context.Background(), runner, target, "ssh", "example.test")
-			execHandle := handle.(*pondMeshExecHandle)
-			cmd := execHandle.cmd
 			env := strings.Join(cmd.Env, "\n")
 			if strings.Contains(env, "TEST_ARD_PASSWORD=") || !strings.Contains(env, "CRABBOX_TEST_KEEP=preserved") {
-				t.Fatalf("child environment=%q", env)
+				t.Fatal("child environment leaked a blocked key or dropped a retained key")
 			}
-			if name == "foreground" && (!execHandle.managed || cmd.Cancel == nil || cmd.WaitDelay != pondMeshCancelWaitDelay) {
-				t.Fatalf("environment-aware foreground runner lost managed cancellation: managed=%v cancel=%v waitDelay=%v", execHandle.managed, cmd.Cancel != nil, cmd.WaitDelay)
+			if strings.Contains(env, "CRABBOX_TEST_OVERRIDE=old") || !strings.Contains(env, "CRABBOX_TEST_OVERRIDE=new") {
+				t.Fatal("child environment did not apply the target override")
+			}
+			if name == "foreground" && (cmd.Cancel == nil || cmd.WaitDelay != pondMeshCancelWaitDelay) {
+				t.Fatalf("foreground runner lost cancellation: cancel=%v waitDelay=%v", cmd.Cancel != nil, cmd.WaitDelay)
 			}
 		})
 	}
@@ -205,18 +182,39 @@ func TestApplyLeaseCreateFlagsSetsExposedPorts(t *testing.T) {
 		Network:     NetworkAuto,
 		Capacity:    CapacityConfig{Market: "spot"},
 	}
-	fs := flag.NewFlagSet("warmup", flag.ContinueOnError)
-	values := registerLeaseCreateFlags(fs, defaults)
-	if err := fs.Parse([]string{"--expose", "8080", "--expose", "9090"}); err != nil {
-		t.Fatal(err)
-	}
-	cfg := defaults
-	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
-		t.Fatalf("applyLeaseCreateFlags: %v", err)
-	}
-	want := []string{"8080", "9090"}
-	if !reflect.DeepEqual(cfg.ExposedPorts, want) {
-		t.Fatalf("cfg.ExposedPorts=%v want %v", cfg.ExposedPorts, want)
+	for _, tc := range []struct {
+		name        string
+		leaseID     string
+		coordinator string
+		mode        BrokerMode
+	}{
+		{name: "managed creation", coordinator: "https://coordinator.example.com", mode: BrokerModeManaged},
+		{name: "direct reuse", leaseID: "cbx_direct"},
+		{name: "registered reuse", leaseID: "cbx_registered", coordinator: "https://coordinator.example.com", mode: BrokerModeRegistered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			cfg := defaults
+			cfg.BrokerMode = tc.mode
+			cfg.Coordinator = tc.coordinator
+			var stderr bytes.Buffer
+			fs := flag.NewFlagSet("warmup", flag.ContinueOnError)
+			fs.SetOutput(&stderr)
+			values := registerLeaseCreateFlags(fs, cfg)
+			if err := fs.Parse([]string{"--provider", "hetzner", "--expose", "9090,8080", "--expose", "9090"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyLeaseCreateFlagsForLease(&cfg, fs, values, tc.leaseID); err != nil {
+				t.Fatalf("applyLeaseCreateFlags: %v", err)
+			}
+			want := []string{"8080", "9090"}
+			if !reflect.DeepEqual(cfg.ExposedPorts, want) {
+				t.Fatalf("cfg.ExposedPorts=%v want %v", cfg.ExposedPorts, want)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("unexpected diagnostic: %s", stderr.String())
+			}
+		})
 	}
 }
 
@@ -232,7 +230,7 @@ func TestDirectLeaseLabelsRecordExposedPorts(t *testing.T) {
 		TTL:          15 * time.Minute,
 		IdleTimeout:  4 * time.Minute,
 	}
-	labels := directLeaseLabels(cfg, "cbx_abcdef123456", "blue-lobster", "hetzner", "", true, now)
+	labels := DirectLeaseLabels(cfg, "cbx_abcdef123456", "blue-lobster", "hetzner", "", true, now)
 	if labels[pondExposedPortsLabelKey] != "8080-9090" {
 		t.Fatalf("crabbox_exposed_ports label=%q want 8080-9090; full=%#v", labels[pondExposedPortsLabelKey], labels)
 	}
@@ -248,7 +246,7 @@ func TestDirectLeaseLabelsOmitExposedPortsWhenEmpty(t *testing.T) {
 		TTL:         15 * time.Minute,
 		IdleTimeout: 4 * time.Minute,
 	}
-	labels := directLeaseLabels(cfg, "cbx_abcdef123456", "blue-lobster", "hetzner", "", true, now)
+	labels := DirectLeaseLabels(cfg, "cbx_abcdef123456", "blue-lobster", "hetzner", "", true, now)
 	if _, ok := labels[pondExposedPortsLabelKey]; ok {
 		t.Fatalf("expected no exposed-ports label when none requested; got %#v", labels)
 	}
@@ -577,7 +575,7 @@ func TestRunPondMeshForwardsReportsUnexpectedCleanExit(t *testing.T) {
 		if len(runner.handles) == 1 {
 			handle := runner.handles[0]
 			runner.mu.Unlock()
-			_ = handle.Process().Signal(os.Interrupt)
+			close(handle.signal)
 			break
 		}
 		runner.mu.Unlock()
@@ -716,7 +714,7 @@ func TestCollectPondMembersResolvesByLeaseIDBeforeSlug(t *testing.T) {
 		{Name: "server-b", Labels: map[string]string{pondLabelKey: "alpha", "slug": "web", "lease": "cbx_web_b", pondExposedPortsLabelKey: "9090"}},
 	}
 	for _, leaseID := range []string{"cbx_web_a", "cbx_web_b"} {
-		if err := claimLeaseForRepoProvider(leaseID, leaseID, "hetzner", t.TempDir(), time.Hour, false); err != nil {
+		if err := ClaimLeaseForRepoProvider(leaseID, leaseID, "hetzner", t.TempDir(), time.Hour, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -731,7 +729,7 @@ func TestCollectPondMembersResolvesByLeaseIDBeforeSlug(t *testing.T) {
 		t.Fatalf("members=%#v", members)
 	}
 	for _, leaseID := range []string{"cbx_web_a", "cbx_web_b"} {
-		claim, ok, err := resolveLeaseClaimForProvider(leaseID, "hetzner")
+		claim, ok, err := ResolveLeaseClaimForProvider(leaseID, "hetzner")
 		if err != nil || !ok || claim.SSHHost != leaseID+".example" || claim.SSHPort != 22 {
 			t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
 		}
@@ -756,7 +754,7 @@ func TestCollectPondMembersRefreshesRetainedStoppedClaim(t *testing.T) {
 			pondExposedPortsLabelKey: "8080",
 		},
 	}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "web", Config{Provider: "hetzner"}, server, SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "web", Config{Provider: "hetzner"}, server, SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	members, err := collectPondMembers(context.Background(), &pondMeshResolveRecordingBackend{}, Config{}, []Server{server}, "alpha")
@@ -766,7 +764,7 @@ func TestCollectPondMembersRefreshesRetainedStoppedClaim(t *testing.T) {
 	if len(members) != 1 || members[0].SSH.Host != leaseID+".example" {
 		t.Fatalf("members=%#v", members)
 	}
-	claim, ok, err := resolveLeaseClaimForProvider(leaseID, "hetzner")
+	claim, ok, err := ResolveLeaseClaimForProvider(leaseID, "hetzner")
 	if err != nil || !ok || claim.Labels["state"] != "ready" || claim.SSHHost != leaseID+".example" || claim.SSHPort != 22 {
 		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
 	}
@@ -786,12 +784,12 @@ func TestCollectPondMembersDoesNotRestoreStoppedClaim(t *testing.T) {
 		pondExposedPortsLabelKey: "8080",
 	}
 	server := Server{CloudID: "server-web", Provider: "hetzner", Name: "server-web", Labels: labels}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "web", Config{Provider: "hetzner"}, server, SSHTarget{Host: "old.example", Port: "22"}, t.TempDir(), time.Hour, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "web", Config{Provider: "hetzner"}, server, SSHTarget{Host: "old.example", Port: "22"}, t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	var stopErr error
 	backend := &pondMeshResolveRecordingBackend{afterResolve: func(LeaseTarget) {
-		claim, ok, err := resolveLeaseClaimForProvider(leaseID, "hetzner")
+		claim, ok, err := ResolveLeaseClaimForProvider(leaseID, "hetzner")
 		if err != nil || !ok {
 			stopErr = fmt.Errorf("resolve claim: ok=%t err=%v", ok, err)
 			return
@@ -799,7 +797,7 @@ func TestCollectPondMembersDoesNotRestoreStoppedClaim(t *testing.T) {
 		stopped := server
 		stopped.Labels = cloneStringMap(server.Labels)
 		stopped.Labels["state"] = "stopped"
-		_, stopErr = updateLeaseClaimEndpointIfUnchanged(leaseID, claim, stopped, SSHTarget{})
+		_, stopErr = UpdateLeaseClaimEndpointIfUnchanged(leaseID, claim, stopped, SSHTarget{})
 	}}
 	_, err := collectPondMembers(context.Background(), backend, Config{}, []Server{server}, "alpha")
 	if stopErr != nil {
@@ -808,7 +806,7 @@ func TestCollectPondMembersDoesNotRestoreStoppedClaim(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "became inactive during resolve") {
 		t.Fatalf("collectPondMembers err=%v", err)
 	}
-	claim, ok, err := resolveLeaseClaimForProvider(leaseID, "hetzner")
+	claim, ok, err := ResolveLeaseClaimForProvider(leaseID, "hetzner")
 	if err != nil || !ok || claim.Labels["state"] != "stopped" || claim.SSHHost != "" || claim.SSHPort != 0 {
 		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
 	}
@@ -915,31 +913,45 @@ func TestDisambiguatePondMemberNamesAvoidsShellExportCollisions(t *testing.T) {
 	}
 }
 
+func assertSyntheticExeDevListCall(t *testing.T, runner *recordingCommandRunner) {
+	t.Helper()
+	if len(runner.calls) != 1 {
+		t.Fatalf("process calls=%d, want one exe.dev list", len(runner.calls))
+	}
+	call := runner.calls[0]
+	wantTail := []string{"exe.example.test", "ls --l --json"}
+	if call.Name != "ssh" || len(call.Args) < len(wantTail) || !reflect.DeepEqual(call.Args[len(call.Args)-len(wantTail):], wantTail) {
+		t.Fatalf("process=%q args=%q, want only synthetic exe.dev list", call.Name, call.Args)
+	}
+}
+
 // TestCollectPondMembersAcrossProvidersFiltersByCapability is the cross-
 // provider gating test for the capability refactor. It seeds claims for a
-// mix of SSH-mesh-capable (Hetzner, RunPod) and URL-only (Islo, Modal)
+// mix of SSH-mesh-capable (Hetzner, exe.dev) and URL-only (Islo, Modal)
 // providers in the same pond, then asserts that `collectPondMembersAcrossProviders`:
 //
-//   - includes Hetzner and RunPod in the iteration (both advertise FeatureSSH);
+//   - includes Hetzner and exe.dev in the iteration (both advertise FeatureSSH);
 //   - lands Islo and Modal in the `ineligible` slice (URLBridge-only, no SSH);
 //   - and filters out claims that belong to a different pond.
 //
-// The actual `pondMember` list comes back empty because the test SSH backend's
-// List() returns nil — the test is about the capability gate, not the member
-// projection.
+// Empty synthetic inventories keep this focused on the capability gate; the
+// real exe.dev adapter lists through the recording command runner.
 func TestCollectPondMembersAcrossProvidersFiltersByCapability(t *testing.T) {
 	withTempClaims(t, []leaseClaim{
 		{LeaseID: "cbx_hetzner", Slug: "api", Provider: "hetzner", Pond: "alpha", RepoRoot: "/r"},
-		{LeaseID: "cbx_runpod", Slug: "edge", Provider: "exe-dev", Pond: "alpha", RepoRoot: "/r"},
+		{LeaseID: "cbx_exedev", Slug: "edge", Provider: "exe-dev", Pond: "alpha", RepoRoot: "/r"},
 		{LeaseID: "isb_modal", Slug: "fn", Provider: "modal", Pond: "alpha", RepoRoot: "/r"},
 		{LeaseID: "isb_islo", Slug: "share", Provider: "islo", Pond: "alpha", RepoRoot: "/r"},
 		{LeaseID: "cbx_beta", Slug: "noise", Provider: "hetzner", Pond: "beta", RepoRoot: "/r"},
 	})
 	cfg := defaultConfig()
-	_, ineligible, err := collectPondMembersAcrossProviders(context.Background(), Runtime{}, cfg, "alpha", "")
+	cfg.ExeDev.ControlHost = "exe.example.test"
+	runner := &recordingCommandRunner{result: LocalCommandResult{Stdout: `{ "vms": [] }`}}
+	_, ineligible, err := collectPondMembersAcrossProviders(context.Background(), testRuntimeWithRunner(runner), cfg, "alpha", "")
 	if err != nil {
 		t.Fatalf("collectPondMembersAcrossProviders: %v", err)
 	}
+	assertSyntheticExeDevListCall(t, runner)
 	sort.Strings(ineligible)
 	want := []string{"islo", "modal"}
 	if !reflect.DeepEqual(ineligible, want) {
@@ -953,13 +965,16 @@ func TestCollectPondMembersAcrossProvidersFiltersByCapability(t *testing.T) {
 func TestCollectPondMembersAcrossProvidersHonorsProviderFilter(t *testing.T) {
 	withTempClaims(t, []leaseClaim{
 		{LeaseID: "cbx_hetzner", Slug: "api", Provider: "hetzner", Pond: "alpha", RepoRoot: "/r"},
-		{LeaseID: "cbx_runpod", Slug: "edge", Provider: "exe-dev", Pond: "alpha", RepoRoot: "/r"},
+		{LeaseID: "cbx_exedev", Slug: "edge", Provider: "exe-dev", Pond: "alpha", RepoRoot: "/r"},
 	})
 	cfg := defaultConfig()
-	_, ineligible, err := collectPondMembersAcrossProviders(context.Background(), Runtime{}, cfg, "alpha", "exe-dev")
+	cfg.ExeDev.ControlHost = "exe.example.test"
+	runner := &recordingCommandRunner{result: LocalCommandResult{Stdout: `{ "vms": [] }`}}
+	_, ineligible, err := collectPondMembersAcrossProviders(context.Background(), testRuntimeWithRunner(runner), cfg, "alpha", "exe-dev")
 	if err != nil {
 		t.Fatalf("collectPondMembersAcrossProviders: %v", err)
 	}
+	assertSyntheticExeDevListCall(t, runner)
 	if len(ineligible) != 0 {
 		t.Fatalf("expected no ineligible when filter excludes other providers, got %v", ineligible)
 	}
@@ -978,7 +993,7 @@ func TestProviderCapabilitiesPrimary(t *testing.T) {
 		{"hetzner", TransportTailnet},
 		{"azure", TransportTailnet},
 		{"gcp", TransportTailnet},
-		{"aws", TransportSSH},     // FeatureSSH only; no FeatureTailscale yet
+		{"aws", TransportTailnet},
 		{"proxmox", TransportSSH}, // legacy mapping was TransportTailnet — capability model corrects to SSH
 		{"exe-dev", TransportSSH},
 		{"daytona", TransportSSH},
@@ -1008,7 +1023,7 @@ func TestProviderCapabilitiesAvailable(t *testing.T) {
 		{"hetzner", []string{TransportTailnet, TransportSSH}},
 		{"azure", []string{TransportTailnet, TransportSSH}},
 		{"gcp", []string{TransportTailnet, TransportSSH}},
-		{"aws", []string{TransportSSH}},
+		{"aws", []string{TransportTailnet, TransportSSH}},
 		{"exe-dev", []string{TransportSSH}},
 		{"islo", []string{TransportURL}},
 		{"modal", nil},

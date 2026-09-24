@@ -9,9 +9,18 @@ import (
 )
 
 type FixedLeaseKind struct {
-	ClaimProvider string
-	IntentVersion int
-	Label         string
+	RemoveKeyAfterRejection bool
+	ClaimProvider           string
+	IntentVersion           int
+	Label                   string
+	// DeletionState retains native validators' existing on-disk cleanup marker.
+	// Empty preserves the claim at admission unless the release policy requests
+	// binding persistence.
+	DeletionState  string
+	ResourcePlural string
+	// AfterTerminal cleans local lease-owned artifacts under the claim fence,
+	// after the receipt is durable. Failure must not undo remote completion.
+	AfterTerminal func(LeaseClaim) error
 	// TerminalIdentityLabels opts into retaining resource/repository identity
 	// and only these immutable labels. Other kinds keep compact tombstones.
 	TerminalIdentityLabels []string
@@ -24,6 +33,7 @@ func (k FixedLeaseKind) IsFixedClaim(claim LeaseClaim) bool {
 func (k FixedLeaseKind) TerminalClaim(claim LeaseClaim, now time.Time) LeaseClaim {
 	intent := *claim.FixedCreateIntent
 	intent.State = "released"
+	terminalFixedJournal(&intent)
 	intent.Attempt = nil
 	intent.FailedAttempts = nil
 	terminal := LeaseClaim{
@@ -57,12 +67,18 @@ func (k FixedLeaseKind) FinalizeAfterCleanup(claim LeaseClaim, action func() err
 		return RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, action)
 	}
 	tombstone := k.TerminalClaim(claim, time.Now().UTC())
+	if k.AfterTerminal != nil {
+		return finalizeFixedLeaseWithArtifacts(k, claim, tombstone, action)
+	}
 	_, err := ReplaceLeaseClaimIfUnchangedDurableAfter(claim.LeaseID, claim, tombstone, action)
 	return err
 }
 
 func (k FixedLeaseKind) ValidateTerminalClaim(claim, previous LeaseClaim, leaseID string, extra func(LeaseClaim) error) error {
 	intent := claim.FixedCreateIntent
+	if err := validateFixedJournal(intent); err != nil {
+		return err
+	}
 	validIdentity := claim.CloudID == "" && len(claim.Labels) == 0
 	if len(k.TerminalIdentityLabels) != 0 {
 		validIdentity = true
@@ -81,7 +97,7 @@ func (k FixedLeaseKind) ValidateTerminalClaim(claim, previous LeaseClaim, leaseI
 		intent.State != "released" ||
 		!validIdentity || claim.SSHHost != "" || claim.SSHPort != 0 ||
 		len(intent.Attempt) != 0 || len(intent.FailedAttempts) != 0 {
-		return exit(4, "lease_id_conflict: fixed %s lease %s has an invalid terminal tombstone", k.Label, leaseID)
+		return Exit(4, "lease_id_conflict: fixed %s lease %s has an invalid terminal tombstone", k.Label, leaseID)
 	}
 	if extra != nil {
 		if err := extra(claim); err != nil {
@@ -95,7 +111,7 @@ func (k FixedLeaseKind) ValidateTerminalClaim(claim, previous LeaseClaim, leaseI
 			if claim.CloudID != expected.CloudID || claim.CloudNumericID != expected.CloudNumericID ||
 				claim.CloudImmutableID != expected.CloudImmutableID || claim.RepoRoot != expected.RepoRoot ||
 				!maps.Equal(claim.Labels, expected.Labels) {
-				return exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed resource identity", k.Label, leaseID)
+				return Exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed resource identity", k.Label, leaseID)
 			}
 		}
 		if previous.LeaseID != leaseID ||
@@ -104,7 +120,7 @@ func (k FixedLeaseKind) ValidateTerminalClaim(claim, previous LeaseClaim, leaseI
 			previousIntent.ProviderScope != intent.ProviderScope ||
 			previousIntent.CheckpointID != intent.CheckpointID ||
 			previousIntent.Slug != intent.Slug {
-			return exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed identity", k.Label, leaseID)
+			return Exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed identity", k.Label, leaseID)
 		}
 	}
 	return nil
@@ -123,7 +139,7 @@ func (k FixedLeaseKind) RetainClaimAfterRelease(
 	}
 	if !exists || !k.IsFixedClaim(claim) {
 		if k.IsFixedClaim(previous) || providerEvidence {
-			return false, exit(4, "lease_id_conflict: fixed %s lease %s has no valid terminal tombstone after release", k.Label, leaseID)
+			return false, Exit(4, "lease_id_conflict: fixed %s lease %s has no valid terminal tombstone after release", k.Label, leaseID)
 		}
 		return false, nil
 	}

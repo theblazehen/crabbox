@@ -156,12 +156,16 @@ One logical `FleetCoordinator` (`worker/src/fleet.ts`) owns:
   Azure, and GCP identity verification and deletion remain adapter-owned.
   Manual retention is the default and local checkpoint records are caches,
   never ownership authority.
-- **Cost and spend caps** (`worker/src/usage.ts`) — `enforceCostLimits` checks
+- **Cost and spend caps** (`worker/src/usage.ts`) — `enforceCostLimitUsage` checks
   active-lease counts and monthly reserved-USD budgets (global / per-owner /
   per-org) from `CRABBOX_MAX_*` env. Over-limit requests get HTTP 429
   `cost_limit_exceeded`. Cost = hourly rate × TTL, where the rate comes from a
   `CRABBOX_COST_RATES_JSON` override, then a provider live price, then built-in
   defaults.
+  Shared predicates in `worker/src/lease-state.ts` keep accounting, host
+  reservations, and lifecycle handling aligned: active/provisioning rows remain
+  live until a terminal transition, even after a heartbeat deadline, and
+  registered inventory stays outside managed usage.
 - **Usage accounting** — `usageSummary` aggregates leases per
   owner/org/provider/server type for the month; served at `GET /v1/usage`.
 - **Cleanup and expiry** — runtime alarms/jobs and reconciliation run maintenance:
@@ -187,7 +191,19 @@ later request can retry. Token acquisition, refresh margins, expiry calculation,
 and metadata-server trust/retry rules remain adapter-owned. Caches are neither
 global nor persisted, and do not fall back to expired credentials.
 
+Binary hex/base64 encoding and SHA-256 formatting live in `worker/src/encoding.ts`,
+independent of authentication. Text digests use UTF-8; binary digests preserve
+the supplied view and byte offsets. Token formats, validation, signing, and
+encryption key derivation remain with the protocols that own them.
+
 Runtime-specific persistence and scheduling stay behind `CoordinatorRuntime`:
+
+Fleet, host-reservation, and checkpoint scans share the ordered, bounded
+`coordinatorStorageEntries` iterator in `worker/src/storage-scan.ts`. It fetches
+the next page only after the current page is consumed. Callers retain their
+page sizes, cache policy, transaction scope, and early-exit conditions;
+checkpoint claim expiry still applies each transition sequentially. Destructive
+first-page draining and maintenance with persisted cursors remain separate.
 
 | Runtime    | Durable state               | Scheduling                                     | WebSockets                               |
 | ---------- | --------------------------- | ---------------------------------------------- | ---------------------------------------- |
@@ -282,7 +298,8 @@ GET  /v1/admin/azure-orphan-sweep
 POST /v1/admin/azure-orphan-sweep
 ```
 
-`GET /v1/pool` and `/v1/admin/*` require the admin token. User tokens scope
+`GET /v1/pool` and `/v1/admin/*` require admin authorization, from the admin token
+or an existing immutable-owner GitHub admin grant. Non-admin user tokens scope
 list, lookup, heartbeat, release, run mutation, and usage to the token's
 owner/org. Run reads also permit every recorded backing lease owner so
 shared-lease and replacement activity remains auditable without granting those

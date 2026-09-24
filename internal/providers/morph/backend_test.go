@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -115,92 +116,106 @@ func (f *fakeMorphAPI) DeleteInstance(ctx context.Context, instanceID string) er
 
 func TestMorphWaitForInstanceReady(t *testing.T) {
 	t.Run("pending to ready", func(t *testing.T) {
-		calls := 0
-		api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
-			calls++
-			if calls == 1 {
-				return morphInstance{ID: "inst_1", Status: "starting"}, nil
+		synctest.Test(t, func(t *testing.T) {
+			calls := 0
+			api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
+				calls++
+				if calls == 1 {
+					return morphInstance{ID: "inst_1", Status: "starting"}, nil
+				}
+				return morphInstance{ID: "inst_1", Status: "ready"}, nil
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
+			got, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
+			if err != nil || got.Status != "ready" || calls != 2 {
+				t.Fatalf("instance=%#v err=%v calls=%d", got, err, calls)
 			}
-			return morphInstance{ID: "inst_1", Status: "ready"}, nil
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
-		got, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
-		if err != nil || got.Status != "ready" || calls != 2 {
-			t.Fatalf("instance=%#v err=%v calls=%d", got, err, calls)
-		}
+		})
 	})
 
 	t.Run("read error", func(t *testing.T) {
-		calls := 0
-		api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
-			calls++
-			return morphInstance{}, errors.New("read denied")
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
-		_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
-		if err == nil || !strings.Contains(err.Error(), "morph get instance inst_1 failed: read denied") || calls != 1 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			calls := 0
+			api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
+				calls++
+				return morphInstance{}, errors.New("read denied")
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
+			_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
+			if err == nil || !strings.Contains(err.Error(), "morph get instance inst_1 failed: read denied") || calls != 1 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
 	})
 
 	t.Run("cancellation during delay", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		calls := 0
-		api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
-			calls++
-			time.AfterFunc(time.Millisecond, cancel)
-			return morphInstance{ID: "inst_1", Status: "starting"}, nil
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Hour}
-		_, err := backend.waitForInstanceReady(ctx, api, "inst_1", false)
-		if !errors.Is(err, context.Canceled) || calls != 1 {
-			t.Fatalf("err=%v calls=%d", err, calls)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			calls := 0
+			api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
+				calls++
+				time.AfterFunc(time.Millisecond, cancel)
+				return morphInstance{ID: "inst_1", Status: "starting"}, nil
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Hour}
+			_, err := backend.waitForInstanceReady(ctx, api, "inst_1", false)
+			if !errors.Is(err, context.Canceled) || calls != 1 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
-			return morphInstance{ID: "inst_1", Status: "starting"}, nil
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Hour, readyTimeout: 10 * time.Millisecond}
-		_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
-		if err == nil || err.Error() != "timed out waiting for morph instance inst_1 to become ready" {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
+				return morphInstance{ID: "inst_1", Status: "starting"}, nil
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Hour, readyTimeout: 10 * time.Millisecond}
+			_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
+			if err == nil || err.Error() != "timed out waiting for morph instance inst_1 to become ready" {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("terminal state", func(t *testing.T) {
-		api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
-			return morphInstance{ID: "inst_1", Status: "failed"}, nil
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
-		_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
-		if err == nil || !strings.Contains(err.Error(), `entered terminal state "failed"`) {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
+				return morphInstance{ID: "inst_1", Status: "failed"}, nil
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
+			_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
+			if err == nil || !strings.Contains(err.Error(), `entered terminal state "failed"`) {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("terminal state at deadline", func(t *testing.T) {
-		api := &fakeMorphAPI{getInstance: func(ctx context.Context, _ string) (morphInstance, error) {
-			<-ctx.Done()
-			return morphInstance{ID: "inst_1", Status: "failed"}, nil
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Hour, readyTimeout: 10 * time.Millisecond}
-		_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
-		if err == nil || !strings.Contains(err.Error(), `entered terminal state "failed"`) || strings.Contains(err.Error(), "timed out") {
-			t.Fatalf("err=%v", err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeMorphAPI{getInstance: func(ctx context.Context, _ string) (morphInstance, error) {
+				<-ctx.Done()
+				return morphInstance{ID: "inst_1", Status: "failed"}, nil
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Hour, readyTimeout: 10 * time.Millisecond}
+			_, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", false)
+			if err == nil || !strings.Contains(err.Error(), `entered terminal state "failed"`) || strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	})
 
 	t.Run("paused allowed", func(t *testing.T) {
-		api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
-			return morphInstance{ID: "inst_1", Status: "paused"}, nil
-		}}
-		backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
-		got, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", true)
-		if err != nil || got.Status != "paused" {
-			t.Fatalf("instance=%#v err=%v", got, err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			api := &fakeMorphAPI{getInstance: func(context.Context, string) (morphInstance, error) {
+				return morphInstance{ID: "inst_1", Status: "paused"}, nil
+			}}
+			backend := &morphLeaseBackend{readyPollInterval: time.Nanosecond, readyTimeout: time.Second}
+			got, err := backend.waitForInstanceReady(context.Background(), api, "inst_1", true)
+			if err != nil || got.Status != "paused" {
+				t.Fatalf("instance=%#v err=%v", got, err)
+			}
+		})
 	})
 }
 
@@ -216,7 +231,7 @@ func TestMorphAcquireStoresMetadataAndKey(t *testing.T) {
 	var gotWakeOnSSH *bool
 	waitCalled := false
 	originalWait := waitForMorphSSHReady
-	waitForMorphSSHReady = func(_ context.Context, target *SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+	waitForMorphSSHReady = func(_ context.Context, target *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
 		waitCalled = true
 		if target.Host != "ssh.cloud.morph.so" || target.User != "inst_1" {
 			t.Fatalf("unexpected target: %#v", target)
@@ -286,7 +301,7 @@ func TestMorphAcquireStoresMetadataAndKey(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+		rt:     core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 		client: fake,
 		now: func() time.Time {
 			nowCalls++
@@ -299,7 +314,7 @@ func TestMorphAcquireStoresMetadataAndKey(t *testing.T) {
 		readyTimeout:      time.Second,
 	}
 
-	lease, err := backend.Acquire(context.Background(), AcquireRequest{RequestedSlug: "blue-lobster"})
+	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{RequestedSlug: "blue-lobster"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +423,7 @@ func TestNewMorphBackendAllowsMissingSnapshotForExistingLeaseOps(t *testing.T) {
 	cfg.Morph.Snapshot = ""
 	cfg.ServerType = ""
 
-	backend, err := NewMorphBackend(Provider{}.Spec(), cfg, Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}})
+	backend, err := NewMorphBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +436,7 @@ func TestNewMorphBackendRejectsTailscaleNetwork(t *testing.T) {
 	cfg := testMorphConfig()
 	cfg.Network = networkTailscale
 
-	_, err := NewMorphBackend(Provider{}.Spec(), cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard})
+	_, err := NewMorphBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
 	if err == nil || !strings.Contains(err.Error(), "--network=tailscale is not supported") {
 		t.Fatalf("NewMorphBackend error=%v", err)
 	}
@@ -445,7 +460,7 @@ func TestApplyMorphProviderFlagsUpdatesServerType(t *testing.T) {
 }
 
 func TestConfigureDoctorReturnsMorphDoctorBackend(t *testing.T) {
-	doctor, err := Provider{}.ConfigureDoctor(testMorphConfig(), Runtime{Stdout: io.Discard, Stderr: io.Discard})
+	doctor, err := core.ConfigureProviderDoctor(Provider{}, testMorphConfig(), core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatalf("ConfigureDoctor: %v", err)
 	}
@@ -464,66 +479,68 @@ func TestMorphAcquireRequiresSnapshot(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+		rt:     core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 		client: &fakeMorphAPI{},
 		now:    time.Now,
 	}
 
-	_, err := backend.Acquire(context.Background(), AcquireRequest{})
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{})
 	if err == nil || !strings.Contains(err.Error(), "CRABBOX_MORPH_SNAPSHOT") {
 		t.Fatalf("Acquire error=%v", err)
 	}
 }
 
 func TestMorphAcquireRollbackIsBounded(t *testing.T) {
-	configureMorphTestHome(t)
-	cfg := testMorphConfig()
-	var stderr bytes.Buffer
-	deleteFinished := make(chan struct{})
-	fake := &fakeMorphAPI{
-		getSnapshot: func(_ context.Context, snapshotID string) (morphSnapshot, error) {
-			return morphSnapshot{ID: snapshotID}, nil
-		},
-		listInstances: func(_ context.Context, _ map[string]string) ([]morphInstance, error) {
-			return nil, nil
-		},
-		bootSnapshot: func(_ context.Context, _ string, _ morphBootSnapshotRequest) (morphInstance, error) {
-			return morphInstance{ID: "inst_rollback", Status: "starting"}, nil
-		},
-		setInstanceMetadata: func(_ context.Context, _ string, _ map[string]string) error {
-			return errors.New("metadata failed")
-		},
-		deleteInstance: func(ctx context.Context, _ string) error {
-			defer close(deleteFinished)
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-	backend := &morphLeaseBackend{
-		spec:            Provider{}.Spec(),
-		cfg:             cfg,
-		rt:              Runtime{Stdout: io.Discard, Stderr: &stderr},
-		client:          fake,
-		now:             time.Now,
-		rollbackTimeout: 20 * time.Millisecond,
-	}
+	synctest.Test(t, func(t *testing.T) {
+		configureMorphTestHome(t)
+		cfg := testMorphConfig()
+		var stderr bytes.Buffer
+		deleteFinished := make(chan struct{})
+		fake := &fakeMorphAPI{
+			getSnapshot: func(_ context.Context, snapshotID string) (morphSnapshot, error) {
+				return morphSnapshot{ID: snapshotID}, nil
+			},
+			listInstances: func(_ context.Context, _ map[string]string) ([]morphInstance, error) {
+				return nil, nil
+			},
+			bootSnapshot: func(_ context.Context, _ string, _ morphBootSnapshotRequest) (morphInstance, error) {
+				return morphInstance{ID: "inst_rollback", Status: "starting"}, nil
+			},
+			setInstanceMetadata: func(_ context.Context, _ string, _ map[string]string) error {
+				return errors.New("metadata failed")
+			},
+			deleteInstance: func(ctx context.Context, _ string) error {
+				defer close(deleteFinished)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		backend := &morphLeaseBackend{
+			spec:            Provider{}.Spec(),
+			cfg:             cfg,
+			rt:              core.Runtime{Stdout: io.Discard, Stderr: &stderr},
+			client:          fake,
+			now:             time.Now,
+			rollbackTimeout: 20 * time.Millisecond,
+		}
 
-	started := time.Now()
-	_, err := backend.Acquire(context.Background(), AcquireRequest{})
-	if err == nil || !strings.Contains(err.Error(), "metadata failed") {
-		t.Fatalf("Acquire error=%v", err)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("Acquire rollback took %s, want bounded timeout", elapsed)
-	}
-	select {
-	case <-deleteFinished:
-	default:
-		t.Fatal("rollback delete did not finish")
-	}
-	if !strings.Contains(stderr.String(), "context deadline exceeded") {
-		t.Fatalf("stderr=%q, want rollback timeout warning", stderr.String())
-	}
+		started := time.Now()
+		_, err := backend.Acquire(context.Background(), core.AcquireRequest{})
+		if err == nil || !strings.Contains(err.Error(), "metadata failed") {
+			t.Fatalf("Acquire error=%v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("Acquire rollback took %s, want bounded timeout", elapsed)
+		}
+		select {
+		case <-deleteFinished:
+		default:
+			t.Fatal("rollback delete did not finish")
+		}
+		if !strings.Contains(stderr.String(), "context deadline exceeded") {
+			t.Fatalf("stderr=%q, want rollback timeout warning", stderr.String())
+		}
+	})
 }
 
 func TestMorphResolveResumesPausedInstanceWithoutWakeOnSSH(t *testing.T) {
@@ -535,7 +552,7 @@ func TestMorphResolveResumesPausedInstanceWithoutWakeOnSSH(t *testing.T) {
 	getInstanceCalls := 0
 	waitCalls := 0
 	originalWait := waitForMorphSSHReady
-	waitForMorphSSHReady = func(_ context.Context, _ *SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+	waitForMorphSSHReady = func(_ context.Context, _ *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
 		waitCalls++
 		return nil
 	}
@@ -569,14 +586,14 @@ func TestMorphResolveResumesPausedInstanceWithoutWakeOnSSH(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:              Provider{}.Spec(),
 		cfg:               cfg,
-		rt:                Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+		rt:                core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 		client:            fake,
 		now:               time.Now,
 		readyPollInterval: time.Millisecond,
 		readyTimeout:      time.Second,
 	}
 
-	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: "inst_2"})
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "inst_2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +610,7 @@ func TestMorphResolveChecksRepoClaimBeforeResume(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	cfg := testMorphConfig()
 	cfg.Morph.WakeOnSSH = false
-	if err := claimLeaseForRepoProvider("cbx_claimed", "claimed", providerName, t.TempDir(), time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProvider("cbx_claimed", "claimed", providerName, t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -619,12 +636,12 @@ func TestMorphResolveChecksRepoClaimBeforeResume(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    time.Now,
 	}
 
-	req := ResolveRequest{ID: "inst_claimed"}
+	req := core.ResolveRequest{ID: "inst_claimed"}
 	req.Repo.Root = t.TempDir()
 	_, err := backend.Resolve(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "is claimed by repo") {
@@ -653,18 +670,18 @@ func TestMorphResolveRestoresRepoClaimWhenSSHKeyFails(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    testMorphConfig(),
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    time.Now,
 	}
-	req := ResolveRequest{ID: "inst_failing"}
+	req := core.ResolveRequest{ID: "inst_failing"}
 	req.Repo.Root = t.TempDir()
 
 	_, err := backend.Resolve(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "key unavailable") {
 		t.Fatalf("Resolve error=%v", err)
 	}
-	if _, exists, err := readLeaseClaimWithPresence("cbx_failing"); err != nil || exists {
+	if _, exists, err := core.ReadLeaseClaimWithPresence("cbx_failing"); err != nil || exists {
 		t.Fatalf("failed resolve retained claim exists=%v err=%v", exists, err)
 	}
 }
@@ -689,23 +706,23 @@ func TestMorphResolveRejectsConcurrentRepoReclaim(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    testMorphConfig(),
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    time.Now,
 	}
 	oldWait := waitForMorphSSHReady
-	waitForMorphSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
-		return claimLeaseForRepoProvider("cbx_race", "race", providerName, repoB, time.Hour, true)
+	waitForMorphSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
+		return core.ClaimLeaseForRepoProvider("cbx_race", "race", providerName, repoB, time.Hour, true)
 	}
 	t.Cleanup(func() { waitForMorphSSHReady = oldWait })
-	req := ResolveRequest{ID: "inst_race"}
+	req := core.ResolveRequest{ID: "inst_race"}
 	req.Repo.Root = repoA
 
 	_, err := backend.Resolve(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "claim changed; retry") {
 		t.Fatalf("Resolve error=%v", err)
 	}
-	claim, ok, claimErr := resolveLeaseClaimForProvider("cbx_race", providerName)
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("cbx_race", providerName)
 	if claimErr != nil || !ok || claim.RepoRoot != repoB {
 		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, claimErr)
 	}
@@ -720,7 +737,7 @@ func TestMorphResolveEnablesProviderWakeOnSSHBeforeRelyingOnIt(t *testing.T) {
 	wakeOnCalls := 0
 	wakeEnabled := false
 	originalWait := waitForMorphSSHReady
-	waitForMorphSSHReady = func(_ context.Context, _ *SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+	waitForMorphSSHReady = func(_ context.Context, _ *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
 		if !wakeEnabled {
 			t.Fatal("SSH readiness checked before wake-on-SSH was enabled")
 		}
@@ -757,14 +774,14 @@ func TestMorphResolveEnablesProviderWakeOnSSHBeforeRelyingOnIt(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:              Provider{}.Spec(),
 		cfg:               cfg,
-		rt:                Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:                core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client:            fake,
 		now:               time.Now,
 		readyPollInterval: time.Millisecond,
 		readyTimeout:      time.Second,
 	}
 
-	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: "inst_wake"})
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "inst_wake"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,7 +798,7 @@ func TestMorphResolveResumesAfterSavingTransitionsToPaused(t *testing.T) {
 	resumeCalls := 0
 	getInstanceCalls := 0
 	originalWait := waitForMorphSSHReady
-	waitForMorphSSHReady = func(_ context.Context, _ *SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+	waitForMorphSSHReady = func(_ context.Context, _ *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
 		return nil
 	}
 	defer func() { waitForMorphSSHReady = originalWait }()
@@ -813,14 +830,14 @@ func TestMorphResolveResumesAfterSavingTransitionsToPaused(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:              Provider{}.Spec(),
 		cfg:               cfg,
-		rt:                Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:                core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client:            fake,
 		now:               time.Now,
 		readyPollInterval: time.Millisecond,
 		readyTimeout:      time.Second,
 	}
 
-	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: "inst_saving"})
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "inst_saving"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -893,12 +910,12 @@ func TestMorphResolveRejectsUnsafeMetadataLeaseID(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    testMorphConfig(),
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    time.Now,
 	}
 
-	_, err = backend.Resolve(context.Background(), ResolveRequest{ID: "inst_unsafe"})
+	_, err = backend.Resolve(context.Background(), core.ResolveRequest{ID: "inst_unsafe"})
 	if err == nil || !strings.Contains(err.Error(), "invalid lease claim id") {
 		t.Fatalf("Resolve error=%v", err)
 	}
@@ -922,12 +939,12 @@ func TestMorphResolveRejectsUnmanagedInstance(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    testMorphConfig(),
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    time.Now,
 	}
 
-	_, err := backend.Resolve(context.Background(), ResolveRequest{ID: "inst_unmanaged"})
+	_, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "inst_unmanaged"})
 	if err == nil || !strings.Contains(err.Error(), "not managed by Crabbox") {
 		t.Fatalf("Resolve error=%v", err)
 	}
@@ -957,13 +974,13 @@ func TestMorphReleaseRejectsUnmanagedInstance(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    time.Now,
 	}
 
-	err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{
-		Lease: LeaseTarget{LeaseID: "cbx_unmanaged", Server: Server{CloudID: "inst_unmanaged"}},
+	err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{
+		Lease: core.LeaseTarget{LeaseID: "cbx_unmanaged", Server: core.Server{CloudID: "inst_unmanaged"}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "not managed by Crabbox") {
 		t.Fatalf("ReleaseLease error=%v", err)
@@ -1009,7 +1026,7 @@ func TestMorphReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 				"crabbox": "true", "provider": providerName, "lease": "cbx_owned",
 				"slug": "owned", "instance_id": "inst_owned",
 			}
-			server := Server{CloudID: "inst_owned", Provider: providerName, Labels: labels}
+			server := core.Server{CloudID: "inst_owned", Provider: providerName, Labels: labels}
 			if tc.claim {
 				claimCfg := cfg
 				claimServer := server
@@ -1034,10 +1051,10 @@ func TestMorphReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 							legacyServer.Labels[key] = value
 						}
 					}
-					if err := core.UpdateLeaseClaimEndpoint("cbx_owned", legacyServer, SSHTarget{}); err != nil {
+					if err := core.UpdateLeaseClaimEndpoint("cbx_owned", legacyServer, core.SSHTarget{}); err != nil {
 						t.Fatal(err)
 					}
-				} else if err := core.ClaimLeaseTargetForRepoConfig("cbx_owned", "owned", claimCfg, claimServer, SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
+				} else if err := core.ClaimLeaseTargetForRepoConfig("cbx_owned", "owned", claimCfg, claimServer, core.SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1074,8 +1091,8 @@ func TestMorphReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 				},
 				setInstanceMetadata: func(context.Context, string, map[string]string) error { return nil },
 			}
-			backend := &morphLeaseBackend{spec: Provider{}.Spec(), cfg: cfg, rt: Runtime{Stderr: io.Discard}, client: fake, now: time.Now}
-			err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{LeaseID: "cbx_owned", Server: server}})
+			backend := &morphLeaseBackend{spec: Provider{}.Spec(), cfg: cfg, rt: core.Runtime{Stderr: io.Discard}, client: fake, now: time.Now}
+			err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: "cbx_owned", Server: server}})
 			wantSuccess := tc.claim && !tc.wrongEndpoint && !tc.wrongInstance && !tc.changedOwner && !tc.providerFails
 			if (err == nil) != wantSuccess {
 				t.Fatalf("err=%v wantSuccess=%v", err, wantSuccess)
@@ -1100,17 +1117,17 @@ func TestMorphReleaseMissingInstanceRequiresMatchingEndpointClaim(t *testing.T) 
 			if wrongEndpoint {
 				claimCfg.Morph.APIURL = "https://another.example.com"
 			}
-			server := Server{
+			server := core.Server{
 				CloudID: "inst_missing", Provider: providerName,
 				Labels: map[string]string{
 					"crabbox": "true", "provider": providerName, "lease": "cbx_missing",
 					"slug": "missing", "instance_id": "inst_missing",
 				},
 			}
-			if err := core.ClaimLeaseTargetForRepoConfig("cbx_missing", "missing", claimCfg, server, SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
+			if err := core.ClaimLeaseTargetForRepoConfig("cbx_missing", "missing", claimCfg, server, core.SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
 				t.Fatal(err)
 			}
-			keyPath, err := testboxKeyPath("cbx_missing")
+			keyPath, err := core.TestboxKeyPath("cbx_missing")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1126,8 +1143,8 @@ func TestMorphReleaseMissingInstanceRequiresMatchingEndpointClaim(t *testing.T) 
 				},
 				listInstances: func(context.Context, map[string]string) ([]morphInstance, error) { return nil, nil },
 			}
-			backend := &morphLeaseBackend{spec: Provider{}.Spec(), cfg: cfg, rt: Runtime{Stderr: io.Discard}, client: fake, now: time.Now}
-			err = backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{LeaseID: "cbx_missing", Server: server}})
+			backend := &morphLeaseBackend{spec: Provider{}.Spec(), cfg: cfg, rt: core.Runtime{Stderr: io.Discard}, client: fake, now: time.Now}
+			err = backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: "cbx_missing", Server: server}})
 			if (err != nil) != wrongEndpoint {
 				t.Fatalf("err=%v wrongEndpoint=%v", err, wrongEndpoint)
 			}
@@ -1146,10 +1163,10 @@ func TestMorphReleaseMissingInstanceRequiresMatchingEndpointClaim(t *testing.T) 
 func TestMorphResolveStatusOnlyAndReleaseOnlySkipSSHPreparation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		req  ResolveRequest
+		req  core.ResolveRequest
 	}{
-		{name: "status-only", req: ResolveRequest{ID: "inst_2", StatusOnly: true}},
-		{name: "release-only", req: ResolveRequest{ID: "inst_2", ReleaseOnly: true}},
+		{name: "status-only", req: core.ResolveRequest{ID: "inst_2", StatusOnly: true}},
+		{name: "release-only", req: core.ResolveRequest{ID: "inst_2", ReleaseOnly: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			configureMorphTestHome(t)
@@ -1179,7 +1196,7 @@ func TestMorphResolveStatusOnlyAndReleaseOnlySkipSSHPreparation(t *testing.T) {
 			backend := &morphLeaseBackend{
 				spec:              Provider{}.Spec(),
 				cfg:               cfg,
-				rt:                Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+				rt:                core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 				client:            fake,
 				now:               time.Now,
 				readyPollInterval: time.Millisecond,
@@ -1221,7 +1238,7 @@ func TestMorphReleaseUsesStoredPolicyAndPreservesPausedClaim(t *testing.T) {
 				cfg.Morph.DeleteOnRelease = false
 				markDeleteOnReleaseExplicit(&cfg)
 			}
-			keyPath, err := testboxKeyPath("cbx_release")
+			keyPath, err := core.TestboxKeyPath("cbx_release")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1231,7 +1248,7 @@ func TestMorphReleaseUsesStoredPolicyAndPreservesPausedClaim(t *testing.T) {
 			if err := os.WriteFile(keyPath, []byte("PRIVATE KEY"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			server := Server{
+			server := core.Server{
 				CloudID:  "inst_release",
 				Provider: providerName,
 				Name:     "crabbox-release",
@@ -1245,7 +1262,7 @@ func TestMorphReleaseUsesStoredPolicyAndPreservesPausedClaim(t *testing.T) {
 					"state":       "ready",
 				},
 			}
-			if err := core.ClaimLeaseTargetForRepoConfig("cbx_release", "release", cfg, server, SSHTarget{Host: "ssh.cloud.morph.so", Port: "22"}, t.TempDir(), time.Hour, false); err != nil {
+			if err := core.ClaimLeaseTargetForRepoConfig("cbx_release", "release", cfg, server, core.SSHTarget{Host: "ssh.cloud.morph.so", Port: "22"}, t.TempDir(), time.Hour, false); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1277,15 +1294,15 @@ func TestMorphReleaseUsesStoredPolicyAndPreservesPausedClaim(t *testing.T) {
 			backend := &morphLeaseBackend{
 				spec:   Provider{}.Spec(),
 				cfg:    cfg,
-				rt:     Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+				rt:     core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 				client: fake,
 				now:    time.Now,
 			}
-			lease := LeaseTarget{LeaseID: "cbx_release", Server: server}
+			lease := core.LeaseTarget{LeaseID: "cbx_release", Server: server}
 			if got := backend.RetainLeaseClaimAfterRelease(lease); got != tc.explicitRetain {
 				t.Fatalf("RetainLeaseClaimAfterRelease=%t release=%s", got, tc.release)
 			}
-			outcome, err := backend.ReleaseLeaseWithOutcome(context.Background(), ReleaseLeaseRequest{
+			outcome, err := backend.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{
 				Lease: lease,
 			})
 			if err != nil || outcome.Terminal != (tc.wantDeleteCalls == 1) {
@@ -1294,7 +1311,7 @@ func TestMorphReleaseUsesStoredPolicyAndPreservesPausedClaim(t *testing.T) {
 			if pauseCalls != tc.wantPauseCalls || deleteCalls != tc.wantDeleteCalls {
 				t.Fatalf("pauseCalls=%d deleteCalls=%d", pauseCalls, deleteCalls)
 			}
-			claim, ok, err := resolveLeaseClaimForProvider("cbx_release", providerName)
+			claim, ok, err := core.ResolveLeaseClaimForProvider("cbx_release", providerName)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1321,9 +1338,9 @@ func TestMorphReleaseUsesStoredPolicyAndPreservesPausedClaim(t *testing.T) {
 }
 
 func TestMorphReleaseLeaseMessage(t *testing.T) {
-	lease := LeaseTarget{
+	lease := core.LeaseTarget{
 		LeaseID: "cbx_release",
-		Server:  Server{CloudID: "inst_release", Labels: map[string]string{"release": "pause"}},
+		Server:  core.Server{CloudID: "inst_release", Labels: map[string]string{"release": "pause"}},
 	}
 
 	pauseBackend := &morphLeaseBackend{cfg: testMorphConfig()}
@@ -1377,14 +1394,14 @@ func TestMorphTouchInitializesMissingMetadata(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+		rt:     core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 		client: fake,
 		now:    func() time.Time { return now },
 	}
-	_, err := backend.Touch(context.Background(), TouchRequest{
-		Lease: LeaseTarget{
+	_, err := backend.Touch(context.Background(), core.TouchRequest{
+		Lease: core.LeaseTarget{
 			LeaseID: "cbx_nil",
-			Server: Server{
+			Server: core.Server{
 				CloudID: "inst_nil",
 				Labels:  map[string]string{"slug": "blue-lobster"},
 			},
@@ -1446,12 +1463,12 @@ func TestMorphTouchPreservesCustomWorkRootAndProtectsActiveRun(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
+		rt:     core.Runtime{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}},
 		client: fake,
 		now:    func() time.Time { return now },
 	}
-	server, err := backend.Touch(context.Background(), TouchRequest{
-		Lease: LeaseTarget{
+	server, err := backend.Touch(context.Background(), core.TouchRequest{
+		Lease: core.LeaseTarget{
 			LeaseID: "cbx_touch",
 			Server:  morphServer(instance, cfg, "cbx_touch", "blue-lobster"),
 		},
@@ -1512,13 +1529,13 @@ func TestMorphTouchPreservesInstanceSnapshotIdentity(t *testing.T) {
 	backend := &morphLeaseBackend{
 		spec:   Provider{}.Spec(),
 		cfg:    cfg,
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 		client: fake,
 		now:    func() time.Time { return now },
 	}
 
-	server, err := backend.Touch(context.Background(), TouchRequest{
-		Lease:       LeaseTarget{LeaseID: "cbx_snapshot", Server: Server{CloudID: instance.ID}},
+	server, err := backend.Touch(context.Background(), core.TouchRequest{
+		Lease:       core.LeaseTarget{LeaseID: "cbx_snapshot", Server: core.Server{CloudID: instance.ID}},
 		State:       "ready",
 		IdleTimeout: 30 * time.Minute,
 	})
@@ -1548,15 +1565,15 @@ func TestMorphServerUsesProviderStateWhenInstanceIsNotReady(t *testing.T) {
 	}
 }
 
-func testMorphConfig() Config {
-	return Config{
+func testMorphConfig() core.Config {
+	return core.Config{
 		Provider:    providerName,
 		TargetOS:    targetLinux,
 		TTL:         2 * time.Hour,
 		IdleTimeout: 15 * time.Minute,
 		SSHPort:     "22",
 		WorkRoot:    "/tmp/crabbox",
-		Morph: MorphConfig{
+		Morph: core.MorphConfig{
 			APIKey:         "token",
 			APIURL:         "https://cloud.morph.so",
 			Snapshot:       "snapshot_123",
@@ -1599,7 +1616,7 @@ func TestMorphConfigFlagAndRoutingContract(t *testing.T) {
 		if err := ApplyMorphProviderFlags(&cfg, fs, values); err != nil {
 			t.Fatal(err)
 		}
-		want := MorphConfig{APIKey: "inert", Snapshot: "flag-snapshot", SSHGatewayHost: "  ", WorkRoot: "/workspace/flag"}
+		want := core.MorphConfig{APIKey: "inert", Snapshot: "flag-snapshot", SSHGatewayHost: "  ", WorkRoot: "/workspace/flag"}
 		if provider != "aws" {
 			want.APIURL = "https://cloud.morph.so"
 			want.SSHGatewayHost = "ssh.cloud.morph.so"
@@ -1678,7 +1695,7 @@ func TestMorphConfigFlagPhaseContract(t *testing.T) {
 
 func TestMorphConfigEffectiveDefaultsContract(t *testing.T) {
 	for _, tc := range []struct{ morph, generic, want string }{{"", "", "/tmp/crabbox"}, {"  ", "/work/crabbox", "/tmp/crabbox"}, {"", "/Users/ec2-user/crabbox", "/tmp/crabbox"}, {"", `C:\crabbox`, "/tmp/crabbox"}, {"", "/workspace/generic", "/workspace/generic"}, {" /workspace/morph ", "/workspace/generic", " /workspace/morph "}} {
-		cfg := Config{WorkRoot: tc.generic, Morph: MorphConfig{APIURL: "  ", SSHGatewayHost: "  ", WorkRoot: tc.morph}, SSHPort: "1234", SSHFallbackPorts: []string{"5678"}}
+		cfg := core.Config{WorkRoot: tc.generic, Morph: core.MorphConfig{APIURL: "  ", SSHGatewayHost: "  ", WorkRoot: tc.morph}, SSHPort: "1234", SSHFallbackPorts: []string{"5678"}}
 		applyMorphDefaults(&cfg)
 		if cfg.Morph.APIURL != "https://cloud.morph.so" || cfg.Morph.SSHGatewayHost != "ssh.cloud.morph.so" || cfg.Morph.WorkRoot != tc.want || cfg.WorkRoot != tc.want || cfg.Morph.WakeOnSSH || cfg.Provider != "morph" || cfg.TargetOS != "linux" || cfg.SSHPort != "22" || len(cfg.SSHFallbackPorts) != 0 || cfg.ServerType != "snapshot" {
 			t.Fatalf("defaults roots=%q/%q cfg=%#v", tc.morph, tc.generic, cfg.Morph)
@@ -1692,7 +1709,7 @@ func TestMorphConfigEffectiveDefaultsContract(t *testing.T) {
 			t.Fatalf("root=%q default=%t want=%t", tc.root, got, tc.want)
 		}
 	}
-	backend, err := NewMorphBackend(Provider{}.Spec(), Config{}, Runtime{})
+	backend, err := NewMorphBackend(Provider{}.Spec(), core.Config{}, core.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1709,7 +1726,7 @@ func TestMorphConfigEndpointAndPresentationContract(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ raw, want string }{{"", "ssh.cloud.morph.so"}, {"  ", "ssh.cloud.morph.so"}, {" gateway.example ", "gateway.example"}} {
-		cfg := Config{Morph: MorphConfig{SSHGatewayHost: tc.raw}}
+		cfg := core.Config{Morph: core.MorphConfig{SSHGatewayHost: tc.raw}}
 		instance := morphInstance{ID: "inst_fixture", Status: "ready"}
 		server := morphServer(instance, cfg, "cbx_fixture", "fixture")
 		if server.PublicNet.IPv4.IP != tc.want {

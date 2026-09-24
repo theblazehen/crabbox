@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 func TestNvidiaBrevParseWorkspaceJSONShapes(t *testing.T) {
@@ -17,7 +19,8 @@ func TestNvidiaBrevParseWorkspaceJSONShapes(t *testing.T) {
 		wantLen int
 		wantErr string
 	}{
-		{name: "empty stdout", stdout: "", wantLen: 0},
+		{name: "empty stdout", stdout: "", wantErr: "unexpected end"},
+		{name: "whitespace stdout", stdout: " \n\t", wantErr: "unexpected end"},
 		{name: "null object", stdout: `{"workspaces": null}`, wantLen: 0},
 		{name: "empty object array", stdout: `{"workspaces": []}`, wantLen: 0},
 		{name: "populated object array", stdout: `{"workspaces": [{"id":"ws-1","name":"crabbox-demo-123","status":"RUNNING"}]}`, wantLen: 1},
@@ -52,7 +55,7 @@ func TestNvidiaBrevClientConstructsNonSecretCommands(t *testing.T) {
 		{args: "stop ws-123"},
 		{args: "delete ws-123"},
 	}}
-	cfg := Config{NvidiaBrev: NvidiaBrevConfig{
+	cfg := core.Config{NvidiaBrev: core.NvidiaBrevConfig{
 		CLI:           "brev",
 		Type:          "gpu-l40s",
 		GPUName:       "L40S",
@@ -61,7 +64,7 @@ func TestNvidiaBrevClientConstructsNonSecretCommands(t *testing.T) {
 		Launchable:    "env-example",
 		StartupScript: "@setup.sh",
 	}}
-	client, err := newBrevClient(cfg, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(cfg, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +90,7 @@ func TestNvidiaBrevClientPreservesInlineStartupScript(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "create crabbox-inline-123456789abc --detached --gpu-name A100 --mode vm --startup-script pip install torch"},
 	}}
-	client, err := newBrevClient(Config{NvidiaBrev: NvidiaBrevConfig{StartupScript: "pip install torch"}}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{NvidiaBrev: core.NvidiaBrevConfig{StartupScript: "pip install torch"}}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +103,7 @@ func TestNvidiaBrevClientScopesReadOnlyListByOrg(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "ls --json --org example-org --all", stdout: `{"workspaces":[]}`},
 	}}
-	client, err := newBrevClient(Config{NvidiaBrev: NvidiaBrevConfig{CLI: "brev", Org: "example-org"}}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{NvidiaBrev: core.NvidiaBrevConfig{CLI: "brev", Org: "example-org"}}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +125,7 @@ func TestNvidiaBrevClientValidatesCachedActiveOrgWithCLI(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "ls orgs --json", stdout: `[{"name":"current","id":"org-current","is_active":true}]`},
 	}}
-	client, err := newBrevClient(Config{}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +144,7 @@ func TestNvidiaBrevClientFallsBackToActiveOrgJSON(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "ls orgs --json", stdout: `[{"name":"one","id":"org-one","is_active":false},{"name":"two","id":"org-two","is_active":true}]`},
 	}}
-	client, err := newBrevClient(Config{}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +163,7 @@ func TestNvidiaBrevClientRequiresActiveOrganization(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "ls orgs --json", stdout: `[{"name":"default","id":"org-default","is_active":false},{"name":"other","id":"org-other","is_active":false}]`},
 	}}
-	client, err := newBrevClient(Config{}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +183,7 @@ func TestNvidiaBrevClientUsesAPIKeyOrganizationWithoutCache(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".brev", "credentials.json"), []byte(`{"api_key":"bak-secret","api_key_org_id":"org-api"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	client, err := newBrevClient(Config{}, Runtime{Exec: &scriptedBrevRunner{}, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{}, core.Runtime{Exec: &scriptedBrevRunner{}, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +212,7 @@ func TestNvidiaBrevClientUsesAPIKeyOrganizationBeforeWorkspace(t *testing.T) {
 	if err := os.WriteFile(brevWorkspaceMetaPath, []byte(`{"workspaceId":"ws-local","organizationId":"org-workspace"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	client, err := newBrevClient(Config{}, Runtime{Exec: &scriptedBrevRunner{}, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{}, core.Runtime{Exec: &scriptedBrevRunner{}, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +226,7 @@ func TestNvidiaBrevClientUsesAPIKeyOrganizationBeforeWorkspace(t *testing.T) {
 }
 
 func TestNvidiaBrevClientRejectsOrgScopedMutations(t *testing.T) {
-	client, err := newBrevClient(Config{NvidiaBrev: NvidiaBrevConfig{CLI: "brev", Org: "example-org"}}, Runtime{Exec: &scriptedBrevRunner{}, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{NvidiaBrev: core.NvidiaBrevConfig{CLI: "brev", Org: "example-org"}}, core.Runtime{Exec: &scriptedBrevRunner{}, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,6 +250,7 @@ func TestNvidiaBrevClientRejectsOrgScopedMutations(t *testing.T) {
 
 func isolateBrevContextFiles(t *testing.T) {
 	t.Helper()
+	t.Setenv("BREV_API_KEY", "")
 	dir := t.TempDir()
 	oldMeta := brevWorkspaceMetaPath
 	brevWorkspaceMetaPath = filepath.Join(dir, "workspace.json")
@@ -259,7 +263,7 @@ func TestNvidiaBrevClientAddsStoppableForStopReleaseAction(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "create crabbox-demo-123456789abc --detached --stoppable --gpu-name A100 --mode vm"},
 	}}
-	client, err := newBrevClient(Config{NvidiaBrev: NvidiaBrevConfig{ReleaseAction: "stop"}}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{NvidiaBrev: core.NvidiaBrevConfig{ReleaseAction: "stop"}}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +276,7 @@ func TestNvidiaBrevClientIncludesProviderDiagnosticsInErrors(t *testing.T) {
 	runner := &scriptedBrevRunner{responses: []scriptedBrevResponse{
 		{args: "create crabbox-demo-123456789abc --detached --gpu-name A100 --mode vm", stderr: "insufficient GPU capacity in selected region", err: errors.New("exit status 1")},
 	}}
-	client, err := newBrevClient(Config{}, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+	client, err := newBrevClient(core.Config{}, core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}

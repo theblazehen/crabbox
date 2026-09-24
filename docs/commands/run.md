@@ -5,6 +5,14 @@ streams the output back, and exits with the remote command's exit code. It is
 the core verb: lease (or reuse) a machine, ship your code, run something, get
 the result.
 
+By default the source is Git. Opt into `sync.source: directory` with a nonempty
+`sync.include` to sync the effective current directory through the ordinary
+POSIX/WSL SSH managed-manifest transport. This still requires installed Git for
+source-tree ignore matching, but does not create source Git metadata. Full
+manifest and size validation runs before acquisition and again before transfer.
+See [directory source](../features/sync.md#explicit-directory-source) for the
+explicit unsupported Git-only, delegated, native-Windows, and watch modes.
+
 ```sh
 crabbox run --id swift-crab -- pnpm test:changed
 crabbox run --class beast -- pnpm check
@@ -36,7 +44,8 @@ snippets, pipes, or shell expansion.
 
 On Cloudflare Sandbox, Superserve, Crownest, Vercel Sandbox, Nomad, CodeSandbox,
 OpenComputer, Docker Sandbox, Agent Sandbox, SmolVM, Upstash Box, Tensorlake,
-and OpenSandbox,
+OpenSandbox, Blaxel, Cloudflare containers, Azure Dynamic Sessions, Anthropic
+Sandbox Runtime, Daytona, Freestyle, Islo, Modal, Cloud Run Sandbox, and Orgo,
 quoted or interpolated profile arguments retain their literal meaning through
 the delegated command transport. A value such as `&&` does not become a shell
 operator, and an executable named `FOO=x` is invoked rather than treated as an
@@ -55,6 +64,21 @@ crabbox run -- bash -c 'set -eu; ./scripts/test.sh'
 This inner Bash inherits exported environment values, not unexported shell
 variables or functions from login startup files.
 
+With the complete release's sibling `crabbox-runtime/` directory installed,
+Linux SSH managed execution can run an independent argv command even when Bash
+is absent. Internal supervision uses the native runtime; argv execution uses
+`/bin/sh` when Bash is unavailable. When Bash is present, including on macOS,
+Crabbox retains the Bash login environment and literal argv behavior. Explicit
+`--shell` and Bash scripts still require Bash.
+
+Newly generated Linux `crabbox-ready` scripts use `/bin/sh`, so Bash absence
+alone does not prevent managed readiness with the complete runtime pack.
+Existing images and their readiness scripts are not upgraded in place. A
+CLI-only `go install` does not supply the companion runtime pack: if an internal
+Bash-dependent path needs Bash on a host without it, the
+error identifies the missing runtime pack and recommends Homebrew or extracting
+the complete platform archive with `crabbox-runtime/` intact.
+
 On POSIX and WSL2 SSH targets, private command staging does not change the
 remote caller's umask for user work. Commands keep the target shell's creation
 policy; Crabbox's staged scripts, input, and workspace-owner state remain private.
@@ -63,7 +87,10 @@ and SIGQUIT dispositions, including intentionally ignored signals.
 
 POSIX workspace ownership uses `flock`, BSD `lockf`, or an atomic directory gate
 when neither tool is available. Acquire, renewal, release, and foreground-child
-registration share the same gate. The directory fallback never steals a gate
+registration share the same gate. The directory fallback requires a
+BSD/GNU-compatible `mkdir -v` creation receipt, so a tool that
+incorrectly returns success for an existing directory cannot grant ownership.
+It never steals a gate
 based on elapsed time: an interrupted helper may still have a writer in flight.
 Stop and replace a managed lease if that gate remains ambiguous. Normal owner
 expiry recovery still requires proof that the recorded foreground child exited.
@@ -95,6 +122,17 @@ discarding the live process record. Stop a disposable lease with `crabbox stop
 are never destroyed by stop: finish or terminate the known remote workload on
 that host before reusing its workspace. Do not delete owner records to bypass
 the busy check.
+
+When a fresh disposable lease loses SSH after sync, Crabbox may replace it once.
+Replacement quiesces the old owner, confirms lease release, and finishes any
+remaining owner cleanup before acquiring fresh ownership and syncing again. Caller
+cancellation still applies throughout replacement acquisition.
+
+If owner inspection or renewal cannot be confirmed, replacement stops and the old
+lease may remain for recovery; Crabbox does not allocate another lease while that
+ownership is uncertain. Check it with `crabbox inspect --provider <provider> --id <lease>`
+and use the matching `stop` command for a disposable lease. Static SSH hosts are
+not destroyed by `stop`.
 
 ## Remote workspace root
 
@@ -217,7 +255,13 @@ Aliases, explicit reclaim, and coordinator-managed leases retain their existing
 resolution paths; stale heartbeat snapshots still fail the exact-claim check.
 
 `--idle-timeout` controls inactivity expiry (default `30m`); `--ttl` is the
-maximum wall-clock lifetime (default `90m`). Use `--stop-after
+maximum wall-clock lifetime (default `90m`). Reusing a claimed direct lease keeps
+its recorded idle timeout unless `--idle-timeout` is explicitly supplied; reader
+defaults and transferring the repository claim with `--reclaim` do not replace
+that policy. This applies to direct allocation even in registered broker mode;
+managed leases continue to use the coordinator's policy. An explicit replacement
+on an existing direct lease is stored in whole seconds, rounded to the nearest
+second with a minimum of one second for a positive value. Use `--stop-after
 success|always|failure|never` to make lease cleanup explicit. Without it, a
 newly acquired one-shot lease is released after the command and an existing
 `--id` lease is left alone. The run details always print the exact `crabbox
@@ -344,12 +388,17 @@ protocol; the small sync-finalization lock remains nested inside it.
 
 Renewal errors retain recognized `MISMATCH`, `EXPIRED`, and `AMBIGUOUS` protocol
 states alongside transport errors. Unrecognized response text is omitted.
+Release errors also retain recognized denial states, including `CHILD`.
+Owner-call errors identify canceled or expired call contexts without printing
+caller-provided cancellation causes; the original transport error is preserved.
+Workspace-owner protocol calls disable SSH connection multiplexing. Sync and
+command transport keep their existing connection policy.
 WSL2 renewal uses a compact marker-only helper with a 60-second execution
 allowance for CPU and disk contention. It retries confirmed lock contention at
 most twice within the original bounded call deadline; that deadline is included
 in the owner expiry window. A transport failure or rejected/ambiguous owner
 state is never retried. Collection and cleanup remain blocked after ownership
-fails closed. Linux and native Windows renewal behavior is unchanged.
+fails closed. Owner authority checks and renewal deadlines are unchanged.
 
 Native Windows stages owner scripts and witnessed command input with exact byte
 counts and asynchronous pipe reads. Empty frames complete without initializing
@@ -510,12 +559,15 @@ created before this bootstrap change need to be recreated.
 
 Use `--script <file>` or `--script-stdin` for multi-line remote commands. On
 POSIX SSH leases, Crabbox uploads a standalone, content-hashed copy into
-`.crabbox/scripts/` under the remote workdir and executes that copy with the
-workdir as its process PWD. `$0` identifies the generated upload path, so
+`.crabbox/scripts/` under the remote workdir and resolves that copy's absolute
+path before starting the login shell. The process starts in the remote workdir;
+Bash login startup files may select a different directory, which the script
+inherits. `$0` identifies the generated upload path, so
 `dirname "$0"` resolves to `.crabbox/scripts/`, not the script's original local
 directory. That directory component is not preserved in the uploaded copy and
 cannot be recovered from `$0`. Standalone uploaded scripts should resolve
-synced project assets from `$PWD`.
+synced project assets from `$PWD` when startup leaves it in the remote workdir,
+or explicitly select that workdir when startup changes it.
 
 **Workload stdin on POSIX SSH leases:**
 
@@ -584,19 +636,57 @@ stays on the remote workdir until you delete it or reset the lease. See
 ## Preflight
 
 `--preflight` prints a target-specific capability snapshot after sync and before
-the remote command. It is diagnostic only: Crabbox does not install tools,
-change the machine, or fail just because a tool is missing. Install logic
+the remote command. It is diagnostic only: Crabbox does not install or upgrade
+host tools, or fail just because a tool is missing. Install logic
 belongs in Actions hydration, a prebaked image, a devcontainer, Nix/mise/asdf,
 or the command/script you run.
 
+On POSIX targets (including WSL2), ordinary version probes retain at most
+4096 bytes of combined stdout/stderr and display its first line. Additional
+output is drained so a verbose tool can finish normally; the retained-output
+limit is not a new execution timeout. Native Windows probes are unchanged.
+
+The `npm`, `pnpm`, and `yarn` version probes disable Corepack networking,
+latest-version lookup, automatic project pinning, and download prompts for that
+probe only. An uncached Corepack-managed version may therefore be unavailable;
+hydrate it separately. The selected project version and the later workload's
+environment are unchanged. These controls do not make arbitrary executable
+wrappers filesystem-pure or prevent every package manager from touching caches.
+The pnpm probe also sets `PNPM_CONFIG_PM_ON_FAIL=ignore` for that child only:
+pnpm versions supporting `pmOnFail` skip their own secondary version checks and
+environment-lockfile reconciliation, while Corepack still selects the project's
+pinned version. Older Corepack-managed pnpm already skips its own version
+switching; this does not promise to suppress every standalone legacy wrapper's
+self-management. The workload's original pnpm policy is restored.
+
 By default it probes common language and infrastructure tools plus OS-specific
-basics. Default generic probes are `git`, `tar`, `node`, `npm`, `corepack`,
-`pnpm`, `yarn`, `bun`, and `docker`. Additional opt-in built-ins are `go`,
-`cargo`, `cmake`, `uv`, `python`, and `python3` on POSIX, WSL2, and native
-Windows targets, plus `make` on POSIX and WSL2. Linux and WSL2 also support the
-opt-in `raw_socket` capability probe. POSIX/Linux/WSL probes include `sudo`,
-`apt`, and `bubblewrap`; native Windows probes include `powershell`,
-`execution_policy`, `longpaths`, `temp`, and `pwsh`.
+basics. Run [`crabbox preflight-tools`](preflight-tools.md), or add `--json`, to
+inspect every accepted name, aliases, default membership, and target support
+from the installed binary. Discovery works offline without configuration or a
+provider and does not run probes.
+
+On macOS, the default `macos_platform` snapshot reports `macos_version`,
+`macos_build`, observed `architecture`, `developer_directory`, and
+`developer_tools=xcode|clt|unavailable`. It uses the workload's directory and
+child environment, including `DEVELOPER_DIR`, without changing global developer
+selection. Standalone `swift`, `xcodebuild`, and `brew` versions are macOS-only
+opt-ins; they invoke the literal commands, not aliases or alternate tools.
+
+These macOS probes run sequentially with a five-second execution allowance per
+native command and a fifteen-second cumulative execution budget for the subset. Transport,
+setup, and confirmed cleanup have separate bounded allowances; this is not a
+fifteen-second full-run deadline. Completed execution is charged conservatively
+at the native timer's centisecond precision. Missing, nonzero, empty, and timed-out
+version probes print `missing`; successful versions contain at most 512 characters
+from the first stdout line. A probe not attempted because the subset budget is
+exhausted includes `reason=budget-exhausted`. Diagnostics allow the workload to
+continue only after confirmed cleanup; transport or ownership failures still
+fail the run. Homebrew auto-update and analytics are disabled only for its probe.
+No probe installs tools, accepts licenses, or changes workload policy.
+The platform snapshot retains fields completed before a later command times out.
+Each command has its own supervised cleanup, including the normal five-second
+termination grace, so a full platform snapshot can take substantially longer
+than its command-execution time.
 
 Use `--preflight-tools` to replace the default tool list for one run:
 
@@ -605,13 +695,16 @@ crabbox run --preflight --preflight-tools node,bun,docker -- bun test
 crabbox run --preflight --preflight-tools default,uv -- node --test
 crabbox run --preflight --preflight-tools default,cmake -- cmake --build build
 crabbox run --preflight --preflight-tools python,python3 -- python3 -m pytest
+crabbox run --preflight --preflight-tools default,python3-venv -- python3 -m pytest
+crabbox run --target macos --preflight --preflight-tools default,swift,xcodebuild,brew -- swift test
 crabbox run --preflight --preflight-tools raw_socket -- ./packet-tests
 crabbox run --preflight --preflight-tools none -- ./smoke.sh
 ```
 
-`default` expands to the default probe list; `none` keeps only the workspace
-summary. Unknown tool names fail before leasing so typos do not hide missing
-diagnostics. Unsupported OS-specific probes are skipped for the current target.
+`default` (alias `defaults`) expands to the default probe list; `none` alone keeps
+only the workspace summary, while mixed `none,git` still selects `git`. Unknown
+tool names fail before leasing and point to `crabbox preflight-tools` so typos do
+not hide missing diagnostics. Unsupported OS-specific probes are skipped for the current target.
 The CMake probe invokes the literal `cmake --version` command on POSIX, WSL2,
 and native Windows targets. It prints only the first output line when CMake is
 present or `cmake=missing` when it is unavailable; either result is diagnostic
@@ -620,6 +713,64 @@ probes likewise invoke the literal requested command with `--version`, including
 `python` and `python3` on native Windows; Crabbox does not map either name to
 `py`. An unavailable literal command prints `<name>=missing` and the run
 continues.
+
+The opt-in `bash` probe invokes the literal `bash --version` on Linux, macOS,
+and WSL2; native Windows skips it. Select it with
+`--preflight --preflight-tools bash`, or append it to the unchanged defaults with
+`--preflight --preflight-tools default,bash`. It prints the bounded first output
+line as `remote preflight bash=<version>`, or `remote preflight bash=missing`
+when Bash is unavailable. This diagnostic does not prevent an independent
+command from running or install Bash; it does not make a Bash-dependent workload
+portable. For example:
+
+```sh
+crabbox run --preflight --preflight-tools bash -- /bin/sh -c 'printf "ready\n"'
+```
+
+`python3-venv` is a separate, opt-in functional probe for Linux, macOS and WSL2;
+native Windows skips it. It creates a fresh disposable virtual environment with
+pip, then invokes that environment's Python and pip. It never selects, activates
+or reuses a project environment, installs project packages, or upgrades host
+Python, `venv`, `ensurepip` or pip. Pip seeding stays inside the disposable
+environment. The literal `python` and `python3` version probes and default list
+remain unchanged; `default,python3-venv,python3-venv` keeps the default order and
+adds one functional result.
+
+The result line is `remote preflight python3-venv=<state> cleanup=<confirmed|unconfirmed>`.
+States are `ready`, `missing-python3`, `venv-unavailable`, `pip-unavailable`,
+`worker-failed`, `timed-out`, `canceled` and `unavailable`. `ready` requires both
+environment-local commands to succeed, owner-confirmed probe-process quiescence
+and scratch removal, and caller-confirmed retirement of the exact transport
+stage. `venv-unavailable` covers missing venv support, environment-creation failure
+or failure of the environment's Python; `pip-unavailable` covers missing or failing
+`ensurepip`, pip seeding or the environment's pip. `unavailable` means no reliable
+capability result. Cleanup is independent: a transport, setup or envelope error
+can remain after confirmed cleanup (`unavailable cleanup=confirmed`); unresolved
+quiescence, scratch removal or stage retirement reports `cleanup=unconfirmed`.
+
+Missing or broken capability is diagnostic only and does not skip the workload.
+Worker failure or probe timeout is also diagnostic only when cleanup is confirmed.
+In contrast, an operational transport, setup, envelope, ownership or cleanup
+failure prevents the next workload, even if cleanup is confirmed. In particular,
+`unavailable cleanup=unconfirmed` never permits continuation with an unresolved
+owned stage.
+Caller cancellation remains cancellation (`canceled`), and no later workload
+starts. An expired caller deadline also reports `canceled` in the preflight line;
+`timed-out` identifies expiration of the functional worker allowance. Operational
+ownership failures report `unavailable`. Saved timing and local history retain
+the caller cancellation or deadline classification, and operational preflight
+failures are not reported as workload `command-exit` errors. The probe has a
+90-second allowance and an independent 30-second cleanup reserve, plus separately
+bounded transport setup; this is not a promise that the whole command finishes
+within 120 seconds. This functional probe cannot be used
+as a profile-doctor version-only tool requirement.
+
+On WSL2, completion and retirement use fixed metadata checks on the selected SSH
+endpoint without creating another staged workload. A private stdin pipe preserves
+the fixed program’s quotes and bytes without passing it as native arguments.
+Each check has a 20-second caller-side cap that cannot extend the shared cleanup deadline. This cap is not
+an independent native WSL watchdog; cleanup still requires verified completion
+and retirement.
 
 `raw_socket` uses `python3`, then `python`, to open and immediately close
 `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` without binding, connecting, sending,
@@ -848,6 +999,13 @@ Before sync, `run` prints a compact context block with run ID, portal/log URLs,
 lease ID, slug, provider, SSH target, remote workdir, and whether the workspace
 is raw or Actions-hydrated.
 
+When available, an additional image line separates the configured reference,
+runtime image ID, and reported repository digests. The same optional
+`imageEvidence` object is retained in timing JSON and opt-in local history and
+included in `--emit-proof` output. These initial image observations are unsigned;
+they do not change signed receipt or checkpoint identities. See
+[local-container image evidence](../providers/local-container.md#initial-image-evidence).
+
 For newly created brokered leases, `run` also prints the exact selected image
 ID/source and provider-side request, network-readiness, bootstrap, and total
 startup timings when the provider reports them.
@@ -959,6 +1117,15 @@ logs <run-id>`](logs.md) prints retained remote output (retention is bounded so
 a noisy command cannot fill storage). See
 [history and logs](../features/history-logs.md).
 
+Use `--record-local` to retain private, bounded local history for this run,
+including coordinator-free and delegated execution. Trusted user configuration
+can enable `history.local.enabled`; an explicit `--record-local=false` disables
+it for one run. Repository policy cannot silently enable this storage. The
+printed run ID works with local history/logs/results after lease cleanup.
+Local history finalization runs after the existing timing/receipt operations;
+failure warns and leaves incomplete metadata without changing their result or
+the original process exit. It never uploads a direct run or creates attestation.
+
 ## Pond
 
 Use `--pond <name>` to tag a new lease into a named pond. Pond is a reserved
@@ -1004,7 +1171,7 @@ lease-acting commands):
 --market spot|on-demand
 --slug <slug>                Only when creating a fresh lease.
 --pond <name>
---expose <port>              Repeatable; SSH-mesh-reachable TCP port.
+--expose <port>              Repeatable; SSH-mesh TCP port; creation-only for managed leases.
 --cache-volume [name=]key:path
                              Require a provider cache volume.
 --ttl <duration>             Default 90m.
@@ -1034,6 +1201,13 @@ lease-acting commands):
 --tailscale-exit-node-allow-lan-access
 ```
 
+For coordinator-managed leases, `--expose` records Pond ports only when creating
+the lease. `run --id <lease> --expose <port>` warns and continues without changing
+those declarations. To reach an existing service on remote loopback, use
+[`crabbox tunnel --id <lease> <port>`](tunnel.md); it does not require a prior
+`--expose` declaration. Registered coordinator leases can still refresh port
+declarations during registration.
+
 Provider-specific flags are registered by each adapter and only apply to that
 provider (for example `--azure-backend`, `--azure-os-disk`, the
 `--blacksmith-*`, `--exe-dev-*`, `--namespace-*`, `--semaphore-*`,
@@ -1054,6 +1228,7 @@ Run-specific flags:
 --no-hydrate
 --full-resync                Alias: --fresh-sync
 --checksum
+--git-seed-source <origin|local>
 --force-sync-large
 --debug
 --shell
@@ -1087,4 +1262,22 @@ Run-specific flags:
 --label <text>
 --timing-json
 --timing-record default|off|path
+--record-local
 ```
+
+For portable typed-pool access, add `--pool-access` alongside
+`--pool-identity-file` and use `--pool-duration` to request up to 30 minutes:
+
+```sh
+crabbox run --pool builders --pool-identity-file pool-identity.json \
+  --pool-access --pool-duration 20m --pool-compatibility-key linux-16-vcpu -- go test ./...
+```
+
+The CLI prints pending/active grant state, a protected receipt path, and the
+immutable hard deadline before execution. It uses a fresh local key, sends
+liveness heartbeats, and cancels the command at that deadline. Heartbeats never
+renew access. Cleanup preserves the original command failure; when the command
+succeeds, a fencing or return failure fails the run. Failed cleanup retains the
+receipt for `pool return --receipt-file <path> --result drain`. AWS v1 removes the
+grant key and observes a reboot before returning a scrubbed machine to ready.
+A longer job must return and borrow again; uninterrupted renewal is deferred.

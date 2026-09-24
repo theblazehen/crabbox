@@ -16,12 +16,20 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
+// PrepareLeaseSSHTrust installs a provider-authoritative host key in the
+// isolated per-lease known_hosts file and binds the target to that identity.
+// It is the exported entry point for provider backends that own a pinned
+// coordinator host key (e.g. the Agent Sandbox SSH runtime).
+func PrepareLeaseSSHTrust(target *SSHTarget, leaseID string) error {
+	return prepareLeaseSSHTrust(target, leaseID)
+}
+
 func prepareLeaseSSHTrust(target *SSHTarget, leaseID string) error {
 	if target == nil || strings.TrimSpace(target.SSHHostKey) == "" {
 		return nil
 	}
 	if target.DisableHostKeyChecking {
-		return exit(2, "refusing authoritative SSH host key with host-key checking disabled")
+		return Exit(2, "refusing authoritative SSH host key with host-key checking disabled")
 	}
 	leaseDir, err := ensureTestboxLeaseDirectory(leaseID)
 	if err != nil {
@@ -31,7 +39,7 @@ func prepareLeaseSSHTrust(target *SSHTarget, leaseID string) error {
 	if target.KnownHostsFile == "" {
 		target.KnownHostsFile = expectedKnownHosts
 	} else if filepath.Clean(target.KnownHostsFile) != expectedKnownHosts {
-		return exit(2, "authoritative coordinator SSH host key requires the isolated per-lease known_hosts path")
+		return Exit(2, "authoritative coordinator SSH host key requires the isolated per-lease known_hosts path")
 	}
 	if target.HostKeyAlias == "" {
 		alias, err := leaseHostKeyAlias(leaseID)
@@ -62,11 +70,11 @@ func installAuthoritativeSSHHostKey(target *SSHTarget) error {
 	}
 	path := filepath.Clean(target.KnownHostsFile)
 	if !filepath.IsAbs(path) {
-		return exit(2, "authoritative SSH host key requires an absolute isolated known_hosts path")
+		return Exit(2, "authoritative SSH host key requires an absolute isolated known_hosts path")
 	}
 	entry := knownhosts.Line([]string{token}, publicKey) + "\n"
 	if err := writeAuthoritativeKnownHosts(path, []byte(entry)); err != nil {
-		return exit(2, "install authoritative SSH host key in %s: %v", path, err)
+		return Exit(2, "install authoritative SSH host key in %s: %v", path, err)
 	}
 	return nil
 }
@@ -75,7 +83,7 @@ func parseAuthoritativeSSHHostKey(value string) (xssh.PublicKey, error) {
 	value = strings.TrimSpace(value)
 	key, _, options, rest, err := xssh.ParseAuthorizedKey([]byte(value + "\n"))
 	if err != nil || len(options) != 0 || len(bytes.TrimSpace(rest)) != 0 {
-		return nil, exit(2, "coordinator-provided SSH host key is malformed; refresh or replace the lease")
+		return nil, Exit(2, "coordinator-provided SSH host key is malformed; refresh or replace the lease")
 	}
 	switch key.Type() {
 	case xssh.KeyAlgoED25519,
@@ -86,7 +94,7 @@ func parseAuthoritativeSSHHostKey(value string) (xssh.PublicKey, error) {
 		xssh.KeyAlgoSKECDSA256,
 		xssh.KeyAlgoRSA:
 	default:
-		return nil, exit(2, "coordinator-provided SSH host key uses an unsupported algorithm; refresh or replace the lease")
+		return nil, Exit(2, "coordinator-provided SSH host key uses an unsupported algorithm; refresh or replace the lease")
 	}
 	return key, nil
 }
@@ -94,14 +102,14 @@ func parseAuthoritativeSSHHostKey(value string) (xssh.PublicKey, error) {
 func authoritativeKnownHostToken(target SSHTarget) (string, error) {
 	if alias := strings.TrimSpace(target.HostKeyAlias); alias != "" {
 		if alias != target.HostKeyAlias || strings.ContainsAny(alias, " ,\t\r\n\x00") {
-			return "", exit(2, "authoritative SSH host-key alias contains unsupported characters")
+			return "", Exit(2, "authoritative SSH host-key alias contains unsupported characters")
 		}
 		return knownhosts.Normalize(alias), nil
 	}
 	host := strings.TrimSpace(target.Host)
 	port := strings.TrimSpace(target.Port)
 	if host == "" || port == "" || host != target.Host || port != target.Port || strings.ContainsAny(host, "\r\n\x00") || strings.ContainsAny(port, "\r\n\x00") {
-		return "", exit(2, "authoritative SSH host key requires a valid host and port")
+		return "", Exit(2, "authoritative SSH host key requires a valid host and port")
 	}
 	return knownhosts.Normalize(net.JoinHostPort(host, port)), nil
 }
@@ -195,7 +203,7 @@ func secureAuthoritativeKnownHostsPath(path string, directory bool) error {
 }
 
 func removeStoredTestboxConnectionArtifacts(ctx context.Context, leaseID string) error {
-	key, err := testboxKeyPath(leaseID)
+	key, err := TestboxKeyPath(leaseID)
 	if err != nil {
 		return err
 	}

@@ -19,23 +19,48 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func TestNativeServerTypeProjection(t *testing.T) {
+	for _, name := range []string{"upstash-box", "upstash", "box", "upstashbox", " Upstash "} {
+		if got := core.ServerTypeForProviderClass(name, "beast"); got != "small" {
+			t.Fatalf("provider=%q default type=%q, want %q", name, got, "small")
+		}
+		provider, err := core.ProviderFor(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolver, ok := provider.(core.ProviderServerTypeProvider)
+		if !ok {
+			t.Fatalf("provider=%q has no native type capability", name)
+		}
+		for _, tc := range []struct{ raw, want string }{{"", "small"}, {"  ", "  "}, {"custom", "custom"}, {" custom ", " custom "}} {
+			cfg := core.Config{Provider: name, Class: "beast", ServerType: "unrelated-type", ServerTypeExplicit: true}
+			cfg.UpstashBox.Size = tc.raw
+			if got := resolver.ServerTypeForConfig(cfg); got != tc.want {
+				t.Fatalf("provider=%q raw=%q type=%q, want %q", name, tc.raw, got, tc.want)
+			}
+		}
+	}
+}
 
 func TestProviderSpecAndAliases(t *testing.T) {
 	p := Provider{}
-	if p.Name() != providerName {
-		t.Fatalf("Name=%q want %s", p.Name(), providerName)
+	if p.Spec().Name != providerName {
+		t.Fatalf("Name=%q want %s", p.Spec().Name, providerName)
 	}
 	for _, alias := range []string{"upstash", "box", "upstashbox"} {
 		got, err := core.ProviderFor(alias)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", alias, err)
 		}
-		if got.Name() != providerName {
-			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Name())
+		if got.Spec().Name != providerName {
+			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Spec().Name)
 		}
 	}
 	spec := p.Spec()
@@ -66,7 +91,7 @@ func TestUpstashBoxFlagPresenceAndExactGuardOrder(t *testing.T) {
 			t.Fatal("API key flag registered")
 		}
 	})
-	cfg.UpstashBox = UpstashBoxConfig{BaseURL: "https://example.invalid/api", Runtime: "python", Size: "large", Workdir: "/workspace/home/app", KeepAlive: true}
+	cfg.UpstashBox = core.UpstashBoxConfig{BaseURL: "https://example.invalid/api", Runtime: "python", Size: "large", Workdir: "/workspace/home/app", KeepAlive: true}
 	before := cfg
 	if err := ApplyUpstashBoxProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
@@ -77,10 +102,11 @@ func TestUpstashBoxFlagPresenceAndExactGuardOrder(t *testing.T) {
 	if err := fs.Parse([]string{"--upstash-box-base-url=https://example.invalid/api", "--upstash-box-runtime=python", "--upstash-box-size=large", "--upstash-box-workdir=/workspace/home/app", "--upstash-box-keep-alive=true"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg.UpstashBox = UpstashBoxConfig{}
+	cfg.UpstashBox = core.UpstashBoxConfig{}
 	if err := ApplyUpstashBoxProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
+	core.RecordProviderFlagInputs(&before, true, "upstash-box")
 	if !reflect.DeepEqual(cfg, before) {
 		t.Fatal("nonempty visited flags not applied")
 	}
@@ -90,12 +116,12 @@ func TestUpstashBoxFlagPresenceAndExactGuardOrder(t *testing.T) {
 	if err := ApplyUpstashBoxProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
-	before.UpstashBox = UpstashBoxConfig{}
+	before.UpstashBox = core.UpstashBoxConfig{}
 	if !reflect.DeepEqual(cfg, before) {
 		t.Fatal("visited clears or wrapper provenance changed")
 	}
 	for _, name := range []string{"upstash-box", "upstash", "box", "upstashbox", "UPSTASH", " upstash-box "} {
-		cfg := Config{Provider: name}
+		cfg := core.Config{Provider: name}
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)
 		fs.String("class", "", "")
 		fs.String("type", "", "")
@@ -122,7 +148,7 @@ func TestUpstashBoxFlagPresenceAndExactGuardOrder(t *testing.T) {
 			}
 		}
 	}
-	cfg = Config{UpstashBox: UpstashBoxConfig{Runtime: "other", Size: "other", Workdir: "relative"}}
+	cfg = core.Config{UpstashBox: core.UpstashBoxConfig{Runtime: "other", Size: "other", Workdir: "relative"}}
 	validationFS := flag.NewFlagSet("validation", flag.ContinueOnError)
 	validationValues := RegisterUpstashBoxProviderFlags(validationFS, cfg)
 	if err := ApplyUpstashBoxProviderFlags(&cfg, validationFS, struct{}{}); err != nil {
@@ -131,7 +157,7 @@ func TestUpstashBoxFlagPresenceAndExactGuardOrder(t *testing.T) {
 	if err := ApplyUpstashBoxProviderFlags(&cfg, validationFS, validationValues); err == nil || err.Error() != `invalid upstash-box runtime "other"` {
 		t.Fatalf("unselected wrapper validation=%v", err)
 	}
-	if _, err := (Provider{}).Configure(cfg, Runtime{}); err != nil {
+	if _, err := (Provider{}).Configure(cfg, core.Runtime{}); err != nil {
 		t.Fatalf("Configure introduced validation: %v", err)
 	}
 	if err := validateConfig(cfg); err == nil || err.Error() != `invalid upstash-box runtime "other"` {
@@ -154,9 +180,9 @@ func TestUpstashBoxEffectiveDefaultsAndWorkspaceBoundary(t *testing.T) {
 		{name: "custom", base: " https://example.invalid/api/ ", runtime: " python ", size: " medium ", dir: " /workspace/home/app ", wantBase: "https://example.invalid/api", wantRuntime: "python", wantSize: "medium", wantDir: "/workspace/home/app", wantHost: "example.invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{UpstashBox: UpstashBoxConfig{APIKey: "inert-constructor-only", BaseURL: tc.base, Runtime: tc.runtime, Size: tc.size, Workdir: tc.dir}}
+			cfg := core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "inert-constructor-only", BaseURL: tc.base, Runtime: tc.runtime, Size: tc.size, Workdir: tc.dir}}
 			before := cfg.UpstashBox
-			api, err := newAPI(cfg, Runtime{HTTP: &http.Client{}})
+			api, err := newAPI(cfg, core.Runtime{HTTP: &http.Client{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -175,7 +201,7 @@ func TestUpstashBoxEffectiveDefaultsAndWorkspaceBoundary(t *testing.T) {
 		})
 	}
 	for _, key := range []string{"", "  "} {
-		if _, err := newAPI(Config{UpstashBox: UpstashBoxConfig{APIKey: key, BaseURL: "https://example.invalid/api"}}, Runtime{HTTP: &http.Client{}}); err == nil || err.Error() != "provider=upstash-box requires UPSTASH_BOX_API_KEY" {
+		if _, err := newAPI(core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: key, BaseURL: "https://example.invalid/api"}}, core.Runtime{HTTP: &http.Client{}}); err == nil || err.Error() != "provider=upstash-box requires UPSTASH_BOX_API_KEY" {
 			t.Fatalf("key requirement=%v", err)
 		}
 	}
@@ -210,11 +236,11 @@ func TestStopRequiresExactScopedUpstashBoxOwnership(t *testing.T) {
 			box := boxData{ID: "box_foreign", Name: "crabbox-foreign-0123456789ab", Status: "running"}
 			fake := &fakeAPI{box: box}
 			withFakeAPI(t, fake)
-			cfg := Config{UpstashBox: UpstashBoxConfig{APIKey: "test-key", BaseURL: "https://one.example.test"}}
-			backend := NewBackend(Provider{}.Spec(), cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
+			cfg := core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "test-key", BaseURL: "https://one.example.test"}}
+			backend := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
 			leaseID := "cbx_0123456789ab"
 			if test.seedClaim {
-				server := boxToServer(backend.cfg, box)
+				server := boxToServer(backend.cfg, box, nil)
 				if test.staleIdentity {
 					server.CloudID = "box_original"
 				}
@@ -225,7 +251,7 @@ func TestStopRequiresExactScopedUpstashBoxOwnership(t *testing.T) {
 			if test.changedScope {
 				backend.cfg.UpstashBox.BaseURL = "https://two.example.test"
 			}
-			err := backend.Stop(context.Background(), StopRequest{ID: test.identifier})
+			err := backend.Stop(context.Background(), core.StopRequest{ID: test.identifier})
 			if test.seedClaim && !test.staleIdentity && !test.changedScope {
 				if err != nil || strings.Join(fake.deletedIDs, ",") != box.ID {
 					t.Fatalf("owned stop err=%v deleted=%v", err, fake.deletedIDs)
@@ -247,13 +273,13 @@ func TestStopFinalizesClaimWhenUpstashBoxVanishesDuringLockedPreflight(t *testin
 	box := boxData{ID: "box_vanished", Name: "crabbox-vanished-0123456789ab", Status: "running"}
 	fake := &fakeAPI{box: box, notFoundOnGet: 2}
 	withFakeAPI(t, fake)
-	cfg := Config{UpstashBox: UpstashBoxConfig{APIKey: "test-key", BaseURL: "https://one.example.test"}}
-	backend := NewBackend(Provider{}.Spec(), cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
+	cfg := core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "test-key", BaseURL: "https://one.example.test"}}
+	backend := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
 	leaseID := "cbx_0123456789ab"
-	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, "vanished", providerName, upstashBoxClaimScope(backend.cfg), "", t.TempDir(), time.Hour, false, boxToServer(backend.cfg, box), core.SSHTarget{}); err != nil {
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, "vanished", providerName, upstashBoxClaimScope(backend.cfg), "", t.TempDir(), time.Hour, false, boxToServer(backend.cfg, box, nil), core.SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Stop(context.Background(), StopRequest{ID: box.ID}); err != nil {
+	if err := backend.Stop(context.Background(), core.StopRequest{ID: box.ID}); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.deletedIDs) != 0 {
@@ -269,13 +295,13 @@ func TestStopFinalizesRetainedClaimAfterUpstashBoxWasAlreadyDeleted(t *testing.T
 	box := boxData{ID: "box_deleted", Name: "crabbox-deleted-0123456789ab", Status: "running"}
 	fake := &fakeAPI{box: box, notFoundOnGet: 1}
 	withFakeAPI(t, fake)
-	cfg := Config{UpstashBox: UpstashBoxConfig{APIKey: "test-key", BaseURL: "https://one.example.test"}}
-	backend := NewBackend(Provider{}.Spec(), cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
+	cfg := core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "test-key", BaseURL: "https://one.example.test"}}
+	backend := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
 	leaseID := "cbx_0123456789ab"
-	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, "deleted", providerName, upstashBoxClaimScope(backend.cfg), "", t.TempDir(), time.Hour, false, boxToServer(backend.cfg, box), core.SSHTarget{}); err != nil {
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, "deleted", providerName, upstashBoxClaimScope(backend.cfg), "", t.TempDir(), time.Hour, false, boxToServer(backend.cfg, box, nil), core.SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Stop(context.Background(), StopRequest{ID: leaseID}); err != nil {
+	if err := backend.Stop(context.Background(), core.StopRequest{ID: leaseID}); err != nil {
 		t.Fatal(err)
 	}
 	if fake.getBoxCalls != 1 || len(fake.deletedIDs) != 0 {
@@ -395,7 +421,7 @@ func TestClientRefusesCrossOriginRedirectBeforeReplay(t *testing.T) {
 	}))
 	defer trusted.Close()
 
-	apiClient, err := newAPI(Config{UpstashBox: UpstashBoxConfig{APIKey: "box_key", BaseURL: trusted.URL}}, Runtime{HTTP: trusted.Client()})
+	apiClient, err := newAPI(core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "box_key", BaseURL: trusted.URL}}, core.Runtime{HTTP: trusted.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +449,7 @@ func TestClientFollowsSameOriginRedirect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	apiClient, err := newAPI(Config{UpstashBox: UpstashBoxConfig{APIKey: "box_key", BaseURL: server.URL}}, Runtime{HTTP: server.Client()})
+	apiClient, err := newAPI(core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "box_key", BaseURL: server.URL}}, core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +474,7 @@ func TestClientPreservesCallerRedirectPolicy(t *testing.T) {
 		callerChecks++
 		return callerErr
 	}
-	apiClient, err := newAPI(Config{UpstashBox: UpstashBoxConfig{APIKey: "box_key", BaseURL: server.URL}}, Runtime{HTTP: httpClient})
+	apiClient, err := newAPI(core.Config{UpstashBox: core.UpstashBoxConfig{APIKey: "box_key", BaseURL: server.URL}}, core.Runtime{HTTP: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,34 +534,32 @@ func TestClientRedactsAPIKeyFromErrors(t *testing.T) {
 }
 
 func TestUploadFileStopsProducerOnTransportFailure(t *testing.T) {
-	archive := filepath.Join(t.TempDir(), "archive.tgz")
-	if err := os.WriteFile(archive, []byte("archive"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	transportErr := errors.New("transport failed")
-	client := &client{
-		apiKey: "box_key",
-		base:   "https://box.example.test",
-		http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, transportErr
-		})},
-	}
-	err := client.UploadFile(context.Background(), "box_1", archive, "/tmp/archive.tgz")
-	if !errors.Is(err, transportErr) {
-		t.Fatalf("UploadFile err=%v, want transport failure", err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if !uploadFileProducerRunning() {
-			return
+	synctest.Test(t, func(t *testing.T) {
+		archive := filepath.Join(t.TempDir(), "archive.tgz")
+		if err := os.WriteFile(archive, []byte("archive"), 0o600); err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("upload producer goroutine still running after transport failure")
+		transportErr := errors.New("transport failed")
+		client := &client{
+			apiKey: "box_key",
+			base:   "https://box.example.test",
+			http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, transportErr
+			})},
+		}
+		err := client.UploadFile(context.Background(), "box_1", archive, "/tmp/archive.tgz")
+		if !errors.Is(err, transportErr) {
+			t.Fatalf("UploadFile err=%v, want transport failure", err)
+		}
+		synctest.Wait()
+		if uploadFileProducerRunning() {
+			t.Fatal("upload producer goroutine still running after transport failure")
+		}
+	})
 }
 
 func TestNewAPIUsesBoundedDefaultHTTPClient(t *testing.T) {
-	api, err := newAPI(testConfig(), Runtime{})
+	api, err := newAPI(testConfig(), core.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +591,7 @@ func TestNewAPIRejectsUnsupportedDefaultTransport(t *testing.T) {
 		return nil, errors.New("deny all")
 	})
 
-	api, err := newAPI(testConfig(), Runtime{})
+	api, err := newAPI(testConfig(), core.Runtime{})
 	if api != nil || err == nil || !strings.Contains(err.Error(), "non-nil *http.Transport") {
 		t.Fatalf("api=%#v err=%v, want transport setup error", api, err)
 	}
@@ -587,7 +611,7 @@ func TestNewAPIAcceptsExplicitClientWithUnsupportedDefault(t *testing.T) {
 	})
 	injected := &http.Client{Transport: injectedTransport}
 
-	api, err := newAPI(testConfig(), Runtime{HTTP: injected})
+	api, err := newAPI(testConfig(), core.Runtime{HTTP: injected})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,36 +670,173 @@ func TestUpstashBoxCreateBoxDeletesFailedProvision(t *testing.T) {
 }
 
 func TestUpstashBoxCreateBoxDeletesCancelledProvision(t *testing.T) {
-	var deleted []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v2/box":
-			_ = json.NewEncoder(w).Encode(boxData{ID: "box_cancelled", Status: "provisioning"})
-		case r.Method == http.MethodDelete && r.URL.Path == "/v2/box":
-			var body struct {
-				IDs []string `json:"ids"`
+	synctest.Test(t, func(t *testing.T) {
+		var deleted []string
+		srv := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/box":
+				_ = json.NewEncoder(w).Encode(boxData{ID: "box_cancelled", Status: "provisioning"})
+			case r.Method == http.MethodDelete && r.URL.Path == "/v2/box":
+				var body struct {
+					IDs []string `json:"ids"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				deleted = append(deleted, body.IDs...)
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatal(err)
-			}
-			deleted = append(deleted, body.IDs...)
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	defer srv.Close()
+		}))
+		defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	client := &client{apiKey: "box_key", base: srv.URL, http: srv.Client()}
-	_, err := client.CreateBox(ctx, createRequest{Name: "crabbox-cancelled"})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("CreateBox err=%v, want deadline exceeded", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		client := &client{apiKey: "box_key", base: srv.URL, http: srv.Client()}
+		_, err := client.CreateBox(ctx, createRequest{Name: "crabbox-cancelled"})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("CreateBox err=%v, want deadline exceeded", err)
+		}
+		if !reflect.DeepEqual(deleted, []string{"box_cancelled"}) {
+			t.Fatalf("deleted=%v, want cancelled box cleanup", deleted)
+		}
+	})
+}
+
+func TestUpstashBoxCreateReadinessBudgetBoundsStalledResponseBody(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var deleted []string
+		pollStarted := false
+		srv := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/box":
+				_ = json.NewEncoder(w).Encode(boxData{ID: "box_stalled", Status: "provisioning"})
+			case r.Method == http.MethodGet && r.URL.Path == "/v2/box/box_stalled":
+				pollStarted = true
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			case r.Method == http.MethodDelete && r.URL.Path == "/v2/box":
+				var body struct {
+					IDs []string `json:"ids"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					return
+				}
+				deleted = append(deleted, body.IDs...)
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer srv.Close()
+		// A later caller deadline bounds the broken implementation without
+		// supplying the five-minute readiness deadline under test.
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		client := &client{apiKey: "box_key", base: srv.URL, http: srv.Client()}
+		started := time.Now()
+		_, err := client.CreateBox(ctx, createRequest{Name: "crabbox-stalled"})
+		if !pollStarted || err == nil {
+			t.Fatalf("pollStarted=%t error=%v", pollStarted, err)
+		}
+		if elapsed := time.Since(started); elapsed > 5*time.Minute+time.Second {
+			t.Errorf("stalled readiness body exceeded five-minute creation budget: elapsed=%s error=%v", elapsed, err)
+		}
+		if !reflect.DeepEqual(deleted, []string{"box_stalled"}) {
+			t.Fatalf("deleted=%v, want exactly one stalled-box rollback", deleted)
+		}
+	})
+}
+
+func TestUpstashBoxReadinessPreservesCompletedResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name, initial, ready string
+		cancelCreate         bool
+		boundary             bool
+		transient            bool
+	}{
+		{name: "completed create after cancellation", initial: "paused", cancelCreate: true},
+		{name: "completed poll at budget boundary", initial: "provisioning", ready: "running", boundary: true},
+		{name: "transient poll failure", initial: "provisioning", ready: "idle", transient: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				polls, deletes := 0, 0
+				started := time.Now()
+				c := &client{base: "https://api.example.test", http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					state := tc.initial
+					switch req.Method {
+					case http.MethodPost:
+						if tc.cancelCreate {
+							cancel()
+						}
+					case http.MethodGet:
+						polls++
+						if tc.transient && polls == 1 {
+							return nil, errors.New("synthetic transient read failure")
+						}
+						if tc.boundary {
+							time.Sleep(5*time.Minute - time.Since(started))
+						}
+						state = tc.ready
+					case http.MethodDelete:
+						deletes++
+					}
+					data, _ := json.Marshal(boxData{ID: "box_completed", Status: state})
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(data)), Header: make(http.Header)}, nil
+				})}}
+				box, err := c.CreateBox(ctx, createRequest{})
+				if err != nil || box.ID != "box_completed" || deletes != 0 {
+					t.Fatalf("box=%+v error=%v deletes=%d", box, err, deletes)
+				}
+				wantPolls := 1
+				if tc.cancelCreate {
+					wantPolls = 0
+				} else if tc.transient {
+					wantPolls = 2
+				}
+				if polls != wantPolls {
+					t.Fatalf("polls=%d want %d", polls, wantPolls)
+				}
+			})
+		})
 	}
-	if !reflect.DeepEqual(deleted, []string{"box_cancelled"}) {
-		t.Fatalf("deleted=%v, want cancelled box cleanup", deleted)
-	}
+}
+
+func TestUpstashBoxReadinessPreservesCallerCancellationCause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cause := errors.New("synthetic caller cancellation")
+		ctx, cancel := context.WithCancelCause(context.Background())
+		defer cancel(nil)
+		deletes := 0
+		c := &client{base: "https://api.example.test", http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.Method {
+			case http.MethodGet:
+				cancel(cause)
+				return nil, req.Context().Err()
+			case http.MethodDelete:
+				deletes++
+				if req.Context().Err() != nil {
+					t.Error("rollback inherited caller cancellation")
+				}
+				deadline, ok := req.Context().Deadline()
+				if !ok || time.Until(deadline) != upstashBoxCleanupTimeout {
+					t.Error("rollback lost its detached cleanup budget")
+				}
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"box_cause","status":"provisioning"}`)), Header: make(http.Header)}, nil
+		})}}
+		_, err := c.CreateBox(ctx, createRequest{})
+		if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || deletes != 1 {
+			t.Fatalf("error=%v deletes=%d", err, deletes)
+		}
+	})
 }
 
 func TestCleanWorkdirAndCommand(t *testing.T) {
@@ -691,7 +852,7 @@ func TestCleanWorkdirAndCommand(t *testing.T) {
 
 func TestWarmupRejectsActionsRunner(t *testing.T) {
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	err := backend.Warmup(context.Background(), WarmupRequest{ActionsRunner: true})
+	err := backend.Warmup(context.Background(), core.WarmupRequest{ActionsRunner: true})
 	if err == nil || !strings.Contains(err.Error(), "--actions-runner is not supported") {
 		t.Fatalf("err=%v, want actions-runner rejection", err)
 	}
@@ -765,8 +926,8 @@ func TestRunCreatesExecsAndDeletesOneShotBox(t *testing.T) {
 	fake := &fakeAPI{}
 	withFakeAPI(t, fake)
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "repo", Root: t.TempDir()},
 		Command: []string{"echo", "hello"},
 		NoSync:  true,
 	})
@@ -806,30 +967,32 @@ func TestRunCreatesExecsAndDeletesOneShotBox(t *testing.T) {
 }
 
 func TestRunCleanupDeleteUsesBoundedContext(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	withUpstashBoxCleanupTimeout(t, 20*time.Millisecond)
-	fake := &fakeAPI{blockDelete: true}
-	withFakeAPI(t, fake)
-	var stderr bytes.Buffer
-	backend := NewBackend(Provider{}.Spec(), testConfig(), Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
-	start := time.Now()
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: t.TempDir()},
-		Command: []string{"echo", "hello"},
-		NoSync:  true,
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		withUpstashBoxCleanupTimeout(t, 20*time.Millisecond)
+		fake := &fakeAPI{blockDelete: true}
+		withFakeAPI(t, fake)
+		var stderr bytes.Buffer
+		backend := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
+		start := time.Now()
+		result, err := backend.Run(context.Background(), core.RunRequest{
+			Repo:    core.Repo{Name: "repo", Root: t.TempDir()},
+			Command: []string{"echo", "hello"},
+			NoSync:  true,
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || result.ExitCode != 1 || result.Status != core.RunStatusFailed || result.ErrorKind != core.RunErrorProvider {
+			t.Fatalf("result=%#v err=%v, want failed deletion reported", result, err)
+		}
+		if result.Session == nil || !result.Session.Kept {
+			t.Fatalf("session=%#v, want retained session after cleanup failure", result.Session)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("Run took %s, want bounded cleanup", elapsed)
+		}
+		if claim, exists, err := core.ReadLeaseClaimWithPresence(result.LeaseID); err != nil || !exists || claim.LeaseID != result.LeaseID {
+			t.Fatalf("failed deletion lost claim: exists=%v err=%v", exists, err)
+		}
 	})
-	if !errors.Is(err, context.DeadlineExceeded) || result.ExitCode != 1 || result.Status != core.RunStatusFailed || result.ErrorKind != core.RunErrorProvider {
-		t.Fatalf("result=%#v err=%v, want failed deletion reported", result, err)
-	}
-	if result.Session == nil || !result.Session.Kept {
-		t.Fatalf("session=%#v, want retained session after cleanup failure", result.Session)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Run took %s, want bounded cleanup", elapsed)
-	}
-	if claim, exists, err := core.ReadLeaseClaimWithPresence(result.LeaseID); err != nil || !exists || claim.LeaseID != result.LeaseID {
-		t.Fatalf("failed deletion lost claim: exists=%v err=%v", exists, err)
-	}
 }
 
 func TestRunKeepsFailuresBeforeCommand(t *testing.T) {
@@ -838,7 +1001,7 @@ func TestRunKeepsFailuresBeforeCommand(t *testing.T) {
 			t.Setenv("XDG_STATE_HOME", t.TempDir())
 			fake := &fakeAPI{}
 			withFakeAPI(t, fake)
-			req := RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, KeepOnFailure: true, TimingJSON: true, Command: []string{"true"}}
+			req := core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, KeepOnFailure: true, TimingJSON: true, Command: []string{"true"}}
 			switch phase {
 			case "workspace":
 				fake.execHook = func(context.Context, string) (execResult, error) {
@@ -855,7 +1018,7 @@ func TestRunKeepsFailuresBeforeCommand(t *testing.T) {
 				fake.uploadHook = func(context.Context, string, string) error { return errors.New("environment upload unavailable") }
 			}
 			var stderr bytes.Buffer
-			b := NewBackend(Provider{}.Spec(), testConfig(), Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
+			b := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
 			result, err := b.Run(t.Context(), req)
 			if err == nil || result.Session == nil || !result.Session.Kept || result.Session.Reused || len(fake.deletedIDs) != 0 || len(fake.streamCommands) != 0 {
 				t.Fatalf("early failure lost retention: result=%#v err=%v calls=%v", result, err, fake.verbs)
@@ -886,51 +1049,53 @@ func TestRunTimingFailurePreservesCommandAndRetention(t *testing.T) {
 	fake := &fakeAPI{streamCode: 42}
 	withFakeAPI(t, fake)
 	cause := errors.New("synthetic timing write failure")
-	b := NewBackend(Provider{}.Spec(), testConfig(), Runtime{Stdout: io.Discard, Stderr: failingTimingWriter{cause}}).(*backend)
-	result, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, KeepOnFailure: true, TimingJSON: true, Command: []string{"false"}})
-	var exitErr ExitError
+	b := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{Stdout: io.Discard, Stderr: failingTimingWriter{cause}}).(*backend)
+	result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, KeepOnFailure: true, TimingJSON: true, Command: []string{"false"}})
+	var exitErr core.ExitError
 	if !errors.Is(err, cause) || !errors.As(err, &exitErr) || exitErr.Code != 42 || result.ExitCode != 42 || result.Status != core.RunStatusFailed || result.ErrorKind != core.RunErrorCommandExit || result.Session == nil || !result.Session.Kept || len(fake.deletedIDs) != 0 {
 		t.Fatalf("timing masked command/retention: result=%#v err=%v deletes=%v", result, err, fake.deletedIDs)
 	}
 }
 
 func TestRunEnvCleanupUsesBoundedContext(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	withUpstashBoxCleanupTimeout(t, 20*time.Millisecond)
-	fake := &fakeAPI{blockEnvCleanup: true}
-	withFakeAPI(t, fake)
-	var stderr bytes.Buffer
-	backend := NewBackend(Provider{}.Spec(), testConfig(), Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
-	start := time.Now()
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:       Repo{Name: "repo", Root: t.TempDir()},
-		Command:    []string{"echo", "hello"},
-		Env:        map[string]string{"TOKEN": "secret"},
-		NoSync:     true,
-		Keep:       true,
-		TimingJSON: true,
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		withUpstashBoxCleanupTimeout(t, 20*time.Millisecond)
+		fake := &fakeAPI{blockEnvCleanup: true}
+		withFakeAPI(t, fake)
+		var stderr bytes.Buffer
+		backend := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
+		start := time.Now()
+		result, err := backend.Run(context.Background(), core.RunRequest{
+			Repo:       core.Repo{Name: "repo", Root: t.TempDir()},
+			Command:    []string{"echo", "hello"},
+			Env:        map[string]string{"TOKEN": "secret"},
+			NoSync:     true,
+			Keep:       true,
+			TimingJSON: true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "upstash-box env cleanup failed for box_1: context deadline exceeded") {
+			t.Fatalf("err=%v, want bounded env cleanup failure", err)
+		}
+		if result.ExitCode != 5 {
+			t.Fatalf("result=%#v", result)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("Run took %s, want bounded cleanup", elapsed)
+		}
+		lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+		var report struct {
+			ExitCode  int    `json:"exitCode"`
+			RunStatus string `json:"runStatus"`
+			ErrorKind string `json:"errorKind"`
+		}
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
+			t.Fatalf("timing json: %v\nstderr=%s", err, stderr.String())
+		}
+		if report.ExitCode != 5 || report.RunStatus != "failed" || report.ErrorKind != "provider-error" {
+			t.Fatalf("timing outcome exit=%d status=%q kind=%q", report.ExitCode, report.RunStatus, report.ErrorKind)
+		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "upstash-box env cleanup failed for box_1: context deadline exceeded") {
-		t.Fatalf("err=%v, want bounded env cleanup failure", err)
-	}
-	if result.ExitCode != 5 {
-		t.Fatalf("result=%#v", result)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Run took %s, want bounded cleanup", elapsed)
-	}
-	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
-	var report struct {
-		ExitCode  int    `json:"exitCode"`
-		RunStatus string `json:"runStatus"`
-		ErrorKind string `json:"errorKind"`
-	}
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
-		t.Fatalf("timing json: %v\nstderr=%s", err, stderr.String())
-	}
-	if report.ExitCode != 5 || report.RunStatus != "failed" || report.ErrorKind != "provider-error" {
-		t.Fatalf("timing outcome exit=%d status=%q kind=%q", report.ExitCode, report.RunStatus, report.ErrorKind)
-	}
 }
 
 func TestRunEnvCleanupFailsOnNonzeroExit(t *testing.T) {
@@ -938,9 +1103,9 @@ func TestRunEnvCleanupFailsOnNonzeroExit(t *testing.T) {
 	fake := &fakeAPI{execResults: []execResult{{ExitCode: 0}, {ExitCode: 7, Error: "permission denied"}}}
 	withFakeAPI(t, fake)
 	var stderr bytes.Buffer
-	backend := NewBackend(Provider{}.Spec(), testConfig(), Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:       Repo{Name: "repo", Root: t.TempDir()},
+	backend := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:       core.Repo{Name: "repo", Root: t.TempDir()},
 		Command:    []string{"echo", "hello"},
 		Env:        map[string]string{"TOKEN": "secret"},
 		NoSync:     true,
@@ -968,8 +1133,8 @@ func TestRunEnvCleanupFailsOnNonzeroExit(t *testing.T) {
 func TestSyncWorkspaceCleansRemoteArchiveWhenExtractFails(t *testing.T) {
 	fake := &fakeAPI{execResults: []execResult{{ExitCode: 0}, {ExitCode: 9, Error: "extract failed"}, {ExitCode: 0}}}
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, _, err := backend.syncWorkspace(context.Background(), fake, "box_1", RunRequest{
-		Repo: Repo{Name: "repo", Root: newGitRepo(t)},
+	_, _, err := backend.syncWorkspace(context.Background(), fake, "box_1", core.RunRequest{
+		Repo: core.Repo{Name: "repo", Root: newGitRepo(t)},
 	}, "/workspace/home/crabbox", "crabbox")
 	if err == nil {
 		t.Fatal("expected extract failure")
@@ -984,7 +1149,7 @@ func TestSyncWorkspaceCleansRemoteArchiveWhenExtractFails(t *testing.T) {
 
 func TestSyncWorkspaceNativePreservesExistingFilesOnTransferFailure(t *testing.T) {
 	for _, failure := range []string{"upload", "extract", ""} {
-		t.Run(blank(failure, "success"), func(t *testing.T) {
+		t.Run(core.Blank(failure, "success"), func(t *testing.T) {
 			root := t.TempDir()
 			work := filepath.Join(root, "crabbox")
 			if err := os.Mkdir(work, 0o755); err != nil {
@@ -998,7 +1163,7 @@ func TestSyncWorkspaceNativePreservesExistingFilesOnTransferFailure(t *testing.T
 			cfg := testConfig()
 			cfg.Sync.Delete = true
 			backend := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
-			_, _, err := backend.syncWorkspace(context.Background(), client, "box_1", RunRequest{Repo: Repo{Name: "repo", Root: newGitRepo(t)}}, "/workspace/home/crabbox", "crabbox")
+			_, _, err := backend.syncWorkspace(context.Background(), client, "box_1", core.RunRequest{Repo: core.Repo{Name: "repo", Root: newGitRepo(t)}}, "/workspace/home/crabbox", "crabbox")
 			if failure != "" {
 				if err == nil {
 					t.Fatal("expected transfer failure")
@@ -1037,7 +1202,7 @@ func TestRunChecksArchiveBeforeAllocation(t *testing.T) {
 	cfg := testConfig()
 	cfg.Sync.FailFiles = 1
 	backend := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
-	_, err := backend.Run(context.Background(), RunRequest{Repo: Repo{Root: newGitRepo(t)}, Command: []string{"true"}})
+	_, err := backend.Run(context.Background(), core.RunRequest{Repo: core.Repo{Root: newGitRepo(t)}, Command: []string{"true"}})
 	if err == nil || !strings.Contains(err.Error(), "sync candidate too large") {
 		t.Fatalf("err=%v", err)
 	}
@@ -1086,9 +1251,9 @@ func (f *filesystemSyncAPI) Exec(ctx context.Context, _ string, command, _ strin
 func TestSyncWorkspaceWarnsWhenRemoteArchiveCleanupExitsNonzero(t *testing.T) {
 	fake := &fakeAPI{execResults: []execResult{{ExitCode: 0}, {ExitCode: 9, Error: "extract failed"}, {ExitCode: 7, Error: "cleanup denied"}}}
 	var stderr bytes.Buffer
-	backend := NewBackend(Provider{}.Spec(), testConfig(), Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
-	_, _, err := backend.syncWorkspace(context.Background(), fake, "box_1", RunRequest{
-		Repo: Repo{Name: "repo", Root: newGitRepo(t)},
+	backend := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{Stdout: io.Discard, Stderr: &stderr}).(*backend)
+	_, _, err := backend.syncWorkspace(context.Background(), fake, "box_1", core.RunRequest{
+		Repo: core.Repo{Name: "repo", Root: newGitRepo(t)},
 	}, "/workspace/home/crabbox", "crabbox")
 	if err == nil {
 		t.Fatal("expected extract failure")
@@ -1103,12 +1268,12 @@ func TestRunReusedBoxReturnsSession(t *testing.T) {
 	const leaseID = "cbx_123456789abc"
 	fake := &fakeAPI{box: boxData{ID: "box_1", Name: "crabbox-blue-123456789abc", Runtime: "node", Size: "small", Status: "running"}}
 	withFakeAPI(t, fake)
-	if err := claimLeaseForRepoProvider(leaseID, "blue", providerName, "/repo", time.Minute, false); err != nil {
+	if err := core.ClaimLeaseForRepoProvider(leaseID, "blue", providerName, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	backend := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	result, err := backend.Run(context.Background(), RunRequest{
-		ID: leaseID, Repo: Repo{Name: "repo", Root: "/repo"}, Command: []string{"echo", "hello"}, NoSync: true,
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		ID: leaseID, Repo: core.Repo{Name: "repo", Root: "/repo"}, Command: []string{"echo", "hello"}, NoSync: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1125,12 +1290,13 @@ func TestRunReusedBoxReturnsSession(t *testing.T) {
 }
 
 func TestStatusMapsBoxName(t *testing.T) {
-	fake := &fakeAPI{box: boxData{ID: "box_1", Name: "crabbox-blue-123456789abc", Runtime: "python", Size: "medium", Status: "running"}}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fake := &fakeAPI{box: boxData{ID: "box_1", Name: "crabbox-blue-123456789abc", Runtime: "python", Size: "medium", Status: "running", CreatedAt: 1700000000, UpdatedAt: 1700000010}}
 	withFakeAPI(t, fake)
 	cfg := testConfig()
 	cfg.UpstashBox.BaseURL = "https://eu-west-1.box.upstash.com"
 	backend := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
-	view, err := backend.Status(context.Background(), StatusRequest{ID: "box_1"})
+	view, err := backend.Status(context.Background(), core.StatusRequest{ID: "box_1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1140,9 +1306,95 @@ func TestStatusMapsBoxName(t *testing.T) {
 	if view.Labels["runtime"] != "python" || view.Labels["size"] != "medium" {
 		t.Fatalf("labels=%v", view.Labels)
 	}
-	server := boxToServer(cfg, fake.box)
+	if view.Labels["created_at"] != "1700000000" || view.Labels["updated_at"] != "1700000010" {
+		t.Fatalf("native timestamps lost: %v", view.Labels)
+	}
+	for _, key := range []string{"last_touched_at", "ttl_secs", "idle_timeout", "expires_at", "keep"} {
+		if _, ok := view.Labels[key]; ok {
+			t.Fatalf("unclaimed observation invented %s: %v", key, view.Labels)
+		}
+	}
+	server := boxToServer(cfg, fake.box, nil)
 	if server.PublicNet.IPv4.IP != "eu-west-1.box.upstash.com" {
 		t.Fatalf("host=%q", server.PublicNet.IPv4.IP)
+	}
+}
+
+func TestObservationPreservesRecordedBoxPolicy(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fake := &fakeAPI{}
+	withFakeAPI(t, fake)
+	cfg := testConfig()
+	cfg.TTL, cfg.IdleTimeout, cfg.Profile = 10*time.Minute, 5*time.Minute, "creation"
+	b := NewBackend(Provider{}.Spec(), cfg, testRuntime()).(*backend)
+	repo := core.Repo{Root: t.TempDir(), Name: "fixture"}
+	leaseID, box, _, err := b.createBox(t.Context(), fake, repo, true, false, "blue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.Labels["ttl_secs"] != "600" || original.Labels["keep"] != "true" || original.IdleTimeoutSeconds != 300 {
+		t.Fatalf("acquisition policy not recorded: %#v", original)
+	}
+	b.cfg.TTL, b.cfg.IdleTimeout, b.cfg.Profile = 90*time.Minute, 30*time.Minute, "reader"
+	for _, reuse := range []bool{false, true} {
+		if reuse {
+			if _, _, _, err := b.resolveBoxID(t.Context(), fake, leaseID, repo.Root, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before, err := core.ReadLeaseClaim(leaseID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, err := b.Status(t.Context(), core.StatusRequest{ID: leaseID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers, err := b.List(t.Context(), core.ListRequest{})
+		if err != nil || len(servers) != 1 {
+			t.Fatalf("list=%v err=%v", servers, err)
+		}
+		for _, labels := range []map[string]string{view.Labels, servers[0].Labels} {
+			if labels["created_at"] != core.LeaseLabelTime(time.Unix(box.CreatedAt, 0)) || labels["ttl_secs"] != "600" || labels["idle_timeout_secs"] != "300" || labels["profile"] != "creation" || labels["keep"] != "true" || labels["keep_alive"] != "false" {
+				t.Fatalf("reuse=%t observed labels=%v", reuse, labels)
+			}
+			if _, ok := labels["expires_at"]; ok {
+				t.Fatalf("invented provider expiry: %v", labels)
+			}
+		}
+		after, err := core.ReadLeaseClaim(leaseID)
+		if err != nil || !reflect.DeepEqual(before, after) {
+			t.Fatalf("status/list mutated claim: %v", err)
+		}
+		if after.Labels["ttl_secs"] != "600" || after.Labels["expires_at"] != original.Labels["expires_at"] {
+			t.Fatalf("reuse replaced recorded policy: %v", after.Labels)
+		}
+	}
+	b.cfg.UpstashBox.BaseURL = "https://other.example.test"
+	view, err := b.Status(t.Context(), core.StatusRequest{ID: leaseID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := view.Labels["ttl_secs"]; ok {
+		t.Fatal("observation borrowed history from another endpoint")
+	}
+}
+
+func TestBoxObservationMissingFacts(t *testing.T) {
+	cfg := testConfig()
+	box := boxData{ID: "box", Name: "crabbox-blue-123456789abc", CreatedAt: -1}
+	view := boxToServer(cfg, box, nil)
+	for _, key := range []string{"created_at", "updated_at", "runtime", "size", "server_type", "ttl_secs", "last_touched_at"} {
+		if _, ok := view.Labels[key]; ok {
+			t.Fatalf("invented %s: %v", key, view.Labels)
+		}
+	}
+	if view.ServerType.Name != "" {
+		t.Fatalf("invented size: %s", view.ServerType.Name)
 	}
 }
 
@@ -1169,12 +1421,12 @@ func TestStatusReadyStates(t *testing.T) {
 func TestStatusWaitTreatsMissingStatusAsNotReady(t *testing.T) {
 	fake := &fakeAPI{box: boxData{ID: "box_1", Name: "crabbox-blue-123456789abc"}}
 	withFakeAPI(t, fake)
-	backend := NewBackend(Provider{}.Spec(), testConfig(), Runtime{
+	backend := NewBackend(Provider{}.Spec(), testConfig(), core.Runtime{
 		Stdout: io.Discard,
 		Stderr: io.Discard,
 		Clock:  &advancingClock{current: time.Unix(100, 0), step: time.Second},
 	}).(*backend)
-	_, err := backend.Status(context.Background(), StatusRequest{ID: "box_1", Wait: true, WaitTimeout: time.Nanosecond})
+	_, err := backend.Status(context.Background(), core.StatusRequest{ID: "box_1", Wait: true, WaitTimeout: time.Nanosecond})
 	if err == nil || !strings.Contains(err.Error(), "timed out waiting for upstash-box box_1 to become ready") {
 		t.Fatalf("err=%v, want timeout for missing status", err)
 	}
@@ -1189,10 +1441,10 @@ func hasFeature(features core.FeatureSet, want core.Feature) bool {
 	return false
 }
 
-func testConfig() Config {
-	return Config{
+func testConfig() core.Config {
+	return core.Config{
 		Provider: providerName,
-		UpstashBox: UpstashBoxConfig{
+		UpstashBox: core.UpstashBoxConfig{
 			APIKey:  "box_key",
 			BaseURL: "https://us-east-1.box.upstash.com",
 			Runtime: "node",
@@ -1202,8 +1454,8 @@ func testConfig() Config {
 	}
 }
 
-func testRuntime() Runtime {
-	return Runtime{Stdout: io.Discard, Stderr: io.Discard}
+func testRuntime() core.Runtime {
+	return core.Runtime{Stdout: io.Discard, Stderr: io.Discard}
 }
 
 type advancingClock struct {
@@ -1219,7 +1471,7 @@ func (c *advancingClock) Now() time.Time {
 func withFakeAPI(t *testing.T, fake *fakeAPI) {
 	t.Helper()
 	original := newAPI
-	newAPI = func(Config, Runtime) (api, error) { return fake, nil }
+	newAPI = func(core.Config, core.Runtime) (api, error) { return fake, nil }
 	t.Cleanup(func() { newAPI = original })
 }
 
@@ -1418,14 +1670,14 @@ func TestRunPartialEnvUploadRetainsCleanup(t *testing.T) {
 				if _, ok := cleanupCtx.Deadline(); !ok {
 					t.Fatal("unbounded cleanup")
 				}
-				if command != "rm -f "+shellQuote(remotePath) {
+				if command != "rm -f "+core.ShellQuote(remotePath) {
 					t.Fatalf("wrong removal: %s", command)
 				}
 				return execResult{}, os.Remove(remote)
 			}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			_, err := b.Run(ctx, RunRequest{Repo: Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+			_, err := b.Run(ctx, core.RunRequest{Repo: core.Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 			want := primary
 			if canceled {
 				want = context.Canceled
@@ -1455,7 +1707,7 @@ func TestRunEnvDiscoveryDoesNotRequireOrCreateClaim(t *testing.T) {
 			fake := &fakeAPI{}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			result, err := b.Run(t.Context(), RunRequest{ID: id, Repo: Repo{Root: t.TempDir()}, NoSync: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+			result, err := b.Run(t.Context(), core.RunRequest{ID: id, Repo: core.Repo{Root: t.TempDir()}, NoSync: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 			if err != nil || result.ExitCode != 0 || len(fake.streamCommands) != 1 || len(fake.deletedIDs) != 0 {
 				t.Fatalf("result=%#v err=%v verbs=%v", result, err, fake.verbs)
 			}
@@ -1603,8 +1855,8 @@ func TestRunPreservesStreamErrorCause(t *testing.T) {
 				}
 				withFakeAPI(t, fake)
 				b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-				result, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
-				var exitErr ExitError
+				result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+				var exitErr core.ExitError
 				if !errors.Is(err, cause) || !errors.As(err, &exitErr) || exitErr.Code != 1 || len(fake.streamCommands) != 1 || t.Context().Err() != nil {
 					t.Fatalf("stream cause lost: err=%v stream calls=%d parent=%v", err, len(fake.streamCommands), t.Context().Err())
 				}
@@ -1633,7 +1885,7 @@ func TestRunSkipsStreamAfterCanceledSuccessfulEnvUpload(t *testing.T) {
 	}
 	withFakeAPI(t, fake)
 	b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, err := b.Run(ctx, RunRequest{Repo: Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+	_, err := b.Run(ctx, core.RunRequest{Repo: core.Repo{Root: t.TempDir()}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 	if !errors.Is(err, context.Canceled) || len(fake.streamCommands) != 0 || cleanups != 1 || len(fake.deletedIDs) != 0 {
 		t.Fatalf("canceled successful upload: err=%v streams=%v cleanups=%d deleted=%v", err, fake.streamCommands, cleanups, fake.deletedIDs)
 	}
@@ -1662,7 +1914,7 @@ func TestRunEnvCleanupPreservesPrimaryOutcome(t *testing.T) {
 			}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			result, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
+			result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, Keep: true, Command: []string{"true"}, Env: map[string]string{"FIXTURE": "synthetic"}})
 			if err == nil || !strings.Contains(err.Error(), "synthetic cleanup failure") {
 				t.Fatalf("missing cleanup diagnosis: %v", err)
 			}
@@ -1671,7 +1923,7 @@ func TestRunEnvCleanupPreservesPrimaryOutcome(t *testing.T) {
 					t.Fatalf("primary cancellation lost: %v", err)
 				}
 			} else {
-				var exitErr ExitError
+				var exitErr core.ExitError
 				if !errors.As(err, &exitErr) || exitErr.Code != wantCode || result.ExitCode != wantCode {
 					t.Fatalf("primary outcome lost: result=%#v err=%v", result, err)
 				}
@@ -1752,7 +2004,7 @@ func TestEnvProfilesOnSameBoxHaveIndependentCustody(t *testing.T) {
 	}
 	fake.execHook = func(_ context.Context, command string) (execResult, error) {
 		for _, path := range paths {
-			if command == "rm -f "+shellQuote(path) {
+			if command == "rm -f "+core.ShellQuote(path) {
 				return execResult{}, os.Remove(filepath.Join(root, filepath.Base(path)))
 			}
 		}
@@ -1902,7 +2154,7 @@ func TestRunEnvProfileThroughNativeHTTPTransport(t *testing.T) {
 						workloads++
 					}
 					if strings.HasPrefix(body.Command[2], "rm -f ") {
-						if body.Command[2] != "rm -f "+shellQuote(profilePath) {
+						if body.Command[2] != "rm -f "+core.ShellQuote(profilePath) {
 							t.Error("removal targeted different file")
 							http.Error(w, "target", 400)
 							return
@@ -1947,7 +2199,7 @@ func TestRunEnvProfileThroughNativeHTTPTransport(t *testing.T) {
 			if scenario == "owned timing failure" {
 				diagnostics = failingTimingWriter{errors.New("synthetic timing write failure")}
 			}
-			b := NewBackend(Provider{}.Spec(), cfg, Runtime{HTTP: server.Client(), Stdout: &stdout, Stderr: diagnostics}).(*backend)
+			b := NewBackend(Provider{}.Spec(), cfg, core.Runtime{HTTP: server.Client(), Stdout: &stdout, Stderr: diagnostics}).(*backend)
 			command := `printf '%s\n' "$FIXTURE"`
 			if scenario == "source failure" {
 				command = "printf first; printf escaped"
@@ -1958,7 +2210,7 @@ func TestRunEnvProfileThroughNativeHTTPTransport(t *testing.T) {
 			if scenario == "owned command exit" || scenario == "owned timing failure" {
 				command = "exit 42"
 			}
-			req := RunRequest{ID: "box_fixture", Repo: Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, TimingJSON: true, Command: []string{command}, ShellMode: true, Env: map[string]string{"FIXTURE": "quote ' newline\n$literal"}}
+			req := core.RunRequest{ID: "box_fixture", Repo: core.Repo{Root: t.TempDir(), Name: "fixture"}, NoSync: true, TimingJSON: true, Command: []string{command}, ShellMode: true, Env: map[string]string{"FIXTURE": "quote ' newline\n$literal"}}
 			if owned {
 				req.ID, req.KeepOnFailure = "", true
 			}
@@ -1993,7 +2245,7 @@ func TestRunEnvProfileThroughNativeHTTPTransport(t *testing.T) {
 					t.Fatalf("workspace error lost: %v", err)
 				}
 			case "owned command exit", "owned timing failure":
-				var exitErr ExitError
+				var exitErr core.ExitError
 				if !errors.As(err, &exitErr) || exitErr.Code != 42 || result.ExitCode != 42 || result.ErrorKind != core.RunErrorCommandExit {
 					t.Fatalf("native command outcome lost: result=%#v err=%v", result, err)
 				}
@@ -2092,7 +2344,7 @@ func TestRunSourceIntentSurvivesNativeShell(t *testing.T) {
 			fake := &fakeAPI{}
 			withFakeAPI(t, fake)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			_, err := b.Run(t.Context(), RunRequest{Repo: Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: tc.command, CommandLiteralArgs: tc.literal})
+			_, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: root, Name: "fixture"}, NoSync: true, Keep: true, Command: tc.command, CommandLiteralArgs: tc.literal})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2118,5 +2370,58 @@ func TestRunSourceIntentSurvivesNativeShell(t *testing.T) {
 				t.Fatalf("literal created sentinel: %v", err)
 			}
 		})
+	}
+}
+
+func TestCompactJSONRequestEnvelope(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "ctx")
+	const base = "https://api.example.test/base"
+	var ptr *string
+	var slice []string
+	for _, tc := range []struct {
+		name string
+		body any
+		want string
+	}{
+		{name: "nil"}, {name: "typed nil pointer", body: ptr, want: "null"}, {name: "typed nil slice", body: slice, want: "null"}, {name: "compact escaped JSON", body: map[string]string{"message": "<&>"}, want: "{\"message\":\"\\u003c\\u0026\\u003e\"}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			path := "/records"
+			endpoint := base + path
+			headers := http.Header{}
+			headers.Set("X-Box-Api-Key", "synthetic-token")
+			if tc.body != nil {
+				headers.Set("Content-Type", "application/json")
+			}
+			httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				testutil.RequireRequestEnvelope(t, req, ctx, http.MethodPost, endpoint, tc.want, headers)
+				return nil, errors.New("synthetic-transport-stop")
+			})}
+			c := &client{base: base, apiKey: "synthetic-token", http: httpClient}
+			err := c.doJSON(ctx, http.MethodPost, path, nil, tc.body, nil)
+			if err == nil || !strings.Contains(err.Error(), "synthetic-transport-stop") || calls != 1 {
+				t.Fatalf("error=%v calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestCompactJSONExecStreamEnvelope(t *testing.T) {
+	ctx := context.Background()
+	calls := 0
+	headers := http.Header{}
+	headers.Set("X-Box-Api-Key", "synthetic-token")
+	headers.Set("Content-Type", "application/json")
+	c := &client{base: "https://api.example.test/base", apiKey: "synthetic-token", http: &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		testutil.RequireRequestEnvelope(t, req, ctx, http.MethodPost, "https://api.example.test/base/v2/box/box%20one/exec-stream", `{"command":["sh","-c","\u003c\u0026\u003e"],"folder":"/work"}`, headers)
+		return nil, errors.New("synthetic-transport-stop")
+	})}}
+	code, err := c.ExecStream(ctx, "box one", "<&>", " /work ", io.Discard)
+	if code != 0 || err == nil || !strings.Contains(err.Error(), "synthetic-transport-stop") || calls != 1 {
+		t.Fatalf("code=%d error=%v calls=%d", code, err, calls)
 	}
 }

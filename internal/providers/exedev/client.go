@@ -2,6 +2,7 @@ package exedev
 
 import (
 	"encoding/json"
+	core "github.com/openclaw/crabbox/internal/cli"
 	"net"
 	"strings"
 )
@@ -28,7 +29,7 @@ type exeDevSSHAddress struct {
 }
 
 func (vm exeDevVM) Name() string {
-	return blank(strings.TrimSpace(vm.VMName), strings.TrimSpace(vm.NameValue))
+	return core.Blank(strings.TrimSpace(vm.VMName), strings.TrimSpace(vm.NameValue))
 }
 
 func (vm exeDevVM) SSHHost() string {
@@ -37,8 +38,8 @@ func (vm exeDevVM) SSHHost() string {
 
 func (vm exeDevVM) SSHAddress() exeDevSSHAddress {
 	value := strings.TrimSpace(vm.SSHDest)
-	if value == "" && vm.Name() != "" {
-		return exeDevSSHAddress{Host: vm.Name() + ".exe.xyz"}
+	if value == "" {
+		return exeDevSSHAddress{}
 	}
 	user := ""
 	if strings.Contains(value, "@") {

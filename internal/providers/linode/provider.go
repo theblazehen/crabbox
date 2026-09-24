@@ -15,14 +15,18 @@ func init() {
 
 type Provider struct{}
 
+func (Provider) NormalizeConfigForShow(cfg core.Config) core.Config {
+	core.ApplyConfigShowSSHDefaults(&cfg, "root")
+	return cfg
+}
+
 var _ core.ProviderClassProfileProvider = Provider{}
 
 var classProfiles = core.UniformLinuxAMD64ClassProfiles(core.ProviderClassMachine{Type: defaultType})
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIToken),
 		Name:             providerName,
 		Family:           providerName,
 		Kind:             core.ProviderKindSSHLease,
@@ -49,13 +53,7 @@ func (p Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.Linode.Type != "" {
 		return cfg.Linode.Type
 	}
-	if candidates, matched := core.ProviderClassCandidatesForProfiles(classProfiles, cfg); matched {
-		return candidates[0]
-	}
-	if core.IsCanonicalProviderClass(cfg.Class) {
-		return ""
-	}
-	return linodeServerTypeForClass(cfg.Class)
+	return core.ProviderClassPrimaryTypeForProfiles(classProfiles, cfg, linodeServerTypeForClass(cfg.Class))
 }
 
 func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
@@ -63,14 +61,33 @@ func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
 	return serverType, serverType != ""
 }
 
-func (Provider) ServerTypeForClass(class string) string {
-	return linodeServerTypeForClass(class)
-}
-
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewLinodeLeaseBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return newLinodeLeaseBackend(p.Spec(), cfg, rt), nil
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	applyNativeDefaults(&cfg.Linode)
+	if core.OSImageWasExplicit(*cfg) && !core.LinodeImageWasExplicit(*cfg) {
+		if cfg.OSImage == "ubuntu:24.04" {
+			cfg.Linode.Image = "linode/ubuntu24.04"
+		} else {
+			// Leave unsupported intent unresolved until acquisition validation.
+			cfg.Linode.Image = ""
+		}
+	}
+	if cfg.Linode.Type == "" {
+		cfg.Linode.Type = core.LinodeConfiguredTypeDefault
+	}
+	base := core.BaseConfig()
+	core.ApplyLinuxConnectionDefaults(cfg, base.SSHUser, base.SSHPort)
+	return nil
+}
+
+func applyNativeDefaults(cfg *core.LinodeConfig) {
+	if cfg.Region == "" {
+		cfg.Region = core.LinodeConfiguredRegionDefault
+	}
+	if cfg.Image == "" {
+		cfg.Image = core.LinodeImageFallback
+	}
 }

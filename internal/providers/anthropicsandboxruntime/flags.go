@@ -12,17 +12,15 @@ func registerFlags(fs *flag.FlagSet, defaults core.Config) any {
 }
 
 func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
-	v, ok := values.(core.AnthropicSRTConfigFlagValues)
-	if !ok {
-		return nil
+	if ok, err := core.ApplyProviderConfigFlags[core.AnthropicSRTConfigFlagValues](cfg, fs, values, &cfg.AnthropicSRT, providerName); !ok || err != nil {
+		return err
 	}
-	v.Apply(&cfg.AnthropicSRT, fs)
 	return validateConfig(*cfg)
 }
 
-func validateConfig(cfg Config) error {
+func validateConfig(cfg core.Config) error {
 	if strings.TrimSpace(cfg.AnthropicSRT.CLIPath) == "" {
-		return exit(2, "anthropicSandboxRuntime cliPath must not be empty")
+		return core.Exit(2, "anthropicSandboxRuntime cliPath must not be empty")
 	}
 	return nil
 }

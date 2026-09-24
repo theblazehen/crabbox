@@ -53,7 +53,7 @@ func TestRemoteRunScriptCommandUsesUploadedFile(t *testing.T) {
 		RemotePath: ".crabbox/scripts/abc-live.sh",
 		Shebang:    true,
 	}
-	got := remoteRunScriptCommandWithEnvFile("/work/repo", map[string]string{"OPENAI_API_KEY": "sk-test"}, "", spec, []string{"arg one"})
+	got := remoteRunScriptCommandWithEnvFiles("/work/repo", map[string]string{"OPENAI_API_KEY": "sk-test"}, nil, spec, []string{"arg one"})
 	for _, want := range []string{
 		"cd '/work/repo'",
 		"OPENAI_API_KEY='sk-test'",
@@ -86,6 +86,9 @@ esac
 script_dir=$(cd "$(dirname "$0")" && pwd -P)
 upload_dir=$(cd "$1/.crabbox/scripts" && pwd -P)
 if [ "$script_dir" = "$upload_dir" ]; then echo DIR_UPLOAD=yes; fi
+printf '%s\n%s\n' "$FIXTURE_VALUE" "$3"
+printf x >> "$1/invocations"
+exit "$2"
 `
 	upload := exec.Command("sh", "-c", "umask 022; "+remoteUploadRunScriptCommand(workdir, remotePath))
 	upload.Env = []string{"HOME=" + t.TempDir(), "PATH=" + os.Getenv("PATH")}
@@ -132,25 +135,117 @@ if [ "$script_dir" = "$upload_dir" ]; then echo DIR_UPLOAD=yes; fi
 		t.Fatalf("completed upload mode: info=%v err=%v", info, err)
 	}
 	spec := &RunScriptSpec{Source: "./scripts/check.sh", RemotePath: remotePath, Shebang: true}
-	command := remoteRunScriptCommandWithEnvFile(workdir, nil, "", spec, []string{workdir})
-	run := exec.Command("bash", "-lc", command)
-	run.Env = upload.Env
-	output, err := run.CombinedOutput()
+	first, second := filepath.Join(workdir, "first.env"), filepath.Join(workdir, "second.env")
+	mustWriteTestFile(t, first, "export FIXTURE_VALUE=first\n")
+	mustWriteTestFile(t, second, "export FIXTURE_VALUE=second\n")
+	withoutBash := t.TempDir()
+	dirname, err := exec.LookPath("dirname")
 	if err != nil {
-		t.Fatalf("execute remote script command: %v\n%s", err, output)
+		t.Fatal(err)
 	}
-	for _, want := range []string{"PWD_WORKDIR=yes", "ZERO_UPLOAD=yes", "DIR_UPLOAD=yes"} {
-		if !strings.Contains(string(output), want) {
-			t.Fatalf("script output missing %q:\n%s", want, output)
+	if err := os.Symlink(dirname, filepath.Join(withoutBash, "dirname")); err != nil {
+		t.Fatal(err)
+	}
+	for _, bashPresent := range []bool{true, false} {
+		for _, code := range []int{0, 23, 127} {
+			t.Run(fmt.Sprintf("bash=%t/exit=%d", bashPresent, code), func(t *testing.T) {
+				path := os.Getenv("PATH")
+				if !bashPresent {
+					path = withoutBash
+				}
+				mustWriteTestFile(t, filepath.Join(workdir, "invocations"), "")
+				command := remoteRunScriptCommandWithEnvFiles(workdir, map[string]string{"PATH": path, "FIXTURE_VALUE": "forwarded"}, []string{first, second}, spec, []string{workdir, strconv.Itoa(code), "literal 'value';*"})
+				run := exec.Command("/bin/sh", "-c", command)
+				run.Env = upload.Env
+				output, err := run.CombinedOutput()
+				want := "PWD_WORKDIR=yes\nZERO_UPLOAD=yes\nDIR_UPLOAD=yes\nforwarded\nliteral 'value';*\n"
+				if exitCode(err) != code || string(output) != want {
+					t.Fatalf("exit=%d want=%d output=%q err=%v", exitCode(err), code, output, err)
+				}
+				if calls, err := os.ReadFile(filepath.Join(workdir, "invocations")); err != nil || string(calls) != "x" {
+					t.Fatalf("script invocations=%q err=%v", calls, err)
+				}
+			})
 		}
 	}
 }
 
-func TestRemoteRunScriptCommandWithoutShebangUsesBash(t *testing.T) {
-	spec := &RunScriptSpec{RemotePath: ".crabbox/scripts/abc-script.sh"}
-	got := remoteRunScriptCommandWithEnvFile("/work/repo", nil, "", spec, nil)
-	if !strings.Contains(got, `exec bash "$@"`) {
-		t.Fatalf("remote command should run script through bash: %q", got)
+func TestRemoteRunScriptPreservesLoginStartupDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX script launcher")
+	}
+	home, workdir := t.TempDir(), t.TempDir()
+	mustWriteTestFile(t, filepath.Join(home, ".bash_profile"), "export FIXTURE_VALUE=profile\ncd \"$HOME\"\n")
+	path := filepath.Join(workdir, "script.sh")
+	mustWriteTestFile(t, path, "#!/bin/sh\nprintf '%s\\n%s' \"$FIXTURE_VALUE\" \"$PWD\"\n")
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, shebang := range []bool{true, false} {
+		command := remoteRunScriptCommandWithEnvFiles(workdir, nil, nil, &RunScriptSpec{RemotePath: path, Shebang: shebang}, nil)
+		cmd := exec.Command("/bin/sh", "-c", command)
+		cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "BASH_ENV=" + os.DevNull, "ENV=" + os.DevNull}
+		if out, err := cmd.CombinedOutput(); err != nil || string(out) != "profile\n"+home {
+			t.Fatalf("shebang=%t startup directory changed: output=%q err=%v", shebang, out, err)
+		}
+	}
+}
+
+func TestRemoteRunScriptLocatesUploadAfterShellStartup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell execution")
+	}
+	for _, relative := range []bool{false, true} {
+		for _, shebang := range []bool{false, true} {
+			t.Run(fmt.Sprintf("relative=%t/shebang=%t", relative, shebang), func(t *testing.T) {
+				root, err := filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				workdir := filepath.Join(root, "-worker ' workspace")
+				workdirArg := workdir
+				if relative {
+					workdirArg = filepath.Base(workdir)
+				}
+				home := filepath.Join(root, "home")
+				for _, dir := range []string{workdir, home} {
+					if err := os.MkdirAll(dir, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				startup := filepath.Join(root, "shell-startup")
+				envFile := filepath.Join(root, "environment")
+				mustWriteTestFile(t, envFile, "cd "+shellQuote(root)+"\n")
+				if err := os.WriteFile(startup, []byte("if shopt -q login_shell; then cd "+shellQuote(home)+"; fi\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "BASH_ENV=" + startup}
+				data := "set -eu\n[ \"$PWD\" = \"$1\" ]\n[ \"$2\" = \"argument with ' quotes\" ]\n[ \"$0\" = \"$3\" ]\nprintf 'uploaded-script-executed\\n'\n"
+				if shebang {
+					data = "#!/bin/sh\n" + data
+				}
+				spec, err := loadRunScript("", true, strings.NewReader(data))
+				if err != nil {
+					t.Fatal(err)
+				}
+				upload := exec.Command("sh", "-c", remoteUploadRunScriptCommand(workdirArg, spec.RemotePath))
+				upload.Dir = root
+				upload.Env, upload.Stdin = env, strings.NewReader(data)
+				if output, err := upload.CombinedOutput(); err != nil {
+					t.Fatalf("upload script: %v\n%s", err, output)
+				}
+				if uploaded, err := os.ReadFile(filepath.Join(workdir, filepath.FromSlash(spec.RemotePath))); err != nil || string(uploaded) != data {
+					t.Fatalf("script upload did not reach the workdir: data=%q err=%v", uploaded, err)
+				}
+				run := exec.Command("sh", "-c", remoteRunScriptCommandWithEnvFiles(workdirArg, nil, []string{envFile}, spec, []string{home, "argument with ' quotes", filepath.Join(workdir, filepath.FromSlash(spec.RemotePath))}))
+				run.Dir = root
+				run.Env = env
+				output, err := run.CombinedOutput()
+				if err != nil || !strings.Contains(string(output), "uploaded-script-executed") {
+					t.Fatalf("uploaded script execution after startup cd: %v\n%s", err, output)
+				}
+			})
+		}
 	}
 }
 

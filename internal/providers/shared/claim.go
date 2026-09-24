@@ -13,6 +13,25 @@ import (
 
 var ErrStrictClaimMismatch = errors.New("strict claim identifier mismatch")
 
+// PreserveClaimIdentityLabels clones observations without granting new cleanup
+// authority: protected values must come from the recorded claim. It returns the
+// first conflicting key in caller order; adapters own the resulting diagnostic.
+func PreserveClaimIdentityLabels(observed, recorded map[string]string, keys ...string) (map[string]string, string) {
+	labels := CloneLabels(observed)
+	for _, key := range keys {
+		stored := recorded[key]
+		if current := labels[key]; stored != "" && current != "" && current != stored {
+			return nil, key
+		}
+		if stored != "" {
+			labels[key] = stored
+		} else {
+			delete(labels, key)
+		}
+	}
+	return labels, ""
+}
+
 type ClaimBinding struct {
 	Provider, ProviderScope, LeaseID, Slug, CloudID string
 	RequiredLabels                                  map[string]string
@@ -34,6 +53,50 @@ type ScopedLeaseFinishOptions struct {
 	Reclaim                         bool
 	IdleTimeout                     time.Duration
 	ValidateClaim                   func(core.LeaseClaim) error
+}
+
+// AdmitResolvedLease authorizes activity on the observed claim and conditionally
+// commits repository admission. Callers own eligibility, provider identity checks,
+// and projection of the returned committed claim; observations must not call this.
+func AdmitResolvedLease(cfg core.Config, req core.ResolveRequest, target core.LeaseTarget, slug string, expected core.LeaseClaim, exists bool, idleOverride *time.Duration) (core.LeaseClaim, error) {
+	if exists {
+		if err := AuthorizeClaimActivity(expected); err != nil {
+			return core.LeaseClaim{}, err
+		}
+	}
+	return core.ClaimLeaseTargetForRepoConfigWithIdleTimeoutOverrideIfUnchanged(target.LeaseID, slug, cfg, target.Server, target.SSH, req.Repo.Root, cfg.IdleTimeout, idleOverride, req.Reclaim, expected, exists)
+}
+
+// RefreshRetainedLeaseActivity refreshes an existing claim after an admitted
+// delegated run. The caller retains its provider operation lock; this does not
+// perform admission or replace the core's recorded idle-timeout policy.
+func RefreshRetainedLeaseActivity(leaseID, provider string, idleTimeout time.Duration) error {
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		return err
+	}
+	if claim.LeaseID == "" {
+		return nil
+	}
+	if idleTimeout <= 0 {
+		idleTimeout = time.Duration(claim.IdleTimeoutSeconds) * time.Second
+	}
+	return core.ClaimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, provider, claim.ProviderScope, claim.Pond, claim.RepoRoot, idleTimeout, false)
+}
+
+// ValidateSandboxOwnershipMetadata checks the common remote sandbox markers.
+// Endpoint admission and binding the response ID to a requested resource remain
+// caller-owned; missing metadata keys retain their existing empty-value semantics.
+func ValidateSandboxOwnershipMetadata(provider, sandboxID string, metadata map[string]string, claim core.LeaseClaim) error {
+	if sandboxID == "" {
+		return core.Exit(5, "%s returned a sandbox without an id", provider)
+	}
+	if metadata["crabbox.provider"] != provider ||
+		metadata["crabbox.scope"] != claim.ProviderScope ||
+		metadata["crabbox.claim"] != claim.LeaseID {
+		return core.Exit(4, "%s sandbox %q ownership metadata does not match its local claim", provider, sandboxID)
+	}
+	return nil
 }
 
 // ValidateClaimBinding checks non-empty structural fields and exact required labels, including empty label values.
@@ -80,14 +143,9 @@ func RequireExactClaim(want ClaimBinding) (core.LeaseClaim, error) {
 	return claim, nil
 }
 
-// RemoveExactClaimAfter keeps the exact claim fenced until the provider action
-// succeeds and its durable ownership record has been removed.
-func RemoveExactClaimAfter(claim core.LeaseClaim, want ClaimBinding, action func() error) error {
-	return RemoveExactClaimAfterContext(context.Background(), claim, want, action)
-}
-
-// RemoveExactClaimAfterContext also bounds waiting for the exact claim fence.
+// RemoveExactClaimAfterContext validates the binding and waits for the claim fence with ctx.
 // The action must honor ctx itself and must not reenter claim operations.
+// Successful actions still complete durable claim removal after cancellation.
 func RemoveExactClaimAfterContext(ctx context.Context, claim core.LeaseClaim, want ClaimBinding, action func() error) error {
 	if err := ValidateClaimBinding(claim, want); err != nil {
 		return core.Exit(2, "%s lease=%s has a stale exact local ownership claim: %v", want.Provider, want.LeaseID, err)
@@ -217,4 +275,36 @@ func CloneLabels(labels map[string]string) map[string]string {
 		clone = map[string]string{}
 	}
 	return clone
+}
+
+// LabelsWithDefaults copies labels and fills missing or empty values. Whitespace
+// is a stored value, and an empty default still creates the corresponding key.
+func LabelsWithDefaults(labels, defaults map[string]string) map[string]string {
+	labels = CloneLabels(labels)
+	for key, value := range defaults {
+		if labels[key] == "" {
+			labels[key] = value
+		}
+	}
+	return labels
+}
+
+// IndexProviderClaims indexes stored snapshots using adapter-owned resource
+// keys. Empty keys are skipped and later snapshots win duplicate keys. The
+// index is a lookup aid; it does not grant ownership or mutation authority.
+func IndexProviderClaims(provider string, key func(core.LeaseClaim) string) (map[string]core.LeaseClaim, error) {
+	claims, err := core.ListLeaseClaims()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]core.LeaseClaim{}
+	for _, claim := range claims {
+		if claim.Provider != provider {
+			continue
+		}
+		if name := key(claim); name != "" {
+			out[name] = claim
+		}
+	}
+	return out, nil
 }

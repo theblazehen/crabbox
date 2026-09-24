@@ -60,6 +60,10 @@ Config keys under `linode:`:
 | `firewall` | `cfg.Linode.FirewallID` | empty | Optional numeric existing Linode firewall id to attach at create time. |
 | `sshCIDRs` | `cfg.Linode.SSHCIDRs` | empty | Reserved for firewall-aware follow-up work; Phase 1 does not create firewall rules. |
 
+Acquisition trims the selected native type. A blank explicit `--type` falls back
+to `linode.type`, then the class default. The create request, lease metadata, and
+recovery records use that same resolved type.
+
 The portable `--os ubuntu:24.04` selector maps to `linode/ubuntu24.04`. Linode
 does not currently offer the portable default Ubuntu 26.04 image in this
 provider, so provisioning with an explicit `--os ubuntu:26.04` is rejected
@@ -154,6 +158,22 @@ also require an exact local claim for the same Linode account, lease, and
 instance id. Linodes with partial, foreign, malformed, claimless, or mismatched
 ownership are skipped or refused; a claimless Linode must first be adopted
 through explicit supported `--reclaim` reuse.
+
+After instance deletion or confirmed absence, cleanup removes generated SSH
+credentials and host-trust files before retiring the local claim, under the same
+unchanged-claim lock. Provider or SSH-artifact cleanup failures retain the claim
+for retry; a retry after successful instance deletion only finalizes local state.
+Terminal cleanup honors caller cancellation while waiting for the claim lock;
+confirmed successful deletion still completes local finalization.
+
+Failed acquisition uses the same cleanup sequence after recording an exact
+recovery claim. Incomplete cleanup is reported alongside the acquisition error
+and prevents a fresh allocation retry. If another claim already exists, rollback
+still deletes the instance created by this attempt, but preserves that claim and
+the SSH files instead of replacing or retiring another owner's local state.
+Rollback remains independent of acquisition cancellation. Its existing
+30-second provider-deletion timeout starts after claim-lock admission; this is
+not a deadline for the entire recovery-claim and finalization sequence.
 
 Heartbeat and Tailscale metadata updates require the same exact account- and
 instance-bound local claim. Crabbox holds the claim lock while updating Linode

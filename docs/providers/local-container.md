@@ -87,6 +87,45 @@ If the command supplies stderr, Crabbox includes its bounded diagnostic in the
 error so daemon startup failures are not hidden behind an empty-identity message.
 These failures stop acquisition before a lease or container is created.
 
+### Initial image evidence
+
+Docker and Podman runs record the configured creation reference separately from
+the actual container's full runtime image ID. The optional `imageEvidence`
+object appears in timing JSON and retained `inspect --json` output; the context
+block, emitted Markdown proof, and opt-in local history expose the same snapshot.
+Saved timing, proof, and local-history records remain readable after cleanup.
+`machineType` and `serverType` keep their existing display-image meanings.
+
+`configuredReference` is the creation reference, not a later invocation's image
+override. `runtimeImageId` is the runtime-reported container image ID, or an empty
+string when unavailable. `repositoryDigests` is a sorted, deduplicated array of
+repository digest references reported by local image inspection using that ID.
+It is never inferred from a tag, a bare digest, or a registry lookup. A pinned
+input digest and the runtime image ID may identify different image objects.
+
+`repositoryDigestStatus` is `available` for a nonempty reported list,
+`unavailable` for a successful empty or null list, and `unknown` when observation
+fails or the image ID is absent. Empty lists serialize as `[]`. An optional
+metadata query is bounded to two seconds; failure warns without changing the
+workload or cleanup result. Caller cancellation still cancels the operation.
+Locally built or tagged images can have repository digests: only observed
+metadata determines availability.
+
+The first validated container inspection is captured into the existing pending
+claim publication before SSH bootstrap completes. During the brief initial
+pending phase before that durable observation, inspection omits `imageEvidence`
+rather than returning a temporary live digest list. Once published, inspection
+and the completed run retain that same snapshot throughout bootstrap, even if
+the runtime's repository-digest list changes in the meantime.
+
+Retained claims keep the snapshot bound to the container and image IDs. Reuse
+preserves it; readiness and cleanup do not perform extra image queries. Older
+claims can be observed when resolved for use. Other providers and old saved run
+records without an observation omit the whole object. This is unsigned evidence
+of the initial image, not an attestation of the container's writable filesystem;
+signed receipts and checkpoint identities are unchanged. Image selection,
+pull policy, architecture, and lifecycle behavior are unchanged.
+
 ### Fixed-ID replay
 
 ```sh
@@ -331,7 +370,7 @@ state; the original removal failure is not converted into success.
    login profile. Profiles added after bootstrap can prepend to or intentionally
    replace that baseline; the profile selected during bootstrap keeps its final
    managed restore block.
-4. With `--desktop`, the container installs and starts Xvfb, XFCE, x11vnc,
+4. With `--desktop`, the container installs and starts resize-capable TigerVNC, XFCE,
    xdotool, screenshot tools, ffmpeg, noVNC, and websockify — no systemd
    required.
 5. With `--browser`, the container preserves a working Chrome, Chromium, Firefox
@@ -369,6 +408,25 @@ state; the original removal failure is not converted into success.
 12. If a local claim remains after its container was removed outside Crabbox,
    `crabbox stop --provider docker <lease-or-slug>` removes the stale claim and
    stored SSH key.
+
+The cleanup sweep admits an old claim without a recorded scope only strictly
+after its idle timeout plus twelve hours. It still verifies the captured runtime
+identity and container absence, preserves claims from another scope, and retains
+stored SSH keys when removing orphan claims. Legacy admission and ordinary
+claimed-container cleanup share the same strict expiry rule.
+
+Endpoint discovery has a 30-second budget covering runtime inspections and
+100 ms waits between attempts. Earlier caller cancellation stops discovery;
+terminal container observations still fail immediately. This budget is separate
+from the subsequent SSH bootstrap readiness wait.
+
+During SSH bootstrap readiness, each exact-container inspection has its own
+30-second limit, including the initial check, periodic checks, and final check
+after SSH succeeds or fails. Earlier caller cancellation still applies. These
+inspection limits are separate from the SSH timeout, so initial and final
+checks can add bounded time to the operation. A failed final diagnostic check
+does not replace the original SSH error unless it observes a terminal or
+replacement container.
 
 When `warmup` or `run --keep` creates the container but SSH readiness is
 canceled, fails, or times out, Crabbox keeps the exact pending claim, container,
@@ -479,14 +537,21 @@ history/log evidence when available, then stops only the lease it created. It
 uses `--ttl 15m --idle-timeout 5m` and the same cleanup path as normal
 `crabbox stop --provider local-container`.
 
-For lower-level Docker-backed E2E coverage, run:
+For lower-level Docker-backed E2E coverage, build the CLI first and point
+`CRABBOX_BIN` at it with an absolute path. Its concurrency subtest drives that
+exact binary, so it fails without one:
 
 ```sh
-go test -tags localcontainer ./cmd/crabbox
+go build -trimpath -o "$PWD/bin/crabbox" ./cmd/crabbox
+CRABBOX_BIN="$PWD/bin/crabbox" go test -tags localcontainer ./cmd/crabbox
 ```
 
 Set `CRABBOX_LOCAL_CONTAINER_E2E_IMAGE` to use a prebuilt image for faster
 startup. The test skips when the Docker CLI or daemon is unavailable.
+The Local Container CI job runs this native test after the CLI smoke and rejects
+a skipped result. It verifies warmup and SSH reuse, then independently checks
+that the container, lease claim, SSH key, and bootstrap directory are absent
+after stopping the lease.
 
 ## Related
 

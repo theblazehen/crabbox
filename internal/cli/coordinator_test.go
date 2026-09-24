@@ -41,6 +41,32 @@ func TestCoordinatorMachineIDAcceptsStringOrNumber(t *testing.T) {
 	}
 }
 
+func TestCoordinatorLeasePreservesSelectedImageRevision(t *testing.T) {
+	for _, revision := range []string{"", "selected-revision"} {
+		t.Run(revision, func(t *testing.T) {
+			input := `{"id":"cbx_test","image":{"id":"ami-11111111","source":"promoted","region":"us-east-1","promotedAt":"2026-09-01T00:00:00Z"`
+			if revision != "" {
+				input += `,"revision":"` + revision + `"`
+			}
+			input += `}}`
+			var lease CoordinatorLease
+			if err := json.Unmarshal([]byte(input), &lease); err != nil {
+				t.Fatal(err)
+			}
+			if lease.Image == nil || lease.Image.Revision != revision {
+				t.Fatalf("image revision was not preserved: %#v", lease.Image)
+			}
+			encoded, err := json.Marshal(lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), `"revision"`) != (revision != "") {
+				t.Fatalf("optional image revision changed on encoding: %s", encoded)
+			}
+		})
+	}
+}
+
 func TestSplitCurlResponseParsesTrailingStatus(t *testing.T) {
 	body, status, err := splitCurlResponse([]byte("{\"ok\":true}\n200"))
 	if err != nil {
@@ -1481,30 +1507,29 @@ func TestCoordinatorCreateLeaseSendsAWSSSHCIDRs(t *testing.T) {
 
 	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
 	_, err := client.CreateLease(context.Background(), Config{
-		Provider:            "google",
-		OSImage:             "ubuntu:26.04",
-		osImageExplicit:     true,
-		ServerType:          "t3.small",
-		ServerTypeExplicit:  true,
-		HostID:              "h-000000000001",
-		AWSSnapshot:         "snap-123",
-		AWSSSHCIDRs:         []string{"198.51.100.7/32"},
-		AzureLocation:       "eastus",
-		AzureImage:          "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
-		azureImageExplicit:  true,
-		AzureSnapshot:       "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/checkpoint",
-		AzureOSDisk:         "managed",
-		AzureOSDiskExplicit: true,
-		GCPProject:          "crabbox-project",
-		gcpProjectExplicit:  true,
-		GCPZone:             "europe-west2-b",
-		GCPImage:            "projects/custom/global/images/crabbox",
-		GCPNetwork:          "crabbox-net",
-		GCPTags:             []string{"crabbox-ci"},
-		GCPSSHCIDRs:         []string{"198.51.100.11/32"},
-		GCPSnapshot:         "projects/crabbox-project/global/snapshots/checkpoint",
-		GCPRootGB:           900,
-		SSHFallbackPorts:    []string{"22", "2022"},
+		Provider:           "google",
+		OSImage:            "ubuntu:26.04",
+		osImageExplicit:    true,
+		ServerType:         "t3.small",
+		ServerTypeExplicit: true,
+		HostID:             "h-000000000001",
+		AWSSnapshot:        "snap-123",
+		AWSSSHCIDRs:        []string{"198.51.100.7/32"},
+		Azure: AzureConfig{
+			Location:       "eastus",
+			Image:          "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
+			imageExplicit:  true,
+			Snapshot:       "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/checkpoint",
+			OSDisk:         "managed",
+			OSDiskExplicit: true,
+		},
+		GCP: GCPConfig{
+			Project: "crabbox-project", projectExplicit: true, Zone: "europe-west2-b",
+			Image: "projects/custom/global/images/crabbox", Network: "crabbox-net",
+			Tags: []string{"crabbox-ci"}, SSHCIDRs: []string{"198.51.100.11/32"},
+			Snapshot: "projects/crabbox-project/global/snapshots/checkpoint", RootGB: 900,
+		},
+		SSHFallbackPorts: []string{"22", "2022"},
 		Capacity: CapacityConfig{
 			Market:   "spot",
 			Strategy: "most-available",
@@ -1737,13 +1762,15 @@ func TestCoordinatorCreateLeaseForwardsOnlyExplicitAzureImage(t *testing.T) {
 
 			client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
 			_, err := client.CreateLease(context.Background(), Config{
-				Provider:           "azure",
-				AzureLocation:      "eastus",
-				AzureImage:         defaultAzureLinuxImage,
-				azureImageExplicit: tc.explicit,
-				SSHFallbackPorts:   []string{"22"},
-				TTL:                time.Hour,
-				IdleTimeout:        30 * time.Minute,
+				Provider: "azure",
+				Azure: AzureConfig{
+					Location:      "eastus",
+					Image:         defaultAzureLinuxImage,
+					imageExplicit: tc.explicit,
+				},
+				SSHFallbackPorts: []string{"22"},
+				TTL:              time.Hour,
+				IdleTimeout:      30 * time.Minute,
 			}, "ssh-ed25519 test", false, "cbx_123", "blue-crab")
 			if err != nil {
 				t.Fatal(err)
@@ -1772,10 +1799,12 @@ func TestCoordinatorCreateLeaseOmitsDefaultAzureOSDisk(t *testing.T) {
 
 	client := CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
 	_, err := client.CreateLease(context.Background(), Config{
-		Provider:         "azure",
-		AzureLocation:    "eastus",
-		AzureImage:       defaultAzureLinuxImage,
-		AzureOSDisk:      AzureOSDiskManaged,
+		Provider: "azure",
+		Azure: AzureConfig{
+			Location: "eastus",
+			Image:    defaultAzureLinuxImage,
+			OSDisk:   AzureOSDiskManaged,
+		},
 		SSHFallbackPorts: []string{"22"},
 		TTL:              time.Hour,
 		IdleTimeout:      30 * time.Minute,
@@ -1819,8 +1848,8 @@ func TestCoordinatorCreateLeaseOmitsAmbientGCPProject(t *testing.T) {
 	if _, err := client.CreateLease(context.Background(), cfg, "ssh-ed25519 test", false, "cbx_123", "blue-crab"); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.GCPProject != "developer-adc-project" {
-		t.Fatalf("test setup project=%q", cfg.GCPProject)
+	if cfg.GCP.Project != "developer-adc-project" {
+		t.Fatalf("test setup project=%q", cfg.GCP.Project)
 	}
 	if _, ok := body["gcpProject"]; ok {
 		t.Fatalf("ambient ADC project should be omitted so coordinator defaults apply: %#v", body)
@@ -2564,6 +2593,52 @@ func TestImagePromoteOrdinaryOutputCompatibility(t *testing.T) {
 	}
 	if _, ok := decoded["variantSelectors"]; ok {
 		t.Fatalf("ordinary JSON gained variantSelectors: %s", jsonOut.String())
+	}
+}
+
+func TestImagePromoteRetainedQualificationScope(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query(); got.Get("provider") != "aws" ||
+			got.Get("target") != "linux" || got.Get("region") != "us-east-1" ||
+			got.Get("serverType") != "t3.small" || got.Get("architecture") != "x86_64" ||
+			got.Get("os") != "ubuntu:24.04" {
+			t.Errorf("retained qualification promotion scope=%v", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, body)
+		_, _ = w.Write([]byte(`{"image":{"id":"ami-11111111","revision":"candidate"},"previous":{"state":"absent","aliases":[{"alias":"regional","state":"absent"}]}}`))
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+
+	scope := []string{"--provider", "aws", "--target", "linux", "--region", "us-east-1",
+		"--type", "t3.small", "--architecture", "x86_64", "--os", "ubuntu:24.04"}
+	var out bytes.Buffer
+	app := App{Stdout: &out, Stderr: io.Discard}
+	args := append([]string{"ami-11111111"}, scope...)
+	args = append(args, "--json", "--expected-current-image", "capture")
+	if err := app.imagePromote(context.Background(), args); err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(t.TempDir(), "promotion.json")
+	if err := os.WriteFile(receiptPath, out.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args = append(append([]string{}, scope...), "--json", "--restore-receipt", receiptPath, "ami-11111111")
+	if err := app.imagePromote(context.Background(), args); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[1]["restorePrevious"] == nil ||
+		requests[1]["retireExpectedCatalog"] != true {
+		t.Fatalf("retained promotion/restore requests=%#v", requests)
 	}
 }
 

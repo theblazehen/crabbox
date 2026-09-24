@@ -7,6 +7,7 @@ import (
 	"time"
 
 	nomadapi "github.com/hashicorp/nomad/api"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const (
@@ -39,17 +40,6 @@ func claimScope(cfg Config) string {
 		"region:" + normalizeRegion(cfg.Nomad.Region),
 		"task:" + strings.TrimSpace(cfg.Nomad.Task),
 	}, "|")
-}
-
-func writeNomadClaim(cfg Config, leaseID, slug string, repo Repo, reclaim bool, ready allocationReadiness, expiresAt time.Time) (LeaseClaim, error) {
-	if err := claimLeaseForRepoProviderScopePond(leaseID, slug, providerName, claimScope(cfg), cfg.Pond, repo.Root, cfg.IdleTimeout, reclaim); err != nil {
-		return LeaseClaim{}, err
-	}
-	claim, err := readLeaseClaim(leaseID)
-	if err != nil {
-		return LeaseClaim{}, err
-	}
-	return updateLeaseClaimLabelsIfUnchanged(leaseID, claim, claimLabels(cfg, leaseID, slug, ready, expiresAt))
 }
 
 func claimLabels(cfg Config, leaseID, slug string, ready allocationReadiness, expiresAt time.Time) map[string]string {
@@ -96,6 +86,9 @@ func resolveNomadClaim(cfg Config, id string) (LeaseClaim, error) {
 }
 
 func authorizeClaimScope(cfg Config, claim LeaseClaim) error {
+	if _, err := registrationState(claim); err != nil {
+		return err
+	}
 	if claim.Provider != "" && claim.Provider != providerName {
 		return exit(2, "lease %s belongs to provider=%s, not %s", claim.LeaseID, claim.Provider, providerName)
 	}
@@ -118,6 +111,9 @@ func listNomadLeaseClaims() ([]LeaseClaim, error) {
 }
 
 func validateRemoteOwnership(cfg Config, claim LeaseClaim, job *nomadapi.Job) error {
+	if _, err := registrationState(claim); err != nil {
+		return err
+	}
 	if job == nil {
 		return exit(4, "nomad job for lease %s is missing or inaccessible", claim.LeaseID)
 	}
@@ -152,9 +148,9 @@ func claimCleanupDue(claim LeaseClaim, now time.Time) (bool, string) {
 			return true, "ttl_expired"
 		}
 	}
-	if claim.IdleTimeoutSeconds > 0 && claim.LastUsedAt != "" {
+	if idle, valid := shared.PositiveIdleDuration(claim.IdleTimeoutSeconds); valid && claim.LastUsedAt != "" {
 		usedAt, err := time.Parse(time.RFC3339, claim.LastUsedAt)
-		if err == nil && !usedAt.Add(time.Duration(claim.IdleTimeoutSeconds)*time.Second).After(now) {
+		if err == nil && !usedAt.Add(idle).After(now) {
 			return true, "idle_expired"
 		}
 	}

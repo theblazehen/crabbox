@@ -28,44 +28,20 @@ func defaultAzureDynamicSessionsConfig() AzureDynamicSessionsConfig {
 
 // AzureDynamicSessionsConfigApplied records accepted assignments during one application.
 type AzureDynamicSessionsConfigApplied struct {
-	Endpoint bool
+	InputAccepted bool
+	Endpoint      bool
 }
 
 func (cfg *AzureDynamicSessionsConfig) applyFile(file *fileAzureDynamicSessionsConfig) (AzureDynamicSessionsConfigApplied, error) {
 	var applied AzureDynamicSessionsConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.Endpoint != "" {
-		cfg.Endpoint = file.Endpoint
-		applied.Endpoint = true
-	}
-	if file.Pool != "" {
-		cfg.Pool = file.Pool
-	}
-	if file.APIVersion != "" {
-		cfg.APIVersion = file.APIVersion
-	}
-	if file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	if file.TimeoutSecs > 0 {
-		cfg.TimeoutSecs = file.TimeoutSecs
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "azure-dynamic-sessions")
+	return applied, err
 }
 
 func (cfg *AzureDynamicSessionsConfig) applyEnv() (AzureDynamicSessionsConfigApplied, error) {
 	var applied AzureDynamicSessionsConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_AZURE_DYNAMIC_SESSIONS_ENDPOINT"); ok {
-		cfg.Endpoint = value
-		applied.Endpoint = true
-	}
-	cfg.Pool = getenv("CRABBOX_AZURE_DYNAMIC_SESSIONS_POOL", cfg.Pool)
-	cfg.APIVersion = getenv("CRABBOX_AZURE_DYNAMIC_SESSIONS_API_VERSION", cfg.APIVersion)
-	cfg.Workdir = getenv("CRABBOX_AZURE_DYNAMIC_SESSIONS_WORKDIR", cfg.Workdir)
-	cfg.TimeoutSecs = getenvInt("CRABBOX_AZURE_DYNAMIC_SESSIONS_TIMEOUT_SECS", cfg.TimeoutSecs)
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 5)
+	return applied, err
 }
 
 // AzureDynamicSessionsConfigFlagValues holds parsed values; only visited flags are applied.
@@ -78,12 +54,9 @@ type AzureDynamicSessionsConfigFlagValues struct {
 
 // RegisterAzureDynamicSessionsConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterAzureDynamicSessionsConfigFlags(fs *flag.FlagSet, defaults AzureDynamicSessionsConfig) AzureDynamicSessionsConfigFlagValues {
-	return AzureDynamicSessionsConfigFlagValues{
-		Endpoint:    fs.String("azure-dynamic-sessions-endpoint", defaults.Endpoint, "Azure Container Apps Dynamic Sessions pool management endpoint"),
-		APIVersion:  fs.String("azure-dynamic-sessions-api-version", defaults.APIVersion, "Azure Dynamic Sessions management API version"),
-		Workdir:     fs.String("azure-dynamic-sessions-workdir", defaults.Workdir, "Absolute working directory inside the Dynamic Sessions sandbox"),
-		TimeoutSecs: fs.Int("azure-dynamic-sessions-timeout-secs", defaults.TimeoutSecs, "Command timeout in seconds"),
-	}
+	var values AzureDynamicSessionsConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // AzureDynamicSessionsConfigVisitedFlags records raw flag visits, independently of application.
@@ -93,27 +66,14 @@ type AzureDynamicSessionsConfigVisitedFlags struct {
 
 // AzureDynamicSessionsConfigFlagPresence reports visits for tracked flag bindings.
 func AzureDynamicSessionsConfigFlagPresence(fs *flag.FlagSet) AzureDynamicSessionsConfigVisitedFlags {
-	return AzureDynamicSessionsConfigVisitedFlags{
-		Endpoint: flagWasSet(fs, "azure-dynamic-sessions-endpoint"),
-	}
+	var visited AzureDynamicSessionsConfigVisitedFlags
+	recordConfigFlagVisits[AzureDynamicSessionsConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values AzureDynamicSessionsConfigFlagValues) Apply(cfg *AzureDynamicSessionsConfig, fs *flag.FlagSet) AzureDynamicSessionsConfigApplied {
+func (values AzureDynamicSessionsConfigFlagValues) Apply(cfg *AzureDynamicSessionsConfig, fs *flag.FlagSet) (AzureDynamicSessionsConfigApplied, error) {
 	var applied AzureDynamicSessionsConfigApplied
-	visited := AzureDynamicSessionsConfigFlagPresence(fs)
-	if visited.Endpoint {
-		cfg.Endpoint = *values.Endpoint
-		applied.Endpoint = true
-	}
-	if flagWasSet(fs, "azure-dynamic-sessions-api-version") {
-		cfg.APIVersion = *values.APIVersion
-	}
-	if flagWasSet(fs, "azure-dynamic-sessions-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "azure-dynamic-sessions-timeout-secs") {
-		cfg.TimeoutSecs = *values.TimeoutSecs
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

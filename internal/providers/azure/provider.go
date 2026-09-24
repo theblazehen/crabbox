@@ -28,13 +28,15 @@ type flagValues struct {
 
 var classProfiles = buildClassProfiles()
 
-func (Provider) Name() string      { return "azure" }
-func (Provider) Aliases() []string { return nil }
 func (Provider) RoutingFlagNames() []string {
 	return []string{"azure-backend"}
 }
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication: core.ProviderAuthentication{
+			{Route: "direct", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSDKCredentials}, Description: "Direct access uses explicit Azure SDK credentials or DefaultAzureCredential."},
+			{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "The client authenticates to the coordinator; cloud credentials remain server-side."},
+		},
 		Name:   "azure",
 		Family: "azure",
 		Kind:   core.ProviderKindSSHLease,
@@ -50,26 +52,29 @@ func (Provider) Spec() core.ProviderSpec {
 }
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return flagValues{
-		Backend:     fs.String("azure-backend", defaults.AzureBackend, "Azure backend: vm or dynamic-sessions"),
-		OSDisk:      fs.String("azure-os-disk", defaults.AzureOSDisk, "Azure OS disk mode: managed, ephemeral, ephemeral-preview, or auto"),
-		SnapshotSKU: fs.String("azure-snapshot-sku", defaults.AzureSnapshotSKU, "Azure checkpoint snapshot storage SKU"),
-		OSDiskSKU:   fs.String("azure-os-disk-sku", defaults.AzureOSDiskSKU, "Azure managed OS disk storage SKU"),
+		Backend:     fs.String("azure-backend", defaults.Azure.Backend, "Azure backend: vm or dynamic-sessions"),
+		OSDisk:      fs.String("azure-os-disk", defaults.Azure.OSDisk, "Azure OS disk mode: managed, ephemeral, ephemeral-preview, or auto"),
+		SnapshotSKU: fs.String("azure-snapshot-sku", defaults.Azure.SnapshotSKU, "Azure checkpoint snapshot storage SKU"),
+		OSDiskSKU:   fs.String("azure-os-disk-sku", defaults.Azure.OSDiskSKU, "Azure managed OS disk storage SKU"),
 	}
 }
 
 func (Provider) RouteConfig(cfg *core.Config, fs *flag.FlagSet, values any) error {
-	backend := cfg.AzureBackend
+	backend := cfg.Azure.Backend
+	acceptedBackend := false
 	if fs != nil && core.FlagWasSet(fs, "azure-backend") {
 		flags, _ := values.(flagValues)
 		if flags.Backend != nil {
 			backend = *flags.Backend
+			acceptedBackend = true
 		}
 	}
 	normalized, err := core.NormalizeAzureBackend(backend)
 	if err != nil {
 		return core.Exit(2, "%s", err)
 	}
-	cfg.AzureBackend = normalized
+	cfg.Azure.Backend = normalized
+	core.RecordProviderFlagInputs(cfg, acceptedBackend, "azure")
 	if normalized == core.AzureBackendDynamicSessions {
 		cfg.Provider = "azure-dynamic-sessions"
 	} else {
@@ -85,7 +90,7 @@ func (p Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) err
 			return err
 		}
 	}
-	if cfg.Provider != p.Name() {
+	if cfg.Provider != p.Spec().Name {
 		return nil
 	}
 	flags, _ := values.(flagValues)
@@ -94,40 +99,48 @@ func (p Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) err
 		if err != nil {
 			return err
 		}
-		cfg.AzureOSDisk = mode
-		cfg.AzureOSDiskExplicit = true
+		cfg.Azure.OSDisk = mode
+		core.RecordProviderFlagInputs(cfg, true, "azure")
+		cfg.Azure.OSDiskExplicit = true
 	}
-	if cfg.AzureOSDisk != "" {
-		mode, err := core.NormalizeAzureOSDiskMode(cfg.AzureOSDisk)
+	if cfg.Azure.OSDisk != "" {
+		mode, err := core.NormalizeAzureOSDiskMode(cfg.Azure.OSDisk)
 		if err != nil {
 			return err
 		}
-		cfg.AzureOSDisk = mode
+		cfg.Azure.OSDisk = mode
 	}
 	if core.FlagWasSet(fs, "azure-snapshot-sku") && flags.SnapshotSKU != nil {
-		cfg.AzureSnapshotSKU = *flags.SnapshotSKU
+		cfg.Azure.SnapshotSKU = *flags.SnapshotSKU
+		core.RecordProviderFlagInputs(cfg, true, "azure")
 	}
-	if cfg.AzureSnapshotSKU != "" {
-		sku, err := core.NormalizeAzureSnapshotSKU(cfg.AzureSnapshotSKU)
+	if cfg.Azure.SnapshotSKU != "" {
+		sku, err := core.NormalizeAzureSnapshotSKU(cfg.Azure.SnapshotSKU)
 		if err != nil {
 			return err
 		}
-		cfg.AzureSnapshotSKU = sku
+		cfg.Azure.SnapshotSKU = sku
 	}
 	if core.FlagWasSet(fs, "azure-os-disk-sku") && flags.OSDiskSKU != nil {
-		cfg.AzureOSDiskSKU = *flags.OSDiskSKU
+		cfg.Azure.OSDiskSKU = *flags.OSDiskSKU
+		core.RecordProviderFlagInputs(cfg, true, "azure")
 	}
-	if cfg.AzureOSDiskSKU != "" {
-		sku, err := core.NormalizeAzureDiskSKU(cfg.AzureOSDiskSKU)
+	if cfg.Azure.OSDiskSKU != "" {
+		sku, err := core.NormalizeAzureDiskSKU(cfg.Azure.OSDiskSKU)
 		if err != nil {
 			return err
 		}
-		cfg.AzureOSDiskSKU = sku
+		cfg.Azure.OSDiskSKU = sku
 	}
 	return nil
 }
 
 func (Provider) PrepareLeaseClaimEndpoint(existing core.LeaseClaim, provider, slug string, server core.Server, allowProviderMetadata bool) (core.Server, error) {
+	if existing.FixedCreateIntent != nil {
+		if err := validateFixedAzureServer(existing, server); err != nil {
+			return core.Server{}, err
+		}
+	}
 	_ = allowProviderMetadata
 	if provider != "azure" {
 		return core.Server{}, core.Exit(2, "refusing to rewrite Azure lease=%s as provider=%s", existing.LeaseID, provider)
@@ -144,17 +157,9 @@ func (Provider) PrepareLeaseClaimEndpoint(existing core.LeaseClaim, provider, sl
 	if existing.CloudImmutableID == "" {
 		server.ImmutableID = ""
 	}
-	labels := make(map[string]string, len(server.Labels))
-	for key, value := range server.Labels {
-		labels[key] = value
-	}
-	if existingValue := existing.Labels["provider_key"]; existingValue != "" {
-		if cloudValue := labels["provider_key"]; cloudValue != "" && cloudValue != existingValue {
-			return core.Server{}, core.Exit(2, "refusing to rewrite Azure lease=%s with mismatched provider_key", existing.LeaseID)
-		}
-		labels["provider_key"] = existingValue
-	} else {
-		delete(labels, "provider_key")
+	labels, conflict := shared.PreserveClaimIdentityLabels(server.Labels, existing.Labels, "provider_key")
+	if conflict != "" {
+		return core.Server{}, core.Exit(2, "refusing to rewrite Azure lease=%s with mismatched provider_key", existing.LeaseID)
 	}
 	server.Labels = labels
 	return server, nil
@@ -171,10 +176,6 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 		return ""
 	}
 	return candidates[0]
-}
-
-func (Provider) ServerTypeForClass(class string) string {
-	return azureVMSizeCandidatesForClass(class)[0]
 }
 
 func (Provider) ClassProfiles() []core.ProviderClassProfile {
@@ -299,16 +300,12 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return NewAzureLeaseBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return shared.ConfigureDoctor("azure", func() (core.Backend, error) { return p.Configure(cfg, rt) })
-}
-
 func (Provider) NativeCheckpointCapability(req core.NativeCheckpointRequest) (core.NativeCheckpointCapability, bool) {
 	if req.Server.CloudID == "" {
 		return core.NativeCheckpointCapability{}, false
 	}
-	targetOS := firstNonBlank(req.Target.TargetOS, req.Config.TargetOS)
-	if targetOS == core.TargetWindows && firstNonBlank(req.Target.WindowsMode, req.Config.WindowsMode) == core.WindowsModeNormal {
+	targetOS := shared.FirstNonEmpty(req.Target.TargetOS, req.Config.TargetOS)
+	if targetOS == core.TargetWindows && shared.FirstNonEmpty(req.Target.WindowsMode, req.Config.WindowsMode) == core.WindowsModeNormal {
 		if core.NormalizeCheckpointStrategy(req.Strategy) == core.CheckpointStrategyImage {
 			return core.NativeCheckpointCapability{}, false
 		}
@@ -326,36 +323,32 @@ func (Provider) NativeCheckpointCapability(req core.NativeCheckpointRequest) (co
 	return core.NativeCheckpointCapability{Kind: core.CheckpointKindAzureOS, RetireSource: true}, true
 }
 
-func firstNonBlank(values ...string) string {
-	return shared.FirstNonEmpty(values...)
-}
-
 func (Provider) ApplyNativeCheckpointForkConfig(req core.NativeCheckpointForkRequest) error {
 	cfg := req.Config
 	switch req.Record.Kind {
 	case core.CheckpointKindAzure:
-		cfg.AzureImage = firstNonBlank(req.Record.Resource, req.Record.ImageID)
+		cfg.Azure.Image = shared.FirstNonEmpty(req.Record.Resource, req.Record.ImageID)
 	case core.CheckpointKindAzureOS:
-		cfg.AzureSnapshot = firstNonBlank(req.Record.Resource, req.Record.ImageID)
+		cfg.Azure.Snapshot = shared.FirstNonEmpty(req.Record.Resource, req.Record.ImageID)
 	default:
 		return core.Exit(2, "provider=azure does not support checkpoint kind=%s", req.Record.Kind)
 	}
 	if req.Record.Region != "" {
-		cfg.AzureLocation = req.Record.Region
+		cfg.Azure.Location = req.Record.Region
 	}
-	if resourceGroup := azureResourceGroup(firstNonBlank(req.Record.Resource, req.Record.ImageID)); resourceGroup != "" {
-		cfg.AzureResourceGroup = resourceGroup
+	if resourceGroup := azureResourceGroup(shared.FirstNonEmpty(req.Record.Resource, req.Record.ImageID)); resourceGroup != "" {
+		cfg.Azure.ResourceGroup = resourceGroup
 	}
-	if subscription := azureSubscription(firstNonBlank(req.Record.Resource, req.Record.ImageID)); subscription != "" {
-		cfg.AzureSubscription = subscription
+	if subscription := azureSubscription(shared.FirstNonEmpty(req.Record.Resource, req.Record.ImageID)); subscription != "" {
+		cfg.Azure.Subscription = subscription
 	}
 	if req.AzureOSDiskExplicit {
 		mode, err := core.NormalizeAzureOSDiskMode(req.AzureOSDisk)
 		if err != nil {
 			return err
 		}
-		cfg.AzureOSDisk = mode
-		cfg.AzureOSDiskExplicit = true
+		cfg.Azure.OSDisk = mode
+		cfg.Azure.OSDiskExplicit = true
 	}
 	return nil
 }
@@ -367,7 +360,7 @@ func (Provider) ApplyNativeCheckpointForkFlags(cfg *core.Config, fs *flag.FlagSe
 		if err != nil {
 			return err
 		}
-		cfg.AzureOSDiskSKU = sku
+		cfg.Azure.OSDiskSKU = sku
 	}
 	return nil
 }

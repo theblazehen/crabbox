@@ -34,62 +34,21 @@ func defaultOrgoConfig() OrgoConfig {
 
 // OrgoConfigApplied records accepted assignments during one application.
 type OrgoConfigApplied struct {
-	APIKey  bool
-	APIBase bool
+	InputAccepted bool
+	APIKey        bool
+	APIBase       bool
 }
 
 func (cfg *OrgoConfig) applyFile(file *fileOrgoConfig, trusted bool) (OrgoConfigApplied, error) {
 	var applied OrgoConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if trusted && file.APIKey != "" {
-		cfg.APIKey = file.APIKey
-		applied.APIKey = true
-	}
-	if file.APIBase != "" {
-		cfg.APIBase = file.APIBase
-		applied.APIBase = true
-	}
-	if file.WorkspaceID != "" {
-		cfg.WorkspaceID = file.WorkspaceID
-	}
-	if file.RAMGB > 0 {
-		cfg.RAMGB = file.RAMGB
-	}
-	if file.CPUs > 0 {
-		cfg.CPUs = file.CPUs
-	}
-	if file.DiskGB > 0 {
-		cfg.DiskGB = file.DiskGB
-	}
-	if file.Resolution != "" {
-		cfg.Resolution = file.Resolution
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, trusted, "orgo")
+	return applied, err
 }
 
 func (cfg *OrgoConfig) applyEnv() (OrgoConfigApplied, error) {
 	var applied OrgoConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_ORGO_API_KEY"); ok {
-		cfg.APIKey = value
-		applied.APIKey = true
-	} else if cfg.APIKey == "" {
-		if value, ok := firstNonEmptyEnv("ORGO_API_KEY"); ok {
-			cfg.APIKey = value
-			applied.APIKey = true
-		}
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_ORGO_API_BASE", "ORGO_API_BASE_URL"); ok {
-		cfg.APIBase = value
-		applied.APIBase = true
-	}
-	cfg.WorkspaceID = getenv("CRABBOX_ORGO_WORKSPACE_ID", getenv("ORGO_WORKSPACE_ID", cfg.WorkspaceID))
-	cfg.RAMGB = getenvInt("CRABBOX_ORGO_RAM_GB", cfg.RAMGB)
-	cfg.CPUs = getenvInt("CRABBOX_ORGO_CPUS", cfg.CPUs)
-	cfg.DiskGB = getenvInt("CRABBOX_ORGO_DISK_GB", cfg.DiskGB)
-	cfg.Resolution = getenv("CRABBOX_ORGO_RESOLUTION", cfg.Resolution)
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 7)
+	return applied, err
 }
 
 // OrgoConfigFlagValues holds parsed values; only visited flags are applied.
@@ -104,14 +63,9 @@ type OrgoConfigFlagValues struct {
 
 // RegisterOrgoConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterOrgoConfigFlags(fs *flag.FlagSet, defaults OrgoConfig) OrgoConfigFlagValues {
-	return OrgoConfigFlagValues{
-		APIBase:     fs.String("orgo-api-base", defaults.APIBase, "Orgo API base URL"),
-		WorkspaceID: fs.String("orgo-workspace-id", defaults.WorkspaceID, "Existing Orgo workspace ID to create computers in"),
-		RAMGB:       fs.Int("orgo-ram", defaults.RAMGB, "Orgo computer RAM in GB"),
-		CPUs:        fs.Int("orgo-cpu", defaults.CPUs, "Orgo computer CPU count"),
-		DiskGB:      fs.Int("orgo-disk", defaults.DiskGB, "Orgo computer disk size in GB"),
-		Resolution:  fs.String("orgo-resolution", defaults.Resolution, "Orgo desktop resolution, for example 1280x720x24"),
-	}
+	var values OrgoConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // OrgoConfigVisitedFlags records raw flag visits, independently of application.
@@ -121,33 +75,14 @@ type OrgoConfigVisitedFlags struct {
 
 // OrgoConfigFlagPresence reports visits for tracked flag bindings.
 func OrgoConfigFlagPresence(fs *flag.FlagSet) OrgoConfigVisitedFlags {
-	return OrgoConfigVisitedFlags{
-		APIBase: flagWasSet(fs, "orgo-api-base"),
-	}
+	var visited OrgoConfigVisitedFlags
+	recordConfigFlagVisits[OrgoConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values OrgoConfigFlagValues) Apply(cfg *OrgoConfig, fs *flag.FlagSet) OrgoConfigApplied {
+func (values OrgoConfigFlagValues) Apply(cfg *OrgoConfig, fs *flag.FlagSet) (OrgoConfigApplied, error) {
 	var applied OrgoConfigApplied
-	visited := OrgoConfigFlagPresence(fs)
-	if visited.APIBase {
-		cfg.APIBase = *values.APIBase
-		applied.APIBase = true
-	}
-	if flagWasSet(fs, "orgo-workspace-id") {
-		cfg.WorkspaceID = *values.WorkspaceID
-	}
-	if flagWasSet(fs, "orgo-ram") {
-		cfg.RAMGB = *values.RAMGB
-	}
-	if flagWasSet(fs, "orgo-cpu") {
-		cfg.CPUs = *values.CPUs
-	}
-	if flagWasSet(fs, "orgo-disk") {
-		cfg.DiskGB = *values.DiskGB
-	}
-	if flagWasSet(fs, "orgo-resolution") {
-		cfg.Resolution = *values.Resolution
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

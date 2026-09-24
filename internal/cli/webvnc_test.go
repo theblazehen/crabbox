@@ -592,7 +592,10 @@ func TestWebVNCWebSocketHeaderDeadlineNetwork(t *testing.T) {
 	})
 	run("upgraded session survives", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		var handlers sync.WaitGroup
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handlers.Add(1)
+			defer handlers.Done()
 			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				t.Error(err)
@@ -608,8 +611,12 @@ func TestWebVNCWebSocketHeaderDeadlineNetwork(t *testing.T) {
 				t.Error(err)
 			}
 		}))
-		t.Cleanup(server.Close)
-		t.Cleanup(cancel)
+		t.Cleanup(func() {
+			cancel()
+			server.Close()
+			// Server.Close does not join handlers for upgraded WebSockets.
+			handlers.Wait()
+		})
 		options, err := webVNCWebSocketDialOptions(nil)
 		if err != nil {
 			t.Fatal(err)
@@ -632,6 +639,7 @@ func TestWebVNCWebSocketHeaderDeadlineNetwork(t *testing.T) {
 		if err != nil || kind != websocket.MessageBinary || !bytes.Equal(got, payload) {
 			t.Fatalf("upgraded session failed after handshake limit: kind=%v payload=%q err=%v", kind, got, err)
 		}
+		handlers.Wait()
 		t.Log("actual upgraded websocket echoed data after 31 seconds")
 	})
 }
@@ -1086,7 +1094,7 @@ func TestMacOSWebVNCPortalConfigUsesStoredMultiTargetLease(t *testing.T) {
 	claimCfg := baseConfig()
 	claimCfg.Provider = "direct-webvnc-test"
 	claimCfg.TargetOS = targetMacOS
-	if err := claimLeaseTargetForRepoConfig(
+	if err := ClaimLeaseTargetForRepoConfig(
 		leaseID,
 		"macos-portal",
 		claimCfg,
@@ -1098,14 +1106,14 @@ func TestMacOSWebVNCPortalConfigUsesStoredMultiTargetLease(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	stored, exists, err := readLeaseClaimWithPresence(leaseID)
+	stored, exists, err := ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || !exists || stored.Labels["target"] != targetMacOS {
 		t.Fatalf("stored claim=%#v exists=%t err=%v", stored, exists, err)
 	}
 	foreignCfg := baseConfig()
 	foreignCfg.Provider = "local-container"
 	foreignCfg.TargetOS = targetLinux
-	if err := claimLeaseTargetForRepoConfig(
+	if err := ClaimLeaseTargetForRepoConfig(
 		"cbx_aaa_foreign",
 		"macos-portal",
 		foreignCfg,
@@ -1134,7 +1142,7 @@ func TestMacOSWebVNCPortalConfigUsesStoredMultiTargetLease(t *testing.T) {
 	if err := persistAutomaticCoordinatorRegistrationBinding(leaseID, &registrationServer, got, "https://broker.example.test"); err != nil {
 		t.Fatal(err)
 	}
-	stored, exists, err = readLeaseClaimWithPresence(leaseID)
+	stored, exists, err = ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || !exists || stored.CoordinatorRegistrationURL != "https://broker.example.test" {
 		t.Fatalf("persisted coordinator claim=%#v exists=%t err=%v", stored, exists, err)
 	}
@@ -1202,8 +1210,6 @@ func TestWebVNCBridgeArgsPreserveProviderRouting(t *testing.T) {
 
 type directWebVNCTestProvider struct{}
 
-func (directWebVNCTestProvider) Name() string      { return "direct-webvnc-test" }
-func (directWebVNCTestProvider) Aliases() []string { return nil }
 func (directWebVNCTestProvider) Spec() ProviderSpec {
 	return ProviderSpec{
 		Name:        "direct-webvnc-test",
@@ -1289,19 +1295,42 @@ func TestWebVNCPortalCredentialsPreserveParallelsVNCMode(t *testing.T) {
 }
 
 func TestWebVNCResetRemoteCommandHandlesWaylandAndX11(t *testing.T) {
-	got := webVNCResetRemoteCommand(SSHTarget{TargetOS: targetLinux})
-	for _, want := range []string{
-		"/var/lib/crabbox/desktop.env",
-		"/usr/local/bin/crabbox-start-desktop",
-		`CRABBOX_DESKTOP_ENV:-xfce`,
-		"crabbox-desktop.service crabbox-wayvnc.service",
-		"crabbox-xvfb.service crabbox-desktop.service crabbox-desktop-session.service",
-		"crabbox-desktop.service crabbox-x11vnc.service",
-		"crabbox-desktop-session.service crabbox-x11vnc.service",
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	for _, tc := range []struct{ mode, want string }{
+		{"wayland", "crabbox-desktop.service crabbox-wayvnc.service"},
+		{"tiger", "crabbox-xvfb.service crabbox-desktop.service"},
+		{"x11", "crabbox-desktop.service crabbox-x11vnc.service"},
 	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("reset command missing %q:\n%s", want, got)
-		}
+		t.Run(tc.mode, func(t *testing.T) {
+			dir := t.TempDir()
+			command := strings.NewReplacer(
+				"/var/lib/crabbox/desktop.env", filepath.Join(dir, "desktop.env"),
+				"/usr/local/bin/crabbox-start-desktop", filepath.Join(dir, "start-desktop"),
+			).Replace(webVNCResetRemoteCommand(SSHTarget{TargetOS: targetLinux}))
+			fixture := `sudo() { "$@"; }
+systemctl() {
+  if [ "$1" = cat ]; then
+    [ "$FIXTURE_MODE" = tiger ] && [ "$2" = crabbox-xvfb.service ] && { echo Xtigervnc; return; }
+    [ "$2" = crabbox-desktop.service ]; return
+  fi
+  [ "$1" = restart ] || return 2
+  shift
+  for unit in "$@"; do [ "$unit" != crabbox-desktop-session.service ] || return 3; done
+  printf '%s\n' "$*"
+}
+`
+			cmd := exec.Command("sh", "-c", fixture+command)
+			cmd.Env = []string{"PATH=/usr/bin:/bin", "FIXTURE_MODE=" + tc.mode}
+			if tc.mode == "wayland" {
+				cmd.Env = append(cmd.Env, "CRABBOX_DESKTOP_ENV=wayland")
+			}
+			out, err := cmd.CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != tc.want {
+				t.Fatalf("reset got %q, %v; want restarted session services %q", out, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -1495,7 +1524,7 @@ func TestDirectSSHWebVNCWSL2StagesLargeCommandBeforeZeroInputExecute(t *testing.
 	remotePath := filepath.Join(dir, "remote")
 	stdinPath := filepath.Join(dir, "stdin")
 	sshPath := filepath.Join(dir, "ssh")
-	script := "#!/bin/sh\nprintf '%s' \"$*\" > " + shellQuote(argvPath) + "\nlast=;for arg;do last=$arg;done\nprintf '%s' \"$last\" > " + shellQuote(remotePath) + "\ncat > " + shellQuote(stdinPath) + "\nprintf running\n"
+	script := "#!/bin/sh\n" + recordLegacyBashProbeShell(t, filepath.Join(dir, "prerequisites")) + "printf '%s' \"$*\" > " + shellQuote(argvPath) + "\nlast=;for arg;do last=$arg;done\nprintf '%s' \"$last\" > " + shellQuote(remotePath) + "\ncat > " + shellQuote(stdinPath) + "\nprintf running\n"
 	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1538,6 +1567,10 @@ func TestDirectSSHWebVNCWSL2StagesLargeCommandBeforeZeroInputExecute(t *testing.
 	if strings.Contains(decodePowerShellCommand(t, string(remoteArg)), "large-webvnc-command") {
 		t.Fatal("encoded launcher embeds the WebVNC payload")
 	}
+	if probes, err := os.ReadFile(filepath.Join(dir, "prerequisites")); err != nil || string(probes) != "probe\n" {
+		t.Fatalf("Bash prerequisite calls=%q err=%v, want one", probes, err)
+	}
+
 }
 
 func TestDirectSSHWebVNCNativeWindowsUsesLocalBridge(t *testing.T) {
@@ -1554,7 +1587,7 @@ func TestDirectSSHWebVNCNativeWindowsUsesLocalBridge(t *testing.T) {
 			t.Fatalf("target unexpectedly selected native Windows bridge: %#v", target)
 		}
 	}
-	command := powershellCommand(directSSHNoVNCRemoteCommand(directSSHWebVNCRemoteOwner{
+	command := PowershellCommand(directSSHNoVNCRemoteCommand(directSSHWebVNCRemoteOwner{
 		ID: strings.Repeat("01", sha256.Size), PreferredPort: "20001",
 	}))
 	if len(command) <= 8191 {
@@ -2417,7 +2450,7 @@ func TestNativeVNCFallbackCommandCarriesNetworkOverride(t *testing.T) {
 }
 
 func TestResolvedWebVNCCommandConfigPrefersResolvedLeaseProvider(t *testing.T) {
-	cfg := resolvedWebVNCCommandConfig(
+	cfg := desktopConfigForResolvedLease(
 		Config{Provider: "azure", TargetOS: targetLinux},
 		Server{Provider: "aws"},
 		SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeWSL2},
@@ -2435,7 +2468,7 @@ func TestResolvedWebVNCCommandConfigPrefersResolvedLeaseProvider(t *testing.T) {
 		t.Fatalf("bridge args=%q", bridge)
 	}
 
-	legacyMac := resolvedWebVNCCommandConfig(Config{Provider: "external"}, Server{Provider: "static"}, SSHTarget{TargetOS: targetMacOS})
+	legacyMac := desktopConfigForResolvedLease(Config{Provider: "external"}, Server{Provider: "static"}, SSHTarget{TargetOS: targetMacOS})
 	username, password := webVNCPortalCredentialsForDaemon(
 		legacyMac.Provider,
 		SSHTarget{TargetOS: targetMacOS},
@@ -2447,7 +2480,7 @@ func TestResolvedWebVNCCommandConfigPrefersResolvedLeaseProvider(t *testing.T) {
 	if username != "screen-user" || password != "screen-secret" {
 		t.Fatalf("persisted static provider lost legacy portal credentials=(%q,%q)", username, password)
 	}
-	externalMac := resolvedWebVNCCommandConfig(Config{Provider: "static"}, Server{Provider: "external"}, SSHTarget{TargetOS: targetMacOS})
+	externalMac := desktopConfigForResolvedLease(Config{Provider: "static"}, Server{Provider: "external"}, SSHTarget{TargetOS: targetMacOS})
 	username, password = webVNCPortalCredentialsForDaemon(
 		externalMac.Provider,
 		SSHTarget{TargetOS: targetMacOS},
@@ -2880,7 +2913,7 @@ func TestWebVNCDaemonStatusRequiresExactWorkspaceAndProcessIdentity(t *testing.T
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	nonce := "0123456789abcdef0123456789abcdef"
 	cmd := startTestWebVNCDaemonProcess(t, nonce)
-	started, err := webVNCDaemonProcessStartIdentity(cmd.Process.Pid)
+	started, err := LocalProcessStartIdentity(cmd.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2909,7 +2942,7 @@ func TestWebVNCDaemonStatusRequiresExactWorkspaceAndProcessIdentity(t *testing.T
 	if _, err := app.stopWebVNCDaemonIfRunning(t.Context(), "workspace-a"); err == nil {
 		t.Fatal("cross-workspace daemon stop was not refused")
 	}
-	if _, alive := webVNCDaemonProcessCommand(cmd.Process.Pid); !alive {
+	if _, alive := LocalProcessCommand(cmd.Process.Pid); !alive {
 		t.Fatal("cross-workspace daemon was killed")
 	}
 }
@@ -2918,7 +2951,7 @@ func TestWebVNCDaemonStopDoesNotSignalRecycledPID(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	nonce := "fedcba9876543210fedcba9876543210"
 	cmd := startTestWebVNCDaemonProcess(t, nonce)
-	started, err := webVNCDaemonProcessStartIdentity(cmd.Process.Pid)
+	started, err := LocalProcessStartIdentity(cmd.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2941,7 +2974,7 @@ func TestWebVNCDaemonStopDoesNotSignalRecycledPID(t *testing.T) {
 	if err == nil || stopped || !strings.Contains(err.Error(), "refusing to drop unverified") {
 		t.Fatalf("stale identity cleanup stopped=%t output=%q err=%v", stopped, stdout.String(), err)
 	}
-	if _, alive := webVNCDaemonProcessCommand(cmd.Process.Pid); !alive {
+	if _, alive := LocalProcessCommand(cmd.Process.Pid); !alive {
 		t.Fatal("recycled pid target was killed")
 	}
 	if _, err := os.Stat(pidPath); err != nil {
@@ -2953,7 +2986,7 @@ func TestWebVNCDaemonStopSignalsOnlyVerifiedIdentity(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	nonce := "00112233445566778899aabbccddeeff"
 	cmd := startTestWebVNCDaemonProcess(t, nonce)
-	started, err := webVNCDaemonProcessStartIdentity(cmd.Process.Pid)
+	started, err := LocalProcessStartIdentity(cmd.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2996,7 +3029,7 @@ func TestLegacyControllerOwnerTokenIdentityIsStaleButStoppable(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	nonce := "aabbccddeeff00112233445566778899"
 	cmd := startTestWebVNCDaemonProcess(t, nonce)
-	started, err := webVNCDaemonProcessStartIdentity(cmd.Process.Pid)
+	started, err := LocalProcessStartIdentity(cmd.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3048,7 +3081,7 @@ func startTestWebVNCDaemonProcess(t *testing.T, nonce string) *exec.Cmd {
 	})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		if command, alive := webVNCDaemonProcessCommand(cmd.Process.Pid); alive && strings.Contains(command, nonce) {
+		if command, alive := LocalProcessCommand(cmd.Process.Pid); alive && strings.Contains(command, nonce) {
 			return cmd
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -3059,7 +3092,7 @@ func startTestWebVNCDaemonProcess(t *testing.T, nonce string) *exec.Cmd {
 
 func currentProcessBootIdentityForTest(t *testing.T) string {
 	t.Helper()
-	bootID, err := processBootIdentity()
+	bootID, err := LocalProcessBootIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}

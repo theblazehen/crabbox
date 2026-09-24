@@ -15,17 +15,19 @@ func init() {
 
 type Provider struct{}
 
+func (Provider) NormalizeConfigForShow(cfg core.Config) core.Config {
+	core.ApplyConfigShowSSHDefaults(&cfg, "ubuntu")
+	return cfg
+}
+
 var classProfiles = buildClassProfiles()
 
 var _ core.ProviderClassProfileProvider = Provider{}
 
-func (Provider) Name() string { return providerName }
-func (Provider) Aliases() []string {
-	return []string{"tencent", "tencent-cvm", "cvm"}
-}
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Aliases:          []string{"tencent", "tencent-cvm", "cvm"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPICredentials),
 		Name:             providerName,
 		Family:           providerName,
 		Kind:             core.ProviderKindSSHLease,
@@ -62,8 +64,10 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 	if !ok {
 		return nil
 	}
-	core.MarkTencentCloudConfigApplied(cfg, v.Apply(&cfg.TencentCloud, fs))
-	return nil
+	applied, err := v.Apply(&cfg.TencentCloud, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	core.MarkTencentCloudConfigApplied(cfg, applied)
+	return err
 }
 
 func (Provider) ServerTypeForConfig(cfg core.Config) string {
@@ -73,10 +77,6 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
 	serverType := strings.TrimSpace(cfg.TencentCloud.Type)
 	return serverType, core.TencentCloudTypeWasExplicit(cfg) && serverType != ""
-}
-
-func (Provider) ServerTypeForClass(class string) string {
-	return serverTypeForClass(class)
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {

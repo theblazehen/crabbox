@@ -39,6 +39,16 @@ func newSSHTransportSession(ctx context.Context, target SSHTarget, localForward 
 		_ = os.RemoveAll(dir)
 		return nil, cause
 	}
+	if target.SSHConfigData != nil {
+		// ProxyJump also reads this snapshot; retain it until the session closes.
+		target.SSHConfigFile = filepath.Join(dir, "provider_config")
+		if err := os.WriteFile(target.SSHConfigFile, target.SSHConfigData, 0o600); err != nil {
+			return fail(fmt.Errorf("write provider SSH config snapshot: %w", err))
+		}
+		if err := secureSSHTransportPath(target.SSHConfigFile, false); err != nil {
+			return fail(fmt.Errorf("secure provider SSH config snapshot: %w", err))
+		}
+	}
 	userPercentExpansion := false
 	if strings.Contains(target.User, "%") {
 		userPercentExpansion, err = probeSSHTransportUserPercentExpansion(ctx, target, dir)
@@ -102,7 +112,7 @@ func newWSLSSHTransportSession(ctx context.Context, target SSHTarget, wslExe, mo
 	// user's config and authentication paths. newResolvedSSHCopySession keeps
 	// those targets out of WSL; enforce the same boundary for direct callers.
 	if target.SSHConfigProxy {
-		return nil, exit(2, "SSH config proxy routes require native OpenSSH")
+		return nil, Exit(2, "SSH config proxy routes require native OpenSSH")
 	}
 	dir, err := os.MkdirTemp("", "crabbox-ssh-transport-*")
 	if err != nil {
@@ -331,7 +341,7 @@ type sshTransportRouteCapabilities struct {
 }
 
 func resolveSSHTransportConfigRoute(ctx context.Context, target SSHTarget, localForward, userPercentExpansion bool) (_ sshTransportConfigRoute, err error) {
-	if !target.SSHConfigProxy {
+	if !target.SSHConfigProxy && target.SSHConfigFile == "" {
 		return sshTransportConfigRoute{}, nil
 	}
 	dir, err := os.MkdirTemp("", "crabbox-ssh-route-*")
@@ -343,8 +353,14 @@ func resolveSSHTransportConfigRoute(ctx context.Context, target SSHTarget, local
 		return sshTransportConfigRoute{}, fmt.Errorf("secure private SSH route directory: %w", err)
 	}
 	seedPath := filepath.Join(dir, "ssh_config")
-	userConfigPath := ""
-	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+	userConfigPath := target.SSHConfigFile
+	if userConfigPath != "" {
+		// Include silently ignores missing files. An explicit provider route must
+		// fail rather than falling back to ambient identities or a literal alias.
+		if _, readErr := os.ReadFile(userConfigPath); readErr != nil {
+			return sshTransportConfigRoute{}, fmt.Errorf("read explicit SSH config: %w", readErr)
+		}
+	} else if home, homeErr := os.UserHomeDir(); homeErr == nil {
 		candidate := filepath.Join(home, ".ssh", "config")
 		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
 			userConfigPath = candidate
@@ -379,11 +395,14 @@ func resolveSSHTransportConfigRoute(ctx context.Context, target SSHTarget, local
 		if cause := context.Cause(ctx); cause != nil {
 			return sshTransportConfigRoute{}, cause
 		}
-		diagnostic := strings.TrimSpace(redactSSHTransportDiagnostic(target, stderr.String()))
+		diagnostic := sshTransportRouteDiagnostic(target, stderr.String())
 		return sshTransportConfigRoute{}, fmt.Errorf("resolve OpenSSH route for %s: %w: %s", target.Host, err, diagnostic)
 	}
 	route := parseSSHTransportConfigRoute(stdout.String(), userConfigPath)
 	route.capabilities = capabilities
+	if target.SSHConfigFile != "" && !route.identitiesOnly {
+		return sshTransportConfigRoute{}, Exit(2, "explicit SSH config did not select a route with IdentitiesOnly yes; refresh provider authentication before retrying: %s", sshTransportRouteDiagnostic(target, stderr.String()))
+	}
 	if target.Key == "" {
 		route.identityFiles, err = resolveSSHTransportAuthenticationPaths(ctx, target, localForward, capabilities, seedPath, route.identityFiles)
 		if err != nil {
@@ -511,7 +530,7 @@ func resolveSSHTransportAuthenticationPaths(
 			if cause := context.Cause(ctx); cause != nil {
 				return nil, cause
 			}
-			diagnostic := strings.TrimSpace(redactSSHTransportDiagnostic(target, stderr.String()))
+			diagnostic := sshTransportRouteDiagnostic(target, stderr.String())
 			return nil, fmt.Errorf("resolve OpenSSH authentication path for %s: %w: %s", target.Host, err, diagnostic)
 		}
 		expanded, ok := parseSSHTransportControlPath(stdout.String())
@@ -521,6 +540,15 @@ func resolveSSHTransportAuthenticationPaths(
 		resolved = append(resolved, expanded)
 	}
 	return resolved, nil
+}
+
+func sshTransportRouteDiagnostic(target SSHTarget, value string) string {
+	// Redact before truncating so a credential crossing the limit cannot leak.
+	detail := strings.TrimSpace(redactSSHTransportDiagnostic(target, value))
+	if len(detail) > 4096 {
+		detail = detail[:4096] + "..."
+	}
+	return detail
 }
 
 func expandSSHTransportHomeToken(value, home string) string {
@@ -615,9 +643,7 @@ func waitOwnedSSHTransportCommand(ctx context.Context, handle *pondMeshExecHandl
 }
 
 func newOwnedSSHTransportCommand(ctx context.Context, target SSHTarget, args []string) *pondMeshExecHandle {
-	handle := pondMeshExecCommand(ctx, target.ChildEnvDenylist, directSSHExecutable(), args...).(*pondMeshExecHandle)
-	applyTargetChildEnvironment(handle.cmd, target)
-	return handle
+	return pondMeshExecCommand(ctx, target, directSSHExecutable(), args...)
 }
 
 func startOwnedSSHTransportSubsystem(ctx context.Context, target SSHTarget, connectTimeout, connectionAttempts, subsystem string, stderr io.Writer) (io.Reader, io.WriteCloser, func() error, error) {
@@ -852,7 +878,7 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 	if target.AuthSecret && !target.SSHConfigProxy && target.User != "" &&
 		(strings.Contains(proxyCommand, target.User) || strings.Contains(strings.ReplaceAll(proxyCommand, "%%", ""), "%r")) {
 		// A private config must not move the username into a proxy child's argv.
-		return "", exit(2, "managed SSH proxy command must not contain or expand the secret SSH user")
+		return "", Exit(2, "managed SSH proxy command must not contain or expand the secret SSH user")
 	}
 	proxyUseFDPass := route.proxyUseFDPass
 	if proxyCommand != "" {
@@ -909,7 +935,7 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 		"proxy command":    proxyCommand,
 	} {
 		if strings.ContainsAny(value, "\x00\r\n") {
-			return "", exit(2, "resolved SSH %s contains an unsupported control character", name)
+			return "", Exit(2, "resolved SSH %s contains an unsupported control character", name)
 		}
 		if name != "proxy command" {
 			if err := validateSSHTransportLiteralValue(name, value); err != nil {
@@ -931,7 +957,7 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 		}
 	}
 	if strings.TrimSpace(target.Host) == "" || strings.TrimSpace(target.User) == "" || strings.TrimSpace(target.Port) == "" {
-		return "", exit(2, "resolved SSH transport requires host, user, and port")
+		return "", Exit(2, "resolved SSH transport requires host, user, and port")
 	}
 
 	var b strings.Builder
@@ -953,13 +979,13 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 		writeSSHTransportLiteralConfigValue(&b, "UserKnownHostsFile", "/dev/null")
 		b.WriteString("  LogLevel ERROR\n")
 	} else {
-		if target.HostKeyAlias != "" || strings.TrimSpace(target.SSHHostKey) != "" {
+		if target.HostKeyAlias != "" || strings.TrimSpace(target.SSHHostKey) != "" || target.AuthoritativeKnownHosts {
 			b.WriteString("  StrictHostKeyChecking yes\n")
 		} else {
 			b.WriteString("  StrictHostKeyChecking accept-new\n")
 		}
 		writeSSHTransportLiteralConfigValue(&b, "UserKnownHostsFile", knownHostsFile(target))
-		if strings.TrimSpace(target.SSHHostKey) != "" {
+		if strings.TrimSpace(target.SSHHostKey) != "" || target.AuthoritativeKnownHosts {
 			b.WriteString("  GlobalKnownHostsFile none\n")
 			b.WriteString("  KnownHostsCommand none\n")
 			b.WriteString("  VerifyHostKeyDNS no\n")
@@ -987,7 +1013,7 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 	if hostKeyAlias != "" {
 		writeSSHTransportLiteralConfigValue(&b, "HostKeyAlias", hostKeyAlias)
 	}
-	if target.HostKeyAlias != "" || strings.TrimSpace(target.SSHHostKey) != "" {
+	if !target.AuthoritativeKnownHosts && (target.HostKeyAlias != "" || strings.TrimSpace(target.SSHHostKey) != "") {
 		writeSSHTransportLiteralConfigValue(&b, "HostKeyAlgorithms", sshHostKeyAlgorithms(target))
 	}
 	if proxyCommand != "" {
@@ -1040,23 +1066,23 @@ func sshTransportDirectiveExpandsPercent(name string) bool {
 
 func validateSSHTransportLiteralValue(name, value string) error {
 	if strings.ContainsAny(value, "\x00\r\n") {
-		return exit(2, "resolved SSH %s contains an unsupported control character", name)
+		return Exit(2, "resolved SSH %s contains an unsupported control character", name)
 	}
 	if strings.Contains(value, "${") {
-		return exit(2, "resolved SSH %s contains unsupported OpenSSH environment expansion syntax", name)
+		return Exit(2, "resolved SSH %s contains unsupported OpenSSH environment expansion syntax", name)
 	}
 	if strings.Contains(value, `"`) {
-		return exit(2, "resolved SSH %s contains an unsupported double quote", name)
+		return Exit(2, "resolved SSH %s contains an unsupported double quote", name)
 	}
 	return nil
 }
 
 func validateSSHTransportRoutedAuthenticationPath(name, value string) error {
 	if strings.ContainsAny(value, "\x00\r\n") {
-		return exit(2, "resolved SSH %s contains an unsupported control character", name)
+		return Exit(2, "resolved SSH %s contains an unsupported control character", name)
 	}
 	if strings.Contains(value, `"`) {
-		return exit(2, "resolved SSH %s contains an unsupported double quote", name)
+		return Exit(2, "resolved SSH %s contains an unsupported double quote", name)
 	}
 	return nil
 }
@@ -1073,7 +1099,7 @@ func validateSSHCommandTokenValue(name, value string) error {
 		case '.', '_', '-', ':', '@', '+', '=', ',', '/', '\\', '%':
 			continue
 		}
-		return exit(2, "resolved SSH %s contains a character unsafe for ProxyCommand expansion", name)
+		return Exit(2, "resolved SSH %s contains a character unsafe for ProxyCommand expansion", name)
 	}
 	return nil
 }
@@ -1119,7 +1145,7 @@ func (a App) probeSSHTransportLeaseAfterClaim(ctx context.Context, cfg Config, l
 	if err != nil {
 		return err
 	}
-	if err := a.claimLeaseTargetForRepoAndRegister(ctx, lease.LeaseID, serverSlug(lease.Server), cfg, &lease.Server, lease.SSH, boundary.root, reclaim); err != nil {
+	if err := a.claimLeaseTargetForRepoAndRegister(ctx, lease.LeaseID, ServerSlug(lease.Server), cfg, &lease.Server, lease.SSH, boundary.root, reclaim); err != nil {
 		return err
 	}
 	lease.Server = a.touchLeaseTargetBestEffort(ctx, cfg, *lease, "")

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -335,10 +334,8 @@ func (b *Backend) targetFromInstance(item instance, req core.ResolveRequest, acc
 	}
 	cfg := cfgForRun(b.Cfg)
 	ssh := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
-	if keyPath, err := core.TestboxKeyPath(leaseID); err == nil {
-		if _, statErr := os.Stat(keyPath); statErr == nil {
-			ssh.Key = keyPath
-		}
+	if err := core.UseStoredTestboxKey(&ssh, leaseID); err != nil {
+		return core.LeaseTarget{}, err
 	}
 	if req.Repo.Root != "" {
 		if _, err := core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, labels["slug"], cfg, server, ssh, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, claim, claimExists); err != nil {
@@ -397,10 +394,8 @@ func (b *Backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server
 	cfg := b.Cfg
 	if req.IdleTimeout > 0 {
 		cfg.IdleTimeout = req.IdleTimeout
-		delete(labels, "idle_timeout")
-		delete(labels, "idle_timeout_secs")
 	}
-	labels = core.TouchDirectLeaseLabels(labels, cfg, req.State, b.clockNow())
+	labels = core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(labels, cfg, req.State, b.clockNow(), req.IdleTimeoutOverride)
 	if err := client.ReplaceInstanceTags(ctx, server.CloudID, item.Tags, tagsFromLabels(labels)); err != nil {
 		return core.Server{}, err
 	}
@@ -428,7 +423,7 @@ func (b *Backend) UpdateTailscaleMetadata(ctx context.Context, lease core.LeaseT
 	if accountID := strings.TrimSpace(server.Labels[accountLabel]); accountID != "" {
 		labels[accountLabel] = accountID
 	}
-	applyTailscaleMetadata(labels, meta)
+	shared.ApplyTailscaleMetadata(labels, meta)
 	if err := client.ReplaceInstanceTags(ctx, server.CloudID, item.Tags, tagsFromLabels(labels)); err != nil {
 		return core.Server{}, err
 	}
@@ -484,7 +479,7 @@ func (b *Backend) deleteServer(ctx context.Context, _ core.Config, server core.S
 	if snapshot, _, set := core.ServerLeaseClaimSnapshot(server); set {
 		claim = snapshot
 	}
-	if err := shared.RemoveExactClaimAfter(claim, binding, func() error {
+	if err := shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
 		client, err := b.clientFactory(b.Cfg, b.RT)
 		if err != nil {
 			return err
@@ -559,7 +554,7 @@ func serverFromInstance(item instance, cfg core.Config) core.Server {
 		Labels:   labels,
 	}
 	server.PublicNet.IPv4.IP = publicIPv4(item)
-	server.ServerType.Name = firstNonBlank(item.InstanceType, cfg.ServerType, serverTypeForConfig(cfg))
+	server.ServerType.Name = shared.FirstNonBlankTrimmed(item.InstanceType, cfg.ServerType, serverTypeForConfig(cfg))
 	return server
 }
 

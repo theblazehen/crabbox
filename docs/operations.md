@@ -355,7 +355,8 @@ CRABBOX_PUBLIC_URL=https://broker.example.com \
 npm run start:node --prefix worker
 ```
 
-Or build the OCI image with `worker/` as context:
+Or build the OCI image with `worker/` as context. The image uses Node.js 24 LTS,
+matching `.node-version`; direct installations still support Node.js 22.12+:
 
 ```sh
 docker build -f worker/Dockerfile.node -t crabbox-coordinator:local worker
@@ -441,6 +442,12 @@ service account, or `DAYTONA_CRABBOX_KEY`. Node additionally requires
 `DATABASE_URL`.
 
 GitHub OAuth start routes remain unauthenticated so a new user can bootstrap login.
+GitHub membership verification shares a 15-second deadline across account, organization, and team-page requests, including response bodies. A stalled check fails closed and releases its shared in-flight entry so later requests can retry; it never extends an expired success-cache entry.
+OAuth uses the same deadline owner: code exchange gets its own 15-second budget,
+and each post-exchange attempt shares 15 seconds across identity, verified-email,
+and membership lookups. Code exchange is never automatically retried; a timeout
+leaves its remote outcome unknown and may require a new login. Post-exchange
+verification retains the existing single retry and encrypted credential reuse.
 The coordinator limits active attempts to ten per caller source and 100 globally for
 both CLI and portal login, after removing expired attempts. Node deployments behind a
 reverse proxy must configure `CRABBOX_TRUSTED_PROXY_CIDRS`; otherwise caller limits use
@@ -651,9 +658,10 @@ as the primary safety rails, and size fleet/org monthly caps with enough room
 for TTL-based reservations during busy test bursts.
 
 Managed checkpoint limits are independent of lease cost accounting. The
-shipped Cloudflare production and preview configuration sets checkpoint caps
-to 20 globally, 10 per owner, and 20 per organization; claim caps retain their
-16/64/256 defaults. Creation and use reject excess work transactionally with
+shipped Cloudflare production configuration sets checkpoint caps to 100
+globally, per owner, and per organization. Preview caps remain 20 globally,
+10 per owner, and 20 per organization; claim caps retain their 16/64/256
+defaults. Creation and use reject excess work transactionally with
 HTTP 429 `checkpoint_limit_exceeded` or `checkpoint_claim_limit_exceeded`.
 Checkpoint events retain only the most recent 256 transitions, so operators
 must not interpret the event endpoint as complete checkpoint lifetime history.
@@ -732,13 +740,38 @@ preparation state, which older workers reject safely.
 
 Trusted operators can use `crabbox admin release` or `crabbox admin delete --force` for stuck leases.
 
-After AWS credential or account rotation, scan old provider accounts directly for Crabbox-tagged EC2 instances that the current coordinator can no longer see:
+Direct AWS cleanup uses one immutable credential snapshot for STS identity, EC2
+observation, termination confirmation, and owned SSH-key deletion. The separate
+image-qualification authority binds a fixed account and Region policy and runs
+immediate STS checks around protected operations; its signer may refresh
+credentials between operations. Empty inventory can complete direct cleanup
+only for leases that persisted the matching 12-digit account scope and explicit
+Region. Historical unbound leases remain cleanupable when the instance is still
+present with exact Crabbox lease labels, but an empty lookup is intentionally
+inconclusive. Administrators can use [audited legacy AWS recovery](commands/inspect.md#audited-legacy-aws-cleanup-recovery)
+when authenticated CloudTrail allocation evidence proves the original scope and
+an exact current read confirms absence. It restores scope and schedules normal
+remaining cleanup, not a deletion receipt. There is no override that turns
+missing account or Region evidence into proof of deletion.
+
+After AWS credential or account rotation, scan old provider accounts directly
+for Crabbox-tagged EC2 instances that the current coordinator can no longer see:
 
 ```sh
 scripts/aws-crabbox-orphan-audit.sh --profile old-crabbox-account
 ```
 
-The audit is read-only. It skips `keep=true` instances, protects active coordinator leases by lease tag or EC2 instance ID, and applies the same grace window as the broker sweep before reporting stale labels. The script intentionally refuses `--terminate`: a local AWS scan cannot atomically lock coordinator lease state before deleting an instance. For broker-owned accounts, use the coordinator AWS orphan sweep below. For rotated legacy accounts, treat the JSON output as investigation evidence and delete through an explicit operator or infrastructure workflow only after confirming no active coordinator can still claim the instance.
+The audit is read-only. It skips `keep=true` instances, protects active
+coordinator leases by lease tag or EC2 instance ID, and applies the same grace
+window as the broker sweep before reporting stale labels. The script
+intentionally refuses `--terminate`: a local AWS scan cannot atomically lock
+coordinator lease state before deleting an instance. For broker-owned accounts,
+restore the lease's original account and Region credentials and retry
+coordinator cleanup. For rotated legacy accounts, treat the JSON output as
+investigation evidence and delete through an explicit operator or infrastructure
+workflow only after confirming no active coordinator can still claim the
+instance. Do not clear the retained cleanup fields or local access evidence to
+force completion.
 
 Direct-provider cleanup is only for debug mode without a coordinator:
 

@@ -42,83 +42,21 @@ func defaultTensorlakeConfig() TensorlakeConfig {
 
 // TensorlakeConfigApplied records accepted assignments during one application.
 type TensorlakeConfigApplied struct {
-	APIKey bool
-	APIURL bool
+	InputAccepted bool
+	APIKey        bool
+	APIURL        bool
 }
 
 func (cfg *TensorlakeConfig) applyFile(file *fileTensorlakeConfig) (TensorlakeConfigApplied, error) {
 	var applied TensorlakeConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.APIURL != "" {
-		cfg.APIURL = file.APIURL
-		applied.APIURL = true
-	}
-	if file.CLIPath != "" {
-		cfg.CLIPath = file.CLIPath
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-	}
-	if file.Snapshot != "" {
-		cfg.Snapshot = file.Snapshot
-	}
-	if file.OrganizationID != "" {
-		cfg.OrganizationID = file.OrganizationID
-	}
-	if file.ProjectID != "" {
-		cfg.ProjectID = file.ProjectID
-	}
-	if file.Namespace != "" {
-		cfg.Namespace = file.Namespace
-	}
-	if file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	if file.CPUs > 0 {
-		cfg.CPUs = file.CPUs
-	}
-	if file.MemoryMB > 0 {
-		cfg.MemoryMB = file.MemoryMB
-	}
-	if file.DiskMB > 0 {
-		cfg.DiskMB = file.DiskMB
-	}
-	if file.TimeoutSecs > 0 {
-		cfg.TimeoutSecs = file.TimeoutSecs
-	}
-	if file.NoInternet != nil {
-		cfg.NoInternet = *file.NoInternet
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "tensorlake")
+	return applied, err
 }
 
 func (cfg *TensorlakeConfig) applyEnv() (TensorlakeConfigApplied, error) {
 	var applied TensorlakeConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_TENSORLAKE_API_KEY", "TENSORLAKE_API_KEY"); ok {
-		cfg.APIKey = value
-		applied.APIKey = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_TENSORLAKE_API_URL", "TENSORLAKE_API_URL"); ok {
-		cfg.APIURL = value
-		applied.APIURL = true
-	}
-	cfg.CLIPath = getenv("CRABBOX_TENSORLAKE_CLI", cfg.CLIPath)
-	cfg.Image = getenv("CRABBOX_TENSORLAKE_IMAGE", cfg.Image)
-	cfg.Snapshot = getenv("CRABBOX_TENSORLAKE_SNAPSHOT", cfg.Snapshot)
-	cfg.OrganizationID = getenv("CRABBOX_TENSORLAKE_ORGANIZATION_ID", getenv("TENSORLAKE_ORGANIZATION_ID", cfg.OrganizationID))
-	cfg.ProjectID = getenv("CRABBOX_TENSORLAKE_PROJECT_ID", getenv("TENSORLAKE_PROJECT_ID", cfg.ProjectID))
-	cfg.Namespace = getenv("CRABBOX_TENSORLAKE_NAMESPACE", getenv("INDEXIFY_NAMESPACE", cfg.Namespace))
-	cfg.Workdir = getenv("CRABBOX_TENSORLAKE_WORKDIR", cfg.Workdir)
-	cfg.CPUs = getenvFloat("CRABBOX_TENSORLAKE_CPUS", cfg.CPUs)
-	cfg.MemoryMB = getenvInt("CRABBOX_TENSORLAKE_MEMORY_MB", cfg.MemoryMB)
-	cfg.DiskMB = getenvInt("CRABBOX_TENSORLAKE_DISK_MB", cfg.DiskMB)
-	cfg.TimeoutSecs = getenvInt("CRABBOX_TENSORLAKE_TIMEOUT_SECS", cfg.TimeoutSecs)
-	if value, ok := getenvBool("CRABBOX_TENSORLAKE_NO_INTERNET"); ok {
-		cfg.NoInternet = value
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 14)
+	return applied, err
 }
 
 // TensorlakeConfigFlagValues holds parsed values; only visited flags are applied.
@@ -140,21 +78,9 @@ type TensorlakeConfigFlagValues struct {
 
 // RegisterTensorlakeConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterTensorlakeConfigFlags(fs *flag.FlagSet, defaults TensorlakeConfig) TensorlakeConfigFlagValues {
-	return TensorlakeConfigFlagValues{
-		APIURL:         fs.String("tensorlake-api-url", defaults.APIURL, "Tensorlake API base URL"),
-		CLIPath:        fs.String("tensorlake-cli", defaults.CLIPath, "Path to the tensorlake CLI binary"),
-		Image:          fs.String("tensorlake-image", defaults.Image, "Tensorlake sandbox image name"),
-		Snapshot:       fs.String("tensorlake-snapshot", defaults.Snapshot, "Tensorlake snapshot ID to restore from"),
-		OrganizationID: fs.String("tensorlake-organization-id", defaults.OrganizationID, "Tensorlake organization ID"),
-		ProjectID:      fs.String("tensorlake-project-id", defaults.ProjectID, "Tensorlake project ID"),
-		Namespace:      fs.String("tensorlake-namespace", defaults.Namespace, "Tensorlake namespace"),
-		Workdir:        fs.String("tensorlake-workdir", defaults.Workdir, "Absolute working directory inside the sandbox (also used as sync target)"),
-		CPUs:           fs.Float64("tensorlake-cpus", defaults.CPUs, "Tensorlake sandbox CPU count"),
-		MemoryMB:       fs.Int("tensorlake-memory-mb", defaults.MemoryMB, "Tensorlake sandbox memory in MB"),
-		DiskMB:         fs.Int("tensorlake-disk-mb", defaults.DiskMB, "Tensorlake sandbox root disk in MB"),
-		TimeoutSecs:    fs.Int("tensorlake-timeout-secs", defaults.TimeoutSecs, "Tensorlake sandbox lifetime timeout in seconds"),
-		NoInternet:     fs.Bool("tensorlake-no-internet", defaults.NoInternet, "Block outbound internet from the sandbox"),
-	}
+	var values TensorlakeConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // TensorlakeConfigVisitedFlags records raw flag visits, independently of application.
@@ -164,54 +90,14 @@ type TensorlakeConfigVisitedFlags struct {
 
 // TensorlakeConfigFlagPresence reports visits for tracked flag bindings.
 func TensorlakeConfigFlagPresence(fs *flag.FlagSet) TensorlakeConfigVisitedFlags {
-	return TensorlakeConfigVisitedFlags{
-		APIURL: flagWasSet(fs, "tensorlake-api-url"),
-	}
+	var visited TensorlakeConfigVisitedFlags
+	recordConfigFlagVisits[TensorlakeConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values TensorlakeConfigFlagValues) Apply(cfg *TensorlakeConfig, fs *flag.FlagSet) TensorlakeConfigApplied {
+func (values TensorlakeConfigFlagValues) Apply(cfg *TensorlakeConfig, fs *flag.FlagSet) (TensorlakeConfigApplied, error) {
 	var applied TensorlakeConfigApplied
-	visited := TensorlakeConfigFlagPresence(fs)
-	if visited.APIURL {
-		cfg.APIURL = *values.APIURL
-		applied.APIURL = true
-	}
-	if flagWasSet(fs, "tensorlake-cli") {
-		cfg.CLIPath = *values.CLIPath
-	}
-	if flagWasSet(fs, "tensorlake-image") {
-		cfg.Image = *values.Image
-	}
-	if flagWasSet(fs, "tensorlake-snapshot") {
-		cfg.Snapshot = *values.Snapshot
-	}
-	if flagWasSet(fs, "tensorlake-organization-id") {
-		cfg.OrganizationID = *values.OrganizationID
-	}
-	if flagWasSet(fs, "tensorlake-project-id") {
-		cfg.ProjectID = *values.ProjectID
-	}
-	if flagWasSet(fs, "tensorlake-namespace") {
-		cfg.Namespace = *values.Namespace
-	}
-	if flagWasSet(fs, "tensorlake-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "tensorlake-cpus") {
-		cfg.CPUs = *values.CPUs
-	}
-	if flagWasSet(fs, "tensorlake-memory-mb") {
-		cfg.MemoryMB = *values.MemoryMB
-	}
-	if flagWasSet(fs, "tensorlake-disk-mb") {
-		cfg.DiskMB = *values.DiskMB
-	}
-	if flagWasSet(fs, "tensorlake-timeout-secs") {
-		cfg.TimeoutSecs = *values.TimeoutSecs
-	}
-	if flagWasSet(fs, "tensorlake-no-internet") {
-		cfg.NoInternet = *values.NoInternet
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

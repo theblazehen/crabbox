@@ -35,9 +35,16 @@ at `root@<publicIp>:<publicPort>` and uses its standard SSH transport. RunPod's
 basic SSH proxy is not used, because rsync needs the SCP/SFTP support the proxy
 lacks.
 
-**SSH auth is public-key only.** Upload your ED25519 public key on the RunPod
-settings page once; RunPod injects it into every pod you launch. Crabbox does
-not manage that key.
+SSH-endpoint discovery has a ten-minute budget covering both API requests and
+jittered retry waits. Caller cancellation stops discovery and retains its error
+cause; a completed provider response is not replaced by a simultaneous
+cancellation. An independent API-client timeout remains a request failure.
+
+**SSH auth is public-key only.** Crabbox reads the public key matching its
+configured SSH key and supplies it to the pod as `PUBLIC_KEY`. The default image
+installs that key for SSH; a custom image must honor `PUBLIC_KEY` and start SSH.
+Provide an existing key with `ssh.key` in config or `CRABBOX_SSH_KEY`; the default is
+`~/.ssh/id_ed25519`. A matching public-key file must exist alongside it.
 
 ### Lifecycle
 
@@ -54,6 +61,26 @@ not manage that key.
   names, and legacy claims alone cannot terminate a pod.
 - **Doctor** — runs read-only identity and pod-list checks; it never creates a
   pod, so it is safe to run on every CI invocation.
+
+The local claim owns heartbeat activity, idle timeout, creation time, TTL, and
+keep policy. Read-only status and list preserve recorded lifecycle values without
+renewing the claim or replacing them with current configuration. Unclaimed pods
+have no inferred lifecycle history; explicit adoption initializes that policy.
+Native stopped or failed state still takes precedence over stored activity.
+After a native restart, a saved runtime stop/failure no longer masks the running
+pod. Logical deletion and expiry holds remain intact.
+
+An ordinary heartbeat preserves the recorded idle timeout. An explicit
+`--idle-timeout` commits the new timeout together with activity, without extending
+the recorded creation-based TTL. Missing or stale claim snapshots, cancellation,
+and changed pod identity are errors rather than successful updates. Earlier
+releases returned heartbeat changes without persisting them; repeat an intended
+timeout change after upgrading if it was not recorded in the claim.
+
+Release uses the exact claim observed during acquisition or resolution. If that
+claim changes before deletion, release refuses the stale target without deleting
+the pod; resolve it again before retrying. It never substitutes a newer claim for
+the observed one.
 
 ## Capabilities
 
@@ -187,8 +214,6 @@ it directly in RunPod.
 - A funded RunPod account is required. `crabbox doctor --provider runpod`
   succeeds on a zero-balance account because it only reads the pod list — the
   balance shortfall only surfaces when an `Acquire` runs.
-- Upload your ED25519 public key to RunPod once before any pod bootstrap will
-  accept your SSH session.
 - The pod's public SSH port is allocated at runtime and changes between pods;
   never hard-code `--ssh-port`.
 - RunPod's basic SSH proxy is not a Crabbox transport, because rsync needs

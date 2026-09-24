@@ -1,7 +1,6 @@
 package vast
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
@@ -113,11 +113,11 @@ type vastAttachSSHKeyResponse struct {
 }
 
 type vastOfferSearchInput struct {
-	Config VastConfig
+	Config core.VastConfig
 }
 
 type vastCreateInstanceInput struct {
-	Config      VastConfig
+	Config      core.VastConfig
 	Label       string
 	SSHKey      string
 	Environment map[string]string
@@ -129,18 +129,18 @@ type vastManageInstanceInput struct {
 	Label string `json:"label,omitempty"`
 }
 
-func newVastClient(cfg VastConfig, rt Runtime) (vastAPI, error) {
+func newVastClient(cfg core.VastConfig, rt core.Runtime) (vastAPI, error) {
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	if apiKey == "" {
-		return nil, exit(2, "provider=%s requires CRABBOX_VAST_API_KEY or VAST_API_KEY", providerName)
+		return nil, core.Exit(2, "provider=%s requires CRABBOX_VAST_API_KEY or VAST_API_KEY", providerName)
 	}
 	apiURL := strings.TrimRight(strings.TrimSpace(cfg.APIURL), "/")
 	parsed, err := url.Parse(apiURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil {
-		return nil, exit(2, "vast.apiUrl must be an absolute URL without credentials")
+		return nil, core.Exit(2, "vast.apiUrl must be an absolute URL without credentials")
 	}
 	if parsed.Scheme != "https" && !isLoopbackHTTPURL(parsed) {
-		return nil, exit(2, "vast.apiUrl must use https unless it targets localhost")
+		return nil, core.Exit(2, "vast.apiUrl must use https unless it targets localhost")
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
@@ -154,19 +154,11 @@ func vastRedirectError(destination *url.URL) error {
 }
 
 func (c *vastClient) do(ctx context.Context, method, path string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(data)
-	}
 	endpoint := c.apiURL + path
 	if parsed, err := url.Parse(path); err == nil && parsed.IsAbs() {
 		endpoint = path
 	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
+	req, err := shared.NewCompactJSONRequest(ctx, method, endpoint, body)
 	if err != nil {
 		return err
 	}
@@ -177,7 +169,7 @@ func (c *vastClient) do(ctx context.Context, method, path string, body any, out 
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return redactVastString(err.Error(), c.apiKey)
+		return shared.ExitErrorWithCause(1, redactVastText(err.Error(), c.apiKey), err)
 	}
 	defer resp.Body.Close()
 	data, readErr := io.ReadAll(io.LimitReader(resp.Body, vastMaxResponseBytes+1))
@@ -200,17 +192,7 @@ func (c *vastClient) do(ctx context.Context, method, path string, body any, out 
 }
 
 func (c *vastClient) decodeAPIError(operation string, statusCode int, status string, data []byte, readErr error) error {
-	body := strings.TrimSpace(string(data))
-	if len(body) > 1600 {
-		body = body[:1600]
-	}
-	body = redactVastText(body, c.apiKey)
-	if readErr != nil {
-		if body != "" {
-			body += "; "
-		}
-		body += "response body read failed: " + readErr.Error()
-	}
+	body := shared.RedactedResponseBody(data, readErr, 1600, func(value string) string { return redactVastText(value, c.apiKey) })
 	return &vastAPIError{Operation: operation, StatusCode: statusCode, Status: status, Body: body}
 }
 
@@ -314,7 +296,7 @@ func (c *vastClient) DetachInstanceSSHKey(ctx context.Context, id int, keyID str
 	return c.do(ctx, http.MethodDelete, "/instances/"+strconv.Itoa(id)+"/ssh/"+url.PathEscape(keyID)+"/", nil, nil)
 }
 
-func buildVastOfferSearchPayload(cfg VastConfig) map[string]any {
+func buildVastOfferSearchPayload(cfg core.VastConfig) map[string]any {
 	payload := map[string]any{
 		"verified":          vastFilter("eq", true),
 		"rentable":          vastFilter("eq", true),
@@ -346,11 +328,11 @@ func vastFilter(operator string, value any) map[string]any {
 }
 
 func vastAPIInstanceType(value string) string {
-	switch normalizeInstanceType(value) {
+	switch core.NormalizeVastInstanceType(value) {
 	case "interruptible":
 		return "bid"
 	default:
-		return normalizeInstanceType(value)
+		return core.NormalizeVastInstanceType(value)
 	}
 }
 
@@ -597,7 +579,7 @@ func (k *vastInstanceSSHKey) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	k.Name = raw.Name
-	k.PublicKey = firstNonBlank(raw.SSHKey, raw.PublicKey, raw.Key)
+	k.PublicKey = shared.FirstNonBlankTrimmed(raw.SSHKey, raw.PublicKey, raw.Key)
 	switch id := raw.ID.(type) {
 	case string:
 		k.ID = strings.TrimSpace(id)
@@ -638,10 +620,6 @@ func isLoopbackHTTPURL(parsed *url.URL) bool {
 	host := strings.ToLower(parsed.Hostname())
 	ip := net.ParseIP(host)
 	return host == "localhost" || host == "127.0.0.1" || host == "::1" || (ip != nil && ip.IsLoopback())
-}
-
-func redactVastString(value, apiKey string) error {
-	return errors.New(redactVastText(value, apiKey))
 }
 
 func redactVastText(value, apiKey string) string {

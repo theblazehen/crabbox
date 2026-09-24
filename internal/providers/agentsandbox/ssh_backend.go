@@ -8,6 +8,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 // Composition deliberately excludes the archive provider's Run and Warmup.
@@ -19,11 +20,11 @@ var _ core.SSHLeaseBackend = (*sshLeaseBackend)(nil)
 var _ core.SSHRunActivityBackend = (*sshLeaseBackend)(nil)
 var _ core.ReleaseLeaseOutcomeBackend = (*sshLeaseBackend)(nil)
 
-func (b *sshLeaseBackend) Spec() ProviderSpec { return b.lifecycle.Spec() }
-func (b *sshLeaseBackend) Doctor(ctx context.Context, req DoctorRequest) (DoctorResult, error) {
+func (b *sshLeaseBackend) Spec() core.ProviderSpec { return b.lifecycle.Spec() }
+func (b *sshLeaseBackend) Doctor(ctx context.Context, req core.DoctorRequest) (core.DoctorResult, error) {
 	return b.lifecycle.Doctor(ctx, req)
 }
-func (b *sshLeaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseView, error) {
+func (b *sshLeaseBackend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
 	views, err := b.lifecycle.List(ctx, req)
 	if err != nil {
 		return nil, err
@@ -52,7 +53,7 @@ func (b *sshLeaseBackend) List(ctx context.Context, req ListRequest) ([]LeaseVie
 	}
 	return views, nil
 }
-func (b *sshLeaseBackend) Status(ctx context.Context, req StatusRequest) (StatusView, error) {
+func (b *sshLeaseBackend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
 	if req.Wait {
 		timeout := req.WaitTimeout
 		if timeout <= 0 {
@@ -65,7 +66,7 @@ func (b *sshLeaseBackend) Status(ctx context.Context, req StatusRequest) (Status
 	for {
 		view, err := b.lifecycle.Status(ctx, req)
 		if err != nil {
-			return StatusView{}, err
+			return core.StatusView{}, err
 		}
 		view.Labels["pod_ready"] = fmt.Sprint(view.Ready)
 		view.Labels["ssh_ready"] = "false"
@@ -77,7 +78,7 @@ func (b *sshLeaseBackend) Status(ctx context.Context, req StatusRequest) (Status
 			err = b.lifecycle.sshHealth(ctx, claim)
 		}
 		if ctx.Err() != nil {
-			return StatusView{}, ctx.Err()
+			return core.StatusView{}, ctx.Err()
 		}
 		if err == nil {
 			view.Labels["ssh_ready"] = "true"
@@ -90,38 +91,38 @@ func (b *sshLeaseBackend) Status(ctx context.Context, req StatusRequest) (Status
 		}
 		select {
 		case <-ctx.Done():
-			return StatusView{}, ctx.Err()
+			return core.StatusView{}, ctx.Err()
 		case <-time.After(agentSandboxStatusPoll):
 		}
 	}
 }
-func (b *sshLeaseBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
+func (b *sshLeaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	return b.lifecycle.Cleanup(ctx, req)
 }
 
-func sshLeaseFromClaim(claim LeaseClaim) core.LeaseTarget {
-	labels := cloneStringMap(claim.Labels)
+func sshLeaseFromClaim(claim core.LeaseClaim) core.LeaseTarget {
+	labels := shared.CloneLabels(claim.Labels)
 	labels["provider"] = sshProviderName
 	labels["lease"] = claim.LeaseID
 	labels["slug"] = claim.Slug
 	labels["pond"] = claim.Pond
 	name := claimNameFromLocalClaim(claim)
-	server := Server{Provider: sshProviderName, CloudID: name, ImmutableID: labels[claimLabelClaimUID], Name: name, Status: labels["state"], Labels: labels}
+	server := core.Server{Provider: sshProviderName, CloudID: name, ImmutableID: labels[claimLabelClaimUID], Name: name, Status: labels["state"], Labels: labels}
 	return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}
 }
 
 func (b *sshLeaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	if req.RequestedLeaseID != "" || req.RequestedCheckpointID != "" {
-		return core.LeaseTarget{}, exit(2, "provider=%s does not support fixed lease IDs or checkpoints", sshProviderName)
+		return core.LeaseTarget{}, core.Exit(2, "provider=%s does not support fixed lease IDs or checkpoints", sshProviderName)
 	}
 	lifecycle := b.lifecycle
 	client, err := lifecycle.client(ctx)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	var observed func(LeaseClaim) error
+	var observed func(core.LeaseClaim) error
 	if req.OnAcquired != nil {
-		observed = func(claim LeaseClaim) error { return req.OnAcquired(sshLeaseFromClaim(claim)) }
+		observed = func(claim core.LeaseClaim) error { return req.OnAcquired(sshLeaseFromClaim(claim)) }
 	}
 	leaseID, name, _, ready, claim, unlock, err := lifecycle.createClaim(ctx, client, req.RequestedSlug, req.Repo, req.Reclaim, observed)
 	if err != nil {
@@ -141,24 +142,24 @@ func (b *sshLeaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) 
 		return core.LeaseTarget{}, errors.Join(err, readErr)
 	}
 	if current.Labels[claimLabelClaimUID] != claim.Labels[claimLabelClaimUID] {
-		return core.LeaseTarget{}, errors.Join(err, exit(4, "lease %s changed during SSH acquisition; recovery claim retained", leaseID))
+		return core.LeaseTarget{}, errors.Join(err, core.Exit(4, "lease %s changed during SSH acquisition; recovery claim retained", leaseID))
 	}
 	if terminal, cleanupErr := lifecycle.deleteOwnedClaim(cleanupCtx, client, current, leaseID, name, false); cleanupErr != nil {
 		if terminal {
 			return core.LeaseTarget{}, errors.Join(err, fmt.Errorf("SSH bootstrap rollback deleted claim %s but local finalization failed: %w", name, cleanupErr))
 		}
-		return core.LeaseTarget{}, errors.Join(err, fmt.Errorf("SSH bootstrap rollback failed; retain lease %s for %s %s: %w", leaseID, agentSandboxRecoveryCommand(lifecycle.cfg, "stop"), shellQuote(leaseID), cleanupErr))
+		return core.LeaseTarget{}, errors.Join(err, fmt.Errorf("SSH bootstrap rollback failed; retain lease %s for %s %s: %w", leaseID, agentSandboxRecoveryCommand(lifecycle.cfg, "stop"), core.ShellQuote(leaseID), cleanupErr))
 	}
 	return core.LeaseTarget{}, err
 }
 
-func (b *sshLeaseBackend) prepare(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (core.LeaseTarget, error) {
+func (b *sshLeaseBackend) prepare(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim core.LeaseClaim) (core.LeaseTarget, error) {
 	updated, err := b.lifecycle.prepareSSH(ctx, client, ready, claim)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
 	if claimTTLExpired(updated, core.ClockNow(b.lifecycle.rt.Clock).UTC()) {
-		return core.LeaseTarget{}, exit(4, "agent-sandbox claim %s reached its TTL expiry during SSH preparation", claim.LeaseID)
+		return core.LeaseTarget{}, core.Exit(4, "agent-sandbox claim %s reached its TTL expiry during SSH preparation", claim.LeaseID)
 	}
 	lease := sshLeaseFromClaim(updated)
 	lease.SSH, err = b.lifecycle.sshTarget(updated)
@@ -173,7 +174,7 @@ func (b *sshLeaseBackend) prepare(ctx context.Context, client kubernetesClient, 
 	return lease, nil
 }
 
-func (b *sshLeaseBackend) reusePreparedSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (core.LeaseTarget, bool) {
+func (b *sshLeaseBackend) reusePreparedSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim core.LeaseClaim) (core.LeaseTarget, bool) {
 	if validateSSHRuntime(claim, ready) != nil || b.lifecycle.probeSSH(ctx, client, ready, claim) != nil {
 		return core.LeaseTarget{}, false
 	}
@@ -226,7 +227,7 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 			if closeErr := closeClaimSSHMasters(ctx, claim); closeErr != nil {
 				return core.LeaseTarget{}, closeErr
 			}
-			return core.LeaseTarget{}, exit(4, "agent-sandbox lease %s expired", claim.LeaseID)
+			return core.LeaseTarget{}, core.Exit(4, "agent-sandbox lease %s expired", claim.LeaseID)
 		}
 		target, targetErr := lifecycle.sshTarget(claim)
 		if targetErr == nil {
@@ -267,7 +268,7 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 	}
 	if expired, reason := sandboxClaimExpired(claim, live, core.ClockNow(lifecycle.rt.Clock).UTC()); expired {
 		if !req.StatusOnly {
-			return core.LeaseTarget{}, exit(4, "agent-sandbox lease %s expired: %s", claim.LeaseID, reason)
+			return core.LeaseTarget{}, core.Exit(4, "agent-sandbox lease %s expired: %s", claim.LeaseID, reason)
 		}
 		lease.Server.Status = "expired"
 		lease.Server.Labels["state"] = "expired"
@@ -311,7 +312,7 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 		core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
 		return lease, nil
 	}
-	claim, err = updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, claimReadinessLabels(claim.Labels, ready))
+	claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, claimReadinessLabels(claim.Labels, ready))
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
@@ -330,19 +331,19 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 	return b.prepare(ctx, client, ready, claim)
 }
 
-func (b *sshLeaseBackend) currentClaimForTarget(lease core.LeaseTarget) (LeaseClaim, error) {
+func (b *sshLeaseBackend) currentClaimForTarget(lease core.LeaseTarget) (core.LeaseClaim, error) {
 	claim, err := resolveLocalClaim(b.lifecycle.cfg, lease.LeaseID)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	if err := authorizeClaimScope(b.lifecycle.cfg, claim); err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	if lease.Server.CloudID != claimNameFromLocalClaim(claim) || strings.TrimSpace(lease.Server.Labels[claimLabelClaimUID]) != strings.TrimSpace(claim.Labels[claimLabelClaimUID]) {
-		return LeaseClaim{}, errors.Join(core.ErrReleaseLeaseOwnershipChanged, exit(4, "agent-sandbox lease %s ownership changed", claim.LeaseID))
+		return core.LeaseClaim{}, errors.Join(core.ErrReleaseLeaseOwnershipChanged, core.Exit(4, "agent-sandbox lease %s ownership changed", claim.LeaseID))
 	}
 	if previous, exists, attached := core.ServerLeaseClaimSnapshot(lease.Server); attached && (!exists || previous.RepoRoot != claim.RepoRoot || previous.ClaimedAt != claim.ClaimedAt) {
-		return LeaseClaim{}, errors.Join(core.ErrReleaseLeaseOwnershipChanged, exit(4, "agent-sandbox lease %s repository ownership changed", claim.LeaseID))
+		return core.LeaseClaim{}, errors.Join(core.ErrReleaseLeaseOwnershipChanged, core.Exit(4, "agent-sandbox lease %s repository ownership changed", claim.LeaseID))
 	}
 	return claim, nil
 }
@@ -385,7 +386,7 @@ func (b *sshLeaseBackend) BeginSSHRunActivity(ctx context.Context, lease core.Le
 			}
 		}
 		if err == nil && claimTTLExpired(claim, core.ClockNow(b.lifecycle.rt.Clock).UTC()) {
-			err = exit(4, "agent-sandbox lease %s reached its TTL expiry; command not run", claim.LeaseID)
+			err = core.Exit(4, "agent-sandbox lease %s reached its TTL expiry; command not run", claim.LeaseID)
 		}
 	}
 	if err != nil {
@@ -397,11 +398,11 @@ func (b *sshLeaseBackend) BeginSSHRunActivity(ctx context.Context, lease core.Le
 
 func (b *sshLeaseBackend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
 	if err := ctx.Err(); err != nil {
-		return Server{}, err
+		return core.Server{}, err
 	}
 	claim, err := b.currentClaimForTarget(req.Lease)
 	if err != nil {
-		return Server{}, err
+		return core.Server{}, err
 	}
 	cfg := b.lifecycle.cfg
 	if req.IdleTimeoutOverride != nil {
@@ -409,7 +410,7 @@ func (b *sshLeaseBackend) Touch(ctx context.Context, req core.TouchRequest) (cor
 	} else if req.IdleTimeout > 0 {
 		cfg.IdleTimeout = req.IdleTimeout
 	}
-	var updated LeaseClaim
+	var updated core.LeaseClaim
 	if claim.RepoRoot == "" {
 		lease := sshLeaseFromClaim(claim)
 		updated, err = core.ClaimLeaseTargetForConfigScopeIfUnchanged(claim.LeaseID, claim.Slug, cfg, claim.ProviderScope, lease.Server, req.Lease.SSH, cfg.IdleTimeout, claim, true)
@@ -417,15 +418,15 @@ func (b *sshLeaseBackend) Touch(ctx context.Context, req core.TouchRequest) (cor
 		updated, err = core.ClaimLeaseForRepoProviderScopePondIfUnchanged(claim.LeaseID, claim.Slug, sshProviderName, claim.ProviderScope, claim.Pond, claim.RepoRoot, cfg.IdleTimeout, false, claim, true)
 	}
 	if err != nil {
-		return Server{}, err
+		return core.Server{}, err
 	}
-	labels := cloneStringMap(updated.Labels)
+	labels := shared.CloneLabels(updated.Labels)
 	if req.State != "" {
 		labels["state"] = req.State
 	}
-	updated, err = updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, updated, labels)
+	updated, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, updated, labels)
 	if err != nil {
-		return Server{}, err
+		return core.Server{}, err
 	}
 	server := sshLeaseFromClaim(updated).Server
 	core.SetServerLeaseClaimSnapshot(&server, updated, true)
@@ -448,7 +449,7 @@ func (b *sshLeaseBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeas
 }
 func (b *sshLeaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.ReleaseLeaseRequest) (core.ReleaseLeaseOutcome, error) {
 	if req.CheckpointID != "" {
-		return core.ReleaseLeaseOutcome{}, exit(2, "provider=%s does not support checkpoints", sshProviderName)
+		return core.ReleaseLeaseOutcome{}, core.Exit(2, "provider=%s does not support checkpoints", sshProviderName)
 	}
 	unlock, err := lockAgentSandboxLeaseOperation(ctx, req.Lease.LeaseID)
 	if err != nil {

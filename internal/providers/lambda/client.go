@@ -1,7 +1,6 @@
 package lambda
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type Client struct {
@@ -50,15 +50,7 @@ func newClient(rt core.Runtime) (*Client, error) {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		var buf bytes.Buffer
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			return err
-		}
-		reader = &buf
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	req, err := shared.NewJSONRequest(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return err
 	}
@@ -99,7 +91,6 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 }
 
 func (c *Client) decodeAPIError(operation string, status int, data []byte, readErr error) error {
-	body := strings.TrimSpace(string(data))
 	var envelope apiErrorEnvelope
 	if err := json.Unmarshal(data, &envelope); err == nil && (envelope.Error.Code != "" || envelope.Error.Message != "") {
 		apiErr := &APIError{
@@ -108,23 +99,11 @@ func (c *Client) decodeAPIError(operation string, status int, data []byte, readE
 			Code:       envelope.Error.Code,
 			Message:    c.redact(envelope.Error.Message),
 			Suggestion: c.redact(envelope.Error.Suggestion),
-			Body:       c.redact(body),
-		}
-		if readErr != nil {
-			apiErr.Body = strings.TrimSpace(apiErr.Body + "; response body read failed: " + readErr.Error())
+			Body:       shared.RedactedResponseBody(data, readErr, 0, c.redact),
 		}
 		return apiErr
 	}
-	if len(body) > 400 {
-		body = body[:400]
-	}
-	body = c.redact(body)
-	if readErr != nil {
-		if body != "" {
-			body += "; "
-		}
-		body += "response body read failed: " + readErr.Error()
-	}
+	body := shared.RedactedResponseBody(data, readErr, 400, c.redact)
 	return &APIError{Operation: operation, Status: status, Body: body}
 }
 
@@ -201,7 +180,7 @@ func decodeInstanceTypes(raw json.RawMessage) ([]InstanceType, error) {
 		item := keyed[key]
 		instanceType := item.InstanceType
 		if instanceType.Name == "" {
-			instanceType.Name = firstNonBlank(item.Name, key)
+			instanceType.Name = shared.FirstNonBlankTrimmed(item.Name, key)
 		}
 		if instanceType.Description == "" {
 			instanceType.Description = item.Description

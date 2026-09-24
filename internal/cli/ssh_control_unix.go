@@ -21,7 +21,7 @@ import (
 func sshControlLeaseDirectory(target SSHTarget) string {
 	for _, file := range []string{target.KnownHostsFile, target.Key} {
 		dir := filepath.Dir(file)
-		key, err := testboxKeyPath(filepath.Base(dir))
+		key, err := TestboxKeyPath(filepath.Base(dir))
 		if err == nil && dir == filepath.Dir(key) {
 			return dir
 		}
@@ -262,7 +262,7 @@ func closeSSHControlMaster(ctx context.Context, path string) error {
 	if err != nil || pid <= 0 || output != fmt.Sprintf("Master running (pid=%d)", pid) {
 		return fmt.Errorf("OpenSSH did not return a valid control-master identity")
 	}
-	started, err := webVNCDaemonProcessStartIdentity(pid)
+	started, err := LocalProcessStartIdentity(pid)
 	if err != nil {
 		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
 			if absent, absentErr := removeInactiveSSHControlSocket(ctx, path); absent {

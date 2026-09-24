@@ -65,10 +65,10 @@ func applyDefaults(cfg *core.Config) {
 	cfg.SSHPort = "22"
 	cfg.SSHFallbackPorts = nil
 	if cfg.NamespaceInstance.CLIPath == "" {
-		cfg.NamespaceInstance.CLIPath = "nsc"
+		cfg.NamespaceInstance.CLIPath = core.NamespaceInstanceConfigDefaultCLIPath
 	}
 	if cfg.NamespaceInstance.WorkRoot == "" {
-		cfg.NamespaceInstance.WorkRoot = "/work/crabbox"
+		cfg.NamespaceInstance.WorkRoot = core.NamespaceInstanceConfigDefaultWorkRoot
 	}
 	if cfg.NamespaceInstance.Duration > 0 {
 		cfg.TTL = cfg.NamespaceInstance.Duration
@@ -96,8 +96,7 @@ func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID st
 	if err := core.UseLeaseKnownHosts(&target.SSH, leaseID); err != nil {
 		return err
 	}
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
 func (b *backend) configForRun() core.Config {
@@ -193,7 +192,7 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 		recoveryLabels["recovery"] = recovery
 		recoveryLabels["state"] = "provisioning"
 		item := instance{ClusterID: id, Labels: recoveryLabels}
-		lease, err := b.lease(item, cfg, leaseID)
+		lease, err := b.lease(item, cfg, leaseID, false)
 		if err != nil {
 			return err
 		}
@@ -223,11 +222,11 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	if err != nil {
 		return core.LeaseTarget{}, rollback(err)
 	}
-	lease, err := b.lease(item, cfg, leaseID)
+	lease, err := b.lease(item, cfg, leaseID, false)
 	if err != nil {
 		return core.LeaseTarget{}, rollback(err)
 	}
-	if err := b.prepareSSH(ctx, cfg, &lease.SSH); err != nil {
+	if err := shared.PrepareSSHWithBootstrap(ctx, cfg, &lease.SSH, b.rt.Stderr, "Namespace instance", namespaceToolBootstrapCommand()); err != nil {
 		return core.LeaseTarget{}, rollback(err)
 	}
 	lease.Server.Status = "ready"
@@ -249,7 +248,7 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	lease, err := b.lease(item, cfg, leaseID)
+	lease, err := b.lease(item, cfg, leaseID, req.ReleaseOnly)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
@@ -260,7 +259,7 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 		return core.LeaseTarget{}, core.Exit(4, "Namespace instance %s has no Crabbox lease id", item.ClusterID)
 	}
 	if req.ReadyProbe || !req.StatusOnly {
-		if err := b.prepareSSH(ctx, cfg, &lease.SSH); err != nil {
+		if err := shared.PrepareSSHWithBootstrap(ctx, cfg, &lease.SSH, b.rt.Stderr, "Namespace instance", namespaceToolBootstrapCommand()); err != nil {
 			return core.LeaseTarget{}, err
 		}
 	}
@@ -336,7 +335,7 @@ func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest
 	if err != nil {
 		return err
 	}
-	if err := shared.RemoveExactClaimAfter(claim, binding, func() error {
+	if err := shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
 		present, err := b.validateDestroyTarget(ctx, cfg, id, leaseID, claim.Slug)
 		if err != nil {
 			return err
@@ -415,7 +414,7 @@ func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server
 		}
 	}
 	server := req.Lease.Server
-	server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, req.State, now)
+	server.Labels = core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(server.Labels, cfg, req.State, now, req.IdleTimeoutOverride)
 	leaseID := strings.TrimSpace(req.Lease.LeaseID)
 	if leaseID != "" {
 		claim, ok, err := resolveNamespaceClaim(leaseID, cfg)
@@ -427,11 +426,7 @@ func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server
 			idleTimeout = cfg.IdleTimeout
 		}
 		if ok {
-			if claim.RepoRoot != "" {
-				_, err = core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, server.Labels["slug"], cfg, server, req.Lease.SSH, claim.RepoRoot, idleTimeout, false, claim, true)
-			} else {
-				_, err = core.ClaimLeaseTargetForConfigIfUnchanged(leaseID, server.Labels["slug"], cfg, server, req.Lease.SSH, idleTimeout, claim, true)
-			}
+			_, err = core.UpdateLeaseClaimTouchIfUnchanged(ctx, leaseID, claim, server.Labels, now, req.IdleTimeoutOverride)
 		} else {
 			err = core.ClaimLeaseTargetForConfig(leaseID, server.Labels["slug"], cfg, server, req.Lease.SSH, idleTimeout)
 		}
@@ -492,7 +487,7 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 			fmt.Fprintf(b.rt.Stdout, "would destroy namespace_instance=%s lease=%s reason=%s\n", item.ClusterID, item.Labels["lease"], reason)
 			continue
 		}
-		if err := shared.RemoveExactClaimAfter(exactClaim, binding, func() error {
+		if err := shared.RemoveExactClaimAfterContext(ctx, exactClaim, binding, func() error {
 			present, err := b.validateDestroyTarget(ctx, cfg, item.ClusterID, leaseID, exactClaim.Slug)
 			if err != nil {
 				return err
@@ -563,7 +558,7 @@ func (b *backend) create(ctx context.Context, cfg core.Config, publicKeyPath str
 		if ambiguousNSCCreateError(result, err) {
 			recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
-			if recovered, recoverErr := b.recoverByLease(recoveryCtx, cfg, labels["lease"], 30*time.Second); recoverErr == nil {
+			if recovered, recoverErr := shared.RetryLeaseLookup(recoveryCtx, cfg, labels["lease"], 30*time.Second, b.findByLease); recoverErr == nil {
 				fmt.Fprintf(b.rt.Stderr, "warning: nsc create returned an error, recovered namespace_instance=%s from lease label\n", recovered.ClusterID)
 				return recovered.ClusterID, nil
 			}
@@ -575,7 +570,7 @@ func (b *backend) create(ctx context.Context, cfg core.Config, publicKeyPath str
 	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
 		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if recovered, recoverErr := b.recoverByLease(recoveryCtx, cfg, labels["lease"], 30*time.Second); recoverErr == nil {
+		if recovered, recoverErr := shared.RetryLeaseLookup(recoveryCtx, cfg, labels["lease"], 30*time.Second, b.findByLease); recoverErr == nil {
 			fmt.Fprintf(b.rt.Stderr, "warning: recovered namespace_instance=%s after invalid nsc create output\n", recovered.ClusterID)
 			return recovered.ClusterID, nil
 		}
@@ -588,7 +583,7 @@ func (b *backend) create(ctx context.Context, cfg core.Config, publicKeyPath str
 	if id == "" {
 		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if recovered, recoverErr := b.recoverByLease(recoveryCtx, cfg, labels["lease"], 30*time.Second); recoverErr == nil {
+		if recovered, recoverErr := shared.RetryLeaseLookup(recoveryCtx, cfg, labels["lease"], 30*time.Second, b.findByLease); recoverErr == nil {
 			fmt.Fprintf(b.rt.Stderr, "warning: recovered namespace_instance=%s after nsc create omitted its id\n", recovered.ClusterID)
 			return recovered.ClusterID, nil
 		}
@@ -680,28 +675,6 @@ func (b *backend) findByLease(ctx context.Context, cfg core.Config, leaseID stri
 	return found[0], nil
 }
 
-func (b *backend) recoverByLease(ctx context.Context, cfg core.Config, leaseID string, timeout time.Duration) (instance, error) {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	var lastErr error
-	for {
-		item, err := b.findByLease(ctx, cfg, leaseID)
-		if err == nil {
-			return item, nil
-		}
-		lastErr = err
-		select {
-		case <-ticker.C:
-		case <-deadline.C:
-			return instance{}, lastErr
-		case <-ctx.Done():
-			return instance{}, ctx.Err()
-		}
-	}
-}
-
 func (b *backend) resolve(ctx context.Context, identifier string, cfg core.Config, allowMissing bool) (instance, string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
@@ -768,7 +741,7 @@ func (b *backend) resolve(ctx context.Context, identifier string, cfg core.Confi
 	return instance{}, "", core.Exit(4, "Namespace instance lease not found: %s", identifier)
 }
 
-func (b *backend) lease(item instance, cfg core.Config, leaseID string) (core.LeaseTarget, error) {
+func (b *backend) lease(item instance, cfg core.Config, leaseID string, releaseOnly bool) (core.LeaseTarget, error) {
 	target := core.SSHTarget{
 		User:            "root",
 		Host:            item.ClusterID,
@@ -781,30 +754,19 @@ func (b *backend) lease(item instance, cfg core.Config, leaseID string) (core.Le
 		SSHConfigProxy:  true,
 		ProxyCommand:    proxyCommand(cfg, item.ClusterID),
 	}
-	if leaseID != "" {
+	if leaseID != "" && !releaseOnly {
 		if err := core.UseLeaseKnownHosts(&target, leaseID); err != nil {
 			return core.LeaseTarget{}, err
 		}
-		core.UseStoredTestboxKey(&target, leaseID)
+		if err := core.UseStoredTestboxKey(&target, leaseID); err != nil {
+			return core.LeaseTarget{}, err
+		}
 	}
 	server := b.server(item, cfg)
 	if claim, ok, _ := resolveNamespaceClaim(leaseID, cfg); ok {
 		mergeClaimLabels(&server, claim)
 	}
 	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
-}
-
-func (b *backend) prepareSSH(ctx context.Context, cfg core.Config, target *core.SSHTarget) error {
-	probe := *target
-	probe.ReadyCheck = "true"
-	if err := core.WaitForSSHReady(ctx, &probe, b.rt.Stderr, "namespace instance ssh", core.BootstrapWaitTimeout(cfg)); err != nil {
-		return err
-	}
-	target.Port = probe.Port
-	if err := core.RunSSHQuiet(ctx, *target, namespaceToolBootstrapCommand()); err != nil {
-		return core.Exit(1, "Namespace instance tool bootstrap failed: %v", err)
-	}
-	return core.WaitForSSHReady(ctx, target, b.rt.Stderr, "namespace instance tools", core.BootstrapWaitTimeout(cfg))
 }
 
 func namespaceToolBootstrapCommand() string {
@@ -836,11 +798,11 @@ func (b *backend) server(item instance, cfg core.Config) core.Server {
 	if labels["state"] == "" {
 		labels["state"] = "running"
 	}
-	labels["server_type"] = firstNonBlank(labels["server_type"], shapeName(item.Shape), cfg.ServerType)
+	labels["server_type"] = shared.FirstNonBlankTrimmed(labels["server_type"], shapeName(item.Shape), cfg.ServerType)
 	server := core.Server{
 		CloudID:  item.ClusterID,
 		Provider: providerName,
-		Name:     firstNonBlank(labels["slug"], item.ClusterID),
+		Name:     shared.FirstNonBlankTrimmed(labels["slug"], item.ClusterID),
 		Status:   labels["state"],
 		Labels:   labels,
 	}
@@ -1002,20 +964,9 @@ func proxyCommand(cfg core.Config, instanceID string) string {
 	}
 	words = append(words, instanceID)
 	for i := range words {
-		words[i] = quoteProxyWord(words[i])
+		words[i] = shared.QuoteSSHProxyCommandWord(words[i])
 	}
 	return strings.Join(words, " ")
-}
-
-func quoteProxyWord(word string) string {
-	word = strings.ReplaceAll(word, "%", "%%")
-	if word != "" && strings.IndexFunc(word, func(r rune) bool {
-		return !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
-			strings.ContainsRune("_-./:,@%+=", r))
-	}) == -1 {
-		return word
-	}
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "$", `\$`, "`", "\\`").Replace(word) + `"`
 }
 
 func (b *backend) destroy(ctx context.Context, id string) error {
@@ -1094,8 +1045,4 @@ func commandError(action string, result core.LocalCommandResult, err error) erro
 		return core.Exit(result.ExitCode, "%s failed: %v: %s", action, err, detail)
 	}
 	return core.Exit(result.ExitCode, "%s failed: %v", action, err)
-}
-
-func firstNonBlank(values ...string) string {
-	return shared.FirstNonBlankTrimmed(values...)
 }

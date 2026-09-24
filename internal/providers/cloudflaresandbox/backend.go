@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"slices"
@@ -27,18 +28,18 @@ const (
 )
 
 type backend struct {
-	spec      ProviderSpec
-	cfg       Config
-	rt        Runtime
-	newClient func(Config, Runtime) (bridgeClient, error)
+	spec      core.ProviderSpec
+	cfg       core.Config
+	rt        core.Runtime
+	newClient func(core.Config, core.Runtime) (bridgeClient, error)
 }
 
-func NewBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func NewBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	cfg.Provider = providerName
 	return &backend{spec: spec, cfg: cfg, rt: rt, newClient: newBridgeClient}
 }
 
-func (b *backend) Spec() ProviderSpec { return b.spec }
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
 func (b *backend) client() (bridgeClient, error) {
 	if b.newClient != nil {
@@ -47,27 +48,27 @@ func (b *backend) client() (bridgeClient, error) {
 	return newBridgeClient(b.cfg, b.rt)
 }
 
-func (b *backend) Doctor(ctx context.Context, _ DoctorRequest) (DoctorResult, error) {
+func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
 	api, err := b.client()
 	if err != nil {
-		return DoctorResult{}, err
+		return core.DoctorResult{}, err
 	}
-	checks := []DoctorCheck{}
+	checks := []core.DoctorCheck{}
 	health, err := api.Health(ctx)
 	if err != nil {
-		checks = append(checks, DoctorCheck{Status: "failed", Check: "health", Message: redactSecrets(err.Error()), Details: map[string]string{"mutation": "false"}})
+		checks = append(checks, core.DoctorCheck{Status: "failed", Check: "health", Message: redactSecrets(err.Error()), Details: map[string]string{"mutation": "false"}})
 	} else if !health.OK {
-		checks = append(checks, DoctorCheck{Status: "failed", Check: "health", Message: fmt.Sprintf("bridge=unhealthy status=%s ok=false mutation=false", blank(health.Status, "-")), Details: map[string]string{"mutation": "false"}})
+		checks = append(checks, core.DoctorCheck{Status: "failed", Check: "health", Message: fmt.Sprintf("bridge=unhealthy status=%s ok=false mutation=false", core.Blank(health.Status, "-")), Details: map[string]string{"mutation": "false"}})
 	} else {
-		checks = append(checks, DoctorCheck{Status: "ok", Check: "health", Message: fmt.Sprintf("bridge=ready ok=%t mutation=false", health.OK), Details: map[string]string{"mutation": "false"}})
+		checks = append(checks, core.DoctorCheck{Status: "ok", Check: "health", Message: fmt.Sprintf("bridge=ready ok=%t mutation=false", health.OK), Details: map[string]string{"mutation": "false"}})
 	}
 	openapi, err := api.OpenAPI(ctx)
 	if err != nil {
-		checks = append(checks, DoctorCheck{Status: "failed", Check: "openapi", Message: redactSecrets(err.Error()), Details: map[string]string{"mutation": "false"}})
+		checks = append(checks, core.DoctorCheck{Status: "failed", Check: "openapi", Message: redactSecrets(err.Error()), Details: map[string]string{"mutation": "false"}})
 	} else {
-		checks = append(checks, DoctorCheck{Status: "ok", Check: "openapi", Message: fmt.Sprintf("openapi=ready title=%s mutation=false", blank(openapi.Info.Title, "-")), Details: map[string]string{"mutation": "false"}})
+		checks = append(checks, core.DoctorCheck{Status: "ok", Check: "openapi", Message: fmt.Sprintf("openapi=ready title=%s mutation=false", core.Blank(openapi.Info.Title, "-")), Details: map[string]string{"mutation": "false"}})
 	}
-	return DoctorResult{
+	return core.DoctorResult{
 		Provider: providerName,
 		Status:   core.DoctorChecksStatus(checks),
 		Message:  "bridge=checked mutation=false",
@@ -75,12 +76,12 @@ func (b *backend) Doctor(ctx context.Context, _ DoctorRequest) (DoctorResult, er
 	}, nil
 }
 
-func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
+func (b *backend) Warmup(ctx context.Context, req core.WarmupRequest) error {
 	if req.ActionsRunner {
-		return exit(2, "--actions-runner is not supported for provider=%s", providerName)
+		return core.Exit(2, "--actions-runner is not supported for provider=%s", providerName)
 	}
 	if req.Options.Tailscale.Enabled {
-		return exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
+		return core.Exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
 	}
 	workdir, err := cloudflareSandboxWorkdir(b.cfg)
 	if err != nil {
@@ -109,7 +110,7 @@ func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
 	})
 }
 
-func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+func (b *backend) Run(ctx context.Context, req core.RunRequest) (core.RunResult, error) {
 	workdir, workdirErr := cloudflareSandboxWorkdir(b.cfg)
 	var api bridgeClient
 	var leaseID, sandboxID, slug string
@@ -124,7 +125,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 		IdleTimeout: b.cfg.IdleTimeout, TTL: b.cfg.TTL, CleanupTimeout: cloudflareSandboxCleanupTimeout,
 		Preflight: func(context.Context) error {
 			if req.Options.Tailscale.Enabled {
-				return exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
+				return core.Exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
 			}
 			if workdirErr != nil {
 				return workdirErr
@@ -133,12 +134,7 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			api, err = b.client()
 			return err
 		},
-		PrepareArchive: func(ctx context.Context) (*core.PreparedArchive, error) {
-			return core.PrepareDelegatedArchive(ctx, core.DelegatedArchivePreparationRequest{
-				Config: b.cfg, Repo: req.Repo, ForceSyncLarge: req.ForceSyncLarge,
-				TempPattern: "crabbox-cloudflare-sandbox-sync-*.tgz", Stderr: b.rt.Stderr, Now: func() time.Time { return core.ClockNow(b.rt.Clock) },
-			})
-		},
+		Workspace: func() shared.SandboxWorkspace { return b.workspace(api, sandboxID, req, workdir) },
 		Acquire: func(ctx context.Context) (shared.DelegatedSandbox, error) {
 			var err error
 			leaseID, sandboxID, slug, unlockOperation, err = b.createSandbox(ctx, api, req.Repo, req.Reclaim, req.RequestedSlug)
@@ -159,19 +155,13 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			}
 			leaseID, sandboxID, slug, err = b.resolveLeaseID(leaseID, req.Repo.Root, req.Reclaim, b.cfg.IdleTimeout)
 			if err == nil {
-				_, err = b.verifyClaim(ctx, api, leaseID, sandboxID)
+				_, err = shared.VerifySandboxClaim(ctx, leaseID, sandboxID, b.validateClaimScope, api.GetSandbox, validateSandboxOwnership)
 			}
 			return handle(), err
 		},
 		Setup: func(context.Context) error {
 			fmt.Fprintf(b.rt.Stderr, "provider=%s lease=%s sandbox=%s workdir=%s\n", providerName, leaseID, sandboxID, workdir)
 			return nil
-		},
-		Sync: func(ctx context.Context, prepared *core.PreparedArchive) ([]core.TimingPhase, time.Duration, error) {
-			return b.syncWorkspace(ctx, api, sandboxID, req, workdir, prepared)
-		},
-		NoSync: func(ctx context.Context) error {
-			return b.ensureWorkspace(ctx, api, sandboxID, workdir)
 		},
 		Command: func(context.Context) (shared.DelegatedSandboxCommand, error) {
 			intent, err := core.ParseCommandIntent(req.Command, req.ShellMode, req.CommandLiteralArgs)
@@ -184,29 +174,29 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 				fmt.Fprintf(b.rt.Stderr, "warning: provider=%s did not forward provider authentication variables: %s\n", providerName, strings.Join(strippedAuthEnv, ","))
 			}
 			if req.EnvSummary || strings.TrimSpace(os.Getenv("CRABBOX_ENV_ALLOW")) != "" {
-				printEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, commandEnv)
+				core.PrintEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, commandEnv)
 			}
-			return shared.DelegatedSandboxCommand{Text: commandText, Run: func(ctx context.Context) (int, error) {
+			return shared.DelegatedSandboxCommand{Text: commandText, Run: func(ctx context.Context, stdout, stderr io.Writer) (int, error) {
 				res, err := api.Exec(ctx, sandboxID, execRequest{
 					Command: commandText, WorkingDir: workdir, Env: commandEnv, TimeoutSecs: b.execTimeoutSecs(),
-				}, b.rt.Stdout, b.rt.Stderr)
+				}, stdout, stderr)
 				return res.ExitCode, err
 			}}, nil
 		},
 		Retained: func(context.Context) error {
-			return b.refreshLeaseActivity(leaseID)
+			return shared.RefreshRetainedLeaseActivity(leaseID, providerName, b.cfg.IdleTimeout)
 		},
 		Cleanup: func(ctx context.Context) error {
 			if err := api.DeleteSandbox(ctx, sandboxID); err != nil && !isCloudflareSandboxNotFound(err) {
 				return fmt.Errorf("cloudflare-sandbox delete failed for %s: %w", sandboxID, err)
 			}
-			removeLeaseClaim(leaseID)
+			core.RemoveLeaseClaim(leaseID)
 			return nil
 		},
 	})
 }
 
-func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) {
+func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
 	api, err := b.client()
 	if err != nil {
 		return nil, err
@@ -215,7 +205,7 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 	if err != nil {
 		return nil, err
 	}
-	views := make([]LeaseView, 0, len(sandboxes))
+	views := make([]core.LeaseView, 0, len(sandboxes))
 	for _, sb := range sandboxes {
 		leaseID := strings.TrimSpace(sb.Metadata[metadataClaimKey])
 		if leaseID == "" && strings.HasPrefix(sb.ID, leasePrefix) {
@@ -233,7 +223,7 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 		if leaseID == "" {
 			continue
 		}
-		claim, err := readLeaseClaim(leaseID)
+		claim, err := core.ReadLeaseClaim(leaseID)
 		if err != nil {
 			return nil, err
 		}
@@ -252,87 +242,39 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 	return views, nil
 }
 
-func (b *backend) Status(ctx context.Context, req StatusRequest) (StatusView, error) {
+func (b *backend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
 	api, err := b.client()
 	if err != nil {
-		return StatusView{}, err
+		return core.StatusView{}, err
 	}
 	leaseID, sandboxID, slug, err := b.resolveLeaseID(req.ID, "", false, 0)
 	if err != nil {
-		return StatusView{}, err
+		return core.StatusView{}, err
 	}
 	claim, ok, err := b.resolveCloudflareSandboxLeaseClaim(leaseID)
 	if err != nil {
-		return StatusView{}, err
+		return core.StatusView{}, err
 	}
 	if !ok {
-		return StatusView{}, exit(4, "cloudflare-sandbox sandbox %q is not claimed by Crabbox", req.ID)
+		return core.StatusView{}, core.Exit(4, "cloudflare-sandbox sandbox %q is not claimed by Crabbox", req.ID)
 	}
-	waitTimeout := req.WaitTimeout
-	if waitTimeout <= 0 {
-		waitTimeout = 5 * time.Minute
-	}
-	deadline := core.ClockNow(b.rt.Clock).Add(waitTimeout)
-	pollCtx := ctx
-	cancel := func() {}
-	if req.Wait {
-		pollCtx, cancel = context.WithTimeout(ctx, waitTimeout)
-	}
-	defer cancel()
-	for {
-		sb, getErr := api.GetSandbox(pollCtx, sandboxID)
-		if getErr != nil {
-			if req.Wait && ctx.Err() == nil && pollCtx.Err() != nil {
-				return StatusView{}, exit(5, "timed out waiting for cloudflare-sandbox sandbox %s to become ready", sandboxID)
-			}
-			if ctx.Err() != nil {
-				return StatusView{}, ctx.Err()
-			}
-			return StatusView{}, getErr
-		}
-		if err := validateSandboxOwnership(claim, sb); err != nil {
-			return StatusView{}, err
-		}
-		state := normalizedSandboxState(sb)
-		view := StatusView{
-			ID:       leaseID,
-			Slug:     slug,
-			Provider: providerName,
-			TargetOS: targetLinux,
-			State:    state,
-			ServerID: sandboxID,
-			Pond:     claim.Pond,
-			Network:  NetworkPublic,
-			Ready:    isReadyState(state),
-			Labels: map[string]string{
-				"provider": providerName,
-				"lease":    leaseID,
-				"slug":     slug,
-				"pond":     claim.Pond,
-				"state":    state,
-			},
-		}
-		if !req.Wait || view.Ready {
+	wait := shared.NewStatusWait(ctx, req, b.rt.Clock, func(id string) error {
+		return core.Exit(5, "timed out waiting for cloudflare-sandbox sandbox %s to become ready", id)
+	})
+	return shared.ObserveSandboxStatus(wait, sandboxID, 2*time.Second, api.GetSandbox,
+		func(sb sandboxSummary) error { return validateSandboxOwnership(claim, sb) },
+		func(_ context.Context, sb sandboxSummary) (core.StatusView, error) {
+			state := normalizedSandboxState(sb)
+			view := shared.SandboxStatusView(providerName, leaseID, slug, sandboxID, claim.Pond, state, isReadyState(state))
+			view.Labels["slug"] = slug
 			return view, nil
-		}
-		if isTerminalState(state) {
-			return StatusView{}, exit(5, "cloudflare-sandbox sandbox %s entered terminal state %q before becoming ready", sandboxID, state)
-		}
-		if core.ClockNow(b.rt.Clock).After(deadline) {
-			return StatusView{}, exit(5, "timed out waiting for cloudflare-sandbox sandbox %s to become ready", sandboxID)
-		}
-		select {
-		case <-pollCtx.Done():
-			if ctx.Err() == nil {
-				return StatusView{}, exit(5, "timed out waiting for cloudflare-sandbox sandbox %s to become ready", sandboxID)
-			}
-			return StatusView{}, pollCtx.Err()
-		case <-time.After(2 * time.Second):
-		}
-	}
+		}, isTerminalState,
+		func(id, state string) error {
+			return core.Exit(5, "cloudflare-sandbox sandbox %s entered terminal state %q before becoming ready", id, state)
+		})
 }
 
-func (b *backend) Stop(ctx context.Context, req StopRequest) error {
+func (b *backend) Stop(ctx context.Context, req core.StopRequest) error {
 	api, err := b.client()
 	if err != nil {
 		return err
@@ -350,12 +292,12 @@ func (b *backend) Stop(ctx context.Context, req StopRequest) error {
 	if err != nil {
 		return err
 	}
-	if _, err := b.verifyClaim(ctx, api, leaseID, sandboxID); err != nil {
+	if _, err := shared.VerifySandboxClaim(ctx, leaseID, sandboxID, b.validateClaimScope, api.GetSandbox, validateSandboxOwnership); err != nil {
 		if !isCloudflareSandboxNotFound(err) || !b.cfg.CloudflareSandbox.ForgetMissing {
 			return err
 		}
 		fmt.Fprintf(b.rt.Stderr, "warning: forgetting missing cloudflare-sandbox sandbox=%s after explicit request\n", sandboxID)
-		removeLeaseClaim(leaseID)
+		core.RemoveLeaseClaim(leaseID)
 		return nil
 	}
 	if err := api.DeleteSandbox(ctx, sandboxID); err != nil {
@@ -364,12 +306,12 @@ func (b *backend) Stop(ctx context.Context, req StopRequest) error {
 		}
 		fmt.Fprintf(b.rt.Stderr, "warning: forgetting missing cloudflare-sandbox sandbox=%s after explicit request\n", sandboxID)
 	}
-	removeLeaseClaim(leaseID)
+	core.RemoveLeaseClaim(leaseID)
 	fmt.Fprintf(b.rt.Stderr, "released lease=%s sandbox=%s\n", leaseID, sandboxID)
 	return nil
 }
 
-func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
+func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	api, err := b.client()
 	if err != nil {
 		return err
@@ -378,7 +320,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 	if err != nil {
 		return err
 	}
-	hasProviderClaims := slices.ContainsFunc(claims, func(claim LeaseClaim) bool {
+	hasProviderClaims := slices.ContainsFunc(claims, func(claim core.LeaseClaim) bool {
 		return claim.Provider == providerName
 	})
 	if !hasProviderClaims {
@@ -396,7 +338,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 			continue
 		}
 		action, err := func() (string, error) {
-			claim, err := readLeaseClaim(listed.LeaseID)
+			claim, err := core.ReadLeaseClaim(listed.LeaseID)
 			if err != nil {
 				return "", err
 			}
@@ -408,7 +350,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 				return "", err
 			}
 			defer unlockOperation()
-			claim, err = readLeaseClaim(listed.LeaseID)
+			claim, err = core.ReadLeaseClaim(listed.LeaseID)
 			if err != nil {
 				return "", err
 			}
@@ -427,16 +369,16 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 					return "skip", nil
 				}
 				if req.DryRun {
-					fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=missing sandbox\n", claim.LeaseID, blank(claim.Slug, "-"))
+					fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=missing sandbox\n", claim.LeaseID, core.Blank(claim.Slug, "-"))
 					return "skip", nil
 				}
-				if err := removeLeaseClaimIfUnchanged(claim.LeaseID, claim); err != nil {
+				if err := core.RemoveLeaseClaimIfUnchanged(claim.LeaseID, claim); err != nil {
 					return "", err
 				}
-				fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=missing sandbox\n", claim.LeaseID, blank(claim.Slug, "-"))
+				fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=missing sandbox\n", claim.LeaseID, core.Blank(claim.Slug, "-"))
 				return "claim-removed", nil
 			}
-			due, reason := claimCleanupDue(claim, now)
+			due, reason := shared.ClaimIdleCleanupDue(claim, now)
 			if !due {
 				fmt.Fprintf(b.rt.Stderr, "skip sandbox=%s lease=%s reason=%s\n", sandboxID, claim.LeaseID, reason)
 				return "skip", nil
@@ -451,7 +393,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 			if err := api.DeleteSandbox(ctx, sandboxID); err != nil && !isCloudflareSandboxNotFound(err) {
 				return "", err
 			}
-			if err := removeLeaseClaimIfUnchanged(claim.LeaseID, claim); err != nil {
+			if err := core.RemoveLeaseClaimIfUnchanged(claim.LeaseID, claim); err != nil {
 				return "", err
 			}
 			fmt.Fprintf(b.rt.Stdout, "delete sandbox=%s lease=%s reason=%s\n", sandboxID, claim.LeaseID, reason)
@@ -473,7 +415,7 @@ func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
 	return nil
 }
 
-func (b *backend) createSandbox(ctx context.Context, api bridgeClient, repo Repo, reclaim bool, requestedSlug string) (string, string, string, func(), error) {
+func (b *backend) createSandbox(ctx context.Context, api bridgeClient, repo core.Repo, reclaim bool, requestedSlug string) (string, string, string, func(), error) {
 	if err := validateProviderConfig(b.cfg); err != nil {
 		return "", "", "", nil, err
 	}
@@ -483,7 +425,7 @@ func (b *backend) createSandbox(ctx context.Context, api bridgeClient, repo Repo
 	}
 	name := newSandboxName(repo)
 	leaseID := leasePrefix + name
-	slug, err := allocateClaimLeaseSlug(leaseID, requestedSlug)
+	slug, err := core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
 	if err != nil {
 		return "", "", "", nil, err
 	}
@@ -497,7 +439,7 @@ func (b *backend) createSandbox(ctx context.Context, api bridgeClient, repo Repo
 		return "", "", "", nil, err
 	}
 	if sb.ID == "" {
-		return "", "", "", nil, b.cleanupCreateFailure(ctx, api, "", exit(5, "cloudflare-sandbox create returned no sandbox id"))
+		return "", "", "", nil, b.cleanupCreateFailure(ctx, api, "", core.Exit(5, "cloudflare-sandbox create returned no sandbox id"))
 	}
 	if !sandboxHasOwnershipMetadata(sb, metadata) {
 		remote, err := api.GetSandbox(ctx, sb.ID)
@@ -511,15 +453,15 @@ func (b *backend) createSandbox(ctx context.Context, api bridgeClient, repo Repo
 	}
 	if returnedLeaseID := strings.TrimSpace(sb.Metadata[metadataClaimKey]); returnedLeaseID == leasePrefix+sb.ID {
 		leaseID = leasePrefix + sb.ID
-		slug, err = allocateClaimLeaseSlug(leaseID, requestedSlug)
+		slug, err = core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
 		if err != nil {
 			return "", "", "", nil, b.cleanupCreateFailure(ctx, api, sb.ID, err)
 		}
 	}
-	if err := validateSandboxOwnership(LeaseClaim{LeaseID: leaseID, Provider: providerName, ProviderScope: providerScope}, sb); err != nil {
+	if err := validateSandboxOwnership(core.LeaseClaim{LeaseID: leaseID, Provider: providerName, ProviderScope: providerScope}, sb); err != nil {
 		return "", "", "", nil, b.cleanupCreateFailure(ctx, api, sb.ID, err)
 	}
-	if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, providerScope, b.cfg.Pond, repo.Root, b.cfg.IdleTimeout, reclaim, Server{
+	if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, providerScope, b.cfg.Pond, repo.Root, b.cfg.IdleTimeout, reclaim, core.Server{
 		CloudID:  sb.ID,
 		Provider: providerName,
 		Labels: map[string]string{
@@ -532,7 +474,7 @@ func (b *backend) createSandbox(ctx context.Context, api bridgeClient, repo Repo
 	return leaseID, sb.ID, slug, func() {}, nil
 }
 
-func (b *backend) ownershipMetadata(providerScope, leaseID, slug string, repo Repo) map[string]string {
+func (b *backend) ownershipMetadata(providerScope, leaseID, slug string, repo core.Repo) map[string]string {
 	out := map[string]string{
 		metadataProviderKey: providerName,
 		metadataScopeKey:    providerScope,
@@ -553,34 +495,21 @@ func sandboxHasOwnershipMetadata(sb sandboxSummary, metadata map[string]string) 
 		sb.Metadata[metadataClaimKey] == metadata[metadataClaimKey]
 }
 
-func (b *backend) serverFromSandbox(claim LeaseClaim, sb sandboxSummary) Server {
+func (b *backend) serverFromSandbox(claim core.LeaseClaim, sb sandboxSummary) core.Server {
 	state := normalizedSandboxState(sb)
-	return Server{
-		Provider: providerName,
-		CloudID:  sb.ID,
-		Name:     sb.ID,
-		Status:   state,
-		Labels: map[string]string{
-			"provider": providerName,
-			"lease":    claim.LeaseID,
-			"slug":     claim.Slug,
-			"pond":     claim.Pond,
-			"target":   targetLinux,
-			"state":    state,
-		},
-	}
+	return shared.SandboxLeaseView(providerName, targetLinux, claim, sb.ID, sb.ID, state)
 }
 
 func (b *backend) resolveLeaseID(id, repoRoot string, reclaim bool, idleTimeout time.Duration) (string, string, string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", "", "", exit(2, "provider=cloudflare-sandbox requires a Crabbox-created sandbox slug or lease id")
+		return "", "", "", core.Exit(2, "provider=cloudflare-sandbox requires a Crabbox-created sandbox slug or lease id")
 	}
 	exactLeaseID := id
 	if !strings.HasPrefix(exactLeaseID, leasePrefix) {
 		exactLeaseID = leasePrefix + exactLeaseID
 	}
-	if claim, err := readLeaseClaim(exactLeaseID); err != nil {
+	if claim, err := core.ReadLeaseClaim(exactLeaseID); err != nil {
 		return "", "", "", err
 	} else if claim.LeaseID == exactLeaseID && claim.Provider == providerName {
 		return b.finishResolvedLease(claim, repoRoot, reclaim, idleTimeout)
@@ -592,35 +521,35 @@ func (b *backend) resolveLeaseID(id, repoRoot string, reclaim bool, idleTimeout 
 	if ok {
 		return b.finishResolvedLease(claim, repoRoot, reclaim, idleTimeout)
 	}
-	return "", "", "", exit(4, "cloudflare-sandbox sandbox %q is not claimed by Crabbox; use a Crabbox slug or %s<sandbox-id>", id, leasePrefix)
+	return "", "", "", core.Exit(4, "cloudflare-sandbox sandbox %q is not claimed by Crabbox; use a Crabbox slug or %s<sandbox-id>", id, leasePrefix)
 }
 
-func (b *backend) resolveCloudflareSandboxLeaseClaim(identifier string) (LeaseClaim, bool, error) {
+func (b *backend) resolveCloudflareSandboxLeaseClaim(identifier string) (core.LeaseClaim, bool, error) {
 	claims, err := listCloudflareSandboxLeaseClaims()
 	if err != nil {
-		return LeaseClaim{}, false, err
+		return core.LeaseClaim{}, false, err
 	}
 	for _, claim := range claims {
 		if claim.Provider == providerName && claim.LeaseID == identifier {
 			if err := b.validateClaimScope(claim); err != nil {
-				return LeaseClaim{}, false, err
+				return core.LeaseClaim{}, false, err
 			}
 			return claim, true, nil
 		}
 	}
-	slug := normalizeLeaseSlug(identifier)
+	slug := core.NormalizeLeaseSlug(identifier)
 	if slug != "" {
 		for _, claim := range claims {
-			if claim.Provider != providerName || normalizeLeaseSlug(claim.Slug) != slug || !b.claimMatchesActiveScope(claim) {
+			if claim.Provider != providerName || core.NormalizeLeaseSlug(claim.Slug) != slug || !b.claimMatchesActiveScope(claim) {
 				continue
 			}
 			return claim, true, nil
 		}
 	}
-	return LeaseClaim{}, false, nil
+	return core.LeaseClaim{}, false, nil
 }
 
-func (b *backend) finishResolvedLease(claim LeaseClaim, repoRoot string, reclaim bool, idleTimeout time.Duration) (string, string, string, error) {
+func (b *backend) finishResolvedLease(claim core.LeaseClaim, repoRoot string, reclaim bool, idleTimeout time.Duration) (string, string, string, error) {
 	if err := b.validateClaimScope(claim); err != nil {
 		return "", "", "", err
 	}
@@ -629,18 +558,18 @@ func (b *backend) finishResolvedLease(claim LeaseClaim, repoRoot string, reclaim
 		if timeout <= 0 && claim.IdleTimeoutSeconds > 0 {
 			timeout = time.Duration(claim.IdleTimeoutSeconds) * time.Second
 		}
-		if err := claimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, providerName, claim.ProviderScope, claim.Pond, repoRoot, timeout, reclaim); err != nil {
+		if err := core.ClaimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, providerName, claim.ProviderScope, claim.Pond, repoRoot, timeout, reclaim); err != nil {
 			return "", "", "", err
 		}
 	}
 	slug := claim.Slug
 	if strings.TrimSpace(slug) == "" {
-		slug = newLeaseSlug(claim.LeaseID)
+		slug = core.NewLeaseSlug(claim.LeaseID)
 	}
 	return claim.LeaseID, claimSandboxID(claim), slug, nil
 }
 
-func claimSandboxID(claim LeaseClaim) string {
+func claimSandboxID(claim core.LeaseClaim) string {
 	if id := strings.TrimSpace(claim.CloudID); id != "" {
 		return id
 	}
@@ -650,7 +579,7 @@ func claimSandboxID(claim LeaseClaim) string {
 func (b *backend) newClaimScope() (string, error) {
 	var token [16]byte
 	if _, err := rand.Read(token[:]); err != nil {
-		return "", exit(5, "generate cloudflare-sandbox ownership token: %v", err)
+		return "", core.Exit(5, "generate cloudflare-sandbox ownership token: %v", err)
 	}
 	return b.providerScopeBase() + "/ownership:" + hex.EncodeToString(token[:]), nil
 }
@@ -663,75 +592,19 @@ func (b *backend) providerScopeBase() string {
 	return "bridge:" + bridge
 }
 
-func (b *backend) validateClaimScope(claim LeaseClaim) error {
+func (b *backend) validateClaimScope(claim core.LeaseClaim) error {
 	if !b.claimMatchesActiveScope(claim) {
-		return exit(4, "cloudflare-sandbox lease %q belongs to a different bridge scope; restore the configuration used to create it", claim.LeaseID)
+		return core.Exit(4, "cloudflare-sandbox lease %q belongs to a different bridge scope; restore the configuration used to create it", claim.LeaseID)
 	}
 	return nil
 }
 
-func (b *backend) claimMatchesActiveScope(claim LeaseClaim) bool {
+func (b *backend) claimMatchesActiveScope(claim core.LeaseClaim) bool {
 	return strings.HasPrefix(strings.TrimSpace(claim.ProviderScope), b.providerScopeBase()+"/ownership:")
 }
 
-func (b *backend) verifyClaim(ctx context.Context, api bridgeClient, leaseID, sandboxID string) (sandboxSummary, error) {
-	claim, err := readLeaseClaim(leaseID)
-	if err != nil {
-		return sandboxSummary{}, err
-	}
-	if err := b.validateClaimScope(claim); err != nil {
-		return sandboxSummary{}, err
-	}
-	sb, err := api.GetSandbox(ctx, sandboxID)
-	if err != nil {
-		return sandboxSummary{}, err
-	}
-	if err := validateSandboxOwnership(claim, sb); err != nil {
-		return sandboxSummary{}, err
-	}
-	return sb, nil
-}
-
-func validateSandboxOwnership(claim LeaseClaim, sb sandboxSummary) error {
-	if sb.ID == "" {
-		return exit(5, "cloudflare-sandbox returned a sandbox without an id")
-	}
-	if sb.Metadata[metadataProviderKey] != providerName ||
-		sb.Metadata[metadataScopeKey] != claim.ProviderScope ||
-		sb.Metadata[metadataClaimKey] != claim.LeaseID {
-		return exit(4, "cloudflare-sandbox sandbox %q ownership metadata does not match its local claim", sb.ID)
-	}
-	return nil
-}
-
-func claimCleanupDue(claim LeaseClaim, now time.Time) (bool, string) {
-	if claim.IdleTimeoutSeconds <= 0 {
-		return false, "idle timeout disabled"
-	}
-	lastUsed, err := time.Parse(time.RFC3339, strings.TrimSpace(claim.LastUsedAt))
-	if err != nil {
-		return false, "invalid last-used time"
-	}
-	deadline := lastUsed.Add(time.Duration(claim.IdleTimeoutSeconds) * time.Second)
-	if now.Before(deadline) {
-		return false, "idle timeout not reached"
-	}
-	return true, "idle timeout"
-}
-
-func (b *backend) refreshLeaseActivity(leaseID string) error {
-	claim, err := readLeaseClaim(leaseID)
-	if err != nil {
-		return err
-	}
-	if claim.LeaseID == "" {
-		return nil
-	}
-	idleTimeout := b.cfg.IdleTimeout
-	if idleTimeout <= 0 && claim.IdleTimeoutSeconds > 0 {
-		idleTimeout = time.Duration(claim.IdleTimeoutSeconds) * time.Second
-	}
-	return claimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, providerName, claim.ProviderScope, claim.Pond, claim.RepoRoot, idleTimeout, false)
+func validateSandboxOwnership(claim core.LeaseClaim, sb sandboxSummary) error {
+	return shared.ValidateSandboxOwnershipMetadata(providerName, sb.ID, sb.Metadata, claim)
 }
 
 func (b *backend) cleanupCreateFailure(ctx context.Context, api bridgeClient, sandboxID string, cause error) error {
@@ -758,7 +631,7 @@ func (b *backend) execTimeoutSecs() int {
 }
 
 func normalizedSandboxState(sb sandboxSummary) string {
-	return strings.ToLower(blank(strings.TrimSpace(sb.Status), "unknown"))
+	return strings.ToLower(core.Blank(strings.TrimSpace(sb.Status), "unknown"))
 }
 
 func isReadyState(state string) bool {
@@ -779,7 +652,7 @@ func isTerminalState(state string) bool {
 	}
 }
 
-func repoScope(repo Repo) string {
+func repoScope(repo core.Repo) string {
 	if strings.TrimSpace(repo.RemoteURL) != "" {
 		return strings.TrimSpace(repo.RemoteURL)
 	}
@@ -789,7 +662,7 @@ func repoScope(repo Repo) string {
 	return strings.TrimSpace(repo.Name)
 }
 
-func bridgeMetadataRepoScope(repo Repo) string {
+func bridgeMetadataRepoScope(repo core.Repo) string {
 	scope := repoScope(repo)
 	parsed, err := url.Parse(scope)
 	if err != nil || parsed.User == nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -799,7 +672,7 @@ func bridgeMetadataRepoScope(repo Repo) string {
 	return parsed.String()
 }
 
-func newSandboxName(repo Repo) string {
+func newSandboxName(repo core.Repo) string {
 	source := repo.Name
 	if strings.TrimSpace(source) == "" {
 		source = "sandbox"

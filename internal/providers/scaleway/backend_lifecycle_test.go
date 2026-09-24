@@ -2,12 +2,20 @@ package scaleway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iam "github.com/scaleway/scaleway-sdk-go/api/iam/v1alpha1"
@@ -18,6 +26,206 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func TestWaitForPublicIPv4HonorsCanceledCaller(t *testing.T) {
+	backend, client := newTestBackend(t)
+	client.server = testServer("srv-1", "ready", nil, "203.0.113.10")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("caller finished")
+	cancel(cause)
+	server, err := backend.waitForPublicIPv4(ctx, client, "srv-1")
+	if server != nil || !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || client.getCalls != 0 {
+		t.Fatalf("server=%v err=%v calls=%d; want caller cause without observation", server, err, client.getCalls)
+	}
+}
+
+func TestWaitForPublicIPv4CancelsRealHTTPObservation(t *testing.T) {
+	requestSeen := make(chan struct{}, 1)
+	requestCanceled := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet || !strings.HasSuffix(req.URL.Path, "/servers/srv-1") || req.TLS == nil {
+			t.Errorf("unexpected SDK request: method=%s path=%s TLS=%t", req.Method, req.URL.Path, req.TLS != nil)
+		}
+		select {
+		case requestSeen <- struct{}{}:
+		case <-releaseHandler:
+			return
+		}
+		select {
+		case <-req.Context().Done():
+			select {
+			case requestCanceled <- struct{}{}:
+			default:
+			}
+		case <-releaseHandler:
+		}
+	}))
+	defer server.Close()
+	defer close(releaseHandler)
+	httpClient := server.Client()
+	defer httpClient.CloseIdleConnections()
+	client := newTestScalewaySDKClient(t, server.URL, httpClient)
+	guard, stopGuard := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopGuard()
+	ctx, cancel := context.WithCancelCause(guard)
+	defer cancel(nil)
+	type result struct {
+		server *instance.Server
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := (&Backend{}).waitForPublicIPv4(ctx, client, "srv-1")
+		done <- result{got, err}
+	}()
+	select {
+	case <-requestSeen:
+	case got := <-done:
+		t.Fatalf("SDK returned before the HTTPS observation reached the server: %v", got.err)
+	case <-ctx.Done():
+		t.Fatal("HTTPS observation did not reach the server")
+	}
+	started := time.Now()
+	cause := core.Exit(7, "caller stopped Scaleway readiness")
+	cancel(cause)
+	select {
+	case got := <-done:
+		if got.server != nil || !errors.Is(got.err, context.Canceled) || !errors.Is(got.err, cause) || core.ExitCodeForError(got.err, 1) != 7 || got.err.Error() != cause.Error() {
+			t.Fatalf("server=%v err=%v, want caller cancellation", got.server, got.err)
+		}
+		classified := core.FinalizeRunResult(core.RunResult{}, got.err)
+		want := core.FinalizeRunResult(core.RunResult{}, ctx.Err())
+		if classified.Status != want.Status || classified.ErrorKind != want.ErrorKind {
+			t.Fatalf("classification=%s/%s want=%s/%s", classified.Status, classified.ErrorKind, want.Status, want.ErrorKind)
+		}
+		t.Logf("real HTTPS SDK readiness: caller cause and cancellation retained, exit=7 diagnostic=%q classification=%s/%s", got.err.Error(), classified.Status, classified.ErrorKind)
+	case <-time.After(5 * time.Second):
+		t.Fatal("SDK observation did not return after cancellation")
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTPS server did not observe request cancellation")
+	}
+	t.Logf("real HTTPS SDK request reached server; caller cancellation returned and server observed cancellation in %s", time.Since(started))
+}
+
+func TestWaitForPublicIPv4SDKObservationBudget(t *testing.T) {
+	readError := errors.New("observation failed")
+	for _, name := range []string{"ready", "pending then ready", "owned timeout", "caller deadline", "client deadline", "read error", "read error after deadline"} {
+		t.Run(name, func(t *testing.T) {
+			clearScalewayEnv(t)
+			t.Setenv("SCW_ACCESS_KEY", testScalewayAccessKey)
+			t.Setenv("SCW_SECRET_KEY", testScalewaySecretKey)
+			t.Setenv("SCW_DEFAULT_PROJECT_ID", testScalewayProjectID)
+			t.Setenv("SCW_DEFAULT_ORGANIZATION_ID", testScalewayOrganizationID)
+			synctest.Test(t, func(t *testing.T) {
+				ctx := context.Background()
+				budget := 5 * time.Minute
+				if name == "caller deadline" {
+					var cancel context.CancelFunc
+					budget = time.Minute
+					ctx, cancel = context.WithTimeout(ctx, budget)
+					defer cancel()
+				}
+				start := time.Now()
+				calls := 0
+				client, err := newClient(core.Config{}, core.Runtime{HTTP: &http.Client{Transport: scalewayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					deadline, bounded := req.Context().Deadline()
+					if !bounded || !deadline.Equal(start.Add(budget)) {
+						t.Errorf("SDK observation deadline=%v bounded=%t; want %v", deadline, bounded, start.Add(budget))
+						return nil, readError
+					}
+					switch name {
+					case "owned timeout", "caller deadline", "read error after deadline":
+						<-req.Context().Done()
+						if name == "read error after deadline" {
+							return nil, readError
+						}
+						return nil, req.Context().Err()
+					case "client deadline":
+						return nil, context.DeadlineExceeded
+					case "read error":
+						return nil, readError
+					}
+					body := `{"server":{"id":"srv-1","public_ip":{"address":"203.0.113.10"}}}`
+					if name == "pending then ready" && calls == 1 {
+						body = `{"server":null}`
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+				})}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				server, err := (&Backend{}).waitForPublicIPv4(ctx, client, "srv-1")
+				switch name {
+				case "ready", "pending then ready":
+					if err != nil || publicIPv4(server) != "203.0.113.10" {
+						t.Fatalf("server=%v err=%v", server, err)
+					}
+				case "owned timeout":
+					var exit core.ExitError
+					if server != nil || !errors.Is(err, context.DeadlineExceeded) || !core.AsExitError(err, &exit) || exit.Code != 5 || exit.Message != "timed out waiting for Scaleway Instance public IPv4" {
+						t.Fatalf("server=%v err=%v; want readiness timeout", server, err)
+					}
+					classified := core.FinalizeRunResult(core.RunResult{}, err)
+					want := core.FinalizeRunResult(core.RunResult{}, context.DeadlineExceeded)
+					if classified.Status != want.Status || classified.ErrorKind != want.ErrorKind {
+						t.Fatalf("classification=%s/%s want=%s/%s", classified.Status, classified.ErrorKind, want.Status, want.ErrorKind)
+					}
+				case "caller deadline", "client deadline":
+					if server != nil || !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatalf("server=%v err=%v; want original deadline", server, err)
+					}
+				default:
+					if server != nil || !errors.Is(err, readError) {
+						t.Fatalf("server=%v err=%v; want original observation error", server, err)
+					}
+				}
+				wantCalls := 1
+				if name == "pending then ready" {
+					wantCalls = 2
+					if elapsed := time.Since(start); elapsed != 3*time.Second {
+						t.Fatalf("poll interval=%v, want 3s", elapsed)
+					}
+				}
+				if calls != wantCalls {
+					t.Fatalf("observations=%d, want %d", calls, wantCalls)
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForPublicIPv4CompletedSDKResponseWinsCancellation(t *testing.T) {
+	for _, ready := range []bool{false, true} {
+		t.Run(fmt.Sprint(ready), func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			client := newTestScalewaySDKClient(t, "https://api.scaleway.com", &http.Client{Transport: scalewayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				cancel(core.Exit(7, "caller stopped readiness"))
+				status, body := http.StatusForbidden, `{"type":"permissions_denied","message":"fixture denied"}`
+				if ready {
+					status, body = http.StatusOK, `{"server":{"id":"srv-1","state":"stopped","public_ips":[{"address":"203.0.113.10"}]}}`
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+			})})
+			server, err := (&Backend{}).waitForPublicIPv4(ctx, client, "srv-1")
+			if ready {
+				if err != nil || publicIPv4(server) != "203.0.113.10" {
+					t.Fatalf("server=%v err=%v; completed public IP must win without a running-state gate", server, err)
+				}
+			} else {
+				var denied *scw.PermissionsDeniedError
+				if server != nil || !errors.As(err, &denied) || errors.Is(err, context.Canceled) {
+					t.Fatalf("server=%v err=%v; completed API response must win", server, err)
+				}
+			}
+		})
+	}
+}
 
 func TestScalewayAcquireListResolveTouchReleaseLifecycle(t *testing.T) {
 	backend, fake := newTestBackend(t)
@@ -78,7 +286,8 @@ func TestScalewayAcquireListResolveTouchReleaseLifecycle(t *testing.T) {
 	if resolved.LeaseID != lease.LeaseID || resolved.Server.CloudID != fake.server.ID {
 		t.Fatalf("resolved=%#v", resolved)
 	}
-	touched, err := backend.Touch(context.Background(), core.TouchRequest{Lease: resolved, State: "running", IdleTimeout: 4 * time.Hour})
+	override := 4 * time.Hour
+	touched, err := backend.Touch(context.Background(), core.TouchRequest{Lease: resolved, State: "running", IdleTimeout: override, IdleTimeoutOverride: &override})
 	if err != nil {
 		t.Fatalf("Touch: %v", err)
 	}
@@ -88,11 +297,26 @@ func TestScalewayAcquireListResolveTouchReleaseLifecycle(t *testing.T) {
 	if touched.Labels["idle_timeout_secs"] != "14400" {
 		t.Fatalf("touch did not persist idle timeout override: %#v", touched.Labels)
 	}
+	claim, _, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || claim.IdleTimeoutSeconds != 14400 || claim.Labels["idle_timeout_secs"] != "14400" {
+		t.Fatalf("explicit touch claim=%#v err=%v", claim, err)
+	}
+	touched, err = backend.Touch(context.Background(), core.TouchRequest{Lease: resolved, State: "ready", IdleTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err = core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || claim.IdleTimeoutSeconds != 14400 || claim.Labels["idle_timeout_secs"] != "14400" || touched.Labels["idle_timeout_secs"] != "14400" || labelsFromTags(fake.server.Tags)["idle_timeout_secs"] != "14400" {
+		t.Fatalf("ordinary touch changed idle: claim=%#v server=%#v err=%v", claim, touched, err)
+	}
 	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: resolved}); err != nil {
 		t.Fatalf("ReleaseLease: %v", err)
 	}
 	if !fake.deletedServer || !fake.deletedKey {
 		t.Fatalf("deleted server=%t key=%t", fake.deletedServer, fake.deletedKey)
+	}
+	if len(fake.volumes) != 0 {
+		t.Fatalf("release retained %d allocation-created volumes after deleting the server and key", len(fake.volumes))
 	}
 	if !fake.poweredOff {
 		t.Fatal("running server was not powered off before deletion")
@@ -126,6 +350,629 @@ func TestScalewayResolveReadOnlyIgnoresStaleClaim(t *testing.T) {
 	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || !exists || claim.CloudID != "srv-stale" {
 		t.Fatalf("read-only resolve changed stale claim: claim=%#v exists=%v err=%v", claim, exists, err)
+	}
+}
+
+func TestScalewayRootVolumeCleanupRetainsUserAttachedDisk(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignID := "55555555-5555-5555-5555-555555555555"
+	fake.server.Volumes["1"] = &instance.VolumeServer{ID: foreignID}
+	fake.volumes[foreignID] = &instance.Volume{ID: foreignID, Project: fake.ProjectID(), Zone: scw.Zone(fake.Zone()), Server: &instance.ServerSummary{ID: fake.server.ID}}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.volumes) != 1 || fake.volumes[foreignID] == nil {
+		t.Fatalf("foreign disk was deleted or allocation disk remains: %v", fake.volumes)
+	}
+}
+
+func TestScalewayRootVolumeCleanupRetriesAfterServerGone(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-retry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("volume service unavailable")
+	fake.deleteVolumeErr = failure
+	err = backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease})
+	if !errors.Is(err, failure) || !fake.deletedServer || fake.deletedKey {
+		t.Fatalf("err=%v deletedServer=%t deletedKey=%t", err, fake.deletedServer, fake.deletedKey)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || !exists || claim.Labels[rootVolumeLabel] != lease.Server.Labels[rootVolumeLabel] {
+		t.Fatalf("root identity not retained: exists=%t err=%v", exists, err)
+	}
+	fake.server = nil
+	fake.getErr = &scw.ResourceNotFoundError{}
+	fake.deleteVolumeErr = nil
+	recovery, err := backend.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: recovery}); err != nil {
+		t.Fatal(err)
+	}
+	_, exists, err = core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || exists || len(fake.volumes) != 0 || !fake.deletedKey {
+		t.Fatalf("cleanup incomplete: claim=%t volumes=%d key=%t err=%v", exists, len(fake.volumes), fake.deletedKey, err)
+	}
+}
+
+func TestScalewayRootVolumeRollbackFailureVetoesFreshAllocation(t *testing.T) {
+	for _, cleanupFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(cleanupFails), func(t *testing.T) {
+			backend, fake := newTestBackend(t)
+			fake.servers = []*instance.Server{}
+			primary := core.Exit(5, "timed out waiting for SSH during fixture bootstrap")
+			cleanup := errors.New("fixture root-volume deletion unavailable")
+			backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error { return primary }
+			if cleanupFails {
+				fake.deleteVolumeErr = cleanup
+			}
+			_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-retry-veto"})
+			wantCalls := core.AcquireAttempts(false)
+			if cleanupFails {
+				wantCalls = 1
+			}
+			if !errors.Is(err, primary) || core.ExitCodeForError(err, 1) != 5 || fake.createCalls != wantCalls || cleanupFails && (!errors.Is(err, cleanup) || fake.deletedKey || len(fake.volumes) != 1) {
+				t.Fatalf("error=%v creates=%d want=%d keyDeleted=%t volumes=%d", err, fake.createCalls, wantCalls, fake.deletedKey, len(fake.volumes))
+			}
+		})
+	}
+}
+
+func TestScalewayRootVolumeCleanupRefusesChangedNativeIdentity(t *testing.T) {
+	for _, change := range []string{"attached elsewhere", "project", "zone", "id"} {
+		t.Run(change, func(t *testing.T) {
+			backend, fake := newTestBackend(t)
+			lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-guard"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			volume := fake.volumes[lease.Server.Labels[rootVolumeLabel]]
+			switch change {
+			case "attached elsewhere":
+				volume.Server = &instance.ServerSummary{ID: "other-server"}
+			case "project":
+				volume.Project = "other-project"
+			case "zone":
+				volume.Zone = scw.Zone("nl-ams-1")
+			case "id":
+				volume.ID = "55555555-5555-5555-5555-555555555555"
+			}
+			err = backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease})
+			if err == nil || fake.deletedServer || fake.deletedKey || len(fake.volumes) != 1 {
+				t.Fatalf("err=%v serverDeleted=%t keyDeleted=%t volumes=%d", err, fake.deletedServer, fake.deletedKey, len(fake.volumes))
+			}
+		})
+	}
+}
+
+func TestScalewayRootManifestCannotDisappearDuringMutation(t *testing.T) {
+	for _, operation := range []string{"touch", "tailscale", "resolve", "status"} {
+		t.Run(operation, func(t *testing.T) {
+			backend, fake := newTestBackend(t)
+			lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-metadata"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, _, _ := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+			labels := labelsFromTags(fake.server.Tags)
+			delete(labels, rootVolumeLabel)
+			delete(labels, volumeContractLabel)
+			fake.server.Tags = tagsFromLabels(labels)
+			updates := fake.updateCalls
+			switch operation {
+			case "touch":
+				_, err = backend.Touch(t.Context(), core.TouchRequest{Lease: lease, State: "ready"})
+			case "tailscale":
+				_, err = backend.UpdateTailscaleMetadata(t.Context(), lease, core.TailscaleMetadata{})
+			case "resolve":
+				_, err = backend.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: core.Repo{Root: t.TempDir()}})
+			case "status":
+				if backend.StatusTouchClaimMatches(core.LeaseTarget{Server: backend.serverFromScaleway(fake.server)}, before) {
+					t.Fatal("status accepted missing allocation identity")
+				}
+				err = errors.New("status rejected")
+			}
+			after, exists, readErr := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+			if err == nil || readErr != nil || !exists || before.Revision != after.Revision || fake.updateCalls != updates {
+				t.Fatalf("mutation escaped guard: err=%v readErr=%v exists=%t updates=%d/%d revision=%s/%s", err, readErr, exists, fake.updateCalls, updates, before.Revision, after.Revision)
+			}
+		})
+	}
+}
+
+func TestScalewayRootManifestPublicationFailureCanOnlyBeReleased(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	fake.updateErr = errors.New("tag publication failed")
+	fake.deleteErr = errors.New("server deletion failed")
+	_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-pending"})
+	if err == nil || fake.deletedKey {
+		t.Fatalf("err=%v keyDeleted=%t", err, fake.deletedKey)
+	}
+	leaseID := labelsFromTags(fake.server.Tags)["lease"]
+	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists || claim.Labels[volumePendingLabel] != "true" || claim.Labels[rootVolumeLabel] == "" {
+		t.Fatalf("pending manifest not retained: exists=%t err=%v", exists, err)
+	}
+	if _, err := backend.Resolve(t.Context(), core.ResolveRequest{ID: leaseID}); err == nil {
+		t.Fatal("pending manifest allowed reuse")
+	}
+	fake.updateErr, fake.deleteErr = nil, nil
+	recovery, err := backend.Resolve(t.Context(), core.ResolveRequest{ID: leaseID, ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: recovery}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.volumes) != 0 || !fake.deletedKey {
+		t.Fatal("pending allocation cleanup incomplete")
+	}
+}
+
+func TestScalewayIncompleteNewRootManifestCannotBecomeLegacy(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	fake.omitRootVolume = true
+	_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-unknown"})
+	if err == nil || fake.deletedServer || fake.deletedKey {
+		t.Fatalf("incomplete allocation was destroyed: err=%v server=%t key=%t", err, fake.deletedServer, fake.deletedKey)
+	}
+	labels := labelsFromTags(fake.server.Tags)
+	if labels[volumeContractLabel] != rootVolumeContract || labels[rootVolumeLabel] != "" {
+		t.Fatalf("initial creation lost contract marker: %v", labels)
+	}
+	core.RemoveLeaseClaim(labels["lease"])
+	_, err = backend.Resolve(t.Context(), core.ResolveRequest{ID: labels["lease"], Reclaim: true, Repo: core.Repo{Root: t.TempDir()}})
+	if err == nil {
+		t.Fatal("claimless new allocation was reclaimed as legacy")
+	}
+}
+
+func TestScalewayRootManifestMustPersistBeforeDestructiveRollback(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	fake.afterCreate = func() {
+		state, err := core.CrabboxStateDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(state, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(state, "claims"), []byte("fixture blocks claim directory"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-journal"})
+	if err == nil || !strings.Contains(err.Error(), "persist Scaleway") || fake.server == nil || fake.deletedServer || fake.deletedKey || fake.updateCalls != 0 {
+		t.Fatalf("unsafe rollback after journal failure: err=%v server=%v deleted=%t keyDeleted=%t updates=%d", err, fake.server != nil, fake.deletedServer, fake.deletedKey, fake.updateCalls)
+	}
+}
+
+func TestScalewayRootManifestPublicationIsDurableBeforeBootstrap(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	called := false
+	backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		called = true
+		labels := labelsFromTags(fake.server.Tags)
+		claim, exists, err := core.ReadLeaseClaimWithPresence(labels["lease"])
+		if err != nil || !exists || claim.Labels[volumePendingLabel] != "" || claim.Labels[rootVolumeLabel] == "" || claim.Labels[rootVolumeLabel] != labels[rootVolumeLabel] {
+			t.Fatalf("manifest not durable before bootstrap: exists=%t pending=%q id=%q err=%v", exists, claim.Labels[volumePendingLabel], claim.Labels[rootVolumeLabel], err)
+		}
+		return nil
+	}
+	lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-published"})
+	if err != nil || !called {
+		t.Fatalf("Acquire err=%v bootstrap=%t", err, called)
+	}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScalewayRollbackCannotOverwriteChangedAllocationIdentity(t *testing.T) {
+	for _, field := range []string{"lease", "slug", "provider", "target", "provider_key", "scaleway_project", "scaleway_zone", "scaleway_ssh_key_id", "scaleway_ssh_key_name", "scaleway_organization", "scaleway_region", "claim slug", "claim lease"} {
+		t.Run(field, func(t *testing.T) {
+			backend, fake := newTestBackend(t)
+			var path string
+			var changed []byte
+			backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+				leaseID := labelsFromTags(fake.server.Tags)["lease"]
+				claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+				if err != nil || !exists {
+					t.Fatalf("allocation claim unavailable: %v", err)
+				}
+				switch field {
+				case "claim slug":
+					claim.Slug = "changed-slug"
+				case "claim lease":
+					claim.LeaseID = "cbx_999999999999"
+				default:
+					claim.Labels[field] = "changed-identity"
+				}
+				changed, err = json.Marshal(claim)
+				if err != nil {
+					t.Fatal(err)
+				}
+				state, err := core.CrabboxStateDir()
+				if err != nil {
+					t.Fatal(err)
+				}
+				path = filepath.Join(state, "claims", leaseID+".json")
+				if err := os.WriteFile(path, changed, 0600); err != nil {
+					t.Fatal(err)
+				}
+				return errors.New("fixture bootstrap failed")
+			}
+			_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "volume-changed"})
+			if err == nil || path == "" || fake.deletedServer || fake.deletedKey {
+				t.Fatalf("changed allocation was destroyed: err=%v pathSet=%t server=%t key=%t", err, path != "", fake.deletedServer, fake.deletedKey)
+			}
+			after, readErr := os.ReadFile(path)
+			if readErr != nil || string(after) != string(changed) {
+				t.Fatalf("changed claim overwritten: readErr=%v", readErr)
+			}
+		})
+	}
+}
+
+func TestScalewayAcquireCannotPublishAfterClaimReplacement(t *testing.T) {
+	for _, phase := range []string{"bootstrap", "callback"} {
+		for _, field := range []string{rootVolumeLabel, "concurrent-owner-note"} {
+			t.Run(phase+"/"+field, func(t *testing.T) {
+				backend, fake := newTestBackend(t)
+				var claimPath string
+				var changed []byte
+				changeClaim := func() {
+					leaseID := labelsFromTags(fake.server.Tags)["lease"]
+					claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+					if err != nil || !exists {
+						t.Fatalf("claim unavailable: %v", err)
+					}
+					labels := maps.Clone(claim.Labels)
+					labels[field] = "55555555-5555-5555-5555-555555555555"
+					if _, err := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, claim, labels); err != nil {
+						t.Fatal(err)
+					}
+					state, err := core.CrabboxStateDir()
+					if err != nil {
+						t.Fatal(err)
+					}
+					claimPath = filepath.Join(state, "claims", leaseID+".json")
+					changed, err = os.ReadFile(claimPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+					if phase == "bootstrap" {
+						changeClaim()
+					}
+					return nil
+				}
+				callbacks := 0
+				_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "stale-publication", OnAcquired: func(core.LeaseTarget) error {
+					callbacks++
+					if phase == "callback" {
+						changeClaim()
+					}
+					return nil
+				}})
+				wantCallbacks := 0
+				if phase == "callback" {
+					wantCallbacks = 1
+				}
+				if err == nil || claimPath == "" || fake.updateCalls != 1 || fake.deletedServer || fake.deletedKey || callbacks != wantCallbacks {
+					t.Fatalf("stale acquisition acted: err=%v updates=%d serverDeleted=%t keyDeleted=%t callbacks=%d want=%d", err, fake.updateCalls, fake.deletedServer, fake.deletedKey, callbacks, wantCallbacks)
+				}
+				after, readErr := os.ReadFile(claimPath)
+				if readErr != nil || string(after) != string(changed) {
+					t.Fatalf("new owner's claim overwritten: %v", readErr)
+				}
+			})
+		}
+	}
+}
+
+func TestScalewayAcquireObserverCannotRewriteRootOwnership(t *testing.T) {
+	backend, fake := newTestBackend(t)
+	lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "observer-copy", OnAcquired: func(observed core.LeaseTarget) error {
+		observed.Server.Labels[rootVolumeLabel] = "55555555-5555-5555-5555-555555555555"
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID := fake.server.Volumes["0"].ID
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || !exists || lease.Server.Labels[rootVolumeLabel] != rootID || claim.Labels[rootVolumeLabel] != rootID || labelsFromTags(fake.server.Tags)[rootVolumeLabel] != rootID {
+		t.Fatalf("observer rewrote ownership: exists=%t err=%v", exists, err)
+	}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScalewayAcquireEmptyRepoRootStillFencesCompletion(t *testing.T) {
+	for _, replaceClaim := range []bool{false, true} {
+		t.Run(fmt.Sprint(replaceClaim), func(t *testing.T) {
+			backend, fake := newTestBackend(t)
+			backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+				if replaceClaim {
+					id := labelsFromTags(fake.server.Tags)["lease"]
+					claim, _, err := core.ReadLeaseClaimWithPresence(id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					labels := maps.Clone(claim.Labels)
+					labels["concurrent-owner-note"] = "changed"
+					if _, err := core.UpdateLeaseClaimLabelsIfUnchanged(id, claim, labels); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return nil
+			}
+			lease, err := backend.Acquire(t.Context(), core.AcquireRequest{RequestedSlug: "empty-root"})
+			if replaceClaim {
+				if err == nil || fake.updateCalls != 1 || fake.deletedServer || fake.deletedKey {
+					t.Fatalf("empty-root stale publication escaped guard: err=%v updates=%d", err, fake.updateCalls)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+			cwd, cwdErr := os.Getwd()
+			if err != nil || cwdErr != nil || !exists || claim.RepoRoot != cwd || claim.Labels["state"] != "ready" || claim.Labels["recovery"] != "" || labelsFromTags(fake.server.Tags)["state"] != "ready" || fake.updateCalls != 2 {
+				t.Fatalf("empty-root completion not published: exists=%t state=%q recovery=%q updates=%d err=%v cwdErr=%v", exists, claim.Labels["state"], claim.Labels["recovery"], fake.updateCalls, err, cwdErr)
+			}
+		})
+	}
+}
+
+func TestScalewaySDKOwnershipGuardsBeforeHTTPMutations(t *testing.T) {
+	const serverID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const rootID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	const keyID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	const otherID = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+	const base = "/instance/v1/zones/fr-par-1"
+	for _, scenario := range []string{"success", "bootstrap replacement", "callback replacement", "reassigned disk"} {
+		t.Run(scenario, func(t *testing.T) {
+			backend, _ := newTestBackend(t)
+			var mu sync.Mutex
+			var server *instance.Server
+			var volume *instance.Volume
+			var key *iam.SSHKey
+			var requests []string
+			https := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				if r.TLS == nil {
+					t.Error("SDK request was not HTTPS")
+				}
+				reply := func(status int, value any) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					if value != nil {
+						_ = json.NewEncoder(w).Encode(value)
+					}
+				}
+				decode := func(value any) bool {
+					if err := json.NewDecoder(r.Body).Decode(value); err != nil {
+						t.Errorf("decode SDK request: %v", err)
+						reply(http.StatusBadRequest, map[string]string{"type": "invalid_arguments"})
+						return false
+					}
+					return true
+				}
+				if strings.HasPrefix(r.URL.Path, "/marketplace/v2/") {
+					// The adapter's supported explicit image-ID fallback needs no catalogue fixture.
+					reply(http.StatusNotFound, map[string]string{"type": "not_found"})
+					return
+				}
+				switch r.Method + " " + r.URL.Path {
+				case "GET " + base + "/servers":
+					items := []*instance.Server{}
+					if server != nil {
+						items = append(items, server)
+					}
+					reply(http.StatusOK, map[string]any{"servers": items})
+				case "POST /iam/v1alpha1/ssh-keys":
+					var req iam.CreateSSHKeyRequest
+					if !decode(&req) {
+						return
+					}
+					key = &iam.SSHKey{ID: keyID, Name: req.Name, PublicKey: req.PublicKey, ProjectID: req.ProjectID}
+					reply(http.StatusCreated, key)
+				case "POST " + base + "/servers":
+					var req instance.CreateServerRequest
+					if !decode(&req) {
+						return
+					}
+					server = &instance.Server{ID: serverID, Name: req.Name, Tags: req.Tags, Project: testScalewayProjectID, Organization: testScalewayOrganizationID, Zone: scw.Zone("fr-par-1"), State: instance.ServerStateStopped, CommercialType: req.CommercialType,
+						PublicIP: &instance.ServerIP{Address: net.ParseIP("203.0.113.10")}, Volumes: map[string]*instance.VolumeServer{"0": {ID: rootID, Zone: scw.Zone("fr-par-1")}}}
+					volume = &instance.Volume{ID: rootID, Project: testScalewayProjectID, Zone: scw.Zone("fr-par-1"), Server: &instance.ServerSummary{ID: serverID}}
+					reply(http.StatusCreated, map[string]any{"server": server})
+				case "GET " + base + "/servers/" + serverID:
+					if server == nil {
+						reply(http.StatusNotFound, map[string]string{"type": "not_found"})
+						return
+					}
+					reply(http.StatusOK, map[string]any{"server": server})
+				case "PATCH " + base + "/servers/" + serverID:
+					var req instance.UpdateServerRequest
+					if !decode(&req) {
+						return
+					}
+					if server == nil || req.Tags == nil {
+						t.Error("unexpected SDK server update")
+						reply(http.StatusBadRequest, nil)
+						return
+					}
+					server.Tags = *req.Tags
+					reply(http.StatusOK, map[string]any{"server": server})
+				case "PATCH " + base + "/servers/" + serverID + "/user_data/cloud-init":
+					_, _ = io.Copy(io.Discard, r.Body)
+					reply(http.StatusNoContent, nil)
+				case "POST " + base + "/servers/" + serverID + "/action":
+					var req instance.ServerActionRequest
+					if !decode(&req) {
+						return
+					}
+					if server == nil {
+						t.Error("action on absent fixture server")
+						reply(http.StatusNotFound, nil)
+						return
+					}
+					switch req.Action {
+					case instance.ServerActionPoweron:
+						server.State = instance.ServerStateRunning
+					case instance.ServerActionPoweroff:
+						server.State = instance.ServerStateStopped
+					default:
+						t.Errorf("unexpected SDK action %s", req.Action)
+					}
+					reply(http.StatusOK, map[string]any{})
+				case "GET " + base + "/volumes/" + rootID:
+					if volume == nil {
+						reply(http.StatusNotFound, map[string]string{"type": "not_found"})
+						return
+					}
+					reply(http.StatusOK, map[string]any{"volume": volume})
+				case "DELETE " + base + "/servers/" + serverID:
+					server = nil
+					if volume != nil {
+						volume.Server = nil
+					}
+					reply(http.StatusNoContent, nil)
+				case "DELETE " + base + "/volumes/" + rootID:
+					volume = nil
+					reply(http.StatusNoContent, nil)
+				case "DELETE /iam/v1alpha1/ssh-keys/" + keyID:
+					key = nil
+					reply(http.StatusNoContent, nil)
+				default:
+					t.Errorf("unexpected SDK request %s %s", r.Method, r.URL.Path)
+					reply(http.StatusBadRequest, map[string]string{"type": "invalid_arguments"})
+				}
+			}))
+			defer https.Close()
+			httpClient := https.Client()
+			defer httpClient.CloseIdleConnections()
+			client := newTestScalewaySDKClient(t, https.URL, httpClient)
+			backend.cfg.Scaleway.ProjectID = testScalewayProjectID
+			backend.cfg.Scaleway.OrganizationID = testScalewayOrganizationID
+			backend.cfg.Scaleway.Image = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+			backend.cfg.Scaleway.SecurityGroup = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+			backend.newClient = func(core.Config, core.Runtime) (Client, error) { return client, nil }
+			checkpoint := -1
+			var claimPath string
+			var expectedClaim []byte
+			replaceClaim := func() {
+				mu.Lock()
+				id := labelsFromTags(server.Tags)["lease"]
+				checkpoint = len(requests)
+				mu.Unlock()
+				claim, exists, err := core.ReadLeaseClaimWithPresence(id)
+				if err != nil || !exists {
+					t.Fatalf("SDK allocation claim absent: %v", err)
+				}
+				labels := maps.Clone(claim.Labels)
+				labels["concurrent-sdk-owner"] = "replacement"
+				if _, err := core.UpdateLeaseClaimLabelsIfUnchanged(id, claim, labels); err != nil {
+					t.Fatal(err)
+				}
+				state, err := core.CrabboxStateDir()
+				if err != nil {
+					t.Fatal(err)
+				}
+				claimPath = filepath.Join(state, "claims", id+".json")
+				expectedClaim, err = os.ReadFile(claimPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+				if scenario == "bootstrap replacement" {
+					replaceClaim()
+				}
+				return nil
+			}
+			lease, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "sdk-ownership", OnAcquired: func(core.LeaseTarget) error {
+				if scenario == "callback replacement" {
+					replaceClaim()
+				}
+				return nil
+			}})
+			if strings.HasSuffix(scenario, "replacement") {
+				if err == nil || checkpoint < 0 {
+					t.Fatalf("expected stale-claim refusal after SDK provisioning, got %v", err)
+				}
+				after, readErr := os.ReadFile(claimPath)
+				if readErr != nil || string(after) != string(expectedClaim) {
+					t.Fatalf("replacement claim changed: %v", readErr)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if len(requests) != checkpoint || server == nil || volume == nil || key == nil {
+					t.Fatalf("stale SDK owner performed requests after replacement: %v", requests[checkpoint:])
+				}
+				t.Logf("actual Scaleway SDK HTTPS: %s; provisioningRequests=%d subsequentRequests=0 resourcesUntouched=true replacementClaimBytesPreserved=true", scenario, checkpoint)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, stateErr := core.CrabboxStateDir()
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			claimPath = filepath.Join(state, "claims", lease.LeaseID+".json")
+			expectedClaim, err = os.ReadFile(claimPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			checkpoint = len(requests)
+			if scenario == "reassigned disk" {
+				volume.Server = &instance.ServerSummary{ID: otherID}
+			}
+			mu.Unlock()
+			err = backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease})
+			mu.Lock()
+			defer mu.Unlock()
+			mutations := 0
+			for _, request := range requests[checkpoint:] {
+				if !strings.HasPrefix(request, "GET ") {
+					mutations++
+				}
+			}
+			if scenario == "reassigned disk" {
+				if err == nil || core.ExitCodeForError(err, 1) != 4 || mutations != 0 || server == nil || key == nil || volume == nil || volume.Server.ID != otherID {
+					t.Fatalf("reassigned disk was not protected: err=%v requests=%v", err, requests[checkpoint:])
+				}
+				after, readErr := os.ReadFile(claimPath)
+				if readErr != nil || string(after) != string(expectedClaim) {
+					t.Fatalf("refused release changed its recovery claim: %v", readErr)
+				}
+				t.Logf("actual Scaleway SDK HTTPS: reassigned disk; observationRequests=%d destructiveOrUpdateRequests=0 serverDiskKeyUntouched=true claimBytesPreserved=true exit=4", len(requests)-checkpoint)
+			} else {
+				if err != nil || server != nil || volume != nil || key != nil || mutations != 4 {
+					t.Fatalf("SDK positive cleanup failed: err=%v requests=%v", err, requests[checkpoint:])
+				}
+				if _, statErr := os.Stat(claimPath); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("successful SDK cleanup retained claim: %v", statErr)
+				}
+				t.Logf("actual Scaleway SDK HTTPS: positive acquisition/publication/release; cleanupMutations=%d serverDiskKeyAbsent=true", mutations)
+			}
+		})
 	}
 }
 
@@ -833,6 +1680,7 @@ type fakeScalewayClient struct {
 	servers                     []*instance.Server
 	server                      *instance.Server
 	keys                        []*iam.SSHKey
+	volumes                     map[string]*instance.Volume
 	lastCreate                  *instance.CreateServerRequest
 	lastListOptions             int
 	lastConfig                  core.Config
@@ -843,10 +1691,17 @@ type fakeScalewayClient struct {
 	poweredOn                   bool
 	poweredOff                  bool
 	createErr                   error
+	createCalls                 int
 	createKeyErr                error
 	getErr                      error
+	getCalls                    int
 	deleteErr                   error
 	deleteKeyErr                error
+	deleteVolumeErr             error
+	updateErr                   error
+	updateCalls                 int
+	omitRootVolume              bool
+	afterCreate                 func()
 	createResponseWithoutServer bool
 }
 
@@ -880,6 +1735,7 @@ func (api *fakeInstanceAPI) ListServers(req *instance.ListServersRequest, opts .
 }
 
 func (api *fakeInstanceAPI) GetServer(req *instance.GetServerRequest, _ ...scw.RequestOption) (*instance.GetServerResponse, error) {
+	api.f.getCalls++
 	for _, server := range append(api.f.servers, api.f.server) {
 		if server != nil && server.ID == req.ServerID {
 			return &instance.GetServerResponse{Server: server}, nil
@@ -892,12 +1748,22 @@ func (api *fakeInstanceAPI) GetServer(req *instance.GetServerRequest, _ ...scw.R
 }
 
 func (api *fakeInstanceAPI) CreateServer(req *instance.CreateServerRequest, _ ...scw.RequestOption) (*instance.CreateServerResponse, error) {
+	api.f.createCalls++
 	api.f.lastCreate = req
 	if api.f.createErr != nil {
 		return nil, api.f.createErr
 	}
 	api.f.server = testServer("srv-1", req.Name, req.Tags, "203.0.113.10")
 	api.f.server.CommercialType = req.CommercialType
+	rootID := "44444444-4444-4444-4444-444444444444"
+	api.f.server.Volumes = map[string]*instance.VolumeServer{"0": {ID: rootID, Project: scw.StringPtr(api.f.ProjectID()), Zone: scw.Zone(api.f.Zone()), VolumeType: instance.VolumeServerVolumeTypeLSSD, Boot: true}}
+	api.f.volumes = map[string]*instance.Volume{rootID: {ID: rootID, Project: api.f.ProjectID(), Zone: scw.Zone(api.f.Zone()), Server: &instance.ServerSummary{ID: api.f.server.ID}}}
+	if api.f.omitRootVolume {
+		api.f.server.Volumes = nil
+	}
+	if api.f.afterCreate != nil {
+		api.f.afterCreate()
+	}
 	if api.f.createResponseWithoutServer {
 		return &instance.CreateServerResponse{}, nil
 	}
@@ -905,6 +1771,10 @@ func (api *fakeInstanceAPI) CreateServer(req *instance.CreateServerRequest, _ ..
 }
 
 func (api *fakeInstanceAPI) UpdateServer(req *instance.UpdateServerRequest, _ ...scw.RequestOption) (*instance.UpdateServerResponse, error) {
+	api.f.updateCalls++
+	if api.f.updateErr != nil {
+		return nil, api.f.updateErr
+	}
 	server := api.f.server
 	if server == nil {
 		for _, candidate := range api.f.servers {
@@ -934,6 +1804,30 @@ func (api *fakeInstanceAPI) DeleteServer(req *instance.DeleteServerRequest, _ ..
 	if api.f.deleteErr != nil {
 		return api.f.deleteErr
 	}
+	for _, volume := range api.f.volumes {
+		if volume.Server != nil && volume.Server.ID == req.ServerID {
+			volume.Server = nil
+		}
+	}
+	return nil
+}
+
+func (api *fakeInstanceAPI) GetVolume(req *instance.GetVolumeRequest, _ ...scw.RequestOption) (*instance.GetVolumeResponse, error) {
+	volume := api.f.volumes[req.VolumeID]
+	if volume == nil {
+		return nil, &scw.ResourceNotFoundError{}
+	}
+	return &instance.GetVolumeResponse{Volume: volume}, nil
+}
+
+func (api *fakeInstanceAPI) DeleteVolume(req *instance.DeleteVolumeRequest, _ ...scw.RequestOption) error {
+	if api.f.deleteVolumeErr != nil {
+		return api.f.deleteVolumeErr
+	}
+	if volume := api.f.volumes[req.VolumeID]; volume != nil && volume.Server != nil {
+		return errors.New("volume remains attached")
+	}
+	delete(api.f.volumes, req.VolumeID)
 	return nil
 }
 

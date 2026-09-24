@@ -15,7 +15,7 @@ func TestProvidersShareParsedAgentSandboxFlags(t *testing.T) {
 		{SSHProvider{}, Provider{}},
 		{SSHProvider{}},
 	} {
-		t.Run(providers[0].Name()+"/"+providers[len(providers)-1].Name(), func(t *testing.T) {
+		t.Run(providers[0].Spec().Name+"/"+providers[len(providers)-1].Spec().Name, func(t *testing.T) {
 			t.Setenv("KUBECONFIG", "")
 			defaults := core.BaseConfig()
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -53,15 +53,15 @@ func TestProvidersShareParsedAgentSandboxFlags(t *testing.T) {
 			want.ForgetMissing = true
 			for i, provider := range providers {
 				cfg := core.BaseConfig()
-				cfg.Provider = provider.Name()
+				cfg.Provider = provider.Spec().Name
 				if err := provider.ApplyFlags(&cfg, fs, values[i]); err != nil {
-					t.Fatalf("provider=%s: %v", provider.Name(), err)
+					t.Fatalf("provider=%s: %v", provider.Spec().Name, err)
 				}
 				if !reflect.DeepEqual(cfg.AgentSandbox, want) {
-					t.Errorf("provider=%s config=%#v; want %#v", provider.Name(), cfg.AgentSandbox, want)
+					t.Errorf("provider=%s config=%#v; want %#v", provider.Spec().Name, cfg.AgentSandbox, want)
 				}
-				if !core.DeleteOnReleaseExplicit(cfg, provider.Name()) {
-					t.Errorf("provider=%s delete policy not marked explicit", provider.Name())
+				if !core.DeleteOnReleaseExplicit(cfg, provider.Spec().Name) {
+					t.Errorf("provider=%s delete policy not marked explicit", provider.Spec().Name)
 				}
 			}
 		})

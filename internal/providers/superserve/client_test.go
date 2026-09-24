@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 func TestSuperserveClientCreateListActivateAndDelete(t *testing.T) {
@@ -53,7 +55,7 @@ func TestSuperserveClientCreateListActivateAndDelete(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +116,7 @@ func TestSuperserveClientRejectsCrossOriginRedirect(t *testing.T) {
 	}))
 	defer server.Close()
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +133,7 @@ func TestSuperserveClientRedactsSecretsFromErrors(t *testing.T) {
 	}))
 	defer server.Close()
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +159,7 @@ func TestSuperserveClientUpdateDoesNotFabricateMissingMetadata(t *testing.T) {
 	}))
 	defer server.Close()
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +185,7 @@ func TestSuperserveClientUpdateFetchesSandboxAfterEmptyPatch(t *testing.T) {
 	}))
 	defer server.Close()
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +245,7 @@ func TestSuperserveClientDataPlaneUploadAndStreamUseAccessTokenRouting(t *testin
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +310,7 @@ func TestSuperserveClientRefreshesAccessTokenOnDataPlane401(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +352,7 @@ func TestSuperserveClientFallsBackToBufferedExecWhenStreamUnsupported(t *testing
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +398,7 @@ func TestSuperserveUploadHonorsCallerDeadline(t *testing.T) {
 		}, nil
 	})}
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL("http://localhost"), Runtime{HTTP: httpClient})
+	client, err := newSuperserveClient(testConfigWithBaseURL("http://localhost"), core.Runtime{HTTP: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,13 +414,19 @@ func TestSuperserveUploadHonorsCallerDeadline(t *testing.T) {
 }
 
 func TestSuperserveExecRequestContextPreservesServiceDefault(t *testing.T) {
-	ctx, cancel := superserveExecRequestContext(context.Background(), 0)
+	ctx, cancel, err := superserveExecRequestContext(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer cancel()
 	if _, ok := ctx.Deadline(); ok {
 		t.Fatal("service-default exec timeout added an absolute client deadline")
 	}
 
-	ctx, cancel = superserveExecRequestContext(context.Background(), 12)
+	ctx, cancel, err = superserveExecRequestContext(context.Background(), 12)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer cancel()
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -445,7 +453,7 @@ func TestSuperserveClientStreamDoesNotRetainUnboundedOutput(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +506,7 @@ func TestSuperserveClientPropagatesOutputWriterFailures(t *testing.T) {
 			defer server.Close()
 
 			t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-			client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+			client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -530,7 +538,7 @@ func TestSuperserveClientRedactsForwardedEnvValuesFromExecErrors(t *testing.T) {
 		defer server.Close()
 
 		t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-		client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+		client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -560,7 +568,7 @@ func TestSuperserveClientRedactsForwardedEnvValuesFromExecErrors(t *testing.T) {
 		defer server.Close()
 
 		t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-		client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+		client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -601,7 +609,7 @@ func TestSuperserveClientStreamRequiresFinishedEvent(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +632,7 @@ func TestSuperserveClientRejectsTerminalStreamError(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,7 +662,7 @@ func TestSuperserveClientPreservesExitCodeWithTerminalStreamError(t *testing.T) 
 	defer server.Close()
 
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "ss_test_key")
-	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), Runtime{HTTP: server.Client()})
+	client, err := newSuperserveClient(testConfigWithBaseURL(server.URL), core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,8 +691,71 @@ func writeTestJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func testConfigWithBaseURL(baseURL string) Config {
+func testConfigWithBaseURL(baseURL string) core.Config {
 	cfg := testConfig()
 	cfg.Superserve.BaseURL = baseURL
 	return cfg
+}
+
+func TestExecRejectsOverflow(t *testing.T) {
+	if uint64(^uint(0)>>1) < uint64(9223372037) {
+		t.Skip("64-bit input")
+	}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; _, _ = io.WriteString(w, `{}`) }))
+	defer server.Close()
+	client := &httpSuperserveClient{http: server.Client(), baseURL: server.URL}
+	for _, seconds := range []int64{9223372037, 9223372032} {
+		for _, stream := range []bool{false, true} {
+			body := execRequest{Command: "true", TimeoutSecs: int(seconds)}
+			var err error
+			if stream {
+				_, err = client.execStream(t.Context(), "sandbox", "", body, io.Discard, io.Discard)
+			} else {
+				_, err = client.execBuffered(t.Context(), "sandbox", "", body)
+			}
+			if err == nil || !strings.Contains(err.Error(), "superserve execution timeout exceeds the supported duration range") {
+				t.Errorf("seconds=%d stream=%t result=%v", seconds, stream, err)
+			}
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("requests=%d", calls)
+	}
+}
+
+func TestRunRejectsExecOverflowBeforeClient(t *testing.T) {
+	if uint64(^uint(0)>>1) < uint64(9223372037) {
+		t.Skip("64-bit input")
+	}
+	cfg := testConfig()
+	var seconds int64 = 9223372032
+	cfg.Superserve.ExecTimeoutSecs = int(seconds)
+	b := NewSuperserveBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*backend)
+	b.newClient = func(core.Config, core.Runtime) (superserveClient, error) {
+		t.Fatal("overflow reached client")
+		return nil, nil
+	}
+	for _, id := range []string{"", "existing"} {
+		_, err := b.Run(t.Context(), core.RunRequest{ID: id, Repo: core.Repo{Root: t.TempDir()}, Command: []string{"true"}, NoSync: true})
+		if err == nil || core.ExitCodeForError(err, 1) != 2 || !strings.Contains(err.Error(), "execution timeout exceeds") {
+			t.Fatalf("run: %v", err)
+		}
+	}
+}
+
+func TestExecContextPreservesParentCancellation(t *testing.T) {
+	for _, seconds := range []int{0, 12} {
+		parent, stop := context.WithCancelCause(t.Context())
+		cause := errors.New("parent stopped")
+		child, cancel, err := superserveExecRequestContext(parent, seconds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop(cause)
+		if context.Cause(child) != cause {
+			t.Fatal("parent cause lost")
+		}
+		cancel()
+	}
 }

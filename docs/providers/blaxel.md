@@ -122,6 +122,10 @@ share the compiled defaults while retaining their raw-empty/trimmed-empty and
 zero-value distinctions. Memory zero remains a service default; exec-timeout zero
 retains its Crabbox fallback. Upload, retry, lifetime, and cleanup policy are
 unchanged.
+Execution timeouts that cannot fit the local duration budget, including the
+one-second process-wait grace, are rejected before run acquisition or reuse.
+The service still receives the configured timeout without that grace;
+inspection and stop do not consume this command budget.
 
 Provider flags:
 
@@ -172,6 +176,13 @@ Fresh `run` builds and validates its archive before creating a sandbox, so local
 guardrail/archive failures do not allocate a resource. The uploaded snapshot
 does not include edits made during provisioning. Reuse prepares only after
 claim and remote ownership validation. `--no-sync` creates no archive.
+
+Multipart upload attempts finish using the borrowed archive before retrying or
+returning; they never close the caller-owned reader. Cancellation stops HTTP and
+pipe work, but returning still waits for an in-flight source read. An arbitrary
+reader that ignores cancellation can therefore keep the call pending; this is not
+a universal bounded-read guarantee. Valid early HTTP success waits for upload
+completion, while HTTP failures retain precedence over producer errors.
 
 1. `warmup` or `run` without `--id` creates a sandbox with a
    `crabbox-<repo-slug>-<random6>` name, the configured image/region/memory and

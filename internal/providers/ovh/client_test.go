@@ -7,12 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 func TestClientRefusesCrossOriginRedirectBeforeSignedHeaderReplay(t *testing.T) {
@@ -135,13 +140,13 @@ func TestClientRedirectGuardUsesEffectiveOrigin(t *testing.T) {
 	same, _ := url.Parse("https://api.ovh.example.test:443/redirected")
 	otherPort, _ := url.Parse("https://api.ovh.example.test:444/redirected")
 	otherScheme, _ := url.Parse("http://api.ovh.example.test:443/redirected")
-	if !sameOVHOrigin(base, same) {
+	if !core.SameHTTPOrigin(base, same) {
 		t.Fatal("default HTTPS port should share origin")
 	}
-	if sameOVHOrigin(base, otherPort) {
+	if core.SameHTTPOrigin(base, otherPort) {
 		t.Fatal("different effective port should be refused")
 	}
-	if sameOVHOrigin(base, otherScheme) {
+	if core.SameHTTPOrigin(base, otherScheme) {
 		t.Fatal("different scheme should be refused")
 	}
 }
@@ -479,6 +484,62 @@ func TestClientErrorRedactsSecrets(t *testing.T) {
 		if strings.Contains(msg, leaked) {
 			t.Fatalf("error leaked %q: %s", leaked, msg)
 		}
+	}
+}
+
+func TestClientPreservesStatusWhenResponseBodyIsTruncated(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusNotFound} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", "1024")
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte("app-secret consumer-key"))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL)
+			_, err := client.ListProjects(context.Background())
+			if code == http.StatusOK {
+				if !errors.Is(err, io.ErrUnexpectedEOF) || err.Error() != "ovh GET /cloud/project response body: unexpected EOF" {
+					t.Fatalf("success-body read error=%v", err)
+				}
+				return
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != code || apiErr.Operation != "GET /cloud/project" {
+				t.Fatalf("typed status was lost: %v", err)
+			}
+			if !strings.HasSuffix(apiErr.Body, "; response body read failed: unexpected EOF") {
+				t.Fatalf("partial-read diagnostic=%q", apiErr.Body)
+			}
+			for _, secret := range []string{"app-secret", "consumer-key"} {
+				if strings.Contains(apiErr.Body, secret) {
+					t.Fatalf("partial body retained credential fixture %q", secret)
+				}
+			}
+		})
+	}
+}
+
+func TestOVHAPIErrorDiagnosticRedaction(t *testing.T) {
+	readErr := errors.New("read interrupted with app-secret consumer-key")
+	c := newTestClientWithHTTP(t, "https://example.test", &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Request: req, Body: io.NopCloser(io.MultiReader(strings.NewReader("partial response"), iotest.ErrReader(readErr)))}, nil
+	})})
+	err := c.do(t.Context(), http.MethodGet, "/auth/time", nil, nil)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Fatalf("typed status changed: %v", err)
+	}
+	for _, secret := range []string{"app-secret", "consumer-key"} {
+		if strings.Contains(apiErr.Body, secret) {
+			t.Fatalf("unsafe API diagnostic: %q", apiErr.Body)
+		}
+	}
+	if !strings.Contains(apiErr.Body, "partial response; response body read failed:") {
+		t.Fatalf("diagnostic context lost: %q", apiErr.Body)
+	}
+	if errors.Is(err, readErr) {
+		t.Fatal("read failure overrode API error classification")
 	}
 }
 

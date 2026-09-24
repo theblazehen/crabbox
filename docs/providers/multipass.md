@@ -148,6 +148,12 @@ CRABBOX_MULTIPASS_DISK
 CRABBOX_MULTIPASS_LAUNCH_TIMEOUT
 ```
 
+Decoded negative CPU counts, including environment and explicit flag values, are
+rejected before acquiring a new VM. Creation-only CPU sizing does not block
+operations on existing leases, including stop and cleanup. Zero leaves the Multipass CPU default,
+and positive counts are passed through. YAML CPU values still apply only when
+positive; zero or negative YAML values leave the previous setting unchanged.
+
 ## Lease Behavior
 
 1. `warmup` or a fresh `run` creates a per-lease SSH key.
@@ -168,11 +174,28 @@ CRABBOX_MULTIPASS_LAUNCH_TIMEOUT
    non-`keep` VMs whose local claim is stale past the idle timeout plus the
    direct-provider grace window.
 
+List and status report the observed state for non-running instances, even when
+a previous readiness check saved a ready label. For running instances, an
+existing saved ready label remains visible.
+
 Multipass does not expose provider labels. Crabbox therefore treats the exact
 instance-bound local lease claim as the source of ownership. `stop` and
 `cleanup` skip every unclaimed instance, including stopped `crabbox-`-prefixed
 instances. Adopt intentionally recovered instances through an explicit
 `--reclaim` reuse before destructive lifecycle operations.
+
+Heartbeats persist the touch timestamp and any explicit `--idle-timeout` override
+in the exact instance-bound local claim. Omitting the flag preserves the recorded
+window despite different current defaults; the original TTL still caps expiry.
+Both status modes retain a prepared endpoint for an acquired running instance,
+while inactive, endpoint-less, and legacy unbound observations stay metadata-only.
+Status/controller resolution never adopts or rewrites claims. The public
+`status --wait` command may separately renew a completed lease through the guarded
+heartbeat path. Ordinary explicit `--reclaim` reuse keeps its existing meaning.
+
+Acquisition publishes endpoint and cache-volume metadata together after recording
+ownership. If publication and VM rollback both fail, the recovery claim and SSH
+key remain available. Reuse preserves existing mount metadata.
 
 ## Limits And Caveats
 

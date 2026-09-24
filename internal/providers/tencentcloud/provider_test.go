@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +70,23 @@ func TestProviderFlagsApply(t *testing.T) {
 }
 
 func TestServerTypeForConfigHonorsClassAndTypeProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  core.Config
+		want string
+	}{
+		{name: "unsupported target", cfg: core.Config{Class: "fast", TargetOS: core.TargetMacOS}},
+		{name: "unsupported architecture", cfg: core.Config{Class: "fast", TargetOS: core.TargetLinux, Architecture: core.ArchitectureARM64}},
+		{name: "legacy normalized fallback", cfg: core.Config{Class: " FAST ", TargetOS: core.TargetMacOS}, want: "SA5.LARGE8"},
+		{name: "unknown legacy fallback", cfg: core.Config{Class: "custom-shape"}, want: defaultType},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.MarkClassExplicit(&test.cfg)
+			if got := (Provider{}).ServerTypeForConfig(test.cfg); got != test.want {
+				t.Fatalf("type=%q want=%q", got, test.want)
+			}
+		})
+	}
 	provider := Provider{}
 	defaults := core.BaseConfig()
 	defaults.Provider = providerName
@@ -90,14 +109,14 @@ func TestServerTypeForConfigHonorsClassAndTypeProvenance(t *testing.T) {
 	}
 
 	explicitProviderType := explicitClass
-	explicitProviderType.TencentCloud.Type = "S5.SMALL2"
+	explicitProviderType.TencentCloud.Type = " S5.SMALL2 "
 	core.SetTencentCloudTypeExplicit(&explicitProviderType)
 	if got := provider.ServerTypeForConfig(explicitProviderType); got != "S5.SMALL2" {
 		t.Fatalf("explicit provider type=%q", got)
 	}
 
 	explicitGenericType := explicitProviderType
-	explicitGenericType.ServerType = "S6.MEDIUM4"
+	explicitGenericType.ServerType = " S6.MEDIUM4 "
 	explicitGenericType.ServerTypeExplicit = true
 	if got := provider.ServerTypeForConfig(explicitGenericType); got != "S6.MEDIUM4" {
 		t.Fatalf("explicit generic type=%q", got)
@@ -607,6 +626,8 @@ type fakeTencentCloudAPI struct {
 	item            instance
 	replacedCurrent []tag
 	replacedDesired []tag
+	replaceCalls    int
+	replaceErr      error
 	terminated      []string
 	terminateFn     func()
 }
@@ -636,8 +657,12 @@ func (f *fakeTencentCloudAPI) TerminateInstance(_ context.Context, id string) er
 }
 
 func (f *fakeTencentCloudAPI) ReplaceInstanceTags(_ context.Context, _ string, current, desired []tag) error {
+	f.replaceCalls++
 	f.replacedCurrent = append([]tag(nil), current...)
 	f.replacedDesired = append([]tag(nil), desired...)
+	if f.replaceErr != nil {
+		return f.replaceErr
+	}
 	f.item.Tags = append([]tag(nil), desired...)
 	return nil
 }
@@ -798,6 +823,20 @@ func TestTencentBindingRuntimeAndClassContract(t *testing.T) {
 		t.Fatal("generic type priority lost")
 	}
 	for _, tc := range []struct {
+		architecture, class, want string
+	}{
+		{core.ArchitectureAMD64, "fast", "SA5.LARGE8"},
+		{core.ArchitectureARM64, "standard", ""},
+	} {
+		cfg := core.Config{Provider: providerName, TargetOS: core.TargetLinux, Architecture: tc.architecture, Class: tc.class}
+		core.MarkClassExplicit(&cfg)
+		core.SetTencentCloudTypeExplicit(&cfg)
+		got := cfgForRun(cfg)
+		if got.TencentCloud.Type != tc.want || got.ServerType != tc.want {
+			t.Fatalf("explicit-empty native type with class=%s architecture=%s resolved=%q/%q want=%q", tc.class, tc.architecture, got.TencentCloud.Type, got.ServerType, tc.want)
+		}
+	}
+	for _, tc := range []struct {
 		market   string
 		explicit bool
 		want     string
@@ -811,5 +850,97 @@ func TestTencentBindingRuntimeAndClassContract(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Fatalf("market=%s explicit=%t got=%s err=%v", tc.market, tc.explicit, got, err)
 		}
+	}
+}
+
+func TestTouchIdleTimeoutIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		storedKey                  string
+		stored, fallback, explicit time.Duration
+		want                       time.Duration
+		writeFails                 bool
+	}{
+		{name: "stored policy beats effective fallback", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, fallback: 90 * time.Minute, want: 30 * time.Minute},
+		{name: "legacy stored spelling", storedKey: "idle_timeout", stored: 30 * time.Minute, fallback: 90 * time.Minute, want: 30 * time.Minute},
+		{name: "explicit pointer beats fallback", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, fallback: time.Minute, explicit: 90 * time.Minute, want: 90 * time.Minute},
+		{name: "explicit without fallback", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, explicit: 90 * time.Minute, want: 90 * time.Minute},
+		{name: "missing policy uses fallback", fallback: 45 * time.Minute, want: 45 * time.Minute},
+		{name: "refreshes live policy", storedKey: "idle_timeout_secs", stored: 90 * time.Minute, fallback: time.Minute, want: 90 * time.Minute},
+		{name: "remote update failure", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, explicit: 90 * time.Minute, want: 90 * time.Minute, writeFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const leaseID = "cbx_abcdef123456"
+			cfg := core.BaseConfig()
+			cfg.Provider = providerName
+			cfg.TargetOS = core.TargetLinux
+			cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
+			cfg.IdleTimeout = 5 * time.Minute
+			cfg.TTL = time.Hour
+			created := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+			now := created.Add(20 * time.Minute)
+			labels := labelsFromTags(leaseTags(cfg, leaseID, "touch", "ready", false, created))
+			delete(labels, "idle_timeout")
+			delete(labels, "idle_timeout_secs")
+			if tc.storedKey != "" {
+				labels[tc.storedKey] = strconv.FormatInt(int64(tc.stored/time.Second), 10)
+			}
+			item := instance{InstanceID: "ins-touch", InstanceName: core.LeaseProviderName(leaseID, "touch"), InstanceState: "RUNNING", Tags: tagsFromLabels(labels)}
+			api := &fakeTencentCloudAPI{item: item}
+			failure := errors.New("synthetic tag update failure")
+			if tc.writeFails {
+				api.replaceErr = failure
+			}
+			b := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*Backend)
+			b.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+			b.now = func() time.Time { return now }
+			server := serverFromInstance(item, cfg)
+			server.Labels["idle_timeout_secs"] = "10" // A cached projection is not authoritative.
+			server.Labels[accountLabel] = "100000000001"
+			before := shared.CloneLabels(server.Labels)
+			req := core.TouchRequest{Lease: core.LeaseTarget{LeaseID: leaseID, Server: server}, State: "running", IdleTimeout: tc.fallback}
+			if tc.explicit > 0 {
+				req.IdleTimeoutOverride = &tc.explicit
+			}
+			got, err := b.Touch(t.Context(), req)
+			if tc.writeFails {
+				if !errors.Is(err, failure) || got.CloudID != "" || !reflect.DeepEqual(api.item.Tags, item.Tags) {
+					t.Fatal("failed update was reported as committed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := strconv.FormatInt(int64(tc.want/time.Second), 10)
+			if got.Labels["idle_timeout_secs"] != want || got.Labels["idle_timeout"] != want {
+				t.Fatalf("timeout=%s want=%s", got.Labels["idle_timeout_secs"], want)
+			}
+			expires := now.Add(tc.want)
+			if expires.After(created.Add(time.Hour)) {
+				expires = created.Add(time.Hour)
+			}
+			if got.Labels["expires_at"] != core.LeaseLabelTime(expires) || got.Labels["last_touched_at"] != core.LeaseLabelTime(now) {
+				t.Fatal("touch timestamp or original TTL cap lost")
+			}
+			for _, key := range []string{"lease", "slug", "provider", "provider_key", "created_at", "ttl_secs"} {
+				if got.Labels[key] != labels[key] {
+					t.Fatalf("lost %s", key)
+				}
+			}
+			if got.Labels[accountLabel] != "100000000001" || api.replaceCalls != 1 || !reflect.DeepEqual(api.replacedCurrent, item.Tags) {
+				t.Fatal("remote replacement lost account or live current tags")
+			}
+			fresh, err := api.GetInstance(t.Context(), item.InstanceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(serverFromInstance(fresh, cfg).Labels, got.Labels) {
+				t.Fatal("returned labels differ from committed remote policy")
+			}
+			if !reflect.DeepEqual(server.Labels, before) {
+				t.Fatal("touch mutated its input projection")
+			}
+		})
 	}
 }

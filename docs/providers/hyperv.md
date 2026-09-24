@@ -80,6 +80,12 @@ Notes:
 
 ## Configuration
 
+`crabbox config show` displays loaded nonsecret Hyper-V settings in the `hyperv`
+text line and JSON section, even when another provider is selected. It preserves
+empty, zero and false values without resolving new defaults or invoking Hyper-V.
+The guest password and credential-presence information are not displayed;
+`initPassword` is only the configured boolean, not evidence of guest changes.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -91,6 +97,18 @@ Notes:
 | `--hyperv-memory` | `8192` | Memory in MB |
 | `--hyperv-switch` | `Default Switch` | Hyper-V virtual switch name |
 | `--hyperv-init-password` | `false` | Set the guest password at first boot via the lease disk (password-less auto-logon templates) |
+
+Decoded negative CPU or memory values, including environment and explicit flag
+values, are rejected when creating a VM, before native commands or local lease
+state changes. Inherited sizing does not block stopping an existing lease or
+cleaning up its resources; those operations retain their existing checks.
+Zero retains the defaults
+of 4 CPUs and 8192 MB. Positive memory values retain the existing binary
+megabyte conversion, but values that overflow a signed 64-bit byte count are
+rejected before native commands or local lease state changes. Other positive
+sizing values are passed through unchanged. YAML CPU
+and memory values still apply only when positive, so zero or negative YAML
+values leave the previous setting unchanged.
 
 ### Config file
 
@@ -165,11 +183,26 @@ installation.
    validated key-only configuration, then waits for SSH readiness.
 2. **Resolve**: Finds a running crabbox VM by lease ID, slug, or instance name.
    Queries live VM state and IP from Hyper-V.
+   Plain and waiting status retain an existing SSH endpoint for acquired, running
+   leases. Status and controller observations never adopt a legacy claim or rewrite
+   local claim/key state; inactive or incomplete leases remain metadata-only.
+   Plain status also remains metadata-only for legacy claims; endpoint access and
+   heartbeat require an exactly bound claim or explicit reclaim through reuse.
+   The public `status --wait` command can separately renew an acquired lease
+   through the same guarded heartbeat path; plain status does not renew it.
 3. **List**: Lists all VMs with the `crabbox-` name prefix.
 4. **Release**: Stops the VM (`Stop-VM -Force`) and removes it
    (`Remove-VM -Force`), then cleans up the provider-created VHDX file.
 5. **Cleanup**: Scans for stale `crabbox-` prefixed VMs and removes only VMs
    bound to an exact expired local claim.
+
+Heartbeats require an exact instance-scoped claim for a completed acquisition.
+They atomically persist the touch timestamp and an explicit `--idle-timeout`
+override; omitting the flag preserves the recorded timeout, even when current
+configuration differs. Fresh status reads retain that policy and the original
+lease TTL cap. A stale snapshot or incomplete acquisition is not renewed.
+Ownership remains bound to the recorded VM name and instance scope, not a
+Hyper-V generation identifier.
 
 ## Notes
 

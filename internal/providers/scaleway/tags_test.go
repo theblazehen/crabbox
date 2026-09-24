@@ -42,6 +42,54 @@ func TestValidateScalewayLabelsRejectsNonCanonicalLease(t *testing.T) {
 	}
 }
 
+func TestRootVolumeTagsRejectConflictsAndDoNotImportLocalJournal(t *testing.T) {
+	labels := labelsFromTags(leaseTags(core.Config{Provider: providerName, TargetOS: core.TargetLinux}, "cbx_999999999999", "volume-tags", "ready", false, time.Now()))
+	labels[volumeContractLabel] = rootVolumeContract
+	labels[rootVolumeLabel] = "44444444-4444-4444-4444-444444444444"
+	tags := tagsFromLabels(labels)
+	got := labelsFromTags(append(tags, "crabbox:"+volumePendingLabel+":true"))
+	if got[volumePendingLabel] != "" || got[rootVolumeLabel] != labels[rootVolumeLabel] || got[volumeContractLabel] != rootVolumeContract {
+		t.Fatalf("unexpected manifest decoding: %v", got)
+	}
+	for key, value := range map[string]string{volumeContractLabel: "unknown-contract", rootVolumeLabel: "55555555-5555-5555-5555-555555555555"} {
+		conflict := labelsFromTags(append(append([]string{}, tags...), "crabbox:"+key+":"+value))
+		if err := validateScalewayLabels(conflict); err == nil {
+			t.Fatalf("accepted conflicting %s tags", key)
+		}
+	}
+}
+
+func TestRootVolumeManifestRejectsIncompleteAndMalformedIdentity(t *testing.T) {
+	for _, manifest := range []rootVolumeManifest{
+		{contract: rootVolumeContract},
+		{id: "44444444-4444-4444-4444-444444444444"},
+		{contract: "unknown", id: "44444444-4444-4444-4444-444444444444"},
+		{contract: rootVolumeContract, id: "not-a-uuid"},
+		{contract: rootVolumeContract, id: "00000000-0000-0000-0000-000000000000"},
+		{pending: true},
+	} {
+		if err := manifest.validate(); err == nil {
+			t.Fatalf("accepted invalid manifest %+v", manifest)
+		}
+	}
+}
+
+func TestRootVolumePendingJournalRejectsReuseEvenWithCompleteLiveTags(t *testing.T) {
+	labels := map[string]string{volumeContractLabel: rootVolumeContract, rootVolumeLabel: "44444444-4444-4444-4444-444444444444", volumePendingLabel: "true", "recovery": "rollback-cleanup"}
+	claim := core.LeaseClaim{Labels: labels}
+	server := core.Server{Labels: labelsFromTags(tagsFromLabels(labels))}
+	if err := validateRootVolumeIdentity(claim, server, false); err == nil {
+		t.Fatal("unacknowledged publication authorized reuse")
+	}
+	if err := validateRootVolumeIdentity(claim, server, true); err != nil {
+		t.Fatalf("completed live tags must still permit cleanup: %v", err)
+	}
+	labels["recovery"] = "unknown"
+	if err := validateRootVolumeIdentity(claim, server, true); err == nil {
+		t.Fatal("unknown recovery state authorized pending cleanup")
+	}
+}
+
 func TestExactTagsPreserveTailscaleValues(t *testing.T) {
 	labels := map[string]string{
 		"provider":           providerName,
@@ -69,4 +117,38 @@ func containsTag(tags []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestScalewayTagDecoderRetainsProviderPrecedence(t *testing.T) {
+	labels := labelsFromTags([]string{
+		"crabbox:state:running", "crabbox:state:provisioning",
+		"crabbox:expires_at:20", "crabbox:expires_at:10",
+		"crabbox:keep:TRUE", "crabbox:unknown_metadata:retained",
+		"crabbox:provider:scaleway", "crabbox:provider:ScaleWay",
+	})
+	for key, want := range map[string]string{
+		"state": "provisioning", "expires_at": "10", "keep": "TRUE",
+		"unknown_metadata": "retained", ownershipTagConflictLabel: "provider",
+	} {
+		if labels[key] != want {
+			t.Errorf("labels[%q]=%q, want %q", key, labels[key], want)
+		}
+	}
+}
+
+func TestScalewaySchemaPreservesExactAndRecoveryFields(t *testing.T) {
+	labels := map[string]string{
+		"tailscale_hostname": "box.example.ts.net", "tailscale_tags": "tag:ci,tag:dev",
+		"tailscale_ipv4": "100.100.10.20", "tailscale_fqdn": "box.example.ts.net",
+		"tailscale_error": "a diagnostic with spaces", "tailscale_exit_node": "100.100.10.21",
+		"recovery": "pending", "scaleway_project": "project-1", "scaleway_organization": "org-1",
+		"scaleway_region": "fr-par", "scaleway_zone": "fr-par-1",
+		"scaleway_ssh_key_id": "key-1", "scaleway_ssh_key_name": "crabbox-key",
+	}
+	got := labelsFromTags(tagsFromLabels(labels))
+	for key, want := range labels {
+		if got[key] != want {
+			t.Errorf("round-trip label[%q]=%q, want %q", key, got[key], want)
+		}
+	}
 }

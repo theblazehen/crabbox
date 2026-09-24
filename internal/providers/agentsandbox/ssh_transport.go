@@ -29,7 +29,7 @@ func validSSHBootstrapPort(port string) bool {
 	return err == nil && n >= 1024 && n <= 65535 && strconv.Itoa(n) == port
 }
 
-func closeClaimSSHMasters(ctx context.Context, claim LeaseClaim) error {
+func closeClaimSSHMasters(ctx context.Context, claim core.LeaseClaim) error {
 	key, err := core.TestboxKeyPath(claim.LeaseID)
 	if err != nil {
 		return err
@@ -37,7 +37,7 @@ func closeClaimSSHMasters(ctx context.Context, claim LeaseClaim) error {
 	return core.CloseSSHControlMasters(ctx, core.SSHTarget{Key: key})
 }
 
-func (b *backend) sshTarget(claim LeaseClaim) (core.SSHTarget, error) {
+func (b *backend) sshTarget(claim core.LeaseClaim) (core.SSHTarget, error) {
 	if err := authorizeClaimScope(b.cfg, claim); err != nil {
 		return core.SSHTarget{}, err
 	}
@@ -229,7 +229,7 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 
 // Probe the actual authenticated SSH endpoint, without running a remote command,
 // bootstrapping, or rewriting local trust. Pod readiness alone is insufficient.
-func (b *backend) probeSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (resultErr error) {
+func (b *backend) probeSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim core.LeaseClaim) (resultErr error) {
 	if err := validateSSHRuntime(claim, ready); err != nil {
 		return err
 	}
@@ -282,7 +282,7 @@ func (b *backend) probeSSH(ctx context.Context, client kubernetesClient, ready s
 	return check()
 }
 
-func (b *backend) sshHealth(ctx context.Context, claim LeaseClaim) error {
+func (b *backend) sshHealth(ctx context.Context, claim core.LeaseClaim) error {
 	identity, err := claimIdentityFromLocalClaim(claim)
 	if err != nil {
 		return err
@@ -322,7 +322,7 @@ func (b *backend) forwardSSH(ctx context.Context, pod, remotePort string, input 
 	parser := &sshForwardOutput{ports: ports, remotePort: remotePort}
 	done := make(chan error, 1)
 	go func() {
-		result, err := b.rt.Exec.Run(processCtx, LocalCommandRequest{
+		result, err := b.rt.Exec.Run(processCtx, core.LocalCommandRequest{
 			Name:                 b.cfg.AgentSandbox.Kubectl,
 			Args:                 args,
 			Stdout:               parser,

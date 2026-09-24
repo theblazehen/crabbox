@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +31,27 @@ type fakeRunner struct {
 
 type fixedClock struct{ now time.Time }
 
+func prepareObservedSSH(t *testing.T, leaseID, host string) (string, string) {
+	t.Helper()
+	target := core.SSHTarget{}
+	if err := core.UseLeaseKnownHosts(&target, leaseID); err != nil {
+		t.Fatal(err)
+	}
+	key, err := core.TestboxKeyPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		key:                   "synthetic fixture key\n",
+		target.KnownHostsFile: host + " ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOCh4W5YA0Lp2pvT+yWIG/tC7BrQalNUIHSqfjYkJei6\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return key, target.KnownHostsFile
+}
+
 func (c fixedClock) Now() time.Time { return c.now }
 
 func (r *fakeRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
@@ -45,8 +68,8 @@ func (r *fakeRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.
 
 func TestProviderContract(t *testing.T) {
 	provider := Provider{}
-	if provider.Name() != providerName || !reflect.DeepEqual(provider.Aliases(), []string{"phala-cloud", "dstack"}) {
-		t.Fatalf("provider identity=%q aliases=%v", provider.Name(), provider.Aliases())
+	if provider.Spec().Name != providerName || !reflect.DeepEqual(provider.Spec().Aliases, []string{"phala-cloud", "dstack"}) {
+		t.Fatalf("provider identity=%q aliases=%v", provider.Spec().Name, provider.Spec().Aliases)
 	}
 	spec := provider.Spec()
 	if spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever ||
@@ -151,6 +174,34 @@ func TestInstanceTypeForClass(t *testing.T) {
 }
 
 func TestServerTypeForConfigHonorsExplicitClassAndProviderType(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		cfg            core.Config
+		classExplicit  bool
+		nativeExplicit bool
+		want           string
+	}{
+		{name: "unsupported target", cfg: core.Config{Class: "fast", TargetOS: core.TargetMacOS}, classExplicit: true},
+		{name: "unsupported architecture", cfg: core.Config{Class: "fast", TargetOS: core.TargetLinux, Architecture: core.ArchitectureARM64}, classExplicit: true},
+		{name: "legacy normalized fallback", cfg: core.Config{Class: " FAST ", TargetOS: core.TargetMacOS}, classExplicit: true, want: "tdx.medium"},
+		{name: "empty legacy class", classExplicit: true, want: "tdx.small"},
+		{name: "custom legacy fallback trims", cfg: core.Config{Class: " tdx.2xlarge "}, classExplicit: true, want: "tdx.2xlarge"},
+		{name: "generic override remains raw", cfg: core.Config{Class: "fast", ServerType: " tdx.2xlarge ", ServerTypeExplicit: true}, classExplicit: true, want: " tdx.2xlarge "},
+		{name: "native override remains raw", cfg: core.Config{Class: "fast", Phala: core.PhalaConfig{InstanceType: " tdx.large "}}, classExplicit: true, nativeExplicit: true, want: " tdx.large "},
+		{name: "implicit class preserves native default", cfg: core.Config{Class: "fast", Phala: core.PhalaConfig{InstanceType: " tdx.large "}}, want: " tdx.large "},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.classExplicit {
+				core.MarkClassExplicit(&test.cfg)
+			}
+			if test.nativeExplicit {
+				core.MarkPhalaInstanceTypeExplicit(&test.cfg)
+			}
+			if got := (Provider{}).ServerTypeForConfig(test.cfg); got != test.want {
+				t.Fatalf("type=%q want=%q", got, test.want)
+			}
+		})
+	}
 	provider := Provider{}
 	defaults := core.BaseConfig()
 	defaults.Provider = providerName
@@ -187,13 +238,13 @@ func TestClassFlagOverridesInheritedPhalaInstanceType(t *testing.T) {
 
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	class := fs.String("class", cfg.Class, "machine class")
-	values := registerFlags(fs, cfg)
+	values := (Provider{}).RegisterFlags(fs, cfg)
 	if err := fs.Parse([]string{"--class", "fast"}); err != nil {
 		t.Fatal(err)
 	}
 	cfg.Class = *class
 	core.MarkClassExplicit(&cfg)
-	if err := applyFlags(&cfg, fs, values); err != nil {
+	if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
 	if got := (Provider{}).ServerTypeForConfig(cfg); got != "tdx.medium" {
@@ -233,12 +284,100 @@ func TestServerTypeForConfigUsesExplicitFileAndEnvironmentClass(t *testing.T) {
 	}
 }
 
+func TestPhalaOrdinaryFlagMetadataAndPointers(t *testing.T) {
+	for _, priorName := range []string{"nil", "false", "true"} {
+		cfg := core.Config{Provider: "other", Phala: core.PhalaConfig{CLIPath: "same", InstanceType: "same", WorkRoot: "same", NodeID: "same", Compose: "same"}}
+		if priorName != "nil" {
+			v := priorName == "true"
+			cfg.Phala.Attest = &v
+		}
+		before := cfg
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		values := (Provider{}).RegisterFlags(fs, cfg)
+		if !reflect.DeepEqual(cfg, before) || cfg.Phala.Attest != before.Phala.Attest {
+			t.Fatal("registration changed defaults")
+		}
+		var names []string
+		fs.VisitAll(func(f *flag.Flag) { names = append(names, f.Name) })
+		if strings.Join(names, ",") != "phala-attest,phala-cli,phala-compose,phala-instance-type,phala-node-id,phala-skip-attestation,phala-work-root" {
+			t.Fatalf("metadata names %v", names)
+		}
+		if fs.Lookup("phala-attest").DefValue != strconv.FormatBool(priorName != "false") || fs.Lookup("phala-skip-attestation").DefValue != "false" {
+			t.Fatal("effective registration defaults")
+		}
+		for _, foreign := range []any{nil, struct{}{}} {
+			if err := (Provider{}).ApplyFlags(&cfg, fs, foreign); err != nil || !reflect.DeepEqual(cfg, before) {
+				t.Fatal("foreign mutation")
+			}
+		}
+		if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil || !reflect.DeepEqual(cfg, before) || cfg.Phala.Attest != before.Phala.Attest {
+			t.Fatal("unvisited pointer changed")
+		}
+		for _, args := range [][]string{{"--phala-attest=true"}, {"--phala-attest=false"}, {"--phala-skip-attestation=false"}, {"--phala-attest=true", "--phala-skip-attestation=true"}} {
+			cfg = before
+			fs = flag.NewFlagSet("test", flag.ContinueOnError)
+			values = (Provider{}).RegisterFlags(fs, cfg)
+			if err := fs.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
+				t.Fatal(err)
+			}
+			want := before
+			ignored := len(args) == 1 && args[0] == "--phala-skip-attestation=false"
+			if !ignored {
+				v := len(args) == 1 && args[0] == "--phala-attest=true"
+				want.Phala.Attest = &v
+				core.RecordProviderFlagInputs(&want, true, "phala")
+				if cfg.Phala.Attest == before.Phala.Attest {
+					t.Fatal("accepted pointer reused")
+				}
+			} else if cfg.Phala.Attest != before.Phala.Attest {
+				t.Fatal("ignored pointer changed")
+			}
+			if !reflect.DeepEqual(cfg, want) {
+				t.Fatalf("flags %v got %#v want %#v", args, cfg, want)
+			}
+			if !ignored {
+				stored := *cfg.Phala.Attest
+				if err := fs.Set("phala-attest", strconv.FormatBool(!stored)); err != nil {
+					t.Fatal(err)
+				}
+				if *cfg.Phala.Attest != stored {
+					t.Fatal("runtime aliases parsed flag storage")
+				}
+			}
+		}
+	}
+	for _, raw := range []string{"", "same", "~/ordinary"} {
+		cfg := core.Config{Provider: "other"}
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		values := (Provider{}).RegisterFlags(fs, cfg)
+		args := []string{}
+		for _, name := range []string{"cli", "instance-type", "node-id", "work-root", "compose"} {
+			args = append(args, "--phala-"+name+"=first", "--phala-"+name+"="+raw)
+		}
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		want := core.Config{Provider: "other", Phala: core.PhalaConfig{CLIPath: raw, InstanceType: raw, NodeID: raw, WorkRoot: raw, Compose: raw}}
+		core.MarkPhalaInstanceTypeExplicit(&want)
+		core.RecordProviderFlagInputs(&want, true, "phala")
+		if !reflect.DeepEqual(cfg, want) {
+			t.Fatalf("raw flags %#v", cfg)
+		}
+	}
+}
+
 func TestFlagsApplyPhalaOptions(t *testing.T) {
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	class := fs.String("class", cfg.Class, "machine class")
-	values := registerFlags(fs, cfg)
+	values := (Provider{}).RegisterFlags(fs, cfg)
 	if err := fs.Parse([]string{
 		"--class", "fast",
 		"--phala-cli", "/opt/phala",
@@ -250,7 +389,7 @@ func TestFlagsApplyPhalaOptions(t *testing.T) {
 	}
 	cfg.Class = *class
 	core.MarkClassExplicit(&cfg)
-	if err := applyFlags(&cfg, fs, values); err != nil {
+	if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Phala.CLIPath != "/opt/phala" || cfg.ServerType != "tdx.medium" ||
@@ -695,6 +834,26 @@ func TestTouchPersistsUpdatedLabelsToClaim(t *testing.T) {
 		claims[0].Labels["gateway_host"] != gatewayHost {
 		t.Fatalf("claims=%#v touched=%#v", claims, touched.Labels)
 	}
+	override := 7 * time.Minute
+	for _, step := range []struct {
+		name     string
+		override *time.Duration
+	}{{"explicit", &override}, {"ordinary", nil}} {
+		t.Run(step.name, func(t *testing.T) {
+			var err error
+			touched, err = b.Touch(context.Background(), core.TouchRequest{
+				Lease: core.LeaseTarget{LeaseID: leaseID, Server: touched, SSH: target},
+				State: "ready", IdleTimeout: time.Hour, IdleTimeoutOverride: step.override,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, _, err := core.ReadLeaseClaimWithPresence(leaseID)
+			if err != nil || claim.IdleTimeoutSeconds != 420 || claim.Labels["idle_timeout"] != "420" || claim.Labels["idle_timeout_secs"] != "420" || touched.Labels["idle_timeout_secs"] != "420" || claim.Labels["gateway_host"] != gatewayHost {
+				t.Fatalf("claim=%#v touched=%#v err=%v", claim, touched, err)
+			}
+		})
+	}
 }
 
 func TestResolveRepairsTruncatedGatewayHostClaim(t *testing.T) {
@@ -718,6 +877,7 @@ func TestResolveRepairsTruncatedGatewayHostClaim(t *testing.T) {
 	if err := core.ClaimLeaseTargetForConfig(leaseID, "blue-box", cfg, server, core.SSHTarget{Host: cloudID, Port: "22"}, cfg.IdleTimeout); err != nil {
 		t.Fatal(err)
 	}
+	prepareObservedSSH(t, leaseID, cloudID)
 	runner := &fakeRunner{results: []core.LocalCommandResult{
 		{Stdout: `{"success":true,"total":1,"items":[{"appId":"` + cloudID + `","cvmName":"crabbox-cbx-abcdef123456","status":"running"}]}`},
 		{Stdout: `{"success":true,"app_id":"` + cloudID + `","gateway":{"base_domain":"dstack-pha-prod5.phala.network"}}`},
@@ -1129,6 +1289,124 @@ func TestReleaseOnlyResolveAllowsExpiredClaim(t *testing.T) {
 // context, a Resolve that returns NIL proves prepareSSH was skipped, while a
 // non-status Resolve returns that context error. The fakeRunner ignores the
 // context, so the `cvms list` inside resolve() still succeeds.
+func TestResolveObservationUsesExistingAccess(t *testing.T) {
+	for _, layout := range []string{"selected", "default"} {
+		for _, mode := range []string{"status", "wait", "controller"} {
+			for _, material := range []string{"absent", "prepared", "missing-key", "missing-pin", "empty-pin", "unsafe-directory", "pin-directory"} {
+				t.Run(layout+"/"+mode+"/"+material, func(t *testing.T) {
+					if material == "unsafe-directory" && runtime.GOOS == "windows" {
+						t.Skip("Unix permission fixture; Windows uses native ACL admission")
+					}
+					root := t.TempDir()
+					home := t.TempDir()
+					t.Setenv("HOME", home)
+					t.Setenv("USERPROFILE", home)
+					t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+					t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+					t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+					t.Setenv("XDG_STATE_HOME", root)
+					if layout == "default" {
+						t.Setenv("XDG_STATE_HOME", "")
+					}
+					cfg := core.BaseConfig()
+					cfg.Provider, cfg.SSHKey = providerName, "must-not-use-configured-fallback"
+					applyDefaults(&cfg)
+					const leaseID, host, gateway = "cbx_abcdef123456", "owned", "owned-22.example.test"
+					labels := core.DirectLeaseLabels(cfg, leaseID, "blue-box", providerName, "", false, time.Now())
+					labels["phala_cvm"], labels["gateway_host"] = host, gateway
+					server := core.Server{CloudID: host, Provider: providerName, Name: "blue-box", Labels: labels}
+					repo := t.TempDir()
+					if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "blue-box", cfg, server, core.SSHTarget{}, repo, cfg.IdleTimeout, false); err != nil {
+						t.Fatal(err)
+					}
+					key, err := core.TestboxKeyPath(leaseID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					pin, dir := filepath.Join(filepath.Dir(key), "known_hosts"), filepath.Dir(key)
+					if material != "absent" {
+						prepareObservedSSH(t, leaseID, host)
+					}
+					switch material {
+					case "missing-key":
+						err = os.Remove(key)
+					case "missing-pin":
+						err = os.Remove(pin)
+					case "empty-pin":
+						err = os.WriteFile(pin, nil, 0o600)
+					case "unsafe-directory":
+						err = os.Chmod(dir, 0o755)
+					case "pin-directory":
+						if err = os.Remove(pin); err == nil {
+							err = os.Mkdir(pin, 0o700)
+						}
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					snapshot := func() map[string]string {
+						result := map[string]string{}
+						err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+							if os.IsNotExist(err) {
+								return nil
+							}
+							if err != nil {
+								return err
+							}
+							contents := ""
+							if info.Mode().IsRegular() {
+								data, err := os.ReadFile(path)
+								if err != nil {
+									return err
+								}
+								contents = string(data)
+							}
+							result[path] = info.Mode().String() + ":" + contents
+							return nil
+						})
+						if err != nil {
+							t.Fatal(err)
+						}
+						return result
+					}
+					beforeFiles := snapshot()
+					before, err := core.ReadLeaseClaim(leaseID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					runner := &fakeRunner{results: []core.LocalCommandResult{{Stdout: `{"success":true,"items":[{"appId":"owned","cvmName":"crabbox-cbx-abcdef123456","status":"running"}]}`}}}
+					b := &backend{cfg: cfg, rt: core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					req := core.ResolveRequest{ID: leaseID, StatusOnly: mode != "controller", ReadyProbe: mode == "wait", NoLocalStateMutations: mode == "controller", Repo: core.Repo{Root: repo}}
+					lease, err := b.Resolve(ctx, req)
+					wantError := material == "unsafe-directory" || material == "pin-directory" || mode == "controller" && material != "prepared"
+					if (err != nil) != wantError {
+						t.Fatalf("resolve error=%v", err)
+					}
+					if err == nil && material == "prepared" {
+						if lease.SSH.Host != host || lease.SSH.Key != key || lease.SSH.KnownHostsFile != pin || !lease.SSH.AuthoritativeKnownHosts || !strings.Contains(lease.SSH.ProxyCommand, "--gateway-host "+gateway) || lease.SSH.User != "root" || lease.SSH.ReadyCheck == "" {
+							t.Fatalf("prepared observation lost strict endpoint: %#v", lease.SSH)
+						}
+					} else if err == nil && !reflect.DeepEqual(lease.SSH, core.SSHTarget{}) {
+						t.Fatal("unprepared status exposed a fallback SSH endpoint")
+					}
+					after, readErr := core.ReadLeaseClaim(leaseID)
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(beforeFiles, snapshot()) {
+						t.Fatal("observation changed claim or connection material")
+					}
+					if len(runner.calls) != 1 {
+						t.Fatalf("unexpected provider preparation calls: %d", len(runner.calls))
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestResolveStatusOnlyReadyProbeSkipsBootstrap(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	cfg := core.BaseConfig()
@@ -1144,6 +1422,7 @@ func TestResolveStatusOnlyReadyProbeSkipsBootstrap(t *testing.T) {
 	if err := core.ClaimLeaseTargetForConfig(leaseID, "blue-box", cfg, server, core.SSHTarget{Host: "owned", User: "root", Port: "22"}, cfg.IdleTimeout); err != nil {
 		t.Fatal(err)
 	}
+	prepareObservedSSH(t, leaseID, "owned")
 	listPayload := `{"success":true,"items":[{"appId":"owned","cvmName":"crabbox-cbx-abcdef123456","status":"running"}]}`
 
 	// status --wait: StatusOnly + ReadyProbe, cancelled context. prepareSSH is
@@ -1278,15 +1557,16 @@ func TestSlugRoundTripsThroughResolveAndList(t *testing.T) {
 		t.Fatalf("List did not surface slug=%q: views=%#v", slug, views)
 	}
 
-	// (3) A Resolve re-claim (with a repo root) must NOT blank the stored slug.
-	// The resolve path returns a synthetic/list item whose labels may lack slug;
-	// the re-claim must prefer the authoritative slug, not overwrite it with blank.
+	// (3) Status with repository context preserves the stored slug and claim;
+	// it must not accidentally become a re-claim path.
+	before, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runner3 := &fakeRunner{results: []core.LocalCommandResult{{Stdout: listPayload}}}
 	b3 := &backend{cfg: cfg, rt: core.Runtime{Exec: runner3, Stdout: io.Discard, Stderr: io.Discard}}
-	// ReadyProbe:true gets past the status-only early return; StatusOnly:true still
-	// skips the SSH bootstrap (FIX F), so the re-claim block runs without SSH.
 	if _, err := b3.Resolve(context.Background(), core.ResolveRequest{ID: leaseID, StatusOnly: true, ReadyProbe: true, Repo: core.Repo{Root: repoRoot}}); err != nil {
-		t.Fatalf("Resolve re-claim failed: %v", err)
+		t.Fatalf("status resolution failed: %v", err)
 	}
 	claim, ok, err := resolvePhalaClaim(leaseID, cfg)
 	if err != nil || !ok {
@@ -1295,7 +1575,10 @@ func TestSlugRoundTripsThroughResolveAndList(t *testing.T) {
 	if claim.Slug != slug {
 		t.Fatalf("Resolve re-claim blanked the slug: claim.Slug=%q want %q", claim.Slug, slug)
 	}
-	// And resolve-by-slug must STILL work after the re-claim.
+	if !reflect.DeepEqual(claim, before) {
+		t.Fatal("status with repository context changed the claim")
+	}
+	// And resolve-by-slug must still work after observation.
 	runner4 := &fakeRunner{results: []core.LocalCommandResult{{Stdout: listPayload}}}
 	b4 := &backend{cfg: cfg, rt: core.Runtime{Exec: runner4, Stdout: io.Discard, Stderr: io.Discard}}
 	if _, lease2, err := b4.resolve(context.Background(), slug, cfg, false); err != nil || lease2 != leaseID {
@@ -1624,7 +1907,7 @@ func TestPhalaLeaseReadyCheckDropsGit(t *testing.T) {
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	applyDefaults(&cfg)
-	lease, err := b.lease(instance{ID: "appid123", Labels: map[string]string{"lease": "cbx_test"}}, cfg, "cbx_test")
+	lease, err := b.lease(instance{ID: "appid123", Labels: map[string]string{"lease": "cbx_test"}}, cfg, "cbx_test", leaseAccessPrepare)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1646,7 +1929,7 @@ func TestPhalaLeasePinsProxyHostKeyPerLease(t *testing.T) {
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	applyDefaults(&cfg)
-	lease, err := (&backend{}).lease(instance{ID: "cvm-id", Labels: map[string]string{"lease": leaseID}}, cfg, leaseID)
+	lease, err := (&backend{}).lease(instance{ID: "cvm-id", Labels: map[string]string{"lease": leaseID}}, cfg, leaseID, leaseAccessPrepare)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1657,6 +1940,12 @@ func TestPhalaLeasePinsProxyHostKeyPerLease(t *testing.T) {
 	wantKnownHosts := filepath.Join(filepath.Dir(keyPath), "known_hosts")
 	if lease.SSH.DisableHostKeyChecking || lease.SSH.KnownHostsFile != wantKnownHosts {
 		t.Fatalf("phala SSH target does not pin its lease host key: %#v", lease.SSH)
+	}
+	if info, err := os.Stat(filepath.Dir(wantKnownHosts)); err != nil || !info.IsDir() {
+		t.Fatalf("ordinary lease preparation did not create connection storage: %v", err)
+	}
+	if lease.SSH.AuthoritativeKnownHosts {
+		t.Fatal("ordinary first contact unexpectedly requires pre-existing trust")
 	}
 	if !lease.SSH.SSHConfigProxy || lease.SSH.ProxyCommand == "" {
 		t.Fatalf("phala SSH proxy routing was lost: %#v", lease.SSH)
@@ -2121,7 +2410,7 @@ func TestGatewayHostRoundTripsThroughClaimToProxyCommand(t *testing.T) {
 		t.Fatalf("gateway_host not surfaced from claim: labels=%v", item.Labels)
 	}
 	b := &backend{cfg: cfg, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
-	lease, err := b.lease(item, cfg, leaseID)
+	lease, err := b.lease(item, cfg, leaseID, leaseAccessPrepare)
 	if err != nil {
 		t.Fatal(err)
 	}

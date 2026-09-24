@@ -25,49 +25,21 @@ func defaultCloudflareSandboxConfig() CloudflareSandboxConfig {
 	}
 }
 
-func (cfg *CloudflareSandboxConfig) applyFile(file *fileCloudflareSandboxConfig, trusted bool) error {
-	if file == nil {
-		return nil
-	}
-	if trusted && file.BridgeURL != nil {
-		cfg.BridgeURL = *file.BridgeURL
-	}
-	if trusted && file.BridgeURLConfigAlias != nil {
-		cfg.BridgeURL = *file.BridgeURLConfigAlias
-	}
-	if trusted && file.Token != nil {
-		cfg.Token = *file.Token
-	}
-	if file.Workdir != nil {
-		cfg.Workdir = *file.Workdir
-	}
-	if file.ExecTimeoutSecs != nil {
-		if *file.ExecTimeoutSecs < 0 {
-			return exit(2, "cloudflare-sandbox execTimeoutSecs must be non-negative")
-		}
-		cfg.ExecTimeoutSecs = *file.ExecTimeoutSecs
-	}
-	if file.ForgetMissing != nil {
-		cfg.ForgetMissing = *file.ForgetMissing
-	}
-	return nil
+// CloudflareSandboxConfigApplied records accepted assignments during one application.
+type CloudflareSandboxConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *CloudflareSandboxConfig) applyEnv() error {
-	cfg.BridgeURL = getenv("CRABBOX_CLOUDFLARE_SANDBOX_URL", cfg.BridgeURL)
-	cfg.Token = getenv("CRABBOX_CLOUDFLARE_SANDBOX_TOKEN", cfg.Token)
-	cfg.Workdir = getenv("CRABBOX_CLOUDFLARE_SANDBOX_WORKDIR", cfg.Workdir)
-	{
-		var err error
-		cfg.ExecTimeoutSecs, err = getenvNonNegativeInt("CRABBOX_CLOUDFLARE_SANDBOX_EXEC_TIMEOUT_SECS", cfg.ExecTimeoutSecs)
-		if err != nil {
-			return err
-		}
-	}
-	if value, ok := getenvBool("CRABBOX_CLOUDFLARE_SANDBOX_FORGET_MISSING"); ok {
-		cfg.ForgetMissing = value
-	}
-	return nil
+func (cfg *CloudflareSandboxConfig) applyFile(file *fileCloudflareSandboxConfig, trusted bool) (CloudflareSandboxConfigApplied, error) {
+	var applied CloudflareSandboxConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, trusted, "cloudflare-sandbox")
+	return applied, err
+}
+
+func (cfg *CloudflareSandboxConfig) applyEnv() (CloudflareSandboxConfigApplied, error) {
+	var applied CloudflareSandboxConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 5)
+	return applied, err
 }
 
 // CloudflareSandboxConfigFlagValues holds parsed values; only visited flags are applied.
@@ -80,26 +52,14 @@ type CloudflareSandboxConfigFlagValues struct {
 
 // RegisterCloudflareSandboxConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterCloudflareSandboxConfigFlags(fs *flag.FlagSet, defaults CloudflareSandboxConfig) CloudflareSandboxConfigFlagValues {
-	return CloudflareSandboxConfigFlagValues{
-		BridgeURL:       fs.String("cloudflare-sandbox-url", defaults.BridgeURL, "Cloudflare Sandbox bridge URL"),
-		Workdir:         fs.String("cloudflare-sandbox-workdir", defaults.Workdir, "Absolute working directory inside the sandbox"),
-		ExecTimeoutSecs: fs.Int("cloudflare-sandbox-exec-timeout-secs", defaults.ExecTimeoutSecs, "command timeout in seconds (0 = bridge default)"),
-		ForgetMissing:   fs.Bool("cloudflare-sandbox-forget-missing", defaults.ForgetMissing, "remove the local claim when stop gets 404 (explicit stale-claim cleanup)"),
-	}
+	var values CloudflareSandboxConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values CloudflareSandboxConfigFlagValues) Apply(cfg *CloudflareSandboxConfig, fs *flag.FlagSet) {
-	if flagWasSet(fs, "cloudflare-sandbox-url") {
-		cfg.BridgeURL = *values.BridgeURL
-	}
-	if flagWasSet(fs, "cloudflare-sandbox-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "cloudflare-sandbox-exec-timeout-secs") {
-		cfg.ExecTimeoutSecs = *values.ExecTimeoutSecs
-	}
-	if flagWasSet(fs, "cloudflare-sandbox-forget-missing") {
-		cfg.ForgetMissing = *values.ForgetMissing
-	}
+func (values CloudflareSandboxConfigFlagValues) Apply(cfg *CloudflareSandboxConfig, fs *flag.FlagSet) (CloudflareSandboxConfigApplied, error) {
+	var applied CloudflareSandboxConfigApplied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

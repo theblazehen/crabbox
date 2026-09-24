@@ -1,18 +1,17 @@
 package runpod
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
@@ -116,18 +115,18 @@ type runpodDeployInput struct {
 	PublicKey         string
 }
 
-func newRunpodClient(cfg Config, rt Runtime) (runpodAPI, error) {
+func newRunpodClient(cfg core.Config, rt core.Runtime) (runpodAPI, error) {
 	apiKey := strings.TrimSpace(cfg.Runpod.APIKey)
 	if apiKey == "" {
-		return nil, exit(2, "provider=%s requires RUNPOD_API_KEY", providerName)
+		return nil, core.Exit(2, "provider=%s requires RUNPOD_API_KEY", providerName)
 	}
 	apiURL := strings.TrimRight(strings.TrimSpace(cfg.Runpod.APIURL), "/")
 	parsed, err := url.Parse(apiURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, exit(2, "%s url %q is invalid", providerName, apiURL)
+		return nil, core.Exit(2, "%s url %q is invalid", providerName, apiURL)
 	}
-	if parsed.Scheme != "https" && !isLoopbackHTTPURL(parsed) {
-		return nil, exit(2, "%s url %q must use https unless it targets localhost", providerName, apiURL)
+	if parsed.Scheme != "https" && !shared.IsLoopbackHTTPURL(parsed) {
+		return nil, core.Exit(2, "%s url %q must use https unless it targets localhost", providerName, apiURL)
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
@@ -141,15 +140,7 @@ func runpodRedirectError(destination *url.URL) error {
 }
 
 func (c *runpodClient) do(ctx context.Context, method, path string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.apiURL+path, reader)
+	req, err := shared.NewCompactJSONRequest(ctx, method, c.apiURL+path, body)
 	if err != nil {
 		return err
 	}
@@ -370,8 +361,4 @@ func (p *runpodPod) UnmarshalJSON(data []byte) error {
 	}
 	p.PortMappings = decodePortMappings(aux.PortMappings)
 	return nil
-}
-
-func isLoopbackHTTPURL(parsed *url.URL) bool {
-	return shared.IsLoopbackHTTPURL(parsed)
 }

@@ -46,7 +46,7 @@ func newBlacksmithArtifactReceipt(now func() time.Time) (*blacksmithArtifactRece
 	return &blacksmithArtifactReceipt{nonce: hex.EncodeToString(nonce[:]), now: now}, nil
 }
 
-func (r *blacksmithArtifactReceipt) command(req RunRequest, budget time.Duration) string {
+func (r *blacksmithArtifactReceipt) command(req core.RunRequest, budget time.Duration) string {
 	// Keep control bytes escaped in source: native --debug may echo this string.
 	format := `\036CRABBOX_BS_` + r.nonce + ":"
 	child := "printf '" + format + "start\\037' || exit 7\n" + blacksmithCommandString(req.Command, req.ShellMode)
@@ -71,7 +71,7 @@ if [ -e "$binding" ] || [ -L "$binding" ]; then
 fi
 ` + "timeout --kill-after=1s 1s /bin/sh -c ':' >/dev/null 2>&1 || exit 7\n" +
 		"command -v sha256sum >/dev/null 2>&1 || { printf '%s\\n' 'artifact collection requires sha256sum' >&2; exit 7; }\n" +
-		"(cd -P \"$native_cwd\" || exit 7\nexec bash -c " + shellQuote(child) + ")\n" +
+		"(cd -P \"$native_cwd\" || exit 7\nexec bash -c " + core.ShellQuote(child) + ")\n" +
 		"workload_code=$?\n" +
 		"printf '" + format + "exit:%d\\037' \"$workload_code\" || exit 7\n" +
 		"collection_code=0\n" +
@@ -80,10 +80,10 @@ fi
 		"if [ -L \"$transfer_parent\" ] || ! mkdir -p -- \"$transfer_parent\"; then exit 7; fi\n" +
 		"transfer_dir=\"$native_cwd/" + filepath.ToSlash(filepath.Dir(r.remotePath())) + "\"\n" +
 		"umask 077\nmkdir -- \"$transfer_dir\" || exit 7\n" +
-		"timeout --kill-after=1s " + shellQuote(fmt.Sprintf("%gs", budget.Seconds())) + " bash -c " + shellQuote(collector) + " -- \"$transfer_dir/archive.tgz\" 2>&1\n" +
+		"timeout --kill-after=1s " + core.ShellQuote(fmt.Sprintf("%gs", budget.Seconds())) + " bash -c " + core.ShellQuote(collector) + " -- \"$transfer_dir/archive.tgz\" 2>&1\n" +
 		"collection_code=$?\nfi\n" +
 		"printf '" + format + "end:%d\\037' \"$collection_code\" || exit 7\nexit 0"
-	return "/bin/sh -c " + shellQuote(body)
+	return "/bin/sh -c " + core.ShellQuote(body)
 }
 
 func (r *blacksmithArtifactReceipt) record(record string) error {
@@ -247,12 +247,12 @@ func (r *blacksmithArtifactReceipt) validateArchiveReceipt() error {
 	// after writing only an archive prefix or base64 fragment.
 	if r.collectCode != 0 {
 		if r.collectCode == 8 {
-			return exit(7, "collection exited 8: missing required artifact")
+			return core.Exit(7, "collection exited 8: missing required artifact")
 		}
-		return exit(7, "collection exited %d", r.collectCode)
+		return core.Exit(7, "collection exited %d", r.collectCode)
 	}
 	if r.archiveSize == 0 || len(r.digest) != 64 {
-		return exit(7, "collection returned incomplete archive metadata")
+		return core.Exit(7, "collection returned incomplete archive metadata")
 	}
 	return nil
 }
@@ -290,34 +290,37 @@ func (g *blacksmithArchiveGuard) flush() {
 
 // Called only inside the original shared claim fence. There is no follow-up
 // native run, route resolution, sync, or stopped-lease recovery.
-func (b *blacksmithBackend) runArtifactTestbox(ctx context.Context, req RunRequest, leaseID string, phases *core.CommandPhaseTracker, stdoutExtra, stderrExtra io.Writer, budget time.Duration) (code int, ended time.Time, collected []core.RunArtifact, artifactErr error) {
+func (b *blacksmithBackend) runArtifactTestbox(ctx context.Context, req core.RunRequest, leaseID string, phases *core.CommandPhaseTracker, stdoutExtra, stderrExtra io.Writer, budget time.Duration) (outcome blacksmithRunOutcome, ended time.Time, collected []core.RunArtifact, artifactErr error) {
+	if err := validateBlacksmithNativeSyncScope(req.Repo.Root); err != nil {
+		return blacksmithRunOutcome{code: 2}, time.Time{}, nil, err
+	}
 	if err := core.ValidateLocalCommandProcessGroupJoin(ctx); err != nil {
-		return 2, time.Time{}, collected, exit(2, "Blacksmith artifact command ownership: %v", err)
+		return blacksmithRunOutcome{code: 2}, time.Time{}, collected, core.Exit(2, "Blacksmith artifact command ownership: %v", err)
 	}
 	capability, err := b.runCommandCaptureInDir(ctx, []string{"testbox", "download", "--help"}, nil, nil, false, req.Repo.Root)
 	if err = blacksmithContextError(ctx, err); err != nil {
-		return core.ExitCodeForError(err, 1), time.Time{}, collected, err
+		return blacksmithRunOutcome{code: core.ExitCodeForError(err, 1)}, time.Time{}, collected, err
 	}
 	if capability.ExitCode != 0 {
-		return capability.ExitCode, time.Time{}, collected, exit(capability.ExitCode, "Blacksmith artifact capability probe failed")
+		return blacksmithRunOutcome{code: capability.ExitCode}, time.Time{}, collected, core.Exit(capability.ExitCode, "Blacksmith artifact capability probe failed")
 	}
 	if !strings.Contains(capability.Stdout, "testbox download --id") || !strings.Contains(capability.Stdout, "--ssh-private-key") {
-		return 2, time.Time{}, collected, exit(2, "Blacksmith artifact collection requires native testbox download support; update the Blacksmith CLI")
+		return blacksmithRunOutcome{code: 2}, time.Time{}, collected, core.Exit(2, "Blacksmith artifact collection requires native testbox download support; update the Blacksmith CLI")
 	}
 	scp, err := blacksmithDownloadExecutable("scp")
 	if err == nil {
 		_, err = inspectBlacksmithDownloadExecutable(ctx, scp)
 	}
 	if err = blacksmithContextError(ctx, err); err != nil {
-		return core.ExitCodeForError(err, 2), time.Time{}, collected, fmt.Errorf("Blacksmith artifact scp preflight: %w", err)
+		return blacksmithRunOutcome{code: core.ExitCodeForError(err, 2)}, time.Time{}, collected, fmt.Errorf("Blacksmith artifact scp preflight: %w", err)
 	}
 	r, err := newBlacksmithArtifactReceipt(b.rt.Clock.Now)
 	if err != nil {
-		return 2, time.Time{}, collected, err
+		return blacksmithRunOutcome{code: 2}, time.Time{}, collected, err
 	}
-	keyPath, err := testboxKeyPath(leaseID)
+	keyPath, err := core.StoredTestboxKeyPath(leaseID)
 	if err != nil {
-		return 2, time.Time{}, collected, err
+		return blacksmithRunOutcome{code: 2}, time.Time{}, collected, err
 	}
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -336,6 +339,8 @@ func (b *blacksmithBackend) runArtifactTestbox(ctx context.Context, req RunReque
 	var out, diagnostic *blacksmithControlDemux
 	var outGuard, errGuard *blacksmithArchiveGuard
 	filter := func(stdout, stderr io.Writer) (io.Writer, io.Writer) {
+		// Both native streams may include provider diagnostics even with control framing.
+		stdout, stderr = req.Observation.CommandWriters(stdout, stderr, core.RunOutputProvider)
 		outGuard, errGuard = &blacksmithArchiveGuard{output: stdout}, &blacksmithArchiveGuard{output: stderr}
 		r.output = outGuard
 		out = &blacksmithControlDemux{data: r.data, record: r.record, cancel: cancel}
@@ -357,42 +362,42 @@ func (b *blacksmithBackend) runArtifactTestbox(ctx context.Context, req RunReque
 	stdoutPhase.Flush()
 	stderrPhase.Flush()
 	ended = r.exitedAt
-	code = native.ExitCode
+	outcome = blacksmithRunOutcome{code: native.ExitCode, syncTimedOut: syncTimeout}
 	if syncTimeout {
-		code = 124
+		outcome.code = 124
 	}
-	if nativeErr != nil || code != 0 || runCtx.Err() != nil || r.stage != 3 || out.err != nil || diagnostic.err != nil {
-		if code == 0 {
-			code = 7
+	if nativeErr != nil || outcome.code != 0 || runCtx.Err() != nil || r.stage != 3 || out.err != nil || diagnostic.err != nil {
+		if outcome.code == 0 {
+			outcome.code = 7
 		}
-		// An observed nonzero child status remains primary even if subsequent
-		// collection or transport fails. It never authorizes publication alone.
+		// An observed nonzero workload status, including 124, remains primary
+		// over later sync or collection failures; it does not authorize publication.
 		if r.stage >= 2 && r.code != 0 {
-			code = r.code
+			outcome = blacksmithRunOutcome{code: r.code}
 		}
-		protocolErr := exit(7, "native run did not complete a clean artifact protocol; artifacts withheld")
-		return code, ended, collected, blacksmithContextError(runCtx, protocolErr)
+		protocolErr := core.Exit(7, "native run did not complete a clean artifact protocol; artifacts withheld")
+		return outcome, ended, collected, blacksmithContextError(runCtx, protocolErr)
 	}
-	code = r.code
-	if code >= 128 {
-		return code, ended, collected, nil
+	outcome.code = r.code
+	if outcome.code >= 128 {
+		return outcome, ended, collected, nil
 	}
 	if err := r.validateArchiveReceipt(); err != nil {
-		return code, ended, collected, err
+		return outcome, ended, collected, err
 	}
 	fmt.Fprintf(stderr, "blacksmith finalized artifact retained lease=%s remote=%s bytes=%d retention=lease-cleanup\n", leaseID, r.remotePath(), r.archiveSize)
 	archive, err := b.downloadArtifact(runCtx, req.Repo.Root, leaseID, keyPath, r.remotePath(), r.archiveSize, r.digest)
 	if err != nil {
-		return code, ended, collected, err
+		return outcome, ended, collected, err
 	}
 	if err := validateBlacksmithArtifactArchive(runCtx, archive, req.ArtifactGlobs, req.RequiredArtifactGlobs); err != nil {
-		return code, ended, collected, err
+		return outcome, ended, collected, err
 	}
 	path := core.LocalRunArtifactPath(req.Repo.Root, "", leaseID, filepath.Join(r.nonce, "blacksmith-artifacts.tgz"))
 	if err := writeBlacksmithRunArchive(runCtx, path, archive, collectionDeadline); err != nil {
-		return code, ended, collected, errors.Join(exit(2, "blacksmith artifact write: %v", err), err)
+		return outcome, ended, collected, errors.Join(core.Exit(2, "blacksmith artifact write: %v", err), err)
 	}
-	return code, ended, []core.RunArtifact{{Kind: "artifact-glob", Path: path, Bytes: len(archive)}}, nil
+	return outcome, ended, []core.RunArtifact{{Kind: "artifact-glob", Path: path, Bytes: len(archive)}}, nil
 }
 
 func writeBlacksmithRunArchive(ctx context.Context, path string, archive []byte, deadline time.Time) (err error) {

@@ -1,6 +1,6 @@
 ---
 name: crabbox
-description: "Use Crabbox for remote execution, repository verification, reusable leases, sync and artifact transfer; diagnose failures without bypassing native lifecycle controls."
+description: "Use Crabbox for remote execution, repository verification, reusable leases, sync and artifact transfer. Use when crabbox.yaml or .crabbox.yaml exists, the crabbox CLI is available, or remote compute is needed."
 license: MIT
 ---
 
@@ -100,8 +100,7 @@ Stopping the local forwarder does not prove the remote process stopped. A
 `state=child` owner wait protects a witnessed surviving workload. Inspect the
 exact lease with native `status` and `connect`; wait for useful work or terminate
 only the verified superseded process. Never delete owner markers, bypass locks,
-or launch a competing build against active outputs. The optional surviving
-remote-workspace-owner reference below covers this recovery when needed.
+or launch a competing build against active outputs.
 
 ## Timeouts and retention
 
@@ -156,21 +155,3 @@ Use the relevant `docs/commands/<command>.md` or `docs/providers/<provider>.md`
 when an operation needs detail. Desktop, Windows, cloud login, publishing and
 specialized GPU/Nix guidance are on-demand topics, not prerequisites for a normal
 CPU test run. Stop only the leases owned by this task after retaining results.
-
-Personal installation notes, when present, live under
-`~/.omp/agent/skill-references/crabbox/`, outside this generic repository. These
-are reference documents, not separately discoverable skills. Read only the
-matching document:
-
-- `personal-crabbox-execution-boundary.md`: installation-specific policy.
-- `crabbox-surviving-remote-workspace-owner.md`: witnessed-child recovery.
-- `crabbox-agent-sandbox-large-artifacts.md`: chunked transfer and receipts.
-- `crabbox-native-blender-artifact-transfer.md`: render input/output placement.
-- `crabbox-pascal-blender.md`: CUDA compatibility and render proof.
-- `crabbox-nix-snapshotter-isolated-store.md`: image-store collisions.
-- `crabbox-isolated-nix-nvidia-vulkan.md`: driver visibility in isolated stores.
-- `crabbox-nfs-scratch-lifecycle.md`: scratch storage lifecycle operations.
-- `gmaps3d-crabbox-build.md`: an installation-specific Android build recipe.
-
-Historical provider limitations in these notes are not capability contracts;
-prefer current CLI capabilities and native transfer over old incident workarounds.

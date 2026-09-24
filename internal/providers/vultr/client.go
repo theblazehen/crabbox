@@ -1,7 +1,6 @@
 package vultr
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const vultrAPIBaseURL = "https://api.vultr.com/v2"
@@ -154,16 +154,7 @@ func newVultrClient(rt core.Runtime) (*vultrClient, error) {
 		token:   token,
 		client:  httpClient,
 		baseURL: vultrAPIBaseURL,
-		sleep: func(ctx context.Context, d time.Duration) error {
-			timer := time.NewTimer(d)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-timer.C:
-				return nil
-			}
-		},
+		sleep:   core.SleepContext,
 	}, nil
 }
 
@@ -172,15 +163,7 @@ func (c *vultrClient) do(ctx context.Context, method, path string, body any, out
 }
 
 func (c *vultrClient) doAttempt(ctx context.Context, method, path string, body any, out any, allowRetry bool) error {
-	var reader io.Reader
-	if body != nil {
-		var buf bytes.Buffer
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			return err
-		}
-		reader = &buf
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	req, err := shared.NewJSONRequest(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return err
 	}
@@ -191,16 +174,18 @@ func (c *vultrClient) doAttempt(ctx context.Context, method, path string, body a
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusTooManyRequests && allowRetry {
 		delay := retryAfter(resp.Header.Get("Retry-After"))
 		if delay > 0 {
+			// Release this attempt's connection before backoff and the next request.
+			_ = resp.Body.Close()
 			if err := c.sleep(ctx, delay); err != nil {
 				return err
 			}
 			return c.doAttempt(ctx, method, path, body, out, false)
 		}
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		body := strings.TrimSpace(string(data))
@@ -587,7 +572,7 @@ func (c *vultrClient) DeleteSSHKey(ctx context.Context, id string) error {
 }
 
 func (c *vultrClient) UpdateInstanceTags(ctx context.Context, id string, tags []string) error {
-	body := map[string]any{"tags": normalizeTags(tags)}
+	body := map[string]any{"tags": shared.NormalizeTags(tags)}
 	return c.do(ctx, http.MethodPatch, "/instances/"+url.PathEscape(id), body, nil)
 }
 

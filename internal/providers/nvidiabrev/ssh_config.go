@@ -1,23 +1,17 @@
 package nvidiabrev
 
 import (
-	"bufio"
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
-)
 
-type brevSSHConfigEntry struct {
-	Aliases        []string
-	HostName       string
-	Port           string
-	User           string
-	IdentityFile   string
-	KnownHostsFile string
-	ProxyCommand   string
-}
+	core "github.com/openclaw/crabbox/internal/cli"
+)
 
 func defaultBrevSSHConfigPath() string {
 	home, err := os.UserHomeDir()
@@ -28,180 +22,86 @@ func defaultBrevSSHConfigPath() string {
 	return filepath.Join(home, ".brev", "ssh_config")
 }
 
-func parseBrevSSHConfig(data string) ([]brevSSHConfigEntry, error) {
-	var entries []brevSSHConfigEntry
-	var current *brevSSHConfigEntry
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := stripSSHConfigComment(scanner.Text())
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		key, value := splitSSHConfigDirective(line)
-		if key == "" {
-			continue
-		}
-		if strings.EqualFold(key, "Host") {
-			aliases := splitSSHConfigFields(value)
-			if len(aliases) == 0 {
-				current = nil
-				continue
-			}
-			entry := brevSSHConfigEntry{Aliases: aliases}
-			entries = append(entries, entry)
-			current = &entries[len(entries)-1]
-			continue
-		}
-		if current == nil {
-			continue
-		}
-		switch strings.ToLower(key) {
-		case "hostname":
-			current.HostName = unquoteSSHConfigValue(value)
-		case "port":
-			current.Port = unquoteSSHConfigValue(value)
-		case "user":
-			current.User = unquoteSSHConfigValue(value)
-		case "identityfile":
-			current.IdentityFile = unquoteSSHConfigValue(value)
-		case "userknownhostsfile":
-			current.KnownHostsFile = unquoteSSHConfigValue(value)
-		case "proxycommand":
-			current.ProxyCommand = strings.TrimSpace(value)
-		}
+// Brev emits Match exec certificate hooks, including entries with no Host stanza.
+// Let OpenSSH interpret its own config, retaining the alias for later renewal.
+func (c *brevClient) resolveSSHConfig(ctx context.Context, cfg core.Config, path, alias string, data []byte) (core.SSHTarget, error) {
+	if !brevSSHNamePattern.MatchString(alias) {
+		return core.SSHTarget{}, core.Exit(2, "invalid nvidia-brev SSH alias %q", alias)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return entries, nil
-}
-
-func stripSSHConfigComment(line string) string {
-	var quoted byte
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-		if quoted != 0 {
-			if c == quoted {
-				quoted = 0
-			}
-			continue
-		}
-		if c == '\'' || c == '"' {
-			quoted = c
-			continue
-		}
-		if c == '#' {
-			return line[:i]
-		}
-	}
-	return line
-}
-
-func splitSSHConfigDirective(line string) (string, string) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return "", ""
-	}
-	for i, r := range line {
-		if r == ' ' || r == '\t' {
-			return strings.TrimSpace(line[:i]), strings.TrimSpace(line[i:])
-		}
-	}
-	return line, ""
-}
-
-func splitSSHConfigFields(value string) []string {
-	var out []string
-	for _, field := range strings.Fields(value) {
-		field = unquoteSSHConfigValue(field)
-		if field != "" {
-			out = append(out, field)
-		}
-	}
-	return out
-}
-
-func unquoteSSHConfigValue(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) >= 2 {
-		if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
-			return value[1 : len(value)-1]
-		}
-	}
-	return value
-}
-
-func selectBrevSSHTarget(cfg Config, data, alias string) (SSHTarget, error) {
-	entries, err := parseBrevSSHConfig(data)
+	file, err := os.CreateTemp("", "crabbox-brev-ssh-*")
 	if err != nil {
-		return SSHTarget{}, err
+		return core.SSHTarget{}, err
 	}
-	var matches []brevSSHConfigEntry
-	for _, entry := range entries {
-		for _, candidate := range entry.Aliases {
-			if candidate == alias {
-				matches = append(matches, entry)
-				break
-			}
+	defer os.Remove(file.Name())
+	_, writeErr := file.Write(data)
+	if writeErr == nil && strings.TrimSpace(cfg.SSHUser) != "" {
+		// A trailing default preserves native first-value precedence while
+		// retaining the generic remote user when Brev does not specify one.
+		user := strings.TrimSpace(cfg.SSHUser)
+		if !brevSSHNamePattern.MatchString(user) {
+			_ = file.Close()
+			return core.SSHTarget{}, core.Exit(2, "invalid fallback SSH User %q", user)
+		}
+		_, writeErr = fmt.Fprintf(file, "\nHost *\n User %s\n", user)
+	}
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		return core.SSHTarget{}, err
+	}
+	args := []string{"-G", "-F", file.Name()}
+	if user := strings.TrimSpace(cfg.NvidiaBrev.User); user != "" {
+		if !brevSSHNamePattern.MatchString(user) {
+			return core.SSHTarget{}, core.Exit(2, "invalid nvidia-brev SSH User %q", user)
+		}
+		args = append(args, "-l", user)
+	}
+	args = append(args, "--", alias)
+	result, err := c.rt.Exec.Run(ctx, core.LocalCommandRequest{Name: "ssh", Args: args})
+	if err != nil {
+		return core.SSHTarget{}, fmt.Errorf("resolve nvidia-brev OpenSSH config for %q: %w%s", alias, err, brevSSHDiagnostic(result.Stderr))
+	}
+	values := make(map[string]string)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		key, value, ok := strings.Cut(line, " ")
+		if ok {
+			values[key] = strings.TrimSpace(value)
 		}
 	}
-	if len(matches) == 0 {
-		return SSHTarget{}, exit(4, "nvidia-brev SSH config entry not found for host %q", alias)
+	// Every Brev route declares IdentitiesOnly and a direct host or proxy. If a
+	// mandatory mint hook fails, ssh -G succeeds with defaults: reject that route.
+	proxy := values["proxycommand"]
+	if values["identitiesonly"] != "yes" ||
+		((values["hostname"] == "" || values["hostname"] == alias) && (proxy == "" || proxy == "none")) {
+		return core.SSHTarget{}, core.Exit(4, "nvidia-brev SSH route not found for %q; run `brev refresh` and check certificate authentication%s", alias, brevSSHDiagnostic(result.Stderr))
 	}
-	if len(matches) > 1 {
-		return SSHTarget{}, exit(2, "nvidia-brev SSH config entry for host %q is ambiguous", alias)
+	if !brevSSHNamePattern.MatchString(values["user"]) {
+		return core.SSHTarget{}, core.Exit(2, "invalid nvidia-brev SSH User %q", values["user"])
 	}
-	entry := matches[0]
-	user := firstNonEmpty(cfg.NvidiaBrev.User, entry.User, cfg.SSHUser)
-	if strings.TrimSpace(user) == "" {
-		return SSHTarget{}, exit(2, "nvidia-brev SSH config entry %q is missing User", alias)
+	port, err := strconv.Atoi(values["port"])
+	if err != nil || port < 1 || port > 65535 {
+		return core.SSHTarget{}, core.Exit(2, "invalid nvidia-brev SSH Port %q", values["port"])
 	}
-	if !validBrevSSHUser(user) {
-		return SSHTarget{}, exit(2, "nvidia-brev SSH config entry %q has invalid User %q", alias, user)
-	}
-	if strings.TrimSpace(entry.IdentityFile) == "" {
-		return SSHTarget{}, exit(2, "nvidia-brev SSH config entry %q is missing IdentityFile", alias)
-	}
-	host := strings.TrimSpace(entry.HostName)
-	proxy := strings.TrimSpace(entry.ProxyCommand)
-	if host == "" && proxy == "" {
-		return SSHTarget{}, exit(2, "nvidia-brev SSH config entry %q is missing HostName or ProxyCommand", alias)
-	}
-	if host == "" {
-		host = alias
-	}
-	port := strings.TrimSpace(entry.Port)
-	if port == "" {
-		port = defaultSSHPort
-	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return SSHTarget{}, exit(2, "nvidia-brev SSH config entry %q has invalid Port %q", alias, port)
-	}
-	target := SSHTarget{
-		User:           user,
-		Host:           host,
-		Key:            entry.IdentityFile,
-		KnownHostsFile: entry.KnownHostsFile,
-		Port:           port,
-		TargetOS:       targetLinux,
-		ReadyCheck:     "command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null",
-		NetworkKind:    networkPublic,
-	}
-	if proxy != "" {
-		target.SSHConfigProxy = true
-		target.ProxyCommand = proxy
-	}
-	return target, nil
+	return core.SSHTarget{
+		User: values["user"], Host: alias, Port: values["port"],
+		SSHConfigFile: path, SSHConfigData: data, SSHConfigProxy: true, NoControlMaster: true,
+		DiagnosticSecrets: []string{os.Getenv("BREV_API_KEY")},
+		KnownHostsFile:    values["userknownhostsfile"],
+		TargetOS:          targetLinux, NetworkKind: networkPublic,
+		ReadyCheck: "command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null",
+	}, nil
 }
 
-func validBrevSSHUser(user string) bool {
-	if user == "" || strings.HasPrefix(user, "-") || strings.Contains(user, "@") {
-		return false
+func brevSSHDiagnostic(stderr string) string {
+	detail := strings.TrimSpace(core.RedactDiagnosticSecrets(stderr, os.Getenv("BREV_API_KEY")))
+	if len(detail) > 4096 {
+		detail = detail[:4096] + "..."
 	}
-	return strings.IndexFunc(user, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}) == -1
+	if detail != "" {
+		return ": " + detail
+	}
+	return ""
 }
+
+var brevSSHNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$`)
 
 func brevSSHConfigAlias(workspaceName, target string) string {
 	name := strings.TrimSpace(workspaceName)
@@ -209,13 +109,4 @@ func brevSSHConfigAlias(workspaceName, target string) string {
 		return name + "-host"
 	}
 	return name
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }

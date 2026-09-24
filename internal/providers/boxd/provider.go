@@ -14,14 +14,13 @@ func init() {
 	core.RegisterProvider(Provider{})
 }
 
-// Provider uses the HTTPS console for lifecycle and authenticated guest bootstrap.
+// Provider uses the TLS gRPC API for lifecycle and authenticated guest
+// bootstrap; the HTTPS console is used only for the API-key exchange.
 type Provider struct{}
-
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIKey),
 		Name:             providerName,
 		Family:           providerName,
 		Kind:             core.ProviderKindSSHLease,
@@ -42,6 +41,9 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 
 func (Provider) ValidateConfig(cfg core.Config) error {
 	if _, err := consoleURL(cfg.Boxd.APIURL); err != nil {
+		return err
+	}
+	if _, err := grpcTarget(cfg.Boxd.GRPCURL); err != nil {
 		return err
 	}
 	workRoot := cfg.Boxd.WorkRoot
@@ -76,16 +78,26 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return newBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	return backend.(core.DoctorBackend), nil
-}
-
 // ClaimScope binds routing; the authenticated user is independently fenced in each claim.
 func (Provider) ClaimScope(cfg core.Config) string {
+	u, err := consoleURL(cfg.Boxd.APIURL)
+	if err != nil {
+		return "invalid-boxd-origin"
+	}
+	target, err := grpcTarget(cfg.Boxd.GRPCURL)
+	if err != nil {
+		return "invalid-boxd-origin"
+	}
+	data, _ := json.Marshal([]string{u.String(), target, cfg.Boxd.Org})
+	return string(data)
+}
+
+// legacyClaimScope is the exact scope serialization the earlier console-based
+// provider wrote: origin and organization, without the gRPC endpoint. Claims
+// carrying it stay visible for status, stop, and cleanup so retained or
+// failed-cleanup machines from before the migration can still be found and
+// destroyed; new acquisitions always write the current scope.
+func legacyClaimScope(cfg core.Config) string {
 	u, err := consoleURL(cfg.Boxd.APIURL)
 	if err != nil {
 		return "invalid-boxd-origin"
@@ -95,7 +107,7 @@ func (Provider) ClaimScope(cfg core.Config) string {
 }
 
 func (Provider) DiagnosticSecrets(core.Config) []string {
-	return []string{os.Getenv("CRABBOX_BOXD_TOKEN"), os.Getenv("BOXD_TOKEN")}
+	return []string{os.Getenv("CRABBOX_BOXD_API_KEY"), os.Getenv("BOXD_API_KEY")}
 }
 
 // ServerTypeForConfig: boxd machine sizing follows the account/org quota, not
@@ -107,10 +119,6 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	return "machine"
 }
 
-func (Provider) ServerTypeForClass(string) string {
-	return "machine"
-}
-
 func applyDefaults(cfg *core.Config) {
 	cfg.Provider = providerName
 	if strings.TrimSpace(cfg.TargetOS) == "" {
@@ -118,6 +126,9 @@ func applyDefaults(cfg *core.Config) {
 	}
 	if cfg.Boxd.APIURL == "" {
 		cfg.Boxd.APIURL = defaultConsoleURL
+	}
+	if strings.TrimSpace(cfg.Boxd.GRPCURL) == "" {
+		cfg.Boxd.GRPCURL = defaultGRPCTarget
 	}
 	if !core.IsBoxdWorkRootExplicit(cfg) && core.IsWorkRootExplicit(cfg) {
 		cfg.Boxd.WorkRoot = cfg.WorkRoot

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 	xssh "golang.org/x/crypto/ssh"
 )
 
@@ -48,7 +49,7 @@ func TestSSHTargetPinsHostKeyAndQuotesLiteralProxyArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	hostKey := strings.TrimSpace(string(xssh.MarshalAuthorizedKey(sshPublic)))
-	claim := LeaseClaim{LeaseID: leaseID, Provider: sshProviderName, ProviderScope: claimScope(cfg), Labels: map[string]string{
+	claim := core.LeaseClaim{LeaseID: leaseID, Provider: sshProviderName, ProviderScope: claimScope(cfg), Labels: map[string]string{
 		claimLabelSSHUser: "root", claimLabelSSHHostKey: hostKey, claimLabelSSHPort: "43210",
 	}}
 	b := &backend{cfg: cfg}
@@ -171,9 +172,9 @@ func TestSSHProxyArgsPinRoutingWithoutChangingImplicitContainerScope(t *testing.
 	}
 }
 
-type sshTransportRunnerFunc func(context.Context, LocalCommandRequest) (LocalCommandResult, error)
+type sshTransportRunnerFunc func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error)
 
-func (f sshTransportRunnerFunc) Run(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+func (f sshTransportRunnerFunc) Run(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	return f(ctx, req)
 }
 
@@ -203,14 +204,14 @@ func TestSSHForwardRemoteEOFCancelsAndReapsWithoutWaitingForStdin(t *testing.T) 
 	cfg.AgentSandbox.Context = "personal"
 	cfg.AgentSandbox.Namespace = "sandboxes"
 	cfg.AgentSandbox.Kubeconfig = "/config/path"
-	var gotRequest LocalCommandRequest
-	b := &backend{cfg: cfg, rt: Runtime{Exec: sshTransportRunnerFunc(func(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+	var gotRequest core.LocalCommandRequest
+	b := &backend{cfg: cfg, rt: core.Runtime{Exec: sshTransportRunnerFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 		gotRequest = req
 		fmt.Fprintf(req.Stdout, "Forwarding from 127.0.0.1:%s -> 43210\n", port)
 		fmt.Fprintln(req.Stderr, "diagnostic")
 		<-ctx.Done()
 		close(reaped)
-		return LocalCommandResult{ExitCode: 1}, ctx.Err()
+		return core.LocalCommandResult{ExitCode: 1}, ctx.Err()
 	})}}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -237,11 +238,11 @@ func TestSSHForwardRemoteEOFCancelsAndReapsWithoutWaitingForStdin(t *testing.T) 
 
 func TestSSHForwardRejectsPostStartIdentityChangeAndReaps(t *testing.T) {
 	reaped := make(chan struct{})
-	b := &backend{cfg: core.BaseConfig(), rt: Runtime{Exec: sshTransportRunnerFunc(func(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+	b := &backend{cfg: core.BaseConfig(), rt: core.Runtime{Exec: sshTransportRunnerFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 		fmt.Fprintln(req.Stdout, "Forwarding from 127.0.0.1:12345 -> 43210")
 		<-ctx.Done()
 		close(reaped)
-		return LocalCommandResult{}, ctx.Err()
+		return core.LocalCommandResult{}, ctx.Err()
 	})}}
 	changed := errors.New("pod UID changed")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -279,11 +280,11 @@ func TestSSHForwardClientEOFCancelsAndReapsWhileServerRemainsOpen(t *testing.T) 
 		<-closeServer
 	}()
 	reaped := make(chan struct{})
-	b := &backend{cfg: core.BaseConfig(), rt: Runtime{Exec: sshTransportRunnerFunc(func(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+	b := &backend{cfg: core.BaseConfig(), rt: core.Runtime{Exec: sshTransportRunnerFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 		fmt.Fprintf(req.Stdout, "Forwarding from 127.0.0.1:%s -> 43210\n", port)
 		<-ctx.Done()
 		close(reaped)
-		return LocalCommandResult{}, ctx.Err()
+		return core.LocalCommandResult{}, ctx.Err()
 	})}}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -328,26 +329,26 @@ func TestSSHProxyRejectsMissingOrInvalidPortBeforeClientCreation(t *testing.T) {
 			b, fake := testSSHBackend(t)
 			claim := createSSHTestClaim(t, b, fake)
 			if port != "" {
-				labels := cloneStringMap(claim.Labels)
+				labels := shared.CloneLabels(claim.Labels)
 				labels[claimLabelSSHPort] = port
 				var err error
-				claim, err = updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+				claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 				if err != nil {
 					t.Fatal(err)
 				}
 			}
-			b.lifecycle.newClient = func(context.Context, Config, Runtime) (kubernetesClient, error) {
+			b.lifecycle.newClient = func(context.Context, core.Config, core.Runtime) (kubernetesClient, error) {
 				t.Fatal("invalid port created a Kubernetes client")
 				return nil, errors.New("unexpected client creation")
 			}
-			b.lifecycle.rt.Exec = sshTransportRunnerFunc(func(context.Context, LocalCommandRequest) (LocalCommandResult, error) {
+			b.lifecycle.rt.Exec = sshTransportRunnerFunc(func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error) {
 				t.Fatal("invalid port started port forwarding")
-				return LocalCommandResult{}, errors.New("unexpected port forwarding")
+				return core.LocalCommandResult{}, errors.New("unexpected port forwarding")
 			})
 			if err := b.ProxySSH(context.Background(), claim.LeaseID, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "pinned SSH port") {
 				t.Fatalf("error=%v", err)
 			}
-			stored, err := readLeaseClaim(claim.LeaseID)
+			stored, err := core.ReadLeaseClaim(claim.LeaseID)
 			if err != nil || !reflect.DeepEqual(stored, claim) {
 				t.Fatalf("proxy mutated claim: stored=%#v error=%v", stored, err)
 			}
@@ -438,15 +439,15 @@ func TestSSHReadOnlyHealthRequiresPinnedAuthenticatedEndpoint(t *testing.T) {
 				}
 			}()
 			defer func() { listener.Close(); <-serverDone }()
-			lifecycle.rt.Exec = sshTransportRunnerFunc(func(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+			lifecycle.rt.Exec = sshTransportRunnerFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 				fmt.Fprintf(req.Stdout, "Forwarding from 127.0.0.1:%s -> 43210\n", port)
 				<-ctx.Done()
-				return LocalCommandResult{}, ctx.Err()
+				return core.LocalCommandResult{}, ctx.Err()
 			})
 			bootstrapExecs := len(client.execs)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			view, err := b.Status(ctx, StatusRequest{ID: claim.LeaseID})
+			view, err := b.Status(ctx, core.StatusRequest{ID: claim.LeaseID})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -458,11 +459,11 @@ func TestSSHReadOnlyHealthRequiresPinnedAuthenticatedEndpoint(t *testing.T) {
 			if err != nil || (lease.Server.Status == statusViewReady) != wantReady {
 				t.Fatalf("inspect readiness=%#v, err=%v", lease.Server, err)
 			}
-			views, err := b.List(ctx, ListRequest{})
+			views, err := b.List(ctx, core.ListRequest{})
 			if err != nil || len(views) != 1 || (views[0].Status == statusViewReady) != wantReady {
 				t.Fatalf("list readiness=%#v, err=%v", views, err)
 			}
-			stored, err := readLeaseClaim(claim.LeaseID)
+			stored, err := core.ReadLeaseClaim(claim.LeaseID)
 			if err != nil || !reflect.DeepEqual(stored, claim) {
 				t.Fatalf("read-only health changed claim: %#v, %v", stored, err)
 			}
@@ -513,7 +514,7 @@ func TestSSHProxyRejectsIdentityChangesBeforeAndAfterForwarding(t *testing.T) {
 			}
 			started := false
 			reaped := make(chan struct{})
-			b.lifecycle.rt.Exec = sshTransportRunnerFunc(func(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+			b.lifecycle.rt.Exec = sshTransportRunnerFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 				started = true
 				if req.Args[len(req.Args)-1] != ":43210" {
 					t.Errorf("proxy ignored persisted port: args=%q", req.Args)
@@ -522,7 +523,7 @@ func TestSSHProxyRejectsIdentityChangesBeforeAndAfterForwarding(t *testing.T) {
 				fmt.Fprintln(req.Stdout, "Forwarding from 127.0.0.1:12345 -> 43210")
 				<-ctx.Done()
 				close(reaped)
-				return LocalCommandResult{}, ctx.Err()
+				return core.LocalCommandResult{}, ctx.Err()
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()

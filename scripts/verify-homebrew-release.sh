@@ -10,10 +10,18 @@ SCRIPT_PATH="$ROOT/scripts/verify-homebrew-release.sh"
 PROTECTED_HOMEBREW_TOOLING=(
   .github/release-allowed-signers
   .goreleaser.yaml
+  go.mod
+  go.sum
+  internal/remoteruntime
+  internal/runner
+  internal/runtimeartifact
+  scripts/build-release-runtime-tool.sh
+  scripts/runtime-artifacts
   scripts/extract-release-notes.sh
   scripts/extract-release-vmd.mjs
   scripts/release-config.sh
   scripts/release-provenance.mjs
+  scripts/release-policy.mjs
   scripts/validate-release-publication.mjs
   scripts/verify-go-release-binary.mjs
   scripts/verify-homebrew-release.sh
@@ -23,8 +31,20 @@ PROTECTED_HOMEBREW_TOOLING=(
 )
 
 cleanup_homebrew_work() {
-  local path=${CRABBOX_HOMEBREW_VERIFY_WORK:-}
-  [[ -z "$path" ]] || rm -rf -- "$path"
+  local primary_status=$? cleanup_status path=${CRABBOX_HOMEBREW_VERIFY_WORK:-}
+  trap - EXIT
+  [[ -n "$path" ]] || return "$primary_status"
+  # Go caches may be read-only; never follow links or chmod linked files.
+  if find -P "$path" -type d -exec chmod u+w {} + && rm -rf -- "$path"; then
+    return "$primary_status"
+  else
+    cleanup_status=$?
+    echo "failed to remove Homebrew verification work directory: $path" >&2
+    if [[ "$primary_status" -ne 0 ]]; then
+      return "$primary_status"
+    fi
+    return "$cleanup_status"
+  fi
 }
 
 usage() {
@@ -244,6 +264,39 @@ if (
 NODE
 }
 
+# Upstream static verification authenticates the pack and controller binding;
+# this checks that Homebrew preserved those exact bytes beside the real CLI.
+verify_homebrew_runtime_pack() {
+  local node_bin=$1 extracted=$2 installed_cli=$3 linked_cli=$4 runtime_pack=${5:-true}
+  "$node_bin" - "$extracted" "$installed_cli" "$linked_cli" "$runtime_pack" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [extracted, installedCLI, linkedCLI, runtimePack] = process.argv.slice(2);
+const controller = fs.realpathSync(installedCLI);
+if (fs.realpathSync(linkedCLI) !== controller) {
+  throw new Error("Homebrew-linked Crabbox CLI does not resolve to the verified controller");
+}
+const directory = path.join(path.dirname(controller), "crabbox-runtime");
+if (!fs.lstatSync(directory).isDirectory()) {
+  throw new Error("Homebrew runtime pack is not a real directory beside the controller");
+}
+if (!["true", "filesystem"].includes(runtimePack)) throw new Error("unsupported runtime pack layout");
+const members = runtimePack === "filesystem"
+  ? ["darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64", "manifest.json", "windows-amd64.exe", "windows-arm64.exe"]
+  : ["linux-amd64", "linux-arm64", "manifest.json"];
+if (JSON.stringify(fs.readdirSync(directory).sort()) !== JSON.stringify(members)) {
+  throw new Error("Homebrew runtime pack member inventory is not exact");
+}
+for (const member of members) {
+  const file = path.join(directory, member);
+  if (!fs.lstatSync(file).isFile() ||
+      !fs.readFileSync(file).equals(fs.readFileSync(path.join(extracted, "crabbox-runtime", member)))) {
+    throw new Error(`Homebrew runtime pack differs from the frozen release archive: ${member}`);
+  }
+}
+NODE
+}
+
 homebrew_phase() {
   [[ $# -eq 9 ]] || usage
   local tag=$1 asset_dir=$2 tag_object=$3 source_commit=$4 verifier_commit=$5
@@ -334,8 +387,23 @@ homebrew_phase() {
   }
   local extracted="$work/extracted"
   mkdir -m 700 "$extracted"
+  local runtime_pack
+  runtime_pack=$("$node_bin" -e '
+    const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    if (![1, 2, 3].includes(p.schemaVersion)) throw new Error("unsupported release provenance schema");
+    process.stdout.write(p.schemaVersion === 3 ? "filesystem" : p.schemaVersion === 2 ? "true" : "false");
+  ' "$asset_dir/provenance.json")
   local expected_members=crabbox
   [[ "$native_arch" == arm64 ]] && expected_members=$'crabbox\ncrabbox-apple-vm-helper'
+  if [[ "$runtime_pack" != false ]]; then
+    expected_members=$(printf '%s\n' "$expected_members" \
+      crabbox-runtime/manifest.json crabbox-runtime/linux-amd64 crabbox-runtime/linux-arm64 | LC_ALL=C sort)
+  fi
+  if [[ "$runtime_pack" == filesystem ]]; then
+    expected_members=$(printf '%s\n' "$expected_members" \
+      crabbox-runtime/darwin-amd64 crabbox-runtime/darwin-arm64 \
+      crabbox-runtime/windows-amd64.exe crabbox-runtime/windows-arm64.exe | LC_ALL=C sort)
+  fi
   [[ "$(tar -tzf "$native_archive" | LC_ALL=C sort)" == "$expected_members" ]] || {
     echo "native release archive member inventory changed" >&2
     return 1
@@ -373,6 +441,18 @@ homebrew_phase() {
     return 1
   fi
 
+  local version_cli="$installed_cli"
+  if [[ "$runtime_pack" != false ]]; then
+    local brew_prefix
+    brew_prefix=$("$brew_bin" --prefix)
+    [[ "$brew_prefix" == /* && "$brew_prefix" != *$'\n'* && -d "$brew_prefix" ]] || {
+      echo "Homebrew returned an invalid global prefix" >&2
+      return 1
+    }
+    version_cli="$brew_prefix/bin/crabbox"
+    verify_homebrew_runtime_pack "$node_bin" "$extracted" "$installed_cli" "$version_cli" "$runtime_pack"
+  fi
+
   assert_no_downstream_credentials
   "$brew_bin" test "$FORMULA"
 
@@ -405,7 +485,7 @@ homebrew_phase() {
       return 1
     }
   fi
-  actual_version=$(HOME="$candidate_home" "$installed_cli" --version)
+  actual_version=$(HOME="$candidate_home" "$version_cli" --version)
   [[ "$actual_version" == "$version" ]] || {
     echo "Homebrew-installed Crabbox version mismatch: $actual_version" >&2
     return 1
@@ -419,6 +499,7 @@ main() {
   local release_id=$6
   [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || usage
   local native_arch brew_bin node_bin go_bin work clean_path user_name homebrew_home homebrew_cache tooling_commit
+  local path_directory remaining_path
   validate_release_identity "$tag" "$tag_object" "$source_commit" "$verifier_commit"
   tooling_commit=${CRABBOX_VERIFY_TOOLING_COMMIT:-$verifier_commit}
   assert_no_downstream_credentials
@@ -461,7 +542,23 @@ main() {
     "$tag" "$asset_dir" "$tag_object" "$source_commit" "$verifier_commit" \
     "$release_id" "$work/public-preflight" "$node_bin"
   asset_dir="$work/public-preflight/public-assets"
-  clean_path="${brew_bin%/*}:${node_bin%/*}:${go_bin%/*}:/usr/bin:/bin:/usr/sbin:/sbin"
+  # Preserve the caller's tool precedence: any selected directory may also
+  # contain a different Go or Node version. Drop every unrelated PATH entry.
+  clean_path=
+  remaining_path=$PATH
+  while :; do
+    path_directory=${remaining_path%%:*}
+    if [[ "$path_directory" == /* ]]; then
+      case "${path_directory%/}" in
+        "${brew_bin%/*}" | "${node_bin%/*}" | "${go_bin%/*}")
+          clean_path="${clean_path:+$clean_path:}$path_directory"
+          ;;
+      esac
+    fi
+    [[ "$remaining_path" == *:* ]] || break
+    remaining_path=${remaining_path#*:}
+  done
+  clean_path="${clean_path:+$clean_path:}/usr/bin:/bin:/usr/sbin:/sbin"
   user_name=$(id -un)
 
   # shellcheck disable=SC2016 # Expanded by the credential-free child shell.

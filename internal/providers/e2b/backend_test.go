@@ -16,9 +16,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -109,7 +111,7 @@ func TestE2BClientRedactsReflectedCredentials(t *testing.T) {
 			}, nil
 		})}
 		client := &e2bClient{envdClient: httpClient}
-		_, err := client.StartProcess(context.Background(), e2bSession{SandboxID: "sbx_1", Domain: "example.test", EnvdAccessToken: secret}, e2bProcessRequest{Command: "true"})
+		_, err := client.StartProcess(context.Background(), shared.EnvdSandboxSession{SandboxID: "sbx_1", Domain: "example.test", EnvdAccessToken: secret}, shared.EnvdSandboxProcessRequest{Command: "true"})
 		testutil.RequireRedactedProviderError(t, err, secret)
 	})
 }
@@ -130,7 +132,7 @@ func TestE2BProcessStreamRedactsReflectedCredential(t *testing.T) {
 }
 
 func TestE2BDefaultHTTPClientsSeparateControlAndDataPlanes(t *testing.T) {
-	api, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "e2b_test"}}, Runtime{})
+	api, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "e2b_test"}}, core.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +162,7 @@ func TestE2BInjectedHTTPClientIsPreservedForBothPlanes(t *testing.T) {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       17 * time.Second,
 	}
-	api, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "e2b_test"}}, Runtime{HTTP: injected})
+	api, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "e2b_test"}}, core.Runtime{HTTP: injected})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,137 +173,149 @@ func TestE2BInjectedHTTPClientIsPreservedForBothPlanes(t *testing.T) {
 }
 
 func TestE2BControlClientBoundsStalledResponseBody(t *testing.T) {
-	const controlTimeout = 40 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"sandboxID":`)
-		w.(http.Flusher).Flush()
-		<-req.Context().Done()
-	}))
-	defer server.Close()
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 40 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"sandboxID":`)
+			w.(http.Flusher).Flush()
+			<-req.Context().Done()
+		}))
+		defer server.Close()
 
-	controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	client := &e2bClient{apiKey: "e2b_test", apiURL: server.URL, httpClient: controlClient}
-	started := time.Now()
-	_, err := client.GetSandbox(context.Background(), "sbx_1")
-	elapsed := time.Since(started)
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("GetSandbox error=%v, want whole-request deadline", err)
-	}
-	if elapsed > time.Second {
-		t.Fatalf("stalled response body bounded after %s, want under 1s", elapsed)
-	}
-	t.Logf("control response-body stall bounded: elapsed=%s timeout=%s", elapsed.Round(time.Millisecond), controlTimeout)
+		controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		controlClient.Transport = server.Client().Transport
+		client := &e2bClient{apiKey: "e2b_test", apiURL: server.URL, httpClient: controlClient}
+		started := time.Now()
+		_, err := client.GetSandbox(context.Background(), "sbx_1")
+		elapsed := time.Since(started)
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetSandbox error=%v, want whole-request deadline", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("stalled response body bounded after %s, want under 1s", elapsed)
+		}
+		t.Logf("control response-body stall bounded: elapsed=%s timeout=%s", elapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestE2BControlClientBoundsWithheldHeaders(t *testing.T) {
-	const controlTimeout = 40 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
-		<-req.Context().Done()
-	}))
-	defer server.Close()
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 40 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+			<-req.Context().Done()
+		}))
+		defer server.Close()
 
-	controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	client := &e2bClient{apiKey: "e2b_test", apiURL: server.URL, httpClient: controlClient}
-	started := time.Now()
-	_, err := client.GetSandbox(context.Background(), "sbx_1")
-	elapsed := time.Since(started)
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("GetSandbox error=%v, want whole-request deadline", err)
-	}
-	if elapsed > time.Second {
-		t.Fatalf("withheld headers bounded after %s, want under 1s", elapsed)
-	}
-	t.Logf("control withheld headers bounded: elapsed=%s timeout=%s", elapsed.Round(time.Millisecond), controlTimeout)
+		controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		controlClient.Transport = server.Client().Transport
+		client := &e2bClient{apiKey: "e2b_test", apiURL: server.URL, httpClient: controlClient}
+		started := time.Now()
+		_, err := client.GetSandbox(context.Background(), "sbx_1")
+		elapsed := time.Since(started)
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetSandbox error=%v, want whole-request deadline", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("withheld headers bounded after %s, want under 1s", elapsed)
+		}
+		t.Logf("control withheld headers bounded: elapsed=%s timeout=%s", elapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestE2BDataPlaneStreamOutlivesControlTimeout(t *testing.T) {
-	const controlTimeout = 30 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		_, _ = io.Copy(io.Discard, req.Body)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(testutil.GRPCWebEnvelope(0, map[string]any{"event": map[string]any{"start": map[string]any{"pid": 42}}}))
-		w.(http.Flusher).Flush()
-		time.Sleep(3 * controlTimeout)
-		_, _ = w.Write(testutil.GRPCWebEnvelope(0, map[string]any{"event": map[string]any{"end": map[string]any{"exitCode": 0, "exited": true}}}))
-		_, _ = w.Write(testutil.GRPCWebEnvelope(2, map[string]any{}))
-	}))
-	defer server.Close()
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			_, _ = io.Copy(io.Discard, req.Body)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(testutil.GRPCWebEnvelope(0, map[string]any{"event": map[string]any{"start": map[string]any{"pid": 42}}}))
+			w.(http.Flusher).Flush()
+			time.Sleep(3 * controlTimeout)
+			_, _ = w.Write(testutil.GRPCWebEnvelope(0, map[string]any{"event": map[string]any{"end": map[string]any{"exitCode": 0, "exited": true}}}))
+			_, _ = w.Write(testutil.GRPCWebEnvelope(2, map[string]any{}))
+		}))
+		defer server.Close()
 
-	controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	client := &e2bClient{
-		domain:     "e2b.test",
-		httpClient: controlClient,
-		envdClient: e2bLoopbackClient(t, server, 0),
-	}
-	started := time.Now()
-	code, err := client.StartProcess(context.Background(), e2bSession{SandboxID: "sbx_1", Domain: "e2b.test"}, e2bProcessRequest{Command: "true"})
-	elapsed := time.Since(started)
-	if err != nil || code != 0 {
-		t.Fatalf("StartProcess code=%d err=%v", code, err)
-	}
-	if elapsed <= controlTimeout {
-		t.Fatalf("stream completed in %s, want it active beyond %s", elapsed, controlTimeout)
-	}
-	t.Logf("envd stream survived control deadline: elapsed=%s control_timeout=%s", elapsed.Round(time.Millisecond), controlTimeout)
+		controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		controlClient.Transport = server.Client().Transport
+		client := &e2bClient{
+			domain:     "e2b.test",
+			httpClient: controlClient,
+			envdClient: e2bLoopbackClient(t, server, 0),
+		}
+		started := time.Now()
+		code, err := client.StartProcess(context.Background(), shared.EnvdSandboxSession{SandboxID: "sbx_1", Domain: "e2b.test"}, shared.EnvdSandboxProcessRequest{Command: "true"})
+		elapsed := time.Since(started)
+		if err != nil || code != 0 {
+			t.Fatalf("StartProcess code=%d err=%v", code, err)
+		}
+		if elapsed <= controlTimeout {
+			t.Fatalf("stream completed in %s, want it active beyond %s", elapsed, controlTimeout)
+		}
+		t.Logf("envd stream survived control deadline: elapsed=%s control_timeout=%s", elapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestE2BDataPlaneUploadOutlivesControlTimeout(t *testing.T) {
-	const controlTimeout = 30 * time.Millisecond
-	type uploadResult struct {
-		data []byte
-		err  error
-	}
-	uploaded := make(chan uploadResult, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		reader, err := req.MultipartReader()
-		if err != nil {
-			uploaded <- uploadResult{err: err}
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		type uploadResult struct {
+			data []byte
+			err  error
 		}
-		part, err := reader.NextPart()
-		if err != nil {
-			uploaded <- uploadResult{err: err}
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		data, err := io.ReadAll(part)
-		uploaded <- uploadResult{data: data, err: err}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
+		uploaded := make(chan uploadResult, 1)
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			reader, err := req.MultipartReader()
+			if err != nil {
+				uploaded <- uploadResult{err: err}
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			part, err := reader.NextPart()
+			if err != nil {
+				uploaded <- uploadResult{err: err}
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			data, err := io.ReadAll(part)
+			uploaded <- uploadResult{data: data, err: err}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
 
-	payload := []byte("before-after")
-	controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	client := &e2bClient{
-		domain:     "e2b.test",
-		httpClient: controlClient,
-		envdClient: e2bLoopbackClient(t, server, 0),
-	}
-	reader := &e2bDelayedReader{data: payload, split: len("before-"), delay: 3 * controlTimeout}
-	started := time.Now()
-	err := client.UploadFile(context.Background(), e2bSession{SandboxID: "sbx_1", Domain: "e2b.test"}, "/tmp/archive.tgz", reader)
-	elapsed := time.Since(started)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := <-uploaded
-	if result.err != nil {
-		t.Fatal(result.err)
-	}
-	if !bytes.Equal(result.data, payload) {
-		t.Fatalf("uploaded=%q, want %q", result.data, payload)
-	}
-	if elapsed <= controlTimeout {
-		t.Fatalf("upload completed in %s, want it active beyond %s", elapsed, controlTimeout)
-	}
-	t.Logf("envd upload completed without truncation: bytes=%d elapsed=%s control_timeout=%s", len(result.data), elapsed.Round(time.Millisecond), controlTimeout)
+		payload := []byte("before-after")
+		controlClient, _ := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		controlClient.Transport = server.Client().Transport
+		client := &e2bClient{
+			domain:     "e2b.test",
+			httpClient: controlClient,
+			envdClient: e2bLoopbackClient(t, server, 0),
+		}
+		reader := &e2bDelayedReader{data: payload, split: len("before-"), delay: 3 * controlTimeout}
+		started := time.Now()
+		err := client.UploadFile(context.Background(), shared.EnvdSandboxSession{SandboxID: "sbx_1", Domain: "e2b.test"}, "/tmp/archive.tgz", reader)
+		elapsed := time.Since(started)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := <-uploaded
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !bytes.Equal(result.data, payload) {
+			t.Fatalf("uploaded=%q, want %q", result.data, payload)
+		}
+		if elapsed <= controlTimeout {
+			t.Fatalf("upload completed in %s, want it active beyond %s", elapsed, controlTimeout)
+		}
+		t.Logf("envd upload completed without truncation: bytes=%d elapsed=%s control_timeout=%s", len(result.data), elapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestValidateE2BAPIURL(t *testing.T) {
@@ -340,8 +354,31 @@ func TestValidateE2BAPIURL(t *testing.T) {
 	}
 }
 
+func TestNativeServerTypeProjection(t *testing.T) {
+	for _, name := range []string{"e2b", " E2B "} {
+		if got := core.ServerTypeForProviderClass(name, "beast"); got != "base" {
+			t.Fatalf("provider=%q default type=%q, want %q", name, got, "base")
+		}
+		provider, err := core.ProviderFor(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolver, ok := provider.(core.ProviderServerTypeProvider)
+		if !ok {
+			t.Fatalf("provider=%q has no native type capability", name)
+		}
+		for _, tc := range []struct{ raw, want string }{{"", "base"}, {"  ", "  "}, {"custom", "custom"}, {" custom ", " custom "}} {
+			cfg := core.Config{Provider: name, Class: "beast", ServerType: "unrelated-type", ServerTypeExplicit: true}
+			cfg.E2B.Template = tc.raw
+			if got := resolver.ServerTypeForConfig(cfg); got != tc.want {
+				t.Fatalf("provider=%q raw=%q type=%q, want %q", name, tc.raw, got, tc.want)
+			}
+		}
+	}
+}
+
 func TestE2BFlagsPreserveExactGuardAndDeferredValidation(t *testing.T) {
-	cfg := Config{Provider: "e2b"}
+	cfg := core.Config{Provider: "e2b"}
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	values := RegisterE2BProviderFlags(fs, cfg)
 	fs.VisitAll(func(f *flag.Flag) {
@@ -349,7 +386,7 @@ func TestE2BFlagsPreserveExactGuardAndDeferredValidation(t *testing.T) {
 			t.Fatal("API key flag introduced")
 		}
 	})
-	cfg.E2B = E2BConfig{APIURL: "https://example.invalid/api", Domain: "example.invalid", Template: "custom", Workdir: "work", User: "alice"}
+	cfg.E2B = core.E2BConfig{APIURL: "https://example.invalid/api", Domain: "example.invalid", Template: "custom", Workdir: "work", User: "alice"}
 	before := cfg
 	if err := ApplyE2BProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
@@ -360,10 +397,11 @@ func TestE2BFlagsPreserveExactGuardAndDeferredValidation(t *testing.T) {
 	if err := fs.Parse([]string{"--e2b-api-url=https://example.invalid/api", "--e2b-domain=example.invalid", "--e2b-template=custom", "--e2b-workdir=work", "--e2b-user=alice"}); err != nil {
 		t.Fatal(err)
 	}
-	cfg.E2B = E2BConfig{}
+	cfg.E2B = core.E2BConfig{}
 	if err := ApplyE2BProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
+	core.RecordProviderFlagInputs(&before, true, "e2b")
 	if !reflect.DeepEqual(cfg, before) {
 		t.Fatal("positive flags changed binding or marker semantics")
 	}
@@ -374,15 +412,15 @@ func TestE2BFlagsPreserveExactGuardAndDeferredValidation(t *testing.T) {
 	if err := ApplyE2BProviderFlags(&cfg, fs, values); err != nil {
 		t.Fatal("wrapper added client validation")
 	}
-	before.E2B = E2BConfig{}
+	before.E2B = core.E2BConfig{}
 	if !reflect.DeepEqual(cfg, before) {
 		t.Fatal("explicit empty values or central provenance side effects changed")
 	}
-	if _, err := (Provider{}).Configure(cfg, Runtime{}); err != nil {
+	if _, err := (Provider{}).Configure(cfg, core.Runtime{}); err != nil {
 		t.Fatalf("Configure added client validation: %v", err)
 	}
 	for _, name := range []string{"e2b", "E2B", " e2b "} {
-		cfg := Config{Provider: name}
+		cfg := core.Config{Provider: name}
 		fs := flag.NewFlagSet("guard", flag.ContinueOnError)
 		fs.String("class", "", "")
 		fs.String("type", "", "")
@@ -413,9 +451,9 @@ func TestE2BFlagsPreserveExactGuardAndDeferredValidation(t *testing.T) {
 
 func TestE2BConfiguredEndpointDefaultsAndRawScope(t *testing.T) {
 	for _, raw := range []string{"", "  ", " https://example.invalid/api/ "} {
-		cfg := Config{E2B: E2BConfig{APIKey: "inert", APIURL: raw}}
+		cfg := core.Config{E2B: core.E2BConfig{APIKey: "inert", APIURL: raw}}
 		before := cfg.E2B
-		api, err := newE2BClient(cfg, Runtime{HTTP: &http.Client{}})
+		api, err := newE2BClient(cfg, core.Runtime{HTTP: &http.Client{}})
 		if raw == "  " {
 			if err == nil {
 				t.Fatal("whitespace client endpoint unexpectedly defaulted")
@@ -452,8 +490,8 @@ func TestE2BConfiguredEndpointDefaultsAndRawScope(t *testing.T) {
 		}
 	}
 	for _, raw := range []string{"", "  ", " sandbox.example.invalid "} {
-		cfg := Config{E2B: E2BConfig{APIKey: "inert", APIURL: "https://example.invalid/api", Domain: raw, User: " alice "}}
-		api, err := newE2BClient(cfg, Runtime{HTTP: &http.Client{}})
+		cfg := core.Config{E2B: core.E2BConfig{APIKey: "inert", APIURL: "https://example.invalid/api", Domain: raw, User: " alice "}}
+		api, err := newE2BClient(cfg, core.Runtime{HTTP: &http.Client{}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -466,11 +504,11 @@ func TestE2BConfiguredEndpointDefaultsAndRawScope(t *testing.T) {
 		}
 	}
 	for _, rawKey := range []string{"", "  "} {
-		if _, err := newE2BClient(Config{E2B: E2BConfig{APIKey: rawKey, APIURL: "relative"}}, Runtime{HTTP: &http.Client{}}); err == nil || err.Error() != "provider=e2b requires E2B_API_KEY" {
+		if _, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: rawKey, APIURL: "relative"}}, core.Runtime{HTTP: &http.Client{}}); err == nil || err.Error() != "provider=e2b requires E2B_API_KEY" {
 			t.Fatalf("key-first=%v", err)
 		}
 	}
-	cfg := Config{E2B: E2BConfig{APIURL: "https://example.invalid/api", Domain: " sandbox.example.invalid ", User: " alice ", Workdir: " project "}}
+	cfg := core.Config{E2B: core.E2BConfig{APIURL: "https://example.invalid/api", Domain: " sandbox.example.invalid ", User: " alice ", Workdir: " project "}}
 	got := (Provider{}).CommandRouting(cfg, core.CommandRoutingRequest{}).Args
 	want := []string{"--e2b-api-url", "https://example.invalid/api", "--e2b-domain", " sandbox.example.invalid ", "--e2b-user", " alice ", "--e2b-workdir", " project "}
 	if !reflect.DeepEqual(got, want) {
@@ -485,9 +523,9 @@ func TestE2BTemplateAcquisitionAndMetadataDefaultAreDistinct(t *testing.T) {
 			cfg := core.BaseConfig()
 			cfg.Provider = "e2b"
 			cfg.E2B.Template = raw
-			b := &e2bBackend{cfg: cfg, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+			b := &e2bBackend{cfg: cfg, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
 			fake := &fakeE2BSyncClient{}
-			_, sandbox, _, err := b.createSandbox(context.Background(), fake, Repo{Name: "example", Root: t.TempDir()}, false, false, "")
+			_, sandbox, _, err := b.createSandbox(context.Background(), fake, core.Repo{Name: "example", Root: t.TempDir()}, false, false, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -498,7 +536,7 @@ func TestE2BTemplateAcquisitionAndMetadataDefaultAreDistinct(t *testing.T) {
 			if fake.createReq.TemplateID != want {
 				t.Fatalf("template=%q want=%q", fake.createReq.TemplateID, want)
 			}
-			if e2bSandboxToServer(sandbox).ServerType.Name != "base" {
+			if sandboxViews.Server(sandbox).ServerType.Name != "base" {
 				t.Fatal("missing remote metadata inferred configured template")
 			}
 		})
@@ -506,22 +544,22 @@ func TestE2BTemplateAcquisitionAndMetadataDefaultAreDistinct(t *testing.T) {
 }
 
 func TestE2BWorkspacePath(t *testing.T) {
-	if got := e2bWorkspacePath(Config{E2B: E2BConfig{User: " alice ", Workdir: "  "}}); got != "/home/alice/crabbox" {
+	if got := workspaceForConfig(core.Config{E2B: core.E2BConfig{User: " alice ", Workdir: "  "}}, core.Runtime{}).Path(); got != "/home/alice/crabbox" {
 		t.Fatalf("whitespace/default workspace=%q", got)
 	}
-	if got := e2bWorkspacePath(Config{}); got != "/home/user/crabbox" {
+	if got := workspaceForConfig(core.Config{}, core.Runtime{}).Path(); got != "/home/user/crabbox" {
 		t.Fatalf("workspace=%q", got)
 	}
-	if got := e2bWorkspacePath(Config{E2B: E2BConfig{Workdir: "repo"}}); got != "/home/user/repo" {
+	if got := workspaceForConfig(core.Config{E2B: core.E2BConfig{Workdir: "repo"}}, core.Runtime{}).Path(); got != "/home/user/repo" {
 		t.Fatalf("workspace=%q", got)
 	}
-	if got := e2bWorkspacePath(Config{E2B: E2BConfig{User: "ubuntu", Workdir: "repo"}}); got != "/home/ubuntu/repo" {
+	if got := workspaceForConfig(core.Config{E2B: core.E2BConfig{User: "ubuntu", Workdir: "repo"}}, core.Runtime{}).Path(); got != "/home/ubuntu/repo" {
 		t.Fatalf("workspace=%q", got)
 	}
-	if got := e2bWorkspacePath(Config{E2B: E2BConfig{User: "root", Workdir: "repo"}}); got != "/root/repo" {
+	if got := workspaceForConfig(core.Config{E2B: core.E2BConfig{User: "root", Workdir: "repo"}}, core.Runtime{}).Path(); got != "/root/repo" {
 		t.Fatalf("workspace=%q", got)
 	}
-	if got := e2bWorkspacePath(Config{E2B: E2BConfig{Workdir: "/work/repo"}}); got != "/work/repo" {
+	if got := workspaceForConfig(core.Config{E2B: core.E2BConfig{Workdir: "/work/repo"}}, core.Runtime{}).Path(); got != "/work/repo" {
 		t.Fatalf("workspace=%q", got)
 	}
 }
@@ -542,7 +580,7 @@ func TestE2BProcessUser(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := e2bProcessUser(tt.user)
+			got, err := workspaceForConfig(core.Config{E2B: core.E2BConfig{User: tt.user}}, core.Runtime{}).ProcessUser()
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err=%v, want %q", err, tt.wantErr)
@@ -561,10 +599,10 @@ func TestE2BProcessUser(t *testing.T) {
 
 func TestE2BWarmupRejectsUnsafeUserBeforeClient(t *testing.T) {
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{User: "../tmp"}},
-		rt:  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{User: "../tmp"}},
+		rt:  core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	err := backend.Warmup(context.Background(), WarmupRequest{})
+	err := backend.Warmup(context.Background(), core.WarmupRequest{})
 	if err == nil || !strings.Contains(err.Error(), "invalid e2b.user") {
 		t.Fatalf("err=%v, want invalid e2b.user", err)
 	}
@@ -595,7 +633,7 @@ func TestCleanE2BWorkspacePath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := cleanE2BWorkspacePath(tt.workspace)
+			got, err := shared.CleanPOSIXWorkspacePath("e2b workspace path", tt.workspace)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err=%v, want %q", err, tt.wantErr)
@@ -629,17 +667,17 @@ func TestE2BClientBindsObservedSandboxID(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(map[string]any{"sandboxID": observed, "alias": "different-template-alias", "envdAccessToken": "synthetic-envd-token", "domain": "sandbox.example.test"})
 				}))
 				defer server.Close()
-				client, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "synthetic-api-token", APIURL: server.URL}}, Runtime{HTTP: server.Client()})
+				client, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "synthetic-api-token", APIURL: server.URL}}, core.Runtime{HTTP: server.Client()})
 				if err != nil {
 					t.Fatal(err)
 				}
 				var id, token string
 				if operation == "connect" {
-					var session e2bSession
+					var session shared.EnvdSandboxSession
 					session, err = client.ConnectSandbox(t.Context(), "sbx_a", 120)
 					id, token = session.SandboxID, session.EnvdAccessToken
 				} else {
-					var sandbox e2bSandbox
+					var sandbox shared.EnvdSandbox
 					sandbox, err = client.GetSandbox(t.Context(), "sbx_a")
 					id, token = sandbox.SandboxID, sandbox.EnvdAccessToken
 				}
@@ -720,11 +758,11 @@ func TestE2BClientCreateConnectListAndDeleteUseOfficialRESTShape(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	api, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "e2b_test", APIURL: srv.URL}}, Runtime{HTTP: srv.Client()})
+	api, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "e2b_test", APIURL: srv.URL}}, core.Runtime{HTTP: srv.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sandbox, err := api.CreateSandbox(t.Context(), e2bCreateSandboxRequest{
+	sandbox, err := api.CreateSandbox(t.Context(), shared.EnvdSandboxCreateRequest{
 		TemplateID:          "base",
 		TimeoutSeconds:      60,
 		AllowInternetAccess: true,
@@ -775,7 +813,7 @@ func TestE2BAPIClientRefusesCrossOriginRedirectBeforeReplay(t *testing.T) {
 	}))
 	defer trusted.Close()
 
-	api, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "e2b_test", APIURL: trusted.URL}}, Runtime{HTTP: trusted.Client()})
+	api, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "e2b_test", APIURL: trusted.URL}}, core.Runtime{HTTP: trusted.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -830,14 +868,14 @@ func TestE2BClientFollowsSameOriginRedirect(t *testing.T) {
 			http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
 		case "/redirected":
 			redirectedKey = r.Header.Get("X-API-Key")
-			_ = json.NewEncoder(w).Encode([]e2bSandbox{})
+			_ = json.NewEncoder(w).Encode([]shared.EnvdSandbox{})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	api, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "e2b_test", APIURL: server.URL}}, Runtime{HTTP: server.Client()})
+	api, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "e2b_test", APIURL: server.URL}}, core.Runtime{HTTP: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -862,7 +900,7 @@ func TestE2BClientPreservesCallerRedirectPolicy(t *testing.T) {
 		callerChecks++
 		return callerErr
 	}
-	api, err := newE2BClient(Config{E2B: E2BConfig{APIKey: "e2b_test", APIURL: server.URL}}, Runtime{HTTP: httpClient})
+	api, err := newE2BClient(core.Config{E2B: core.E2BConfig{APIKey: "e2b_test", APIURL: server.URL}}, core.Runtime{HTTP: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -873,18 +911,20 @@ func TestE2BClientPreservesCallerRedirectPolicy(t *testing.T) {
 }
 
 func TestE2BUploadFileRejectsMalformedDomainBeforeProducer(t *testing.T) {
-	client := &e2bClient{apiKey: "e2b_test", domain: "%zz", httpClient: http.DefaultClient}
-	err := client.UploadFile(context.Background(), e2bSession{SandboxID: "sbx_1"}, "/tmp/archive.tgz", strings.NewReader("archive"))
-	if err == nil {
-		t.Fatal("UploadFile err=nil, want malformed URL error")
-	}
-	runtime.Gosched()
-	time.Sleep(10 * time.Millisecond)
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	if bytes.Contains(buf[:n], []byte("github.com/openclaw/crabbox/internal/providers/e2b.(*e2bClient).UploadFile.func1")) {
-		t.Fatalf("multipart producer goroutine still running after malformed URL:\n%s", buf[:n])
-	}
+	synctest.Test(t, func(t *testing.T) {
+		client := &e2bClient{apiKey: "e2b_test", domain: "%zz", httpClient: http.DefaultClient}
+		err := client.UploadFile(context.Background(), shared.EnvdSandboxSession{SandboxID: "sbx_1"}, "/tmp/archive.tgz", strings.NewReader("archive"))
+		if err == nil {
+			t.Fatal("UploadFile err=nil, want malformed URL error")
+		}
+		runtime.Gosched()
+		synctest.Wait()
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		if bytes.Contains(buf[:n], []byte("github.com/openclaw/crabbox/internal/providers/e2b.(*e2bClient).UploadFile.func1")) {
+			t.Fatalf("multipart producer goroutine still running after malformed URL:\n%s", buf[:n])
+		}
+	})
 }
 
 func TestE2BSyncWorkspaceUploadsRepoArchive(t *testing.T) {
@@ -905,13 +945,13 @@ func TestE2BSyncWorkspaceUploadsRepoArchive(t *testing.T) {
 	}
 	client := &fakeE2BSyncClient{}
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{User: "ubuntu", Workdir: "repo"}},
-		rt:  Runtime{Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{User: "ubuntu", Workdir: "repo"}},
+		rt:  core.Runtime{Stderr: io.Discard},
 	}
-	workspace := e2bWorkspacePath(backend.cfg)
-	_, _, err := backend.syncWorkspace(context.Background(), client, e2bSession{SandboxID: "sbx_1"}, RunRequest{
-		Repo: Repo{Root: root, Name: "repo"},
-	}, workspace)
+	workspace := workspaceForConfig(backend.cfg, core.Runtime{}).Path()
+	_, _, err := workspaceForConfig(backend.cfg, backend.rt).Bind(client, shared.EnvdSandboxSession{SandboxID: "sbx_1"}, core.RunRequest{
+		Repo: core.Repo{Root: root, Name: "repo"},
+	}, workspace).Sync(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,13 +987,13 @@ func TestE2BSyncWorkspaceCleansRemoteArchiveWhenExtractFails(t *testing.T) {
 	}
 	client := &fakeE2BSyncClient{processCodes: []int{0, 7, 0}}
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{User: "ubuntu", Workdir: "repo"}},
-		rt:  Runtime{Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{User: "ubuntu", Workdir: "repo"}},
+		rt:  core.Runtime{Stderr: io.Discard},
 	}
-	workspace := e2bWorkspacePath(backend.cfg)
-	_, _, err := backend.syncWorkspace(context.Background(), client, e2bSession{SandboxID: "sbx_1"}, RunRequest{
-		Repo: Repo{Root: root, Name: "repo"},
-	}, workspace)
+	workspace := workspaceForConfig(backend.cfg, core.Runtime{}).Path()
+	_, _, err := workspaceForConfig(backend.cfg, backend.rt).Bind(client, shared.EnvdSandboxSession{SandboxID: "sbx_1"}, core.RunRequest{
+		Repo: core.Repo{Root: root, Name: "repo"},
+	}, workspace).Sync(context.Background())
 	if err == nil {
 		t.Fatalf("expected extract failure")
 	}
@@ -990,12 +1030,12 @@ func TestE2BSyncDeletePreservesWorkspaceWhenReplacementFails(t *testing.T) {
 				failExtract:  tc.failExtract,
 				executeShell: true,
 			}
-			backend := &e2bBackend{rt: Runtime{Stderr: io.Discard}}
+			backend := &e2bBackend{rt: core.Runtime{Stderr: io.Discard}}
 			backend.cfg.Sync.Delete = true
 
-			_, _, err := backend.syncWorkspace(t.Context(), client, e2bSession{SandboxID: "sbx_1"}, RunRequest{
-				Repo: Repo{Root: root, Name: "repo"},
-			}, workspace)
+			_, _, err := workspaceForConfig(backend.cfg, backend.rt).Bind(client, shared.EnvdSandboxSession{SandboxID: "sbx_1"}, core.RunRequest{
+				Repo: core.Repo{Root: root, Name: "repo"},
+			}, workspace).Sync(t.Context())
 			if err == nil {
 				t.Fatal("sync unexpectedly succeeded")
 			}
@@ -1014,38 +1054,40 @@ func TestE2BSyncDeletePreservesWorkspaceWhenReplacementFails(t *testing.T) {
 }
 
 func TestE2BSyncWorkspaceHonorsConfiguredTimeout(t *testing.T) {
-	root := newE2BSyncTestRepo(t)
-	client := &fakeE2BSyncClient{uploadWaitForCancel: true}
-	backend := &e2bBackend{rt: Runtime{Stderr: io.Discard}}
-	backend.cfg.Sync.Timeout = 500 * time.Millisecond
-	started := time.Now()
+	synctest.Test(t, func(t *testing.T) {
+		root := newE2BSyncTestRepo(t)
+		client := &fakeE2BSyncClient{uploadWaitForCancel: true}
+		backend := &e2bBackend{rt: core.Runtime{Stderr: io.Discard}}
+		backend.cfg.Sync.Timeout = 500 * time.Millisecond
+		started := time.Now()
 
-	_, _, err := backend.syncWorkspace(t.Context(), client, e2bSession{SandboxID: "sbx_1"}, RunRequest{
-		Repo: Repo{Root: root, Name: "repo"},
-	}, "/home/user/repo")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("sync err=%v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(started); elapsed > 5*time.Second {
-		t.Fatalf("sync timeout returned after %s", elapsed)
-	}
-	if !client.uploadDeadlineSet {
-		t.Fatal("upload did not receive the configured sync deadline")
-	}
-	if !client.cleanupDeadlineSet {
-		t.Fatal("timed-out sync cleanup did not use an independent bounded context")
-	}
+		_, _, err := workspaceForConfig(backend.cfg, backend.rt).Bind(client, shared.EnvdSandboxSession{SandboxID: "sbx_1"}, core.RunRequest{
+			Repo: core.Repo{Root: root, Name: "repo"},
+		}, "/home/user/repo").Sync(t.Context())
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("sync err=%v, want deadline exceeded", err)
+		}
+		if elapsed := time.Since(started); elapsed > 5*time.Second {
+			t.Fatalf("sync timeout returned after %s", elapsed)
+		}
+		if !client.uploadDeadlineSet {
+			t.Fatal("upload did not receive the configured sync deadline")
+		}
+		if !client.cleanupDeadlineSet {
+			t.Fatal("timed-out sync cleanup did not use an independent bounded context")
+		}
+	})
 }
 
 func TestE2BPrepareWorkspaceRejectsUnsafePath(t *testing.T) {
 	client := &fakeE2BSyncClient{}
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Sync.Delete = true
 	backend := &e2bBackend{
 		cfg: cfg,
-		rt:  Runtime{Stderr: io.Discard},
+		rt:  core.Runtime{Stderr: io.Discard},
 	}
-	err := backend.prepareWorkspace(context.Background(), client, e2bSession{SandboxID: "sbx_1"}, "/")
+	err := workspaceForConfig(backend.cfg, backend.rt).Bind(client, shared.EnvdSandboxSession{SandboxID: "sbx_1"}, core.RunRequest{}, "/").Ensure(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "too broad") {
 		t.Fatalf("err=%v, want unsafe workspace error", err)
 	}
@@ -1057,10 +1099,10 @@ func TestE2BPrepareWorkspaceRejectsUnsafePath(t *testing.T) {
 func TestE2BCreateSandboxRejectsUnsafeWorkdirBeforeAPI(t *testing.T) {
 	client := &fakeE2BSyncClient{}
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{Workdir: "/"}},
-		rt:  Runtime{Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{Workdir: "/"}},
+		rt:  core.Runtime{Stderr: io.Discard},
 	}
-	_, _, _, err := backend.createSandbox(context.Background(), client, Repo{}, false, false, "")
+	_, _, _, err := backend.createSandbox(context.Background(), client, core.Repo{}, false, false, "")
 	if err == nil || !strings.Contains(err.Error(), "too broad") {
 		t.Fatalf("err=%v, want unsafe workspace error", err)
 	}
@@ -1071,11 +1113,11 @@ func TestE2BCreateSandboxRejectsUnsafeWorkdirBeforeAPI(t *testing.T) {
 
 func TestE2BStatusReady(t *testing.T) {
 	for _, status := range []string{"", "running"} {
-		if !e2bStatusReady(status) {
+		if !shared.EnvdSandboxStatusReady(status) {
 			t.Fatalf("expected %q ready", status)
 		}
 	}
-	if e2bStatusReady("paused") {
+	if shared.EnvdSandboxStatusReady("paused") {
 		t.Fatal("paused should not be ready")
 	}
 }
@@ -1089,30 +1131,32 @@ func TestE2BStatusWaitBoundsInFlightSandboxLookup(t *testing.T) {
 		{name: "readiness poll", getWaitAfterCalls: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("XDG_STATE_HOME", t.TempDir())
-			client := &fakeE2BSyncClient{}
-			restore := swapNewE2BClient(client)
-			defer restore()
-			backend := &e2bBackend{
-				cfg: Config{E2B: E2BConfig{APIURL: "https://api.example.test", Template: "base"}},
-				rt:  Runtime{Stdout: io.Discard, Stderr: io.Discard},
-			}
-			leaseID, _, _, err := backend.createSandbox(t.Context(), client, Repo{Root: t.TempDir()}, true, false, "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			client.getWaitForCancel = true
-			client.getWaitAfterCalls = tc.getWaitAfterCalls
-			started := time.Now()
+			synctest.Test(t, func(t *testing.T) {
+				t.Setenv("XDG_STATE_HOME", t.TempDir())
+				client := &fakeE2BSyncClient{}
+				restore := swapNewE2BClient(client)
+				defer restore()
+				backend := &e2bBackend{
+					cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api.example.test", Template: "base"}},
+					rt:  core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
+				}
+				leaseID, _, _, err := backend.createSandbox(t.Context(), client, core.Repo{Root: t.TempDir()}, true, false, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				client.getWaitForCancel = true
+				client.getWaitAfterCalls = tc.getWaitAfterCalls
+				started := time.Now()
 
-			_, err = backend.Status(t.Context(), StatusRequest{ID: leaseID, Wait: true, WaitTimeout: 30 * time.Millisecond})
-			var exitErr ExitError
-			if !errors.As(err, &exitErr) || exitErr.Code != 5 || !strings.Contains(err.Error(), "timed out waiting for sandbox") {
-				t.Fatalf("status err=%v, want sandbox wait timeout with exit code 5", err)
-			}
-			if elapsed := time.Since(started); elapsed > time.Second {
-				t.Fatalf("in-flight sandbox lookup returned after %s", elapsed)
-			}
+				_, err = backend.Status(t.Context(), core.StatusRequest{ID: leaseID, Wait: true, WaitTimeout: 30 * time.Millisecond})
+				var exitErr core.ExitError
+				if !errors.As(err, &exitErr) || exitErr.Code != 5 || !strings.Contains(err.Error(), "timed out waiting for sandbox") {
+					t.Fatalf("status err=%v, want sandbox wait timeout with exit code 5", err)
+				}
+				if elapsed := time.Since(started); elapsed > time.Second {
+					t.Fatalf("in-flight sandbox lookup returned after %s", elapsed)
+				}
+			})
 		})
 	}
 }
@@ -1133,14 +1177,14 @@ func TestE2BCreateSandboxCapsDefaultTTL(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	client := &fakeE2BSyncClient{}
 	backend := &e2bBackend{
-		cfg: Config{
+		cfg: core.Config{
 			TTL:         90 * time.Minute,
 			IdleTimeout: 30 * time.Minute,
-			E2B:         E2BConfig{Template: "base"},
+			E2B:         core.E2BConfig{Template: "base"},
 		},
-		rt: Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	_, _, _, err := backend.createSandbox(context.Background(), client, Repo{Root: t.TempDir(), Name: "repo"}, true, false, "")
+	_, _, _, err := backend.createSandbox(context.Background(), client, core.Repo{Root: t.TempDir(), Name: "repo"}, true, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1154,7 +1198,7 @@ func TestE2BCreateSandboxCapsDefaultTTL(t *testing.T) {
 
 func TestE2BCreateSandboxReportsCleanupFailureAfterClaimFailure(t *testing.T) {
 	origClaim := claimLeaseTargetForRepoConfig
-	claimLeaseTargetForRepoConfig = func(_, _ string, _ Config, _ Server, _ SSHTarget, _ string, _ time.Duration, _ bool) error {
+	claimLeaseTargetForRepoConfig = func(_, _ string, _ core.Config, _ core.Server, _ core.SSHTarget, _ string, _ time.Duration, _ bool) error {
 		return errors.New("claim write failed")
 	}
 	t.Cleanup(func() { claimLeaseTargetForRepoConfig = origClaim })
@@ -1162,10 +1206,10 @@ func TestE2BCreateSandboxReportsCleanupFailureAfterClaimFailure(t *testing.T) {
 	client := &fakeE2BSyncClient{deleteErr: errors.New("delete failed")}
 	var stderr bytes.Buffer
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{Template: "base"}},
-		rt:  Runtime{Stdout: io.Discard, Stderr: &stderr},
+		cfg: core.Config{E2B: core.E2BConfig{Template: "base"}},
+		rt:  core.Runtime{Stdout: io.Discard, Stderr: &stderr},
 	}
-	_, _, _, err := backend.createSandbox(context.Background(), client, Repo{Root: t.TempDir(), Name: "repo"}, false, false, "")
+	_, _, _, err := backend.createSandbox(context.Background(), client, core.Repo{Root: t.TempDir(), Name: "repo"}, false, false, "")
 	if err == nil {
 		t.Fatal("expected claim failure")
 	}
@@ -1196,16 +1240,16 @@ func TestE2BRunReturnsSessionHandleForKeptSandbox(t *testing.T) {
 	restore := swapNewE2BClient(client)
 	defer restore()
 	backend := &e2bBackend{
-		cfg: Config{
+		cfg: core.Config{
 			IdleTimeout: 30 * time.Minute,
 			TTL:         2 * time.Minute,
-			E2B:         E2BConfig{APIKey: "test", Workdir: "repo"},
+			E2B:         core.E2BConfig{APIKey: "test", Workdir: "repo"},
 		},
-		rt: Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
 
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "repo", Root: t.TempDir()},
 		Command: []string{"true"},
 		Keep:    true,
 		NoSync:  true,
@@ -1220,7 +1264,7 @@ func TestE2BRunReturnsSessionHandleForKeptSandbox(t *testing.T) {
 	if got.Provider != e2bProvider || got.LeaseID == "" || got.Slug == "" || got.Reused || !got.Kept {
 		t.Fatalf("session=%#v", got)
 	}
-	if got.CleanupCommand != "crabbox stop --provider e2b --id "+shellQuote(got.LeaseID) {
+	if got.CleanupCommand != "crabbox stop --provider e2b --id "+core.ShellQuote(got.LeaseID) {
 		t.Fatalf("cleanup command=%q", got.CleanupCommand)
 	}
 	if len(client.deleteIDs) != 0 {
@@ -1235,22 +1279,22 @@ func TestE2BRunReturnsSessionHandleWhenKeepOnFailureRetainsSandbox(t *testing.T)
 	defer restore()
 	var stderr bytes.Buffer
 	backend := &e2bBackend{
-		cfg: Config{
+		cfg: core.Config{
 			IdleTimeout: 30 * time.Minute,
 			TTL:         2 * time.Minute,
-			E2B:         E2BConfig{APIKey: "test", Workdir: "repo"},
+			E2B:         core.E2BConfig{APIKey: "test", Workdir: "repo"},
 		},
-		rt: Runtime{Stdout: io.Discard, Stderr: &stderr},
+		rt: core.Runtime{Stdout: io.Discard, Stderr: &stderr},
 	}
 
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:          Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:          core.Repo{Name: "repo", Root: t.TempDir()},
 		Command:       []string{"false"},
 		KeepOnFailure: true,
 		NoSync:        true,
 		TimingJSON:    true,
 	})
-	var ee ExitError
+	var ee core.ExitError
 	if !errors.As(err, &ee) || ee.Code != 7 {
 		t.Fatalf("err=%v want ExitError code 7", err)
 	}
@@ -1298,16 +1342,16 @@ func TestE2BRunKeepOnFailureRetainsSandboxAfterSetupFailure(t *testing.T) {
 			defer restore()
 			var stderr bytes.Buffer
 			backend := &e2bBackend{
-				cfg: Config{
+				cfg: core.Config{
 					IdleTimeout: 30 * time.Minute,
 					TTL:         2 * time.Minute,
-					E2B:         E2BConfig{APIKey: "test", Workdir: "repo"},
+					E2B:         core.E2BConfig{APIKey: "test", Workdir: "repo"},
 				},
-				rt: Runtime{Stdout: io.Discard, Stderr: &stderr},
+				rt: core.Runtime{Stdout: io.Discard, Stderr: &stderr},
 			}
 
-			result, err := backend.Run(t.Context(), RunRequest{
-				Repo:          Repo{Name: "repo", Root: newE2BSyncTestRepo(t)},
+			result, err := backend.Run(t.Context(), core.RunRequest{
+				Repo:          core.Repo{Name: "repo", Root: newE2BSyncTestRepo(t)},
 				Command:       []string{"true"},
 				KeepOnFailure: true,
 				NoSync:        tc.noSync,
@@ -1321,7 +1365,7 @@ func TestE2BRunKeepOnFailureRetainsSandboxAfterSetupFailure(t *testing.T) {
 			if len(client.deleteIDs) != 0 {
 				t.Fatalf("deleted sandbox=%v, want retained sandbox", client.deleteIDs)
 			}
-			if _, exists, claimErr := readLeaseClaimWithPresence(result.Session.LeaseID); claimErr != nil || !exists {
+			if _, exists, claimErr := core.ReadLeaseClaimWithPresence(result.Session.LeaseID); claimErr != nil || !exists {
 				t.Fatalf("retained sandbox claim exists=%t err=%v", exists, claimErr)
 			}
 			if !strings.Contains(stderr.String(), "keep-on-failure") {
@@ -1337,16 +1381,16 @@ func TestE2BRunCleanupUsesExactClaim(t *testing.T) {
 	restore := swapNewE2BClient(client)
 	defer restore()
 	backend := &e2bBackend{
-		cfg: Config{
+		cfg: core.Config{
 			IdleTimeout: 30 * time.Minute,
 			TTL:         2 * time.Minute,
-			E2B:         E2BConfig{APIKey: "test", Workdir: "repo"},
+			E2B:         core.E2BConfig{APIKey: "test", Workdir: "repo"},
 		},
-		rt: Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
 
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "repo", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "repo", Root: t.TempDir()},
 		Command: []string{"true"},
 		NoSync:  true,
 	})
@@ -1362,13 +1406,13 @@ func TestE2BRunCleanupUsesExactClaim(t *testing.T) {
 	if !client.deleteDeadlineSet {
 		t.Fatal("run cleanup did not use a bounded context")
 	}
-	if _, exists, err := readLeaseClaimWithPresence(result.Session.LeaseID); err != nil || exists {
+	if _, exists, err := core.ReadLeaseClaimWithPresence(result.Session.LeaseID); err != nil || exists {
 		t.Fatalf("cleanup claim exists=%t err=%v", exists, err)
 	}
 }
 
 func TestE2BSandboxToServerUsesMetadata(t *testing.T) {
-	server := e2bSandboxToServer(e2bSandbox{
+	server := sandboxViews.Server(shared.EnvdSandbox{
 		SandboxID:  "sbx_1",
 		TemplateID: "base",
 		State:      "running",
@@ -1390,7 +1434,7 @@ func TestE2BSandboxToServerUsesMetadata(t *testing.T) {
 func TestE2BResolveSyntheticIDRequiresCrabboxMetadata(t *testing.T) {
 	backend := &e2bBackend{}
 	client := &fakeE2BSyncClient{
-		sandbox: e2bSandbox{
+		sandbox: shared.EnvdSandbox{
 			SandboxID: "sbx_1",
 			Metadata:  map[string]string{"provider": "other"},
 		},
@@ -1419,16 +1463,16 @@ func TestE2BCreateBindsExactSandboxAndEndpoint(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	client := &fakeE2BSyncClient{}
 	backend := &e2bBackend{
-		cfg: Config{
+		cfg: core.Config{
 			IdleTimeout: 30 * time.Minute,
-			E2B: E2BConfig{
+			E2B: core.E2BConfig{
 				APIURL:   "https://api.example.test/root/",
 				Template: "base",
 			},
 		},
-		rt: Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	leaseID, sandbox, _, err := backend.createSandbox(context.Background(), client, Repo{Root: t.TempDir()}, true, false, "")
+	leaseID, sandbox, _, err := backend.createSandbox(context.Background(), client, core.Repo{Root: t.TempDir()}, true, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1443,7 +1487,7 @@ func TestE2BCreateBindsExactSandboxAndEndpoint(t *testing.T) {
 
 func TestE2BStopRejectsLabelledButUnclaimedSandbox(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	client := &fakeE2BSyncClient{sandbox: e2bSandbox{
+	client := &fakeE2BSyncClient{sandbox: shared.EnvdSandbox{
 		SandboxID: "sbx_unclaimed",
 		Metadata: map[string]string{
 			"provider": e2bProvider,
@@ -1454,8 +1498,8 @@ func TestE2BStopRejectsLabelledButUnclaimedSandbox(t *testing.T) {
 	}}
 	restore := swapNewE2BClient(client)
 	defer restore()
-	backend := &e2bBackend{cfg: e2bClaimConfig(Config{}), rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
-	err := backend.Stop(context.Background(), StopRequest{ID: "sbx_unclaimed"})
+	backend := &e2bBackend{cfg: e2bClaimConfig(core.Config{}), rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+	err := backend.Stop(context.Background(), core.StopRequest{ID: "sbx_unclaimed"})
 	if err == nil || !strings.Contains(err.Error(), "no exact local claim") {
 		t.Fatalf("Stop err=%v, want exact-claim rejection", err)
 	}
@@ -1470,33 +1514,33 @@ func TestE2BStopChecksLiveOwnershipAndRemovesClaimAtomically(t *testing.T) {
 	restore := swapNewE2BClient(client)
 	defer restore()
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{APIURL: "https://api.example.test", Template: "base"}},
-		rt:  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api.example.test", Template: "base"}},
+		rt:  core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	leaseID, sandbox, _, err := backend.createSandbox(context.Background(), client, Repo{Root: t.TempDir()}, true, false, "")
+	leaseID, sandbox, _, err := backend.createSandbox(context.Background(), client, core.Repo{Root: t.TempDir()}, true, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.sandbox.Metadata["lease"] = "cbx_ffffffffffff"
-	err = backend.Stop(context.Background(), StopRequest{ID: leaseID})
+	err = backend.Stop(context.Background(), core.StopRequest{ID: leaseID})
 	if err == nil || !strings.Contains(err.Error(), "no longer has canonical ownership metadata") {
 		t.Fatalf("mismatched Stop err=%v", err)
 	}
 	if len(client.deleteIDs) != 0 {
 		t.Fatalf("mismatched Stop deleted %#v", client.deleteIDs)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || !exists {
+	if _, exists, err := core.ReadLeaseClaimWithPresence(leaseID); err != nil || !exists {
 		t.Fatalf("mismatched Stop lost recovery claim: exists=%t err=%v", exists, err)
 	}
 
 	client.sandbox.Metadata["lease"] = leaseID
-	if err := backend.Stop(context.Background(), StopRequest{ID: leaseID}); err != nil {
+	if err := backend.Stop(context.Background(), core.StopRequest{ID: leaseID}); err != nil {
 		t.Fatalf("Stop exact claim: %v", err)
 	}
 	if len(client.deleteIDs) != 1 || client.deleteIDs[0] != sandbox.SandboxID {
 		t.Fatalf("deleteIDs=%#v", client.deleteIDs)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || exists {
+	if _, exists, err := core.ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
 		t.Fatalf("successful Stop claim exists=%t err=%v", exists, err)
 	}
 }
@@ -1507,21 +1551,21 @@ func TestE2BStopRetainsClaimWhenDeleteFails(t *testing.T) {
 	restore := swapNewE2BClient(client)
 	defer restore()
 	backend := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{APIURL: "https://api.example.test", Template: "base"}},
-		rt:  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api.example.test", Template: "base"}},
+		rt:  core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	leaseID, sandbox, _, err := backend.createSandbox(context.Background(), client, Repo{Root: t.TempDir()}, true, false, "")
+	leaseID, sandbox, _, err := backend.createSandbox(context.Background(), client, core.Repo{Root: t.TempDir()}, true, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = backend.Stop(context.Background(), StopRequest{ID: leaseID})
+	err = backend.Stop(context.Background(), core.StopRequest{ID: leaseID})
 	if err == nil || !strings.Contains(err.Error(), "delete failed") {
 		t.Fatalf("Stop err=%v, want delete failure", err)
 	}
 	if len(client.deleteIDs) != 1 || client.deleteIDs[0] != sandbox.SandboxID {
 		t.Fatalf("deleteIDs=%#v", client.deleteIDs)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || !exists {
+	if _, exists, err := core.ReadLeaseClaimWithPresence(leaseID); err != nil || !exists {
 		t.Fatalf("failed Stop lost recovery claim: exists=%t err=%v", exists, err)
 	}
 }
@@ -1530,10 +1574,10 @@ func TestE2BStopRejectsDifferentAPIEndpointBeforeRemoteRead(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	client := &fakeE2BSyncClient{}
 	creator := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{APIURL: "https://api-a.example.test", Template: "base"}},
-		rt:  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api-a.example.test", Template: "base"}},
+		rt:  core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	leaseID, _, _, err := creator.createSandbox(context.Background(), client, Repo{Root: t.TempDir()}, true, false, "")
+	leaseID, _, _, err := creator.createSandbox(context.Background(), client, core.Repo{Root: t.TempDir()}, true, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1541,10 +1585,10 @@ func TestE2BStopRejectsDifferentAPIEndpointBeforeRemoteRead(t *testing.T) {
 	restore := swapNewE2BClient(client)
 	defer restore()
 	other := &e2bBackend{
-		cfg: Config{E2B: E2BConfig{APIURL: "https://api-b.example.test"}},
-		rt:  Runtime{Stdout: io.Discard, Stderr: io.Discard},
+		cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api-b.example.test"}},
+		rt:  core.Runtime{Stdout: io.Discard, Stderr: io.Discard},
 	}
-	err = other.Stop(context.Background(), StopRequest{ID: leaseID})
+	err = other.Stop(context.Background(), core.StopRequest{ID: leaseID})
 	if err == nil || !strings.Contains(err.Error(), "different API endpoint") {
 		t.Fatalf("Stop err=%v, want endpoint rejection", err)
 	}
@@ -1555,7 +1599,7 @@ func TestE2BStopRejectsDifferentAPIEndpointBeforeRemoteRead(t *testing.T) {
 
 func TestE2BReclaimAndStopAdoptsExactSandbox(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	client := &fakeE2BSyncClient{sandbox: e2bSandbox{
+	client := &fakeE2BSyncClient{sandbox: shared.EnvdSandbox{
 		SandboxID: "sbx_reclaim",
 		Metadata: map[string]string{
 			"provider": e2bProvider,
@@ -1566,14 +1610,14 @@ func TestE2BReclaimAndStopAdoptsExactSandbox(t *testing.T) {
 	}}
 	restore := swapNewE2BClient(client)
 	defer restore()
-	backend := &e2bBackend{cfg: e2bClaimConfig(Config{}), rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
-	if err := backend.ReclaimAndStop(context.Background(), StopRequest{ID: "sbx_reclaim"}); err != nil {
+	backend := &e2bBackend{cfg: e2bClaimConfig(core.Config{}), rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+	if err := backend.ReclaimAndStop(context.Background(), core.StopRequest{ID: "sbx_reclaim"}); err != nil {
 		t.Fatalf("ReclaimAndStop: %v", err)
 	}
 	if len(client.deleteIDs) != 1 || client.deleteIDs[0] != "sbx_reclaim" {
 		t.Fatalf("deleteIDs=%#v", client.deleteIDs)
 	}
-	if _, exists, err := readLeaseClaimWithPresence("cbx_123456789abc"); err != nil || exists {
+	if _, exists, err := core.ReadLeaseClaimWithPresence("cbx_123456789abc"); err != nil || exists {
 		t.Fatalf("successful reclaim claim exists=%t err=%v", exists, err)
 	}
 }
@@ -1581,12 +1625,12 @@ func TestE2BReclaimAndStopAdoptsExactSandbox(t *testing.T) {
 type fakeE2BSyncClient struct {
 	commands            []string
 	users               []string
-	sandbox             e2bSandbox
-	createReq           e2bCreateSandboxRequest
+	sandbox             shared.EnvdSandbox
+	createReq           shared.EnvdSandboxCreateRequest
 	createCalls         int
 	getIDs              []string
 	listFilters         []map[string]string
-	listedSandboxes     []e2bSandbox
+	listedSandboxes     []shared.EnvdSandbox
 	connectIDs          []string
 	getErr              error
 	getWaitForCancel    bool
@@ -1606,40 +1650,40 @@ type fakeE2BSyncClient struct {
 	processCodes        []int
 }
 
-func swapNewE2BClient(fake e2bAPI) func() {
+func swapNewE2BClient(fake shared.EnvdSandboxAPI) func() {
 	prev := newE2BClient
-	newE2BClient = func(Config, Runtime) (e2bAPI, error) { return fake, nil }
+	newE2BClient = func(core.Config, core.Runtime) (shared.EnvdSandboxAPI, error) { return fake, nil }
 	return func() { newE2BClient = prev }
 }
 
-func (f *fakeE2BSyncClient) CreateSandbox(_ context.Context, req e2bCreateSandboxRequest) (e2bSandbox, error) {
+func (f *fakeE2BSyncClient) CreateSandbox(_ context.Context, req shared.EnvdSandboxCreateRequest) (shared.EnvdSandbox, error) {
 	f.createReq = req
 	f.createCalls++
 	if f.sandbox.SandboxID != "" {
 		return f.sandbox, nil
 	}
-	f.sandbox = e2bSandbox{SandboxID: "sbx_1", Metadata: req.Metadata, State: "running"}
+	f.sandbox = shared.EnvdSandbox{SandboxID: "sbx_1", Metadata: req.Metadata, State: "running"}
 	return f.sandbox, nil
 }
 
-func (f *fakeE2BSyncClient) ConnectSandbox(_ context.Context, sandboxID string, _ int) (e2bSession, error) {
+func (f *fakeE2BSyncClient) ConnectSandbox(_ context.Context, sandboxID string, _ int) (shared.EnvdSandboxSession, error) {
 	f.connectIDs = append(f.connectIDs, sandboxID)
-	return e2bSession{}, f.connectErr
+	return shared.EnvdSandboxSession{}, f.connectErr
 }
 
-func (f *fakeE2BSyncClient) GetSandbox(ctx context.Context, sandboxID string) (e2bSandbox, error) {
+func (f *fakeE2BSyncClient) GetSandbox(ctx context.Context, sandboxID string) (shared.EnvdSandbox, error) {
 	f.getIDs = append(f.getIDs, sandboxID)
 	if f.getWaitForCancel && len(f.getIDs) > f.getWaitAfterCalls {
 		<-ctx.Done()
-		return e2bSandbox{}, ctx.Err()
+		return shared.EnvdSandbox{}, ctx.Err()
 	}
 	if f.getErr != nil {
-		return e2bSandbox{}, f.getErr
+		return shared.EnvdSandbox{}, f.getErr
 	}
 	return f.sandbox, nil
 }
 
-func (f *fakeE2BSyncClient) ListSandboxes(_ context.Context, filter map[string]string) ([]e2bSandbox, error) {
+func (f *fakeE2BSyncClient) ListSandboxes(_ context.Context, filter map[string]string) ([]shared.EnvdSandbox, error) {
 	f.listFilters = append(f.listFilters, filter)
 	return f.listedSandboxes, nil
 }
@@ -1653,7 +1697,7 @@ func (f *fakeE2BSyncClient) DeleteSandbox(ctx context.Context, sandboxID string)
 	return f.deleteErr
 }
 
-func (f *fakeE2BSyncClient) UploadFile(ctx context.Context, _ e2bSession, targetPath string, r io.Reader) error {
+func (f *fakeE2BSyncClient) UploadFile(ctx context.Context, _ shared.EnvdSandboxSession, targetPath string, r io.Reader) error {
 	f.uploadPath = targetPath
 	_, f.uploadDeadlineSet = ctx.Deadline()
 	if f.uploadWaitForCancel {
@@ -1672,7 +1716,7 @@ func (f *fakeE2BSyncClient) UploadFile(ctx context.Context, _ e2bSession, target
 	return nil
 }
 
-func (f *fakeE2BSyncClient) StartProcess(ctx context.Context, _ e2bSession, req e2bProcessRequest) (int, error) {
+func (f *fakeE2BSyncClient) StartProcess(ctx context.Context, _ shared.EnvdSandboxSession, req shared.EnvdSandboxProcessRequest) (int, error) {
 	f.commands = append(f.commands, req.Command)
 	f.users = append(f.users, req.User)
 	if strings.HasPrefix(req.Command, "rm -f ") {
@@ -1737,10 +1781,10 @@ func TestE2BRunLifecycleArchiveGuardrailBeforeCreation(t *testing.T) {
 	client := &fakeE2BSyncClient{}
 	restore := swapNewE2BClient(client)
 	defer restore()
-	backend := &e2bBackend{cfg: Config{E2B: E2BConfig{Workdir: "repo"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+	backend := &e2bBackend{cfg: core.Config{E2B: core.E2BConfig{Workdir: "repo"}}, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
 	backend.cfg.Sync.FailFiles = 1
-	result, err := backend.Run(t.Context(), RunRequest{Repo: Repo{Name: "repo", Root: newE2BSyncTestRepo(t)}, Command: []string{"true"}})
-	var ee ExitError
+	result, err := backend.Run(t.Context(), core.RunRequest{Repo: core.Repo{Name: "repo", Root: newE2BSyncTestRepo(t)}, Command: []string{"true"}})
+	var ee core.ExitError
 	if !errors.As(err, &ee) || ee.Code != 6 || result.ExitCode != 6 || client.createCalls != 0 || result.Session != nil {
 		t.Fatalf("result=%#v err=%v creates=%d", result, err, client.createCalls)
 	}
@@ -1754,17 +1798,17 @@ func TestE2BRunLifecycleCleanupOutcomeAndTiming(t *testing.T) {
 			restore := swapNewE2BClient(client)
 			defer restore()
 			var stderr bytes.Buffer
-			backend := &e2bBackend{cfg: Config{TTL: time.Minute, E2B: E2BConfig{Workdir: "repo"}}, rt: Runtime{Stdout: io.Discard, Stderr: &stderr}}
-			result, err := backend.Run(t.Context(), RunRequest{Repo: Repo{Name: "repo", Root: t.TempDir()}, Command: []string{"true"}, NoSync: true, TimingJSON: true})
+			backend := &e2bBackend{cfg: core.Config{TTL: time.Minute, E2B: core.E2BConfig{Workdir: "repo"}}, rt: core.Runtime{Stdout: io.Discard, Stderr: &stderr}}
+			result, err := backend.Run(t.Context(), core.RunRequest{Repo: core.Repo{Name: "repo", Root: t.TempDir()}, Command: []string{"true"}, NoSync: true, TimingJSON: true})
 			wantCode, wantKind := code, core.RunErrorCommandExit
 			if code == 0 {
 				wantCode, wantKind = 1, core.RunErrorProvider
 			}
-			var ee ExitError
+			var ee core.ExitError
 			if !errors.As(err, &ee) || ee.Code != wantCode || result.ExitCode != wantCode || result.ErrorKind != wantKind || result.Session == nil || !result.Session.Kept || len(client.deleteIDs) != 1 || !client.deleteDeadlineSet {
 				t.Fatalf("result=%#v err=%v deletes=%v", result, err, client.deleteIDs)
 			}
-			if _, exists, claimErr := readLeaseClaimWithPresence(result.LeaseID); claimErr != nil || !exists {
+			if _, exists, claimErr := core.ReadLeaseClaimWithPresence(result.LeaseID); claimErr != nil || !exists {
 				t.Fatalf("cleanup failure lost claim: exists=%t err=%v", exists, claimErr)
 			}
 			var report core.TimingReport
@@ -1788,9 +1832,9 @@ func TestRunCommandIntentReachesExistingShell(t *testing.T) {
 		client := &fakeE2BSyncClient{}
 		restore := swapNewE2BClient(client)
 		t.Cleanup(restore)
-		backend := &e2bBackend{cfg: Config{E2B: E2BConfig{Template: "base", Workdir: root}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
-		_, runErr := backend.Run(t.Context(), RunRequest{
-			Repo:               Repo{Root: root},
+		backend := &e2bBackend{cfg: core.Config{E2B: core.E2BConfig{Template: "base", Workdir: root}}, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+		_, runErr := backend.Run(t.Context(), core.RunRequest{
+			Repo:               core.Repo{Root: root},
 			NoSync:             true,
 			Keep:               true,
 			Command:            intent.Command,
@@ -1817,14 +1861,14 @@ func TestE2BRunCanonicalIDPreservesInventoryRecovery(t *testing.T) {
 			client := &fakeE2BSyncClient{}
 			restore := swapNewE2BClient(client)
 			defer restore()
-			backend := &e2bBackend{cfg: Config{E2B: E2BConfig{APIURL: "https://api.example.test", Template: "base"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
-			repo := Repo{Root: t.TempDir()}
+			backend := &e2bBackend{cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api.example.test", Template: "base"}}, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+			repo := core.Repo{Root: t.TempDir()}
 			otherID, _, _, err := backend.createSandbox(t.Context(), client, repo, true, false, "cbx-aaaaaaaaaaaa")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if state != "missing" {
-				client.listedSandboxes = []e2bSandbox{{SandboxID: "sbx_requested", Metadata: map[string]string{"lease": requestedID, "slug": "requested", "provider": e2bProvider, "crabbox": "true"}}}
+				client.listedSandboxes = []shared.EnvdSandbox{{SandboxID: "sbx_requested", Metadata: map[string]string{"lease": requestedID, "slug": "requested", "provider": e2bProvider, "crabbox": "true"}}}
 			}
 			if state == "legacy exact claim" {
 				if err := claimLeaseForRepoProvider(requestedID, "legacy", e2bProvider, repo.Root, time.Minute, false); err != nil {
@@ -1835,7 +1879,7 @@ func TestE2BRunCanonicalIDPreservesInventoryRecovery(t *testing.T) {
 			if err != nil || !exists {
 				t.Fatal(err)
 			}
-			result, err := backend.Run(t.Context(), RunRequest{ID: requestedID, Repo: repo, Command: []string{"true"}, NoSync: true, Keep: true})
+			result, err := backend.Run(t.Context(), core.RunRequest{ID: requestedID, Repo: repo, Command: []string{"true"}, NoSync: true, Keep: true})
 			if state == "missing" {
 				var ee core.ExitError
 				if !errors.As(err, &ee) || ee.Code != 4 || len(client.connectIDs) != 0 || len(client.commands) != 0 {
@@ -1862,9 +1906,9 @@ func TestE2BStopRejectsMissingCanonicalIDMatchingAnotherSlug(t *testing.T) {
 	client := &fakeE2BSyncClient{}
 	restore := swapNewE2BClient(client)
 	defer restore()
-	backend := &e2bBackend{cfg: Config{E2B: E2BConfig{APIURL: "https://api.example.test", Template: "base"}}, rt: Runtime{Stdout: io.Discard, Stderr: io.Discard}}
+	backend := &e2bBackend{cfg: core.Config{E2B: core.E2BConfig{APIURL: "https://api.example.test", Template: "base"}}, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}}
 	const missingID = "cbx_aaaaaaaaaaaa"
-	leaseID, sandbox, _, err := backend.createSandbox(t.Context(), client, Repo{Root: t.TempDir()}, true, false, "cbx-aaaaaaaaaaaa")
+	leaseID, sandbox, _, err := backend.createSandbox(t.Context(), client, core.Repo{Root: t.TempDir()}, true, false, "cbx-aaaaaaaaaaaa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1880,7 +1924,7 @@ func TestE2BStopRejectsMissingCanonicalIDMatchingAnotherSlug(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.getIDs = nil
-	err = backend.Stop(t.Context(), StopRequest{ID: missingID})
+	err = backend.Stop(t.Context(), core.StopRequest{ID: missingID})
 	var ee core.ExitError
 	if !errors.As(err, &ee) || ee.Code != 4 {
 		t.Errorf("missing canonical ID selected a slug: err=%v", err)
@@ -1893,7 +1937,7 @@ func TestE2BStopRejectsMissingCanonicalIDMatchingAnotherSlug(t *testing.T) {
 	if err != nil || marshalErr != nil || !exists || !bytes.Equal(before, after) {
 		t.Fatalf("unrelated claim changed: exists=%v err=%v marshal=%v", exists, err, marshalErr)
 	}
-	if err := backend.Stop(t.Context(), StopRequest{ID: leaseID}); err != nil {
+	if err := backend.Stop(t.Context(), core.StopRequest{ID: leaseID}); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.deleteIDs) != 1 || client.deleteIDs[0] != sandbox.SandboxID {
@@ -1956,5 +2000,170 @@ func TestE2BProcessEndDoesNotUseStatusAsDiagnostic(t *testing.T) {
 	code, err := interpretE2BProcessEnd(shared.EnvdProcessEnd{ExitCode: -1, Status: "fixture status"}, &diagnostic)
 	if code != -1 || err != nil || diagnostic.Len() != 0 {
 		t.Fatalf("code=%d err=%v diagnostic=%q", code, err, diagnostic.String())
+	}
+}
+
+func TestJSONRequestAdoptionEnvelope(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "capture")
+	var typedNil *struct{ Value string }
+	const base = "https://api.example.test/base"
+	sentinel := errors.New("synthetic captured transport stop")
+	for _, tc := range []struct {
+		name        string
+		body        any
+		want        string
+		query, fail bool
+	}{
+		{name: "nil"},
+		{name: "typed nil", body: typedNil, want: "null\n"},
+		{name: "JSON bytes", body: map[string]string{"message": "<&>"}, want: "{\"message\":\"\\u003c\\u0026\\u003e\"}\n"},
+		{name: "query without body", query: true},
+		{name: "transport error", fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			endpoint := "/records"
+			if tc.query {
+				endpoint += "?limit=2&prefix=two+words"
+			}
+			var query url.Values
+			if tc.query {
+				query = url.Values{"limit": []string{"2"}, "prefix": []string{"two words"}}
+			}
+			headers := http.Header{"X-Api-Key": []string{"synthetic-token"}}
+			headers.Set("Accept", "application/json")
+			if tc.body != nil {
+				headers.Set("Content-Type", "application/json")
+			}
+			transport := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				testutil.RequireRequestEnvelope(t, req, ctx, http.MethodPost, base+endpoint, tc.want, headers)
+				if tc.fail {
+					return nil, sentinel
+				}
+				return &http.Response{StatusCode: 204, Header: http.Header{"X-Capture": []string{"yes"}}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			})}
+			c := &e2bClient{apiURL: base, apiKey: "synthetic-token", httpClient: transport}
+			gotHeaders, err := c.doJSONWithHeaders(ctx, http.MethodPost, "/records", query, tc.body, nil)
+			if tc.fail {
+				if !errors.Is(err, sentinel) || gotHeaders != nil {
+					t.Fatalf("error/headers=%v %v", err, gotHeaders)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.fail && (gotHeaders.Get("X-Capture") != "yes") {
+				t.Fatalf("response headers=%v", gotHeaders)
+			}
+			if calls != 1 {
+				t.Fatalf("calls=%d", calls)
+			}
+		})
+	}
+}
+
+type responseCloseObserver struct {
+	io.Reader
+	close func() error
+}
+
+func (b responseCloseObserver) Close() error { return b.close() }
+
+func TestRawJSONResponseContract(t *testing.T) {
+	readFailure := errors.New("synthetic response read failure")
+	closeFailure := errors.New("synthetic ignored close failure")
+	for _, tc := range []struct {
+		name, data        string
+		status            int
+		nilOut, readError bool
+		wantError         string
+		wantValue         int
+	}{
+		{name: "nil output still reads invalid JSON", data: "not JSON", nilOut: true, wantValue: 99},
+		{name: "raw empty", wantValue: 99},
+		{name: "whitespace with output", data: " \t\n", wantError: "syntax", wantValue: 99},
+		{name: "whitespace without output", data: " \t\n", nilOut: true, wantValue: 99},
+		{name: "JSON object", data: `{"value":12}`, wantValue: 12},
+		{name: "JSON null", data: "null", wantValue: 99},
+		{name: "JSON trailing whitespace", data: "{\"value\":12}\n \t", wantValue: 12},
+		{name: "trailing JSON value", data: `{"value":12}{"value":13}`, wantError: "syntax", wantValue: 99},
+		{name: "wrong JSON field type", data: `{"value":"bad"}`, wantError: "type", wantValue: 99},
+		{name: "status error", data: "  unavailable \n", status: 503, wantError: "status", wantValue: 99},
+		{name: "status error with nil output", data: "  unavailable \n", status: 503, nilOut: true, wantError: "status", wantValue: 99},
+		{name: "read error beats success", data: `{"value":12}`, readError: true, wantError: "read", wantValue: 99},
+		{name: "read error beats status and nil output", data: "partial body", status: 503, nilOut: true, readError: true, wantError: "read", wantValue: 99},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := bytes.NewReader([]byte(tc.data))
+			var reader io.Reader = payload
+			if tc.readError {
+				reader = io.MultiReader(payload, iotest.ErrReader(readFailure))
+			}
+			closed, calls := 0, 0
+			responseHeaders := http.Header{"X-Trace": []string{"before-close", "second"}}
+			body := responseCloseObserver{Reader: reader, close: func() error { closed++; responseHeaders["X-Trace"][0] = "after-close"; return closeFailure }}
+			status := tc.status
+			if status == 0 {
+				status = 200
+			}
+			const base = "https://api.example.test"
+			httpClient := &http.Client{Transport: e2bRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: status, Status: strconv.Itoa(status) + " Synthetic", Header: responseHeaders, Body: body, Request: req}, nil
+			})}
+			client := &e2bClient{apiURL: base, apiKey: "synthetic-token", httpClient: httpClient}
+			out := struct {
+				Value int `json:"value"`
+			}{Value: 99}
+			var destination any = &out
+			if tc.nilOut {
+				destination = nil
+			}
+			headers, err := client.doJSONWithHeaders(context.Background(), http.MethodGet, "/records", nil, nil, destination)
+			if calls != 1 || closed != 1 || payload.Len() != 0 {
+				t.Fatalf("calls=%d closes=%d unread=%d", calls, closed, payload.Len())
+			}
+			if out.Value != tc.wantValue {
+				t.Fatalf("value=%d want%d", out.Value, tc.wantValue)
+			}
+			switch tc.wantError {
+			case "":
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "read":
+				if err != readFailure {
+					t.Fatalf("read error=%T %v want exact sentinel", err, err)
+				}
+			case "syntax":
+				if _, ok := err.(*json.SyntaxError); !ok {
+					t.Fatalf("decode error=%T %v want unwrapped SyntaxError", err, err)
+				}
+			case "type":
+				if _, ok := err.(*json.UnmarshalTypeError); !ok {
+					t.Fatalf("decode error=%T %v want unwrapped UnmarshalTypeError", err, err)
+				}
+			case "status":
+				api, ok := err.(*e2bAPIError)
+				if !ok || api.StatusCode != 503 || api.Status != "503 Synthetic" || api.Body != "unavailable" {
+					t.Fatalf("status error=%T %#v", err, err)
+				}
+			}
+			if tc.wantError != "" {
+				if headers != nil {
+					t.Fatalf("error headers=%v", headers)
+				}
+			} else {
+				want := http.Header{"X-Trace": []string{"before-close", "second"}}
+				if !reflect.DeepEqual(headers, want) {
+					t.Fatalf("headers=%v want pre-close clone%v", headers, want)
+				}
+				headers["X-Trace"][0] = "caller-change"
+				if responseHeaders["X-Trace"][0] != "after-close" {
+					t.Fatal("returned headers share backing values")
+				}
+			}
+		})
 	}
 }

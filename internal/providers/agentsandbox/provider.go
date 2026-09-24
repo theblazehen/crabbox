@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
-	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 func init() {
@@ -19,7 +18,9 @@ type Provider struct{}
 
 type SSHProvider struct{}
 
-func selectedProvider(cfg Config) string {
+// selectedProvider keeps the archive and SSH transports in one configuration
+// namespace while preserving each transport's own claim identity.
+func selectedProvider(cfg core.Config) string {
 	if strings.TrimSpace(cfg.Provider) == sshProviderName {
 		return sshProviderName
 	}
@@ -30,6 +31,7 @@ func (SSHProvider) Name() string      { return sshProviderName }
 func (SSHProvider) Aliases() []string { return nil }
 func (SSHProvider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationNativeConfig),
 		Name:             sshProviderName,
 		Family:           "agent-sandbox",
 		Kind:             core.ProviderKindSSHLease,
@@ -67,7 +69,15 @@ func (p SSHProvider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, 
 	return &sshLeaseBackend{lifecycle: &backend{spec: p.Spec(), cfg: cfg, rt: rt, newClient: newKubernetesClient}}, nil
 }
 func (p SSHProvider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return shared.ConfigureDoctor(sshProviderName, func() (core.Backend, error) { return p.Configure(cfg, rt) })
+	backend, err := p.Configure(cfg, rt)
+	if err != nil {
+		return nil, err
+	}
+	doctor, ok := backend.(core.DoctorBackend)
+	if !ok {
+		return nil, core.Exit(2, "%s doctor backend unavailable", sshProviderName)
+	}
+	return doctor, nil
 }
 
 func (Provider) Name() string      { return providerName }
@@ -75,12 +85,13 @@ func (Provider) Aliases() []string { return nil }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:             core.DirectProviderAuthentication(core.ProviderAuthenticationNativeConfig),
 		SyncGuardrailFullCandidate: true,
 		Name:                       providerName,
 		Family:                     "agent-sandbox",
 		Kind:                       core.ProviderKindDelegatedRun,
 		Targets:                    []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:                   core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup, core.FeatureRunSession},
+		Features:                   core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup, core.FeatureRunSession, core.FeatureFixedCurrentRepoStop},
 		Coordinator:                core.CoordinatorNever,
 		ClassDisposition:           core.ProviderClassDispositionUnmapped,
 	}
@@ -116,7 +127,15 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 }
 
 func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return shared.ConfigureDoctor(providerName, func() (core.Backend, error) { return p.Configure(cfg, rt) })
+	backend, err := p.Configure(cfg, rt)
+	if err != nil {
+		return nil, err
+	}
+	doctor, ok := backend.(core.DoctorBackend)
+	if !ok {
+		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
+	}
+	return doctor, nil
 }
 
 func validateConfig(cfg core.Config) error {
@@ -166,4 +185,20 @@ func validateConfig(cfg core.Config) error {
 		return core.Exit(2, "agent-sandbox execTimeoutSecs must be non-negative")
 	}
 	return nil
+}
+
+// Controller scope describes trusted local routing; live authority is pinned at acquisition.
+func (p Provider) ControllerProviderScope(cfg core.Config) (string, error) {
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return "", core.Exit(2, "provider=%s supports target=linux only", providerName)
+	}
+	if err := p.ValidateConfig(cfg); err != nil {
+		return "", err
+	}
+	return claimScope(cfg), nil
+}
+
+func (p Provider) SupportsControllerFixedLeaseID(cfg core.Config) bool {
+	_, err := p.ControllerProviderScope(cfg)
+	return err == nil && cfg.TTL > 0
 }

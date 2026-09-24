@@ -22,41 +22,21 @@ func defaultCloudflareConfig() CloudflareConfig {
 
 // CloudflareConfigApplied records accepted assignments during one application.
 type CloudflareConfigApplied struct {
-	APIURL bool
-	Token  bool
+	InputAccepted bool
+	APIURL        bool
+	Token         bool
 }
 
 func (cfg *CloudflareConfig) applyFile(file *fileCloudflareConfig) (CloudflareConfigApplied, error) {
 	var applied CloudflareConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.APIURL != "" {
-		cfg.APIURL = file.APIURL
-		applied.APIURL = true
-	}
-	if file.Token != "" {
-		cfg.Token = file.Token
-		applied.Token = true
-	}
-	if file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "cloudflare")
+	return applied, err
 }
 
 func (cfg *CloudflareConfig) applyEnv() (CloudflareConfigApplied, error) {
 	var applied CloudflareConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_CLOUDFLARE_RUNNER_URL"); ok {
-		cfg.APIURL = value
-		applied.APIURL = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_CLOUDFLARE_RUNNER_TOKEN"); ok {
-		cfg.Token = value
-		applied.Token = true
-	}
-	cfg.Workdir = getenv("CRABBOX_CLOUDFLARE_WORKDIR", cfg.Workdir)
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 3)
+	return applied, err
 }
 
 // CloudflareConfigFlagValues holds parsed values; only visited flags are applied.
@@ -67,10 +47,9 @@ type CloudflareConfigFlagValues struct {
 
 // RegisterCloudflareConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterCloudflareConfigFlags(fs *flag.FlagSet, defaults CloudflareConfig) CloudflareConfigFlagValues {
-	return CloudflareConfigFlagValues{
-		APIURL:  fs.String("cloudflare-url", defaults.APIURL, "Cloudflare runner API URL"),
-		Workdir: fs.String("cloudflare-workdir", defaults.Workdir, "Absolute working directory inside the Cloudflare workspace"),
-	}
+	var values CloudflareConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // CloudflareConfigVisitedFlags records raw flag visits, independently of application.
@@ -80,21 +59,14 @@ type CloudflareConfigVisitedFlags struct {
 
 // CloudflareConfigFlagPresence reports visits for tracked flag bindings.
 func CloudflareConfigFlagPresence(fs *flag.FlagSet) CloudflareConfigVisitedFlags {
-	return CloudflareConfigVisitedFlags{
-		APIURL: flagWasSet(fs, "cloudflare-url"),
-	}
+	var visited CloudflareConfigVisitedFlags
+	recordConfigFlagVisits[CloudflareConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values CloudflareConfigFlagValues) Apply(cfg *CloudflareConfig, fs *flag.FlagSet) CloudflareConfigApplied {
+func (values CloudflareConfigFlagValues) Apply(cfg *CloudflareConfig, fs *flag.FlagSet) (CloudflareConfigApplied, error) {
 	var applied CloudflareConfigApplied
-	visited := CloudflareConfigFlagPresence(fs)
-	if visited.APIURL {
-		cfg.APIURL = *values.APIURL
-		applied.APIURL = true
-	}
-	if flagWasSet(fs, "cloudflare-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

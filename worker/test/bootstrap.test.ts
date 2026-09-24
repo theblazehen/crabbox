@@ -1,3 +1,8 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -228,6 +233,90 @@ describe("cloud-init bootstrap", () => {
     expect(got).not.toContain("path: /etc/ssh/ssh_host_ed25519_key");
   });
 
+  it.skipIf(process.platform === "win32").each(
+    [false, true].flatMap((awsPrivate) => {
+      const failures = awsPrivate
+        ? ["", "git", "curl", "jq", "systemctl", "marker", "workroot"]
+        : [
+            "",
+            "git",
+            "rsync",
+            "curl",
+            "jq",
+            "tmux",
+            "flock",
+            "systemctl",
+            "ss",
+            "socket",
+            "marker",
+            "workroot",
+          ];
+      return failures.map((failure) => ({
+        awsPrivate,
+        failure,
+        scenario: failure || "success",
+      }));
+    }),
+  )(
+    "runs readiness without Bash and retains failure checks (private $awsPrivate, $scenario)",
+    ({ awsPrivate, failure }) => {
+      const fixture = mkdtempSync(join(tmpdir(), "crabbox-ready-"));
+      try {
+        for (const tool of ["git", "rsync", "curl", "jq", "tmux", "flock", "systemctl", "ss"]) {
+          writeFileSync(
+            join(fixture, tool),
+            "#!/bin/sh\n" +
+              (tool === "ss" ? 'printf "%s\\n" "${SOCKETS-127.0.0.1:5900}"\n' : "") +
+              '[ "${FAIL_TOOL-}" != "' +
+              tool +
+              '" ]\n',
+            { mode: 0o755 },
+          );
+        }
+        symlinkSync("/usr/bin/grep", join(fixture, "grep"));
+        const generated = cloudInit({
+          ...config,
+          desktop: !awsPrivate,
+          awsPrivate,
+          workRoot: fixture,
+        });
+        const lines = generated
+          .split("  - path: /usr/local/bin/crabbox-ready\n")[1]
+          .split("    content: |\n")[1]
+          .split("\n");
+        const end = lines.findIndex((line) => line !== "" && !line.startsWith("      "));
+        const script = lines
+          .slice(0, end)
+          .map((line) => line.slice(6))
+          .join("\n")
+          .replaceAll("/var/lib/crabbox/bootstrapped", join(fixture, "bootstrapped"))
+          .replaceAll(fixture + "/workspaces", fixture);
+        expect(script).toMatch(/^#!\/bin\/sh\nset -eu\n/);
+        writeFileSync(join(fixture, "bootstrapped"), "");
+        if (failure === "marker") rmSync(join(fixture, "bootstrapped"));
+        const candidate =
+          failure === "workroot"
+            ? script.replace(
+                "test " + (awsPrivate ? "-d " : "-w ") + fixture,
+                "test -d " + fixture + "/missing",
+              )
+            : script;
+        const result = spawnSync("/bin/sh", ["-c", candidate], {
+          env: {
+            PATH: fixture,
+            FAIL_TOOL: failure,
+            ...(failure === "socket" ? { SOCKETS: "127.0.0.1:9999" } : {}),
+          },
+        });
+        expect(result.status, `${awsPrivate}/${failure}: ${result.stderr}`).toBe(
+          failure === "" ? 0 : 1,
+        );
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("uses retrying package installation in runcmd", () => {
     const got = cloudInit(config);
     const minimalUpdate = "retry apt-get -o Acquire::Languages=none";
@@ -315,7 +404,7 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("/usr/local/bin/crabbox-configure-desktop-theme");
     expect(got).toContain("/etc/systemd/system/crabbox-desktop.service");
     expect(got).toContain("/usr/local/bin/crabbox-desktop-session");
-    expect(got).toContain("/etc/systemd/system/crabbox-desktop-session.service");
+    expect(got).toContain("/etc/xdg/autostart/crabbox-desktop.desktop");
     expect(got).not.toContain("/etc/systemd/system/crabbox-x11vnc.service");
     expect(got).toContain("ExecStart=/usr/bin/Xtigervnc :99");
     expect(got).toContain("-AcceptSetDesktopSize");
@@ -323,11 +412,8 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("-SecurityTypes VncAuth");
     expect(got).toContain("ExecStart=/usr/bin/startxfce4");
     expect(got).toContain("systemctl is-active --quiet crabbox-desktop.service");
-    expect(got).toContain("systemctl is-active --quiet crabbox-desktop-session.service");
-    expect(got).toContain('requested_mode="${1:-${CRABBOX_DESKTOP_THEME:-}}"');
+    expect(got).toContain('requested_mode="${1:-}"');
     expect(got).toContain('"$config_dir/crabbox/desktop-theme"');
-    expect(got).toContain(`printf '%s\\n' "$mode" > "$config_dir/crabbox/desktop-theme"`);
-    expect(got).not.toContain(`printf '%s\n' "$mode" > "$config_dir/crabbox/desktop-theme"`);
     expect(got).toContain("gtk_theme=Adwaita-dark");
     expect(got).toContain('gtk_candidates="Arc-Dark Greybird-dark Adwaita-dark Greybird"');
     expect(got).toContain('gtk_candidates="Arc Greybird Adwaita"');
@@ -350,15 +436,7 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain('mkdir -p "$config_dir/xfce4/xfconf/xfce-perchannel-xml"');
     expect(got).toContain("xfconf-query -c xsettings -p /Gtk/ApplicationPreferDarkTheme");
     expect(got).toContain("xfconf-query -c xfwm4 -p /general/theme");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/box_move");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/box_resize");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/move_opacity");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/resize_opacity");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/snap_to_border");
     expect(got).toContain("xfconf-query -c xfwm4 -p /general/snap_width");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/tile_on_move");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/use_compositing");
-    expect(got).toContain("xfconf-query -c xfwm4 -p /general/wrap_windows");
     expect(got).toContain("xfconf-query -c xfce4-panel -p /panels/dark-mode");
     expect(got).toContain("/panels/$panel_id/background-rgba");
     expect(got).toContain("desktop-background-$mode.svg");
@@ -368,15 +446,6 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("border-color: transparent");
     expect(got).toContain("menubar > menuitem");
     expect(got).toContain("menubar > menuitem label");
-    expect(got).toContain("crabbox-xfce4-panel-$user.log");
-    expect(got).toContain('pkill -TERM -u "$user_id" -x xfce4-panel');
-    expect(got).toContain("pkill -TERM -u \"$user_id\" -f '/xfce4/panel/wrapper-2.0'");
-    expect(got).toContain('pgrep -u "$user_id" -x xfce4-panel');
-    expect(got).toContain("sleep 1");
-    expect(got).toContain("xfce4-panel --disable-wm-check");
-    expect(got).toContain("xfwm4 --replace --compositor=off");
-    expect(got).toContain('xsetroot -solid "$root_color"');
-    expect(got).toContain("crabbox-xfdesktop-$user.log");
     expect(got).toContain(
       'gsettings set org.gnome.desktop.interface color-scheme "$gsettings_scheme"',
     );
@@ -391,16 +460,12 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("xterm -title 'Crabbox Desktop'");
     expect(got).toContain("(umask 077 && openssl rand -base64 18 > /var/lib/crabbox/vnc.password)");
     expect(got).toContain("tigervncpasswd -f > /var/lib/crabbox/vnc.pass");
-    expect(got).toContain("ss -ltn | grep -q '127.0.0.1:5900'");
+    expect(got).toContain("listening_sockets=$(ss -ltn)");
     expect(got).toContain(
       "systemctl disable --now crabbox-wayvnc.service crabbox-x11vnc.service 2>/dev/null || true",
     );
-    expect(got).toContain(
-      "systemctl enable crabbox-xvfb.service crabbox-desktop.service crabbox-desktop-session.service",
-    );
-    expect(got).toContain(
-      "systemctl restart crabbox-xvfb.service crabbox-desktop.service crabbox-desktop-session.service",
-    );
+    expect(got).toContain("systemctl enable crabbox-xvfb.service crabbox-desktop.service");
+    expect(got).toContain("systemctl restart crabbox-xvfb.service crabbox-desktop.service");
   });
 
   it("adds Wayland desktop services when requested", () => {

@@ -3,6 +3,8 @@ package nomad
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -394,7 +397,7 @@ func TestWarmupTimingJSONIncludesNomadLease(t *testing.T) {
 	}
 }
 
-func TestWarmupCleansRegisteredJobWhenReadinessFailsBeforeClaim(t *testing.T) {
+func TestWarmupCleansRegisteredJobWhenReadinessFails(t *testing.T) {
 	fake := newLifecycleFakeClient()
 	fake.evalStatus = nomadapi.EvalStatusFailed
 	b, _, _ := testBackend(t, fake)
@@ -405,6 +408,10 @@ func TestWarmupCleansRegisteredJobWhenReadinessFailsBeforeClaim(t *testing.T) {
 	}
 	if len(fake.deregisters) != 1 {
 		t.Fatalf("deregisters=%v, want one cleanup", fake.deregisters)
+	}
+	var displayed core.ExitError
+	if !core.AsExitError(err, &displayed) || !strings.Contains(displayed.Message, fake.deregisters[0]) || !strings.Contains(displayed.Message, "lease=") || !strings.Contains(displayed.Message, "rolled back") || strings.Contains(displayed.Message, "recover with") {
+		t.Fatalf("warmup rollback diagnostic lost identity or implied retention: %v", err)
 	}
 	claims, err := listNomadLeaseClaims()
 	if err != nil {
@@ -525,19 +532,98 @@ func TestStopRetainsClaimWhenRemovalCannotBeConfirmed(t *testing.T) {
 func TestSetupFailureRefusesCleanupAfterRemoteOwnershipChanges(t *testing.T) {
 	fake := newLifecycleFakeClient()
 	b, _, _ := testBackend(t, fake)
-	expected, err := buildJobSpec(b.cfg, jobSpecInput{LeaseID: "cbx_474747474747", Slug: "changed-crab", JobID: "crabbox-474747474747"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake.jobs[stringValue(expected.ID)] = cloneJob(expected)
-	fake.jobs[stringValue(expected.ID)].Meta[metadataLeaseID] = "cbx_someone_else"
+	claim := createClaim(t, b, "cbx_474747474747", "changed-crab", "crabbox-474747474747", "alloc-47")
+	claim = markRegistrationClaim(t, claim, fake.jobs[claim.Labels[claimLabelJobID]], registrationConfirmed)
+	fake.jobs[claim.Labels[claimLabelJobID]].Meta[metadataLeaseID] = "cbx_someone_else"
 
-	err = b.cleanupUnclaimedJob(context.Background(), fake, expected, errors.New("readiness failed"))
+	_, err := b.rollbackRegistration(context.Background(), fake, claim, errors.New("readiness failed"))
 	if err == nil || !strings.Contains(err.Error(), "ownership changed") {
 		t.Fatalf("err=%v, want ownership refusal", err)
 	}
 	if len(fake.deregisters) != 0 {
 		t.Fatalf("deregisters=%v", fake.deregisters)
+	}
+}
+
+// Legacy fixture construction intentionally has no registration-attempt markers.
+func writeNomadClaim(cfg Config, leaseID, slug string, repo Repo, reclaim bool, ready allocationReadiness, expiresAt time.Time) (LeaseClaim, error) {
+	if err := core.ClaimLeaseForRepoProviderScopePond(leaseID, slug, providerName, claimScope(cfg), cfg.Pond, repo.Root, cfg.IdleTimeout, reclaim); err != nil {
+		return LeaseClaim{}, err
+	}
+	claim, err := readLeaseClaim(leaseID)
+	if err != nil {
+		return LeaseClaim{}, err
+	}
+	return updateLeaseClaimLabelsIfUnchanged(leaseID, claim, claimLabels(cfg, leaseID, slug, ready, expiresAt))
+}
+
+func markRegistrationClaim(t *testing.T, claim LeaseClaim, job *nomadapi.Job, state string) LeaseClaim {
+	t.Helper()
+	metadata, err := json.Marshal(job.Meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := make(map[string]string, len(claim.Labels)+3)
+	for key, value := range claim.Labels {
+		labels[key] = value
+	}
+	labels[registrationVersionLabel] = "1"
+	labels[registrationStateLabel] = state
+	delete(labels, claimLabelAllocationID)
+	keys := make([]string, 0, len(job.Meta))
+	for key := range job.Meta {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	keyJSON, err := json.Marshal(keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(metadata)
+	labels[registrationMetaKeysLabel] = string(keyJSON)
+	labels[registrationMetaHashLabel] = hex.EncodeToString(digest[:])
+	updated, err := core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return updated
+}
+
+func TestClaimCleanupDuePreservesIdleBoundsAndTTLPrecedence(t *testing.T) {
+	now := time.Date(2026, 6, 24, 20, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name      string
+		seconds   int64
+		lastUsed  string
+		expiresAt string
+		checkAt   time.Time
+		wantDue   bool
+		wantWhy   string
+	}{
+		{name: "overflowing positive remains retained", seconds: 9223372037, lastUsed: now.Format(time.RFC3339), wantWhy: "retained"},
+		{name: "TTL still expires with malformed idle", seconds: 9223372037, lastUsed: now.Format(time.RFC3339), expiresAt: now.Format(time.RFC3339), wantDue: true, wantWhy: "ttl_expired"},
+		{name: "negative wrapping positive remains retained", seconds: -18446744073, lastUsed: now.Add(-time.Hour).Format(time.RFC3339), wantWhy: "retained"},
+		{name: "disabled idle remains retained", lastUsed: now.Add(-time.Hour).Format(time.RFC3339), wantWhy: "retained"},
+		{name: "idle expires at equality", seconds: 60, lastUsed: now.Add(-time.Minute).Format(time.RFC3339), wantDue: true, wantWhy: "idle_expired"},
+		{name: "idle retained before equality", seconds: 60, lastUsed: now.Add(-time.Minute).Format(time.RFC3339), checkAt: now.Add(-time.Nanosecond), wantWhy: "retained"},
+		{name: "timestamp remains untrimmed", seconds: 60, lastUsed: " " + now.Add(-time.Hour).Format(time.RFC3339) + " ", wantWhy: "retained"},
+		{name: "TTL precedes invalid timestamp", seconds: 60, lastUsed: "invalid", expiresAt: now.Format(time.RFC3339), wantDue: true, wantWhy: "ttl_expired"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			seconds := int(tt.seconds)
+			if int64(seconds) != tt.seconds {
+				t.Skip("persisted timeout is not representable on this architecture")
+			}
+			checkAt := tt.checkAt
+			if checkAt.IsZero() {
+				checkAt = now
+			}
+			claim := LeaseClaim{IdleTimeoutSeconds: seconds, LastUsedAt: tt.lastUsed, Labels: map[string]string{claimLabelExpiresAt: tt.expiresAt}}
+			due, why := claimCleanupDue(claim, checkAt)
+			if due != tt.wantDue || why != tt.wantWhy {
+				t.Fatalf("claimCleanupDue() = (%v, %q), want (%v, %q)", due, why, tt.wantDue, tt.wantWhy)
+			}
+		})
 	}
 }
 
@@ -626,7 +712,7 @@ func TestSyncWorkspaceStreamsArchiveThroughAllocationExec(t *testing.T) {
 	b, _, stderr := testBackend(t, fake)
 	repo := newNomadRunRepo(t)
 	ready := allocationReadiness{JobID: "job-sync", AllocationID: "alloc-sync", NodeID: "node-1", NodeName: "worker-1", Task: "crabbox"}
-	phases, _, err := b.syncWorkspace(context.Background(), fake, ready, RunRequest{Repo: repo}, b.cfg.Nomad.Workdir)
+	phases, _, err := b.workspace(fake, ready, RunRequest{Repo: repo}, b.cfg.Nomad.Workdir).Sync(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1118,7 +1204,7 @@ func TestRunLiteralArgumentsSurviveNativeStdinTransport(t *testing.T) {
 	b, _, _ := testBackend(t, fake)
 	workdir := t.TempDir()
 	marker := filepath.Join(workdir, "must-not-exist")
-	_, err = b.runCommand(context.Background(), fake, allocationReadiness{JobID: "job", AllocationID: "alloc", Task: "task"}, RunRequest{Command: []string{"printf", "%s", ";", "touch", marker}, CommandLiteralArgs: map[int]bool{2: true}}, workdir)
+	_, err = b.runCommand(context.Background(), fake, allocationReadiness{JobID: "job", AllocationID: "alloc", Task: "task"}, RunRequest{Command: []string{"printf", "%s", ";", "touch", marker}, CommandLiteralArgs: map[int]bool{2: true}}, workdir, b.rt.Stdout, b.rt.Stderr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1134,5 +1220,54 @@ func TestRunLiteralArgumentsSurviveNativeStdinTransport(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("literal semicolon created marker: %v", err)
+	}
+}
+
+func TestExecRejectsOverflow(t *testing.T) {
+	if uint64(^uint(0)>>1) < uint64(9223372037) {
+		t.Skip("64-bit input")
+	}
+	var seconds int64 = 9223372037
+	b := &backend{cfg: core.Config{Nomad: core.NomadConfig{ExecTimeoutSecs: int(seconds)}}}
+	err := b.execShell(t.Context(), &fakeClient{}, allocationReadiness{AllocationID: "alloc", Task: "task"}, "true")
+	if err == nil || !strings.Contains(err.Error(), "nomad execution timeout exceeds the supported duration range") {
+		t.Fatalf("overflow result: %v", err)
+	}
+}
+
+func TestRunRejectsExecOverflowBeforeClient(t *testing.T) {
+	if uint64(^uint(0)>>1) < uint64(9223372037) {
+		t.Skip("64-bit input")
+	}
+	cfg := core.BaseConfig()
+	var seconds int64 = 9223372037
+	cfg.Nomad.ExecTimeoutSecs = int(seconds)
+	b := &backend{spec: Provider{}.Spec(), cfg: cfg, rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard}, clientFactory: func(Config, Runtime) (Client, error) { t.Fatal("overflow reached client"); return nil, nil }}
+	for _, id := range []string{"", "existing"} {
+		_, err := b.Run(t.Context(), core.RunRequest{ID: id, Repo: core.Repo{Root: t.TempDir()}, Command: []string{"true"}, NoSync: true})
+		if err == nil || core.ExitCodeForError(err, 1) != 2 || !strings.Contains(err.Error(), "execution timeout exceeds") {
+			t.Fatalf("run: %v", err)
+		}
+	}
+}
+
+func TestExecContextPreservesDisabledAndParentCancellation(t *testing.T) {
+	for _, seconds := range []int{0, 12} {
+		b := &backend{cfg: core.Config{Nomad: core.NomadConfig{ExecTimeoutSecs: seconds}}}
+		parent, stop := context.WithCancelCause(t.Context())
+		cause := errors.New("parent stopped")
+		child, cancel, err := b.execContext(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deadline, hasDeadline := child.Deadline()
+		if (seconds == 0 && hasDeadline) || (seconds > 0 && (!hasDeadline || time.Until(deadline) <= 0 || time.Until(deadline) > 12*time.Second)) {
+			t.Fatal("budget changed")
+		}
+		stop(cause)
+		if context.Cause(child) != cause {
+			t.Fatal("parent cause lost")
+		}
+		cancel()
 	}
 }

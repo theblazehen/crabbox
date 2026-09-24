@@ -2,9 +2,9 @@ package exedev
 
 import (
 	"flag"
+	"os"
 
 	core "github.com/openclaw/crabbox/internal/cli"
-	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 func init() {
@@ -13,14 +13,14 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string {
-	return []string{"exe", "exedev"}
+func (Provider) ServerTypeForConfig(cfg core.Config) string {
+	return core.Blank(cfg.ExeDev.Image, core.ExeDevDefaultImageLabel)
 }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Aliases:          []string{"exe", "exedev"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationSSH),
 		Name:             providerName,
 		Family:           "exe-dev",
 		Kind:             core.ProviderKindSSHLease,
@@ -41,14 +41,36 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
-		return nil, exit(2, "provider=%s managed provisioning supports target=linux only", providerName)
+		return nil, core.Exit(2, "provider=%s managed provisioning supports target=linux only", providerName)
 	}
 	if cfg.Tailscale.Enabled || string(cfg.Network) == "tailscale" {
-		return nil, exit(2, "--tailscale is not supported for provider=%s; exe.dev VMs expose public SSH only", providerName)
+		return nil, core.Exit(2, "--tailscale is not supported for provider=%s; exe.dev VMs expose public SSH only", providerName)
 	}
 	return NewExeDevLeaseBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return shared.ConfigureDoctor("exe.dev", func() (core.Backend, error) { return p.Configure(cfg, rt) })
+func (Provider) ConfigDefaultsTargetFinalization() core.ProviderConfigDefaultsTargetFinalization {
+	return core.ProviderConfigDefaultsCallerFinalizes
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if cfg.ExeDev.User != "" {
+		cfg.SSHUser = cfg.ExeDev.User
+	} else if cfg.SSHUser == core.BaseConfig().SSHUser {
+		if user := os.Getenv("USER"); user != "" {
+			cfg.SSHUser = user
+		}
+	}
+	if cfg.SSHPort == "" || cfg.SSHPort == core.BaseConfig().SSHPort {
+		cfg.SSHPort = "22"
+	}
+	cfg.SSHFallbackPorts = nil
+	cfg.ExeDev.WorkRoot = core.ResolveInheritedWorkRoot(cfg.ExeDev.WorkRoot, cfg.WorkRoot, core.ExeDevWorkRootFallback)
+	if cfg.ExeDev.WorkRoot != "" {
+		cfg.WorkRoot = cfg.ExeDev.WorkRoot
+	}
+	if cfg.TargetOS == "" {
+		cfg.TargetOS = core.TargetLinux
+	}
+	return nil
 }

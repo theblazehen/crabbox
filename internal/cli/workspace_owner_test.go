@@ -36,6 +36,126 @@ func (f workspaceOwnerTransportFunc) Do(ctx context.Context, req workspaceOwnerR
 	return f(ctx, req)
 }
 
+func TestWorkspaceOwnerTransportErrorDiagnostics(t *testing.T) {
+	original := errors.New("ordinary transport error")
+	for _, response := range []string{"MISMATCH", "EXPIRED", "AMBIGUOUS", "", "unrecognized response", "CHILD", "OWNED"} {
+		recognized := response == "MISMATCH" || response == "EXPIRED" || response == "AMBIGUOUS" || response == "CHILD"
+		annotated := workspaceOwnerProtocolError(response, original)
+		if !errors.Is(annotated, original) {
+			t.Fatal("annotation lost original error")
+		}
+		if !recognized && annotated != original {
+			t.Fatal("unknown response changed original error")
+		}
+		for _, operation := range []string{"renew", "inspect", "wait", "release"} {
+			t.Run(operation+"/"+response, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls := 0
+				owner := &workspaceOwner{
+					ctx: ctx, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{}),
+					transport: workspaceOwnerTransportFunc(func(_ context.Context, req workspaceOwnerRemoteRequest) (string, error) {
+						calls++
+						wantAction := workspaceOwnerInspect
+						if operation == "renew" {
+							wantAction = workspaceOwnerRenew
+						} else if operation == "release" {
+							wantAction = workspaceOwnerRelease
+						}
+						if req.Action != wantAction {
+							t.Fatalf("action=%v", req.Action)
+						}
+						return response, original
+					}),
+				}
+				var err error
+				var prefix string
+				switch operation {
+				case "renew":
+					ticks := make(chan time.Time, 1)
+					ticks <- time.Now()
+					owner.renewLoopWithTicks(ticks, time.Second)
+					err = owner.Err()
+					prefix = "remote workspace owner renewal failed closed: "
+					if ctx.Err() != context.Canceled {
+						t.Fatal("renewal no longer cancels")
+					}
+				case "inspect":
+					var result workspaceOwnerInspectResult
+					result, err = owner.inspectChild(ctx)
+					prefix = "confirm remote workspace owner child state: ambiguous remote state: "
+					if result != workspaceOwnerQuiescent {
+						t.Fatal("inspection failure result changed")
+					}
+				case "wait":
+					err = owner.WaitForChild(ctx, time.Second)
+					prefix = "confirm remote workspace phase witness: ambiguous remote state: "
+				case "release":
+					close(owner.done)
+					err = owner.Close(ctx)
+					prefix = "release remote workspace owner: ambiguous remote state: "
+				}
+				want := prefix + original.Error()
+				if recognized {
+					want = prefix + "protocol state " + response + ": " + original.Error()
+				}
+				var exitErr ExitError
+				if calls != 1 || !AsExitError(err, &exitErr) || exitErr.Code != 7 || err.Error() != want {
+					t.Fatalf("calls=%d err=%v want=%q", calls, err, want)
+				}
+				if operation != "renew" && ctx.Err() != nil {
+					t.Fatal("diagnostic canceled caller context")
+				}
+			})
+		}
+	}
+}
+
+func TestWorkspaceOwnerTransportContextDiagnostics(t *testing.T) {
+	original := errors.New("signal: killed")
+	privateCause := errors.New("private-cancellation-cause-must-not-appear")
+	for _, scenario := range []string{"call deadline", "caller deadline", "caller cancellation", "uncanceled transport error"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := t.Context()
+			timeout := time.Minute
+			wantState := ""
+			switch scenario {
+			case "call deadline":
+				timeout = 0
+				wantState = "deadline-exceeded"
+			case "caller deadline":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadlineCause(ctx, time.Now().Add(-time.Second), privateCause)
+				defer cancel()
+				wantState = "deadline-exceeded"
+			case "caller cancellation":
+				var cancel context.CancelCauseFunc
+				ctx, cancel = context.WithCancelCause(ctx)
+				cancel(privateCause)
+				wantState = "canceled"
+			}
+			calls := 0
+			transport := workspaceOwnerTransportFunc(func(context.Context, workspaceOwnerRemoteRequest) (string, error) {
+				calls++
+				return "unchanged-response", original
+			})
+			response, err := callWorkspaceOwnerTransport(ctx, timeout, transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerRenew})
+			if calls != 1 || response != "unchanged-response" || !errors.Is(err, original) {
+				t.Fatalf("transport outcome changed: calls=%d response=%q err=%v", calls, response, err)
+			}
+			want := original.Error()
+			if wantState != "" {
+				want = "workspace owner call context=" + wantState + ": " + want
+			} else if err != original {
+				t.Fatal("uncanceled transport error acquired a context classification")
+			}
+			if err.Error() != want || strings.Contains(err.Error(), privateCause.Error()) {
+				t.Fatalf("unsafe or incorrect context diagnostic: %v", err)
+			}
+		})
+	}
+}
+
 func newFakeWorkspaceOwnerRemote() *fakeWorkspaceOwnerRemote {
 	return &fakeWorkspaceOwnerRemote{changed: make(chan struct{})}
 }
@@ -159,7 +279,11 @@ func TestWorkspaceOwnerSerializesIndependentClientsAndRevisions(t *testing.T) {
 		if active.Add(1) != 1 {
 			overlap.Store(true)
 		}
-		defer active.Add(-1)
+		var result error
+		defer func() {
+			active.Add(-1)
+			done <- result
+		}()
 		workspace.Lock()
 		workspace.revision = revision
 		workspace.Unlock()
@@ -173,10 +297,8 @@ func TestWorkspaceOwnerSerializesIndependentClientsAndRevisions(t *testing.T) {
 		executed := workspace.revision
 		workspace.Unlock()
 		if executed != revision {
-			done <- fmt.Errorf("executed revision %s, want %s", executed, revision)
-			return
+			result = fmt.Errorf("executed revision %s, want %s", executed, revision)
 		}
-		done <- nil
 	}
 	go run(ownerA, "revision-a", startedA, releaseA)
 	<-startedA
@@ -575,8 +697,7 @@ func installWorkspaceOwnerRecordingSSH(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	sshPath := filepath.Join(dir, "ssh")
-	script := `#!/bin/sh
-log_dir=$CRABBOX_OWNER_SSH_LOG_DIR
+	script := "#!/bin/sh\n" + recordLegacyBashProbeShell(t, filepath.Join(dir, "prerequisites")) + `log_dir=$CRABBOX_OWNER_SSH_LOG_DIR
 count=0
 if [ -f "$log_dir/count" ]; then read count < "$log_dir/count"; fi
 count=$((count + 1))
@@ -737,6 +858,9 @@ func TestSSHSingletonPortExecutesOnceWithoutProbe(t *testing.T) {
 			if text := "\n" + string(args); !strings.Contains(text, "\n-p\n"+test.port+"\n") || strings.Contains(text, "\n-p\n\n") {
 				t.Fatalf("SSH args=%q, want pinned port %s", text, test.port)
 			}
+			if runtime.GOOS != "windows" && !strings.Contains(string(args), "ControlMaster=auto") {
+				t.Fatalf("ordinary SSH command changed its multiplexing policy: %q", args)
+			}
 		})
 	}
 }
@@ -773,6 +897,43 @@ func TestWorkspaceOwnerSSHProtocolIgnoresSuccessfulWarnings(t *testing.T) {
 			})
 			if err != nil || got != "ACQUIRED" {
 				t.Fatalf("response=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestWorkspaceOwnerControlUsesAdmittedMasterOrFreshProxy(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		requireMaster bool
+		wantProxy     string
+		wantMaster    bool
+	}{
+		{name: "reused", requireMaster: true, wantProxy: "ProxyCommand=/usr/bin/false", wantMaster: true},
+		{name: "fresh", wantProxy: "ProxyCommand=provider-proxy route"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := installWorkspaceOwnerRecordingSSH(t)
+			t.Setenv("CRABBOX_OWNER_SSH_SUCCESS_STDOUT", "ACQUIRED")
+			target := SSHTarget{
+				User: "crabbox", Host: "127.0.0.1", Port: "22", TargetOS: targetLinux,
+				ProxyCommand: "provider-proxy route", RequireControlMaster: tc.requireMaster,
+			}
+			got, err := (sshWorkspaceOwnerTransport{target: target}).Do(t.Context(), workspaceOwnerRemoteRequest{
+				Action: workspaceOwnerAcquire,
+				Key:    workspaceOwnerKey("cbx_owner_route_" + tc.name),
+				Token:  strings.Repeat("a", 64),
+				TTL:    time.Minute,
+			})
+			if err != nil || got != "ACQUIRED" {
+				t.Fatalf("response=%q err=%v", got, err)
+			}
+			args, err := os.ReadFile(filepath.Join(dir, "1.args"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(args), tc.wantProxy) || strings.Contains(string(args), "ControlMaster=auto") != tc.wantMaster {
+				t.Fatalf("owner control used the wrong SSH route: %q", args)
 			}
 		})
 	}
@@ -885,36 +1046,53 @@ func TestWorkspaceOwnerSSHProtocolResolvesFallbackBeforeSingleDelivery(t *testin
 		name   string
 		target SSHTarget
 	}{
-		{name: "POSIX", target: SSHTarget{TargetOS: targetLinux}},
+		{name: "Linux", target: SSHTarget{TargetOS: targetLinux}},
+		{name: "macOS", target: SSHTarget{TargetOS: targetMacOS}},
 		{name: "native Windows", target: SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			dir := installWorkspaceOwnerRecordingSSH(t)
-			t.Setenv("CRABBOX_OWNER_SSH_RETRY_CALL", "1")
-			t.Setenv("CRABBOX_OWNER_SSH_RETRY_STDOUT", "MISMATCH")
-			t.Setenv("CRABBOX_OWNER_SSH_RETRY_STDERR", "first port failed")
-			t.Setenv("CRABBOX_OWNER_SSH_SUCCESS_STDOUT", "ACQUIRED")
-			t.Setenv("CRABBOX_OWNER_SSH_SUCCESS_STDERR", "second port warning")
-			test.target.User, test.target.Host, test.target.Port = "crabbox", "127.0.0.1", "2222"
-			test.target.FallbackPorts = []string{"22"}
-			got, err := (sshWorkspaceOwnerTransport{target: test.target}).Do(context.Background(), workspaceOwnerRemoteRequest{
-				Action: workspaceOwnerAcquire,
-				Key:    workspaceOwnerKey("cbx_fallback_" + test.name),
-				Token:  strings.Repeat("c", 64),
-				TTL:    time.Minute,
-			})
-			if err != nil || got != "ACQUIRED" {
-				t.Fatalf("fallback response=%q err=%v", got, err)
-			}
-			if count, readErr := os.ReadFile(filepath.Join(dir, "count")); readErr != nil || string(count) != "3" {
-				t.Fatalf("SSH call count=%q err=%v", count, readErr)
-			}
-			requireWorkspaceOwnerSSHProbe(t, dir, 1, "2222")
-			requireWorkspaceOwnerSSHProbe(t, dir, 2, "22")
-			command, _ := readWorkspaceOwnerSSHCall(t, dir, 3)
-			if command == "exit 0" {
-				t.Fatal("owner delivery was replaced by another probe")
+			for _, action := range []struct {
+				action workspaceOwnerAction
+				want   string
+			}{
+				{workspaceOwnerAcquire, "ACQUIRED"},
+				{workspaceOwnerRenew, "RENEWED"},
+				{workspaceOwnerInspect, "OWNED"},
+				{workspaceOwnerRelease, "RELEASED"},
+			} {
+				t.Run(string(action.action), func(t *testing.T) {
+					dir := installWorkspaceOwnerRecordingSSH(t)
+					t.Setenv("CRABBOX_OWNER_SSH_RETRY_CALL", "1")
+					t.Setenv("CRABBOX_OWNER_SSH_RETRY_STDOUT", "MISMATCH")
+					t.Setenv("CRABBOX_OWNER_SSH_RETRY_STDERR", "first port failed")
+					t.Setenv("CRABBOX_OWNER_SSH_SUCCESS_STDOUT", action.want)
+					t.Setenv("CRABBOX_OWNER_SSH_SUCCESS_STDERR", "second port warning")
+					test.target.User, test.target.Host, test.target.Port = "crabbox", "127.0.0.1", "2222"
+					test.target.FallbackPorts = []string{"22"}
+					got, err := (sshWorkspaceOwnerTransport{target: test.target}).Do(context.Background(), workspaceOwnerRemoteRequest{
+						Action: action.action,
+						Key:    workspaceOwnerKey("cbx_fallback_" + test.name),
+						Token:  strings.Repeat("c", 64),
+						TTL:    time.Minute,
+					})
+					if err != nil || got != action.want {
+						t.Fatalf("fallback response=%q err=%v", got, err)
+					}
+					if count, readErr := os.ReadFile(filepath.Join(dir, "count")); readErr != nil || string(count) != "3" {
+						t.Fatalf("SSH call count=%q err=%v", count, readErr)
+					}
+					requireWorkspaceOwnerSSHProbe(t, dir, 1, "2222")
+					requireWorkspaceOwnerSSHProbe(t, dir, 2, "22")
+					for index := 1; index <= 3; index++ {
+						requireWorkspaceOwnerSSHNoMux(t, dir, index)
+						requireWorkspaceOwnerSSHOptions(t, dir, index, "10", "3")
+					}
+					command, _ := readWorkspaceOwnerSSHCall(t, dir, 3)
+					if command == "exit 0" {
+						t.Fatal("owner delivery was replaced by another probe")
+					}
+				})
 			}
 		})
 	}
@@ -1012,6 +1190,9 @@ func TestWorkspaceOwnerWSL2StagesThenExecutesOnceWithoutStdin(t *testing.T) {
 	}
 	if staged != 4 {
 		t.Fatalf("stage calls=%d want 4", staged)
+	}
+	if probes, err := os.ReadFile(filepath.Join(dir, "prerequisites")); err != nil || string(probes) != strings.Repeat("probe\n", 4) {
+		t.Fatalf("Bash prerequisite calls=%q err=%v, want four", probes, err)
 	}
 }
 

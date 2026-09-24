@@ -17,12 +17,9 @@ type providerSSHProxyTestProvider struct {
 }
 
 func (*providerSSHProxyTestProvider) Name() string { return "ssh-proxy-test" }
-func (*providerSSHProxyTestProvider) Aliases() []string {
-	return []string{"ssh-proxy-test-alias"}
-}
 func (p *providerSSHProxyTestProvider) Spec() ProviderSpec {
 	return ProviderSpec{
-		Name: p.Name(), Kind: ProviderKindSSHLease,
+		Name: p.Name(), Aliases: []string{"ssh-proxy-test-alias"}, Kind: ProviderKindSSHLease,
 		Targets:  []TargetSpec{{OS: targetLinux}},
 		Features: FeatureSet{FeatureSSH}, Coordinator: CoordinatorSupported,
 	}
@@ -66,7 +63,7 @@ func setupProviderSSHProxyTest(t *testing.T) *providerSSHProxyTestProvider {
 	RegisterProvider(p)
 	t.Cleanup(func() {
 		delete(providerRegistry, p.Name())
-		for _, alias := range p.Aliases() {
+		for _, alias := range p.Spec().Aliases {
 			delete(providerRegistry, alias)
 		}
 	})
@@ -106,7 +103,7 @@ func TestProviderSSHProxyDispatchesRawStreamsDirectly(t *testing.T) {
 					return err
 				}}, nil
 			}
-			args := []string{"__provider-ssh-proxy", p.Aliases()[0], "lease-123"}
+			args := []string{"__provider-ssh-proxy", p.Spec().Aliases[0], "lease-123"}
 			if override {
 				args = append(args, "--proxy-route", "explicit route")
 			}

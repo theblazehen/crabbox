@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -181,13 +182,13 @@ func (c *sshBootstrapTestClient) Exec(ctx context.Context, req podExecRequest) e
 	}
 }
 
-func newSSHBootstrapTestSetup(t *testing.T) (*backend, *sshBootstrapTestClient, sandboxReadiness, LeaseClaim) {
+func newSSHBootstrapTestSetup(t *testing.T) (*backend, *sshBootstrapTestClient, sandboxReadiness, core.LeaseClaim) {
 	t.Helper()
 	cfg := testAgentSandboxConfig(t)
 	cfg.Provider = sshProviderName
 	fake := readyFakeClient(cfg)
 	b := testBackend(cfg, fake, nil, nil)
-	_, _, _, ready, claim, unlock, err := b.createClaim(t.Context(), fake, "ssh-bootstrap", Repo{Root: t.TempDir()}, false, nil)
+	_, _, _, ready, claim, unlock, err := b.createClaim(t.Context(), fake, "ssh-bootstrap", core.Repo{Root: t.TempDir()}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,11 +256,11 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 			trustPath := filepath.Join(filepath.Dir(keyPath), "known_hosts")
 			var priorTrust []byte
 			if scenario != "publish" {
-				labels := cloneStringMap(claim.Labels)
+				labels := shared.CloneLabels(claim.Labels)
 				labels[claimLabelSSHUser] = "root"
 				labels[claimLabelSSHHostKey] = key
 				labels[claimLabelSSHPort] = "43210"
-				claim, err = updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+				claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -286,9 +287,9 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 			}
 			if scenario == "claim changed" {
 				client.during = func() error {
-					labels := cloneStringMap(claim.Labels)
+					labels := shared.CloneLabels(claim.Labels)
 					labels["concurrent_change"] = "preserved"
-					_, err := updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+					_, err := core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 					return err
 				}
 			}
@@ -318,7 +319,7 @@ func TestPrepareSSHPublishesPinnedIdentityAndFailsClosed(t *testing.T) {
 					t.Fatal("lease key was put in remote command arguments rather than stdin")
 				}
 			}
-			stored, err := readLeaseClaim(claim.LeaseID)
+			stored, err := core.ReadLeaseClaim(claim.LeaseID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -447,7 +448,7 @@ func TestSSHSeedProbeReadsExecutableWithoutRunningIt(t *testing.T) {
 			dir := t.TempDir()
 			seed := filepath.Join(dir, "initialize")
 			marker := filepath.Join(dir, "executed")
-			data := []byte("#!/bin/sh\nprintf executed > " + shellQuote(marker) + "\n")
+			data := []byte("#!/bin/sh\nprintf executed > " + core.ShellQuote(marker) + "\n")
 			if scenario != "missing" {
 				if err := os.WriteFile(seed, data, 0o755); err != nil {
 					t.Fatal(err)
@@ -586,7 +587,7 @@ func TestPrepareSSHRetriesOnlyAuthenticatedRuntimeReplacement(t *testing.T) {
 				client.initializeErr = errors.New("authenticated initialization failed")
 			}
 			_, prepareErr := b.prepareSSH(t.Context(), client, ready, claim)
-			stored, err := readLeaseClaim(claim.LeaseID)
+			stored, err := core.ReadLeaseClaim(claim.LeaseID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -626,12 +627,12 @@ func TestPrepareSSHRepairsIncompleteEndpointThroughKubernetes(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			b, client, ready, claim := newSSHBootstrapTestSetup(t)
-			labels := cloneStringMap(claim.Labels)
+			labels := shared.CloneLabels(claim.Labels)
 			for key, value := range endpoint {
 				labels[key] = value
 			}
 			var err error
-			claim, err = updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+			claim, err = core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 			if err != nil {
 				t.Fatal(err)
 			}

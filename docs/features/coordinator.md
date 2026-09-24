@@ -105,12 +105,31 @@ resource and deletion evidence are preserved independently.
 
 ## CLI request budgets
 
-The CLI bounds individual lease reads (including authoritative provider
-metadata), health, identity, provider readiness, and HTTP heartbeat requests to
-30 seconds. The same deadline covers authentication, response-body reads, and
-any eligible read-only curl fallback; an earlier caller deadline still wins.
-Best-effort foreground lease touches retain their shorter 20-second budget.
-Provisioning and image operations retain the 30-minute HTTP budget.
+Read-only lease lookups (including authoritative provider metadata), lease
+lists and audits, pool inventory, run history/events/logs, health, identity, and
+provider readiness use a 60-second total read budget. Each attempt allows
+30 seconds, including authentication, response-body reads, and any eligible
+read-only curl fallback.
+An earlier caller deadline always wins, and cancellation interrupts both requests
+and backoff waits.
+
+These GETs retry timeouts, connection resets or interrupted responses, HTTP
+502–504, and HTTP 429, up to five attempts. Backoff grows from one to two, four,
+and eight seconds with jitter, capped at eight seconds. `Retry-After` seconds
+or HTTP dates are honored up to that cap. The CLI prints one concise
+`coordinator read retry 1/4 reason=...` line on stderr when retries begin.
+HTTP 400/401/403/404/409 and other terminal errors return immediately.
+
+The per-attempt deadline stays at 30 seconds to leave room for a fresh request
+within the total budget. Mutations never gain retries through this policy;
+their existing token-bound replay contracts are unchanged. Terminal receipt
+verification also keeps its single-request behavior: the run finalization owner
+controls retries and shares its original 60-second deadline with the finish POST
+and receipt GET, without adding the read policy's 30-second attempt cap.
+HTTP heartbeats retain the 30-minute mutation budget because a changed source policy can require
+a provider access refresh. Automatic heartbeats and best-effort foreground
+lease touches retain their shorter 20-second caller budgets. Provisioning and
+image operations retain the 30-minute HTTP budget.
 
 Before releasing a lease, `stop` allows ten seconds for its preliminary lookup.
 If that lookup fails, ordinary stop can use the existing provider-scoped release
@@ -253,6 +272,11 @@ An unbound canceled tombstone rejects only that exact owner/org/token operation;
 it does not reserve the provisional ID against a fresh token or a fixed,
 registered, or workspace lifecycle. Pending and canonical-bound attempts remain
 global ID reservations.
+An exact `502 tailscale_unavailable` response stops create replay because the
+coordinator rejected Tailscale preparation before provider allocation. The CLI
+still cancels its ordinary create attempt and reports the original error; fixed
+ID operations retain their existing caller-owned recovery. Other server errors
+and transport failures continue to use the same-token recovery path.
 Tokenless POSTs from older CLIs remain supported with their previous behavior,
 but they do not gain this cancellation guarantee. Roll out the coordinator
 before distributing a CLI that sends create attempts; once token-bound creates
@@ -283,10 +307,12 @@ receipt-bearing CLI.
 The fixed-ID `PUT` route is fail-closed and does not replace legacy `POST`.
 It atomically reserves a versioned normalized immutable request hash before
 provider work. An identical owner-scoped replay returns an active lease or the
-same provisioning record; request drift and terminal-ID reuse return
-`lease_id_conflict` without invoking the provider. CLIs using `--lease-id`
-poll a provisioning replay until it becomes active or terminal. Coordinators
-that predate this route return not found before any create side effect.
+same provisioning record; the same request against its terminal record returns
+`fixed_lease_terminal`, while request drift and terminal-ID reuse by a different
+request return `lease_id_conflict`. Neither terminal response invokes the
+provider. CLIs using `--lease-id` poll a provisioning replay until it becomes
+active or terminal. Coordinators that predate this route return not found before
+any create side effect.
 If the PUT response is ambiguous, the CLI repeats the full identical PUT until
 the coordinator atomically confirms the same stored intent or returns a
 conflict/definite error. Public GET is used only after that PUT confirmation,
@@ -498,15 +524,18 @@ retries preserve that wakeup, including after coordinator reconstruction.
 An already-due stored alarm time is rearmed at the earlier of that time and the
 requested deadline: a consumed runtime job can leave its timestamp behind.
 An earlier future alarm is preserved without another scheduling write.
-AWS heartbeat access refresh also arms its recorded ingress reconciliation at the
-existing one-second minimum delay instead of rescanning unrelated fleet metadata
-while holding the ingress lock. Earlier alarms remain scheduled.
+AWS heartbeats with complete, unchanged SSH source policy record ingress
+reconciliation and arm its existing one-second wakeup before acknowledging the
+renewal. They do not wait behind other AWS ingress work. The AWS provider compares
+the current policy using the same pinned-range and address-family rules as an
+access refresh. Changed sources or incomplete source metadata still finish the
+normal refresh attempt before the response. Earlier alarms remain scheduled.
 Alarm storage errors still fail the request and do not certify cleanup success.
 The existing full scheduler shares the lifecycle mutex with this arming, so a
 scan cannot race an acknowledgement's earlier wakeup. Full maintenance scans,
-slug resolution, provider access refresh, and provider ingress locking retain
-their existing behavior; their work and other shared-queue stalls are not
-bounded by this acknowledgement path.
+slug resolution, access refreshes that change sources, and provider ingress locking
+retain their existing behavior. An acknowledgement confirms the renewal and its
+scheduled maintenance, not successful installation of security-group rules.
 
 **Expiry and cleanup.** A DO alarm and the cron both run maintenance:
 `expireLeases` deletes cloud servers for active leases past `expiresAt`

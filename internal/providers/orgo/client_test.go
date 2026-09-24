@@ -11,9 +11,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 func TestRunBashExitCodeFieldPresence(t *testing.T) {
@@ -405,7 +408,7 @@ func (fn orgoRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error)
 func TestNewOrgoClientRejectsInsecureNonLoopbackAPIBase(t *testing.T) {
 	t.Setenv("CRABBOX_ORGO_API_KEY", "test-key")
 	t.Setenv("CRABBOX_ORGO_API_BASE", "http://api.example.test")
-	if _, err := newOrgoClient(Config{Orgo: OrgoConfig{APIBase: "http://api.example.test"}}, Runtime{}); err == nil || !strings.Contains(err.Error(), "must use https") {
+	if _, err := newOrgoClient(core.Config{Orgo: core.OrgoConfig{APIBase: "http://api.example.test"}}, core.Runtime{}); err == nil || !strings.Contains(err.Error(), "must use https") {
 		t.Fatalf("err=%v, want HTTPS requirement", err)
 	}
 }
@@ -413,7 +416,7 @@ func TestNewOrgoClientRejectsInsecureNonLoopbackAPIBase(t *testing.T) {
 func TestNewOrgoClientUsesResolvedConfigBeforeAmbientAPIBase(t *testing.T) {
 	t.Setenv("CRABBOX_ORGO_API_KEY", "test-key")
 	t.Setenv("CRABBOX_ORGO_API_BASE", "https://ambient.example.test")
-	backend := NewOrgoBackend(Provider{}.Spec(), Config{Orgo: OrgoConfig{APIBase: "https://flag-selected.example.test"}}, Runtime{}).(*orgoBackend)
+	backend := NewOrgoBackend(Provider{}.Spec(), core.Config{Orgo: core.OrgoConfig{APIBase: "https://flag-selected.example.test"}}, core.Runtime{}).(*orgoBackend)
 	client, err := backend.api()
 	if err != nil {
 		t.Fatal(err)
@@ -431,51 +434,54 @@ func TestNewOrgoClientUsesResolvedConfigBeforeAmbientAPIBase(t *testing.T) {
 }
 
 func TestOrgoFallbackBoundsControlAndPreservesCommand(t *testing.T) {
-	const controlTimeout = 30 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/computers/computer-1":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"id":`)
-			w.(http.Flusher).Flush()
-			<-r.Context().Done()
-		case "/computers/computer-1/bash":
-			time.Sleep(3 * controlTimeout)
-			_ = json.NewEncoder(w).Encode(map[string]any{"stdout": "ok", "exit_code": 0})
-		default:
-			http.NotFound(w, r)
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/computers/computer-1":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"id":`)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			case "/computers/computer-1/bash":
+				time.Sleep(3 * controlTimeout)
+				_ = json.NewEncoder(w).Encode(map[string]any{"stdout": "ok", "exit_code": 0})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		control.Transport, data.Transport = server.Client().Transport, server.Client().Transport
+		client := &orgoHTTPClient{baseURL: server.URL, apiKey: "test-key", http: control, dataHTTP: data}
+		started := time.Now()
+		_, err := client.GetComputer(context.Background(), "computer-1")
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetComputer error=%v, want whole-request deadline", err)
 		}
-	}))
-	defer server.Close()
-	control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	client := &orgoHTTPClient{baseURL: server.URL, apiKey: "test-key", http: control, dataHTTP: data}
-	started := time.Now()
-	_, err := client.GetComputer(context.Background(), "computer-1")
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("GetComputer error=%v, want whole-request deadline", err)
-	}
-	controlElapsed := time.Since(started)
-	if controlElapsed >= time.Second {
-		t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
-	}
+		controlElapsed := time.Since(started)
+		if controlElapsed >= time.Second {
+			t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
+		}
 
-	started = time.Now()
-	code, err := client.RunBash(context.Background(), "computer-1", "true", io.Discard, io.Discard)
-	if err != nil || code != 0 {
-		t.Fatalf("RunBash code=%d err=%v", code, err)
-	}
-	dataElapsed := time.Since(started)
-	if dataElapsed <= controlTimeout {
-		t.Fatalf("command completed in %s, want beyond %s", dataElapsed, controlTimeout)
-	}
-	t.Logf("Orgo control body bounded in %s; synchronous command completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+		started = time.Now()
+		code, err := client.RunBash(context.Background(), "computer-1", "true", io.Discard, io.Discard)
+		if err != nil || code != 0 {
+			t.Fatalf("RunBash code=%d err=%v", code, err)
+		}
+		dataElapsed := time.Since(started)
+		if dataElapsed <= controlTimeout {
+			t.Fatalf("command completed in %s, want beyond %s", dataElapsed, controlTimeout)
+		}
+		t.Logf("Orgo control body bounded in %s; synchronous command completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestOrgoInjectedHTTPClientIsPreservedForBothPlanes(t *testing.T) {
 	t.Setenv("CRABBOX_ORGO_API_KEY", "test-key")
 	injected := &http.Client{Timeout: 17 * time.Second}
-	api, err := newOrgoClient(Config{Orgo: OrgoConfig{APIBase: "http://127.0.0.1:8787"}}, Runtime{HTTP: injected})
+	api, err := newOrgoClient(core.Config{Orgo: core.OrgoConfig{APIBase: "http://127.0.0.1:8787"}}, core.Runtime{HTTP: injected})
 	if err != nil {
 		t.Fatal(err)
 	}

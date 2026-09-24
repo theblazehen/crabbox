@@ -12,14 +12,126 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 
 	"github.com/openclaw/crabbox/internal/providers/shared"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+type blaxelResponseBody struct {
+	*strings.Reader
+	readErr error
+	close   func() error
+}
+
+func (b *blaxelResponseBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err == io.EOF && b.readErr != nil {
+		return n, b.readErr
+	}
+	return n, err
+}
+
+func (b *blaxelResponseBody) Close() error { return b.close() }
+
+func TestBlaxelBufferedResponseContract(t *testing.T) {
+	t.Setenv("CRABBOX_BLAXEL_API_KEY", "synthetic-first-key")
+	t.Setenv("BL_API_KEY", "synthetic-second-key")
+	readErr := errors.New("synthetic read failure")
+	for _, path := range []string{"json", "multipart"} {
+		t.Run(path, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, body, kind, wantValue, wantErrorBody string
+				status                                     int
+				nilOutput, failRead                        bool
+			}{
+				{name: "empty", status: 200, wantValue: "initial"},
+				{name: "no-content", status: 204, wantValue: "initial"},
+				{name: "whitespace", status: 200, body: " \t\n", wantValue: "initial"},
+				{name: "nil-output-non-json", status: 200, body: "ordinary text", nilOutput: true, wantValue: "initial"},
+				{name: "raw-json", status: 200, body: " {\"value\":\"ok\"}\n", wantValue: "ok"},
+				{name: "null", status: 200, body: "null", wantValue: "initial"},
+				{name: "syntax", status: 200, body: "{", kind: "syntax", wantValue: "initial"},
+				{name: "trailing-data", status: 200, body: "{} {}", kind: "syntax", wantValue: "initial"},
+				{name: "type", status: 200, body: "{\"value\":3}", kind: "type", wantValue: "initial"},
+				{name: "read", status: 200, body: "partial", failRead: true, kind: "read", wantValue: "initial"},
+				{name: "read-before-status", status: 503, body: "partial", failRead: true, nilOutput: true, kind: "read", wantValue: "initial"},
+				{name: "status", status: 503, body: " unavailable \n", kind: "status", wantErrorBody: " unavailable \n", wantValue: "initial"},
+				{name: "status-nil-output", status: 503, body: " unavailable \n", nilOutput: true, kind: "status", wantErrorBody: " unavailable \n", wantValue: "initial"},
+				{name: "status-redaction", status: 503, body: " synthetic-first-key/synthetic-second-key \n", kind: "status", wantErrorBody: " <redacted>/<redacted> \n", wantValue: "initial"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					out := struct {
+						Value string `json:"value"`
+					}{Value: "initial"}
+					closes, calls := 0, 0
+					body := &blaxelResponseBody{Reader: strings.NewReader(tc.body)}
+					if tc.failRead {
+						body.readErr = readErr
+					}
+					body.close = func() error {
+						closes++
+						if body.Len() != 0 || out.Value != tc.wantValue {
+							t.Errorf("close before consumption/decode: remaining=%d value=%q", body.Len(), out.Value)
+						}
+						return errors.New("ignored synthetic close failure")
+					}
+					httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+						calls++
+						return &http.Response{StatusCode: tc.status, Body: body, Header: make(http.Header)}, nil
+					})}
+					client := &restClient{http: httpClient, dataHTTP: httpClient}
+					var target any = &out
+					if tc.nilOutput {
+						target = nil
+					}
+					var data []byte
+					var err error
+					if path == "json" {
+						data, err = client.doAt(context.Background(), httpClient, "https://example.test", http.MethodGet, "/fixture", nil, nil, target)
+					} else {
+						data, err = client.doMultipartAt(context.Background(), "https://example.test", http.MethodPut, "/fixture", nil, "application/octet-stream", strings.NewReader("fixture"), target)
+					}
+					switch tc.kind {
+					case "":
+						if err != nil || data == nil || string(data) != tc.body {
+							t.Fatalf("data=%q nil=%v error=%v", data, data == nil, err)
+						}
+					case "read":
+						if err != readErr {
+							t.Fatalf("error=%v, want exact read error", err)
+						}
+					case "syntax":
+						if _, ok := err.(*json.SyntaxError); !ok {
+							t.Fatalf("error=%T %v, want unwrapped syntax error", err, err)
+						}
+					case "type":
+						if _, ok := err.(*json.UnmarshalTypeError); !ok {
+							t.Fatalf("error=%T %v, want unwrapped type error", err, err)
+						}
+					case "status":
+						got, ok := err.(apiError)
+						if !ok || got.StatusCode != tc.status || got.Body != tc.wantErrorBody {
+							t.Fatalf("error=%T %#v", err, err)
+						}
+					}
+					if tc.kind != "" && data != nil {
+						t.Fatalf("error returned bytes %q", data)
+					}
+					if calls != 1 || closes != 1 || out.Value != tc.wantValue {
+						t.Fatalf("calls=%d closes=%d value=%q", calls, closes, out.Value)
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestRedactErrorPreservesCauseAndSafeFormatting(t *testing.T) {
 	if err := redactError(nil); err != nil {
@@ -210,62 +322,65 @@ func TestUploadFileRewindsArchiveAfterNativeMultipartFailure(t *testing.T) {
 }
 
 func TestBlaxelFallbackBoundsControlAndPreservesUpload(t *testing.T) {
-	const controlTimeout = 30 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes":
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `[{"metadata":`)
-			w.(http.Flusher).Flush()
-			<-r.Context().Done()
-		case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-1":
-			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{
-				"name": "sbx-1",
-				"url":  serverURL(r) + "/sandbox/sbx-1",
-			}})
-		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/filesystem-multipart/initiate/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"uploadId": "upload-1"})
-		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/filesystem-multipart/upload-1/part"):
-			if err := r.ParseMultipartForm(1024); err != nil {
-				t.Error(err)
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes":
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `[{"metadata":`)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-1":
+				_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{
+					"name": "sbx-1",
+					"url":  serverURL(r) + "/sandbox/sbx-1",
+				}})
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/filesystem-multipart/initiate/"):
+				_ = json.NewEncoder(w).Encode(map[string]any{"uploadId": "upload-1"})
+			case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/filesystem-multipart/upload-1/part"):
+				if err := r.ParseMultipartForm(1024); err != nil {
+					t.Error(err)
+				}
+				time.Sleep(3 * controlTimeout)
+				_ = json.NewEncoder(w).Encode(map[string]any{"etag": "etag-1", "partNumber": 1})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/filesystem-multipart/upload-1/complete"):
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			default:
+				http.NotFound(w, r)
 			}
-			time.Sleep(3 * controlTimeout)
-			_ = json.NewEncoder(w).Encode(map[string]any{"etag": "etag-1", "partNumber": 1})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/filesystem-multipart/upload-1/complete"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-		default:
-			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		control.Transport, data.Transport = server.Client().Transport, server.Client().Transport
+		client := &restClient{
+			base:     server.URL,
+			apiKey:   "test-key",
+			version:  defaultAPIVersion,
+			http:     secureHTTPClient(control),
+			dataHTTP: secureHTTPClient(data),
 		}
-	}))
-	defer server.Close()
+		started := time.Now()
+		err := client.Probe(context.Background())
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Probe error=%v, want whole-request deadline", err)
+		}
+		controlElapsed := time.Since(started)
+		if controlElapsed >= time.Second {
+			t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
+		}
 
-	control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
-	client := &restClient{
-		base:     server.URL,
-		apiKey:   "test-key",
-		version:  defaultAPIVersion,
-		http:     secureHTTPClient(control),
-		dataHTTP: secureHTTPClient(data),
-	}
-	started := time.Now()
-	err := client.Probe(context.Background())
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Probe error=%v, want whole-request deadline", err)
-	}
-	controlElapsed := time.Since(started)
-	if controlElapsed >= time.Second {
-		t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
-	}
-
-	started = time.Now()
-	if err := client.UploadFile(context.Background(), "sbx-1", "/tmp/archive.tgz", strings.NewReader("archive")); err != nil {
-		t.Fatal(err)
-	}
-	dataElapsed := time.Since(started)
-	if dataElapsed <= controlTimeout {
-		t.Fatalf("upload completed in %s, want beyond %s", dataElapsed, controlTimeout)
-	}
-	t.Logf("Blaxel control body bounded in %s; multipart upload completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+		started = time.Now()
+		if err := client.UploadFile(context.Background(), "sbx-1", "/tmp/archive.tgz", strings.NewReader("archive")); err != nil {
+			t.Fatal(err)
+		}
+		dataElapsed := time.Since(started)
+		if dataElapsed <= controlTimeout {
+			t.Fatalf("upload completed in %s, want beyond %s", dataElapsed, controlTimeout)
+		}
+		t.Logf("Blaxel control body bounded in %s; multipart upload completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+	})
 }
 
 func TestBlaxelInjectedHTTPSettingsArePreservedForBothPlanes(t *testing.T) {
@@ -873,5 +988,306 @@ func TestDoSandboxRetryDoesNotRetryOtherErrors(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected 1 call for non-retryable error, got %d", calls)
+	}
+}
+
+// A finite local archive with an observable in-flight Read. The test releases
+// that Read itself; it does not require cancellation to interrupt arbitrary I/O.
+type multipartLifetimeReadSeeker struct {
+	file             *os.File
+	entered          chan struct{}
+	release          chan struct{}
+	pauseOnce        sync.Once
+	releaseOnce      sync.Once
+	reading          atomic.Bool
+	seekWhileReading atomic.Bool
+	closeCalls       atomic.Int32
+	readErr          error
+}
+
+func (r *multipartLifetimeReadSeeker) Read(p []byte) (int, error) {
+	r.reading.Store(true)
+	defer r.reading.Store(false)
+	r.pauseOnce.Do(func() { close(r.entered); <-r.release })
+	if r.readErr != nil {
+		return 0, r.readErr
+	}
+	return r.file.Read(p)
+}
+
+func (r *multipartLifetimeReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	if r.reading.Load() {
+		r.seekWhileReading.Store(true)
+		return 0, errors.New("archive reader still borrowed by multipart producer")
+	}
+	return r.file.Seek(offset, whence)
+}
+
+func (r *multipartLifetimeReadSeeker) Close() error { r.closeCalls.Add(1); return r.file.Close() }
+
+func (r *multipartLifetimeReadSeeker) resume() { r.releaseOnce.Do(func() { close(r.release) }) }
+
+func TestUploadFileDoesNotRewindWhilePreviousMultipartReadIsActive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		archive := filepath.Join(t.TempDir(), "archive.tgz")
+		if err := os.WriteFile(archive, []byte("finite archive payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.Open(archive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		source := &multipartLifetimeReadSeeker{file: file, entered: make(chan struct{}), release: make(chan struct{})}
+		defer source.resume()
+		producerTransportDone := make(chan error, 1)
+		var parts atomic.Int32
+		retriedBytes := make(chan string, 1)
+		response := func(code int, body string) *http.Response {
+			return &http.Response{StatusCode: code, Status: fmt.Sprintf("%d %s", code, http.StatusText(code)), Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+		}
+		httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPut && req.Body != nil {
+				_, _ = io.Copy(io.Discard, req.Body)
+				_ = req.Body.Close()
+			}
+			switch {
+			case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/sandboxes/sbx-owned"):
+				return response(200, `{"metadata":{"name":"sbx-owned","url":"http://127.0.0.1:9443/sandbox/sbx-owned"},"status":"DEPLOYED"}`), nil
+			case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/filesystem-multipart/initiate/"):
+				return response(200, `{"uploadId":"owned-upload"}`), nil
+			case req.Method == http.MethodPut && strings.HasSuffix(req.URL.Path, "/part"):
+				if parts.Add(1) == 1 {
+					// RoundTripper may return response headers before request-body completion
+					// and close the body asynchronously. Its body owner is explicitly joined.
+					go func() {
+						_, copyErr := io.Copy(io.Discard, req.Body)
+						_ = req.Body.Close()
+						producerTransportDone <- copyErr
+					}()
+					<-source.entered
+					return response(503, "WORKLOAD_UNAVAILABLE"), nil
+				}
+				multipartBody, parseErr := req.MultipartReader()
+				if parseErr != nil {
+					_ = req.Body.Close()
+					return nil, parseErr
+				}
+				filePart, parseErr := multipartBody.NextPart()
+				if parseErr != nil {
+					_ = req.Body.Close()
+					return nil, parseErr
+				}
+				payload, copyErr := io.ReadAll(filePart)
+				if copyErr == nil {
+					_, copyErr = multipartBody.NextPart()
+					if copyErr == io.EOF {
+						copyErr = nil
+					}
+				}
+				_ = req.Body.Close()
+				if copyErr != nil {
+					return nil, copyErr
+				}
+				retriedBytes <- string(payload)
+				return response(200, `{"etag":"synthetic-etag","partNumber":1}`), nil
+			case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/complete"):
+				return response(204, ""), nil
+			default:
+				return nil, fmt.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+			}
+		})}
+		client := &restClient{base: "http://127.0.0.1:9443", http: httpClient, dataHTTP: httpClient}
+		result := make(chan error, 1)
+		go func() { result <- client.UploadFile(t.Context(), "sbx-owned", "/tmp/archive.tgz", source) }()
+		select {
+		case <-source.entered:
+		case early := <-result:
+			t.Fatalf("upload ended before controlled producer read: %v", early)
+		}
+		synctest.Wait()
+		overlappingSeek := source.seekWhileReading.Load()
+		source.resume()
+		uploadErr := <-result
+		<-producerTransportDone
+		synctest.Wait()
+		if uploadErr != nil {
+			var apiErr apiError
+			if !errors.As(uploadErr, &apiErr) || apiErr.StatusCode != 503 || !strings.Contains(apiErr.Body, "WORKLOAD_UNAVAILABLE") {
+				t.Fatalf("HTTP failure precedence changed: %v", uploadErr)
+			}
+		}
+		if overlappingSeek {
+			t.Fatalf("retry attempted Seek while the previous multipart producer still owned an active Read; original HTTP 503 preserved: %v", uploadErr)
+		}
+		if uploadErr != nil {
+			t.Fatalf("completed producer should permit the existing retry: %v", uploadErr)
+		}
+		if parts.Load() != 2 {
+			t.Fatalf("part attempts=%d, want existing retry", parts.Load())
+		}
+		if got := <-retriedBytes; got != "finite archive payload" {
+			t.Fatalf("retry payload=%q", got)
+		}
+		if source.closeCalls.Load() != 0 {
+			t.Fatal("borrowed source was closed")
+		}
+		if _, err := source.Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := io.ReadAll(source); err != nil || string(got) != "finite archive payload" {
+			t.Fatalf("caller lost source ownership: %q %v", got, err)
+		}
+	})
+}
+
+func TestMultipartAttemptRetainsBorrowedSourceUntilCompletion(t *testing.T) {
+	t.Setenv("CRABBOX_BLAXEL_API_KEY", "synthetic-source-secret")
+	for _, tc := range []struct {
+		name, response, want                                     string
+		status                                                   int
+		sourceFailure, cancel, transportFailure, responseFailure bool
+	}{
+		{name: "early success finishes upload", status: 200, response: `{"etag":"ok"}`},
+		{name: "producer error after success", status: 200, response: `{"etag":"ok"}`, sourceFailure: true, want: "source"},
+		{name: "HTTP error remains primary", status: 400, response: "rejected", sourceFailure: true, want: "http"},
+		{name: "retryable HTTP error remains primary", status: 503, response: "WORKLOAD_UNAVAILABLE", sourceFailure: true, want: "http"},
+		{name: "decode error remains primary", status: 200, response: "{", sourceFailure: true, want: "decode"},
+		{name: "missing etag remains primary", status: 200, response: "{}", sourceFailure: true, want: "etag"},
+		{name: "transport failure remains primary", transportFailure: true, sourceFailure: true, want: "transport"},
+		{name: "response read failure remains primary", status: 200, response: `{"etag":"ok"}`, responseFailure: true, sourceFailure: true, want: "read"},
+		{name: "cancellation awaits borrowed read", status: 200, response: `{"etag":"ok"}`, cancel: true, want: "cancel"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				archive := filepath.Join(t.TempDir(), "archive")
+				if err := os.WriteFile(archive, []byte("payload"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				file, err := os.Open(archive)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				sourceErr := errors.New("synthetic source read failure: synthetic-source-secret")
+				transportErr := errors.New("synthetic transport failure")
+				responseErr := errors.New("synthetic response read failure")
+				source := &multipartLifetimeReadSeeker{file: file, entered: make(chan struct{}), release: make(chan struct{})}
+				if tc.sourceFailure {
+					source.readErr = sourceErr
+				}
+				defer source.resume()
+				bodyDone := make(chan struct{}, 1)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodGet {
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"metadata":{"name":"sbx-owned","url":"http://127.0.0.1:9443/sandbox/sbx-owned"}}`)), Header: make(http.Header)}, nil
+					}
+					go func() { _, _ = io.Copy(io.Discard, req.Body); _ = req.Body.Close(); bodyDone <- struct{}{} }()
+					<-source.entered
+					if tc.transportFailure {
+						return nil, transportErr
+					}
+					var body io.ReadCloser = io.NopCloser(strings.NewReader(tc.response))
+					if tc.responseFailure {
+						body = &blaxelResponseBody{Reader: strings.NewReader(tc.response), readErr: responseErr, close: func() error { return nil }}
+					}
+					return &http.Response{StatusCode: tc.status, Body: body, Header: make(http.Header)}, nil
+				})}
+				client := &restClient{base: "http://127.0.0.1:9443", http: httpClient, dataHTTP: httpClient}
+				result := make(chan error, 1)
+				go func() {
+					_, err := client.uploadMultipartPart(ctx, "sbx-owned", "upload", 1, "archive", source)
+					result <- err
+				}()
+				select {
+				case <-source.entered:
+				case err := <-result:
+					t.Fatalf("returned before controlled read: %v", err)
+				}
+				synctest.Wait()
+				if tc.cancel {
+					cancel()
+					synctest.Wait()
+				}
+				returnedEarly := false
+				var uploadErr error
+				select {
+				case uploadErr = <-result:
+					returnedEarly = true
+				default:
+				}
+				bodyStopped := false
+				select {
+				case <-bodyDone:
+					bodyStopped = true
+				default:
+				}
+				wantAbort := tc.want == "http" || tc.want == "decode" || tc.want == "etag" || tc.want == "transport" || tc.want == "read" || tc.cancel
+				if bodyStopped != wantAbort {
+					t.Errorf("pipe stopped=%v want=%v while Read paused", bodyStopped, wantAbort)
+				}
+				source.resume()
+				if !returnedEarly {
+					uploadErr = <-result
+				}
+				if !bodyStopped {
+					<-bodyDone
+				}
+				synctest.Wait()
+				if returnedEarly {
+					t.Errorf("attempt returned before borrowed Read completed: %v", uploadErr)
+				}
+				if source.closeCalls.Load() != 0 {
+					t.Error("attempt closed borrowed source")
+				}
+				if _, err := file.Seek(0, io.SeekStart); err != nil {
+					t.Fatal(err)
+				}
+				if data, err := io.ReadAll(file); err != nil || string(data) != "payload" {
+					t.Fatalf("caller ownership lost: %q %v", data, err)
+				}
+				switch tc.want {
+				case "":
+					if uploadErr != nil {
+						t.Fatal(uploadErr)
+					}
+				case "source":
+					if uploadErr != nil && strings.Contains(uploadErr.Error(), "synthetic-source-secret") {
+						t.Fatal("producer error bypassed existing redaction")
+					}
+					if !errors.Is(uploadErr, sourceErr) {
+						t.Fatalf("error=%v want source failure", uploadErr)
+					}
+				case "http":
+					var apiErr apiError
+					if !errors.As(uploadErr, &apiErr) || apiErr.StatusCode != tc.status || apiErr.Body != tc.response {
+						t.Fatalf("HTTP precedence: %v", uploadErr)
+					}
+				case "decode":
+					var syntaxErr *json.SyntaxError
+					if !errors.As(uploadErr, &syntaxErr) {
+						t.Fatalf("decode precedence: %v", uploadErr)
+					}
+				case "etag":
+					if uploadErr == nil || uploadErr.Error() != "blaxel multipart upload response omitted etag" {
+						t.Fatalf("ETag precedence: %v", uploadErr)
+					}
+				case "transport":
+					if !errors.Is(uploadErr, transportErr) {
+						t.Fatalf("transport precedence: %v", uploadErr)
+					}
+				case "read":
+					if !errors.Is(uploadErr, responseErr) {
+						t.Fatalf("response-read precedence: %v", uploadErr)
+					}
+				case "cancel":
+					if !errors.Is(uploadErr, context.Canceled) {
+						t.Fatalf("cancellation error=%v", uploadErr)
+					}
+				}
+			})
+		})
 	}
 }

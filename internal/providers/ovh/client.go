@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -252,7 +251,7 @@ func secureOVHHTTPClient(source *http.Client, trusted *url.URL) *http.Client {
 	client := *source
 	originalCheckRedirect := source.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if !sameOVHOrigin(trusted, req.URL) {
+		if !core.SameHTTPOrigin(trusted, req.URL) {
 			return errOVHCrossOriginRedirect
 		}
 		if originalCheckRedirect != nil {
@@ -264,10 +263,6 @@ func secureOVHHTTPClient(source *http.Client, trusted *url.URL) *http.Client {
 		return nil
 	}
 	return &client
-}
-
-func sameOVHOrigin(a, b *url.URL) bool {
-	return shared.SameOrigin(a, b)
 }
 
 func sanitizeOVHClientError(err error) error {
@@ -413,30 +408,12 @@ func (c *Client) do(ctx context.Context, method, requestPath string, body any, o
 		return sanitizeOVHClientError(err)
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body := redactSecrets(strings.TrimSpace(string(data)), c.applicationKey, c.applicationSecret, c.consumerKey)
-		if len(body) > 400 {
-			body = body[:400]
-		}
-		if readErr != nil {
-			if body != "" {
-				body += "; "
-			}
-			body += "response body read failed: " + readErr.Error()
-		}
-		return &APIError{Operation: method + " " + requestPath, Status: resp.StatusCode, Body: body}
-	}
-	if readErr != nil {
-		return fmt.Errorf("ovh %s %s response body: %w", method, requestPath, readErr)
-	}
-	if out == nil || len(data) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("ovh %s %s decode: %w", method, requestPath, err)
-	}
-	return nil
+	return shared.DecodeStatusFirstJSONResponse(resp, out, "ovh "+method+" "+requestPath, func(status int, data []byte, readErr error) error {
+		body := shared.RedactedResponseBody(data, readErr, 400, func(value string) string {
+			return redactSecrets(value, c.applicationKey, c.applicationSecret, c.consumerKey)
+		})
+		return &APIError{Operation: method + " " + requestPath, Status: status, Body: body}
+	})
 }
 
 func (c *Client) ensureServerTime(ctx context.Context) error {

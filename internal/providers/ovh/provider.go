@@ -19,10 +19,9 @@ var _ core.ProviderClassProfileProvider = Provider{}
 
 var classProfiles = core.UniformLinuxAMD64ClassProfiles(core.ProviderClassMachine{Type: "b3-8"})
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPICredentials),
 		Name:             providerName,
 		Family:           providerName,
 		Kind:             core.ProviderKindSSHLease,
@@ -46,11 +45,12 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 	if !ok {
 		return nil
 	}
-	applied := v.Apply(&cfg.OVH, fs)
+	applied, err := v.Apply(&cfg.OVH, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
 	if applied.Image {
 		core.SetOVHImageExplicit(cfg)
 	}
-	return nil
+	return err
 }
 
 func (Provider) ServerTypeForConfig(cfg core.Config) string {
@@ -60,13 +60,7 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.OVH.Flavor != "" {
 		return cfg.OVH.Flavor
 	}
-	if candidates, matched := core.ProviderClassCandidatesForProfiles(classProfiles, cfg); matched {
-		return candidates[0]
-	}
-	if core.IsCanonicalProviderClass(cfg.Class) {
-		return ""
-	}
-	return ovhServerTypeForClass(cfg.Class)
+	return core.ProviderClassPrimaryTypeForProfiles(classProfiles, cfg, ovhServerTypeForClass(cfg.Class))
 }
 
 func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
@@ -74,15 +68,7 @@ func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
 	return flavor, flavor != ""
 }
 
-func (Provider) ServerTypeForClass(class string) string {
-	return ovhServerTypeForClass(class)
-}
-
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
-	return NewBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
 	return NewBackend(p.Spec(), cfg, rt), nil
 }
 
@@ -93,4 +79,24 @@ func ovhServerTypeForClass(class string) string {
 		}
 	}
 	return "b3-8"
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if cfg.OVH.Endpoint == "" {
+		cfg.OVH.Endpoint = core.OVHConfigDefaultEndpoint
+	}
+	cfg.OVH.Image = imageForConfig(*cfg)
+	if cfg.OVH.Flavor == "" {
+		cfg.OVH.Flavor = core.OVHConfigDefaultFlavor
+	}
+	base := core.BaseConfig()
+	core.ApplyLinuxConnectionDefaults(cfg, base.SSHUser, base.SSHPort)
+	return nil
+}
+
+func imageForConfig(cfg core.Config) string {
+	if cfg.OVH.Image == "" {
+		return core.OVHConfigDefaultImage
+	}
+	return cfg.OVH.Image
 }

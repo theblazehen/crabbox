@@ -9,13 +9,13 @@ import (
 
 func (a App) providerSSHProxy(ctx context.Context, args []string) error {
 	if len(args) < 2 || strings.TrimSpace(args[0]) == "" || strings.TrimSpace(args[1]) == "" || strings.HasPrefix(args[1], "-") {
-		return exit(2, "provider SSH proxy requires PROVIDER LEASE [provider flags]")
+		return Exit(2, "provider SSH proxy requires PROVIDER LEASE [provider flags]")
 	}
 	provider, err := ProviderFor(args[0])
 	if err != nil {
 		return err
 	}
-	cfg, err := loadConfigWithOverrides("", provider.Name())
+	cfg, err := loadConfigWithOverrides("", provider.Spec().Name)
 	if err != nil {
 		return err
 	}
@@ -27,17 +27,17 @@ func (a App) providerSSHProxy(ctx context.Context, args []string) error {
 	fs.SetOutput(stderr)
 	values := provider.RegisterFlags(fs, cfg)
 	if err := fs.Parse(args[2:]); err != nil {
-		return exit(2, "%v", err)
+		return Exit(2, "%v", err)
 	}
 	if fs.NArg() != 0 {
-		return exit(2, "provider SSH proxy accepts only provider flags after LEASE; unexpected argument %q", fs.Arg(0))
+		return Exit(2, "provider SSH proxy accepts only provider flags after LEASE; unexpected argument %q", fs.Arg(0))
 	}
 	if err := provider.ApplyFlags(&cfg, fs, values); err != nil {
 		return err
 	}
 	// This is an already selected transport, not a new allocation. Never route
 	// it through a configured broker or through another provider's defaults.
-	setProviderSelection(&cfg, provider.Name(), providerSelectionFlag)
+	setProviderSelection(&cfg, provider.Spec().Name, providerSelectionFlag)
 	cfg.brokerProvider = ""
 	// Reserve stdout exclusively for the SSH byte stream, including during
 	// provider configuration and any local commands the provider starts.
@@ -49,7 +49,7 @@ func (a App) providerSSHProxy(ctx context.Context, args []string) error {
 	}
 	proxy, ok := backend.(SSHProxyBackend)
 	if !ok {
-		return exit(2, "provider %q does not support an SSH stdio proxy", provider.Name())
+		return Exit(2, "provider %q does not support an SSH stdio proxy", provider.Spec().Name)
 	}
 	stdout := a.Stdout
 	if stdout == nil {

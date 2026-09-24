@@ -4,8 +4,10 @@ import { extname, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath, URL as NodeURL } from "node:url";
 
+import { AsyncMutex } from "../src/async-mutex";
 import { prepareCoordinatorRequest, routeCoordinatorRequest } from "../src/coordinator-entry";
 import { FleetCoordinator } from "../src/fleet";
+import { AsyncOperationTracker } from "./async-operation-tracker";
 import {
   createAWSDeploymentGuard,
   nodeCoordinatorEnv,
@@ -13,8 +15,6 @@ import {
 } from "./aws-deployment";
 import { NodeCoordinatorRuntime, type NodeUpgradeContext } from "./node-runtime";
 import {
-  AsyncMutex,
-  AsyncOperationTracker,
   RequestBodyTooLargeError,
   closeServer,
   createUntrustedForwardingDiagnostic,

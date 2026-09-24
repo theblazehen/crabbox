@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,7 +16,7 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
-func ownedFixture(t *testing.T) (*backend, *fakeAPI, LeaseClaim, LeaseTarget) {
+func ownedFixture(t *testing.T) (*backend, *fakeAPI, core.LeaseClaim, core.LeaseTarget) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("BOX_ORG", "")
@@ -27,14 +28,14 @@ func ownedFixture(t *testing.T) (*backend, *fakeAPI, LeaseClaim, LeaseTarget) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b, f, claim, lease
 }
 
-func assertClaimRetained(t *testing.T, claim LeaseClaim) {
+func assertClaimRetained(t *testing.T, claim core.LeaseClaim) {
 	t.Helper()
 	got, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID)
 	if err != nil || !exists || !reflect.DeepEqual(got, claim) {
@@ -42,7 +43,7 @@ func assertClaimRetained(t *testing.T, claim LeaseClaim) {
 	}
 }
 
-func assertCompletedDeletionRetained(t *testing.T, original LeaseClaim) LeaseClaim {
+func assertCompletedDeletionRetained(t *testing.T, original core.LeaseClaim) core.LeaseClaim {
 	t.Helper()
 	claim, exists, err := core.ReadLeaseClaimWithPresence(original.LeaseID)
 	if err != nil || !exists || !boxFromClaim(claim).deletionCompleted {
@@ -63,7 +64,7 @@ func assertCompletedDeletionRetained(t *testing.T, original LeaseClaim) LeaseCla
 	return claim
 }
 
-func assertPendingDeletionRetained(t *testing.T, original LeaseClaim, operationID string) LeaseClaim {
+func assertPendingDeletionRetained(t *testing.T, original core.LeaseClaim, operationID string) core.LeaseClaim {
 	t.Helper()
 	claim, exists, err := core.ReadLeaseClaimWithPresence(original.LeaseID)
 	if err != nil || !exists || claim.Labels[boxDeletionOperationLabel] != operationID || claim.Labels[boxDeletionOperationBindingLabel] != boxDeletionOperationBinding(claim, operationID) || claim.Labels[boxDeletionLabel] != "" {
@@ -84,12 +85,12 @@ func assertPendingDeletionRetained(t *testing.T, original LeaseClaim, operationI
 	return claim
 }
 
-func completedDeletionFixture(t *testing.T) (*backend, *fakeAPI, LeaseClaim) {
+func completedDeletionFixture(t *testing.T) (*backend, *fakeAPI, core.LeaseClaim) {
 	t.Helper()
 	b, f, claim, lease := ownedFixture(t)
 	inventoryErr := errors.New("complete inventory unavailable")
 	f.listHook = func() ([]boxData, error) { return nil, inventoryErr }
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, inventoryErr) {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, inventoryErr) {
 		t.Fatalf("release err=%v, want inventory failure", err)
 	}
 	completed := assertCompletedDeletionRetained(t, claim)
@@ -97,14 +98,14 @@ func completedDeletionFixture(t *testing.T) (*backend, *fakeAPI, LeaseClaim) {
 	return b, f, completed
 }
 
-func pendingDeletionFixture(t *testing.T) (*backend, *fakeAPI, LeaseClaim) {
+func pendingDeletionFixture(t *testing.T) (*backend, *fakeAPI, core.LeaseClaim) {
 	t.Helper()
 	b, f, claim, lease := ownedFixture(t)
 	f.releaseHook = func(id string) error {
 		f.deleted = true
 		return &boxDeletionIncompleteError{operation: boxDeletionOperation{ID: testDeletionID, Kind: "box", TargetID: id, Status: "pending"}, err: context.DeadlineExceeded}
 	}
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, context.DeadlineExceeded) {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("release err=%v, want deadline", err)
 	}
 	pending := assertPendingDeletionRetained(t, claim, testDeletionID)
@@ -122,18 +123,18 @@ func TestReleaseAcceptedNativeDeletionDoesNotRecordCompletion(t *testing.T) {
 		{name: "canceled acceptance", cancelOn: "delete"},
 		{name: "canceled poll", cancelOn: "deletion", poll: deletionOutcome(testDeletionID, "bx_1", "box", "blocked")},
 		{name: "changed poll target", poll: deletionOutcome(testDeletionID, "bx_other", "box", "completed")},
-		{name: "malformed poll", poll: commandOutcome{result: LocalCommandResult{Stdout: `{"operation":null}`}}},
+		{name: "malformed poll", poll: commandOutcome{result: core.LocalCommandResult{Stdout: `{"operation":null}`}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, _, claim, _ := ownedFixture(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			info := commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
+			info := commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
 			runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{
-				"info": {info, info, info, info}, "stop": {{result: LocalCommandResult{}}},
+				"info": {info, info, info, info, info}, "stop": {{result: core.LocalCommandResult{}}},
 				"delete":   {deletionOutcome(testDeletionID, claim.CloudID, "box", "pending")},
 				"deletion": {test.poll},
-				"list":     {{result: LocalCommandResult{Stderr: "confirmation unavailable"}, err: errors.New("exit status 1")}},
+				"list":     {{result: core.LocalCommandResult{Stderr: "confirmation unavailable"}, err: errors.New("exit status 1")}},
 			}, onAction: func(action string) {
 				if action == test.cancelOn {
 					cancel()
@@ -150,20 +151,21 @@ func TestReleaseAcceptedNativeDeletionDoesNotRecordCompletion(t *testing.T) {
 
 func TestReleaseCompletedNativeDeletionRetainsWitnessUntilConfirmation(t *testing.T) {
 	_, _, claim, _ := ownedFixture(t)
-	info := commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
+	info := commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
 	runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{
-		"info": {info, info, info, info}, "stop": {{result: LocalCommandResult{}}},
+		"info": {info, info, info, info, info}, "stop": {{result: core.LocalCommandResult{}}},
 		"delete":   {deletionOutcome(testDeletionID, claim.CloudID, "box", "pending")},
 		"deletion": {deletionOutcome(testDeletionID, claim.CloudID, "box", "blocked"), deletionOutcome(testDeletionID, claim.CloudID, "box", "completed")},
-		"list":     {{result: LocalCommandResult{Stderr: "confirmation unavailable"}, err: errors.New("exit status 1")}},
+		"list":     {{result: core.LocalCommandResult{Stderr: "confirmation unavailable"}, err: errors.New("exit status 1")}},
 	}}
 	c := &client{apiKey: "box_test", apiURL: "https://ascii.dev", home: t.TempDir(), cliPath: "box", runner: runner, releasePollInterval: time.Nanosecond}
 	if err := releaseClaimedBox(context.Background(), c, claim, nil); err == nil || !strings.Contains(err.Error(), "confirmation unavailable") {
 		t.Fatalf("release err=%v, want inventory confirmation failure", err)
 	}
 	completed := assertCompletedDeletionRetained(t, claim)
-	runner.outcomes["info"] = []commandOutcome{{result: LocalCommandResult{Stderr: "box not found (404)"}, err: errors.New("exit status 1")}}
-	runner.outcomes["list"] = []commandOutcome{{result: LocalCommandResult{Stdout: `{"boxes":[]}`}}}
+	nativeExit := boxNativeExit(t)
+	runner.outcomes["info"] = []commandOutcome{{result: core.LocalCommandResult{ExitCode: 1, Stderr: "box not found (404)"}, err: nativeExit}}
+	runner.outcomes["list"] = []commandOutcome{{result: core.LocalCommandResult{Stdout: `{"boxes":[]}`}}}
 	commandCount := len(runner.commands)
 	if err := releaseClaimedBox(context.Background(), c, completed, nil); err != nil {
 		t.Fatal(err)
@@ -182,9 +184,9 @@ func TestReleaseMalformedAcceptanceDoesNotRecordOperation(t *testing.T) {
 	for _, response := range []string{`{}`, `{"operation":null}`, deletionOutcome(testDeletionID, "bx_other", "box", "pending").result.Stdout} {
 		t.Run(response, func(t *testing.T) {
 			_, _, claim, _ := ownedFixture(t)
-			info := commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
+			info := commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
 			runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{
-				"info": {info, info, info, info}, "stop": {{result: LocalCommandResult{}}}, "delete": {{result: LocalCommandResult{Stdout: response}}},
+				"info": {info, info, info, info, info}, "stop": {{result: core.LocalCommandResult{}}}, "delete": {{result: core.LocalCommandResult{Stdout: response}}},
 			}}
 			c := &client{apiKey: "box_test", apiURL: "https://ascii.dev", home: t.TempDir(), cliPath: "box", runner: runner}
 			if err := releaseClaimedBox(context.Background(), c, claim, nil); err == nil {
@@ -226,7 +228,7 @@ func TestReleasePendingReferenceRejectsChangedBinding(t *testing.T) {
 				t.Fatal("invalid reference reached provider lookup")
 				return boxDeletionOperation{}, nil
 			}
-			if _, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
+			if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
 				t.Fatal("changed pending binding authorized lookup")
 			}
 			assertClaimRetained(t, changed)
@@ -234,27 +236,31 @@ func TestReleasePendingReferenceRejectsChangedBinding(t *testing.T) {
 	}
 }
 
-func TestReleasePendingReferenceRechecksCompletionInsideFence(t *testing.T) {
+func TestReleasePendingReferenceRechecksObservableBoxInsideFence(t *testing.T) {
 	b, f, claim := pendingDeletionFixture(t)
+	lookups := 0
+	f.getHook = func(string) (boxData, error) {
+		lookups++
+		if lookups == 1 {
+			return boxData{}, &boxNotFoundError{id: "bx_1"}
+		}
+		return f.box, nil
+	}
+	f.listHook = func() ([]boxData, error) { return []boxData{}, nil }
 	reads := 0
 	f.deletionHook = func(targetID, operationID string) (boxDeletionOperation, error) {
 		reads++
-		op := boxDeletionOperation{ID: operationID, Kind: "box", TargetID: targetID, Status: "completed", CompletedAt: "2026-09-02T09:00:00Z"}
-		if reads > 1 {
-			op.Status = "blocked"
-			op.CompletedAt = ""
-		}
-		return op, nil
+		return boxDeletionOperation{ID: operationID, Kind: "box", TargetID: targetID, Status: "blocked"}, nil
 	}
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	teardown := false
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, LeaseTarget) { teardown = true }}); err == nil {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, core.LeaseTarget) { teardown = true }}); err == nil {
 		t.Fatal("earlier completion read replaced release-fence verification")
 	}
-	if reads != 2 || teardown || len(f.deletedIDs) != 0 || len(f.prepareIDs) != 0 {
+	if lookups != 3 || reads != 1 || teardown || len(f.deletedIDs) != 0 || len(f.prepareIDs) != 0 {
 		t.Fatalf("unsafe pending retry: reads=%d teardown=%t deleted=%v prepared=%v", reads, teardown, f.deletedIDs, f.prepareIDs)
 	}
 	assertClaimRetained(t, claim)
@@ -264,6 +270,7 @@ func TestReleasePendingReferenceRejectsUncertainOperation(t *testing.T) {
 	for _, failure := range []string{"operation", "target", "kind", "completion timestamp", "lookup", "canceled"} {
 		t.Run(failure, func(t *testing.T) {
 			b, f, claim := pendingDeletionFixture(t)
+			f.deleted = false
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			f.deletionHook = func(targetID, operationID string) (boxDeletionOperation, error) {
@@ -284,11 +291,7 @@ func TestReleasePendingReferenceRejectsUncertainOperation(t *testing.T) {
 				}
 				return op, nil
 			}
-			f.getHook = func(string) (boxData, error) {
-				t.Fatal("uncertain operation reached Box lookup")
-				return boxData{}, nil
-			}
-			if _, err := b.Resolve(ctx, ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
+			if _, err := b.Resolve(ctx, core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
 				t.Fatal("uncertain operation authorized cleanup")
 			}
 			assertClaimRetained(t, claim)
@@ -297,11 +300,12 @@ func TestReleasePendingReferenceRejectsUncertainOperation(t *testing.T) {
 }
 
 func TestReleasePendingDeletionSurvivesTimeoutAndRetries(t *testing.T) {
+	nativeExit := boxNativeExit(t)
 	synctest.Test(t, func(t *testing.T) {
 		b, _, claim, _ := ownedFixture(t)
-		info := commandOutcome{result: LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
+		info := commandOutcome{result: core.LocalCommandResult{Stdout: fmt.Sprintf(`{"box":{"id":%q,"createdAt":%q}}`, claim.CloudID, claim.Labels[boxCreationLabel])}}
 		runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{
-			"info": {info, info, info, info}, "stop": {{result: LocalCommandResult{}}},
+			"info": {info, info, info, info, info}, "stop": {{result: core.LocalCommandResult{}}},
 			"delete": {deletionOutcome(testDeletionID, claim.CloudID, "box", "pending")},
 		}}
 		c := &client{apiKey: "box_test", apiURL: "https://ascii.dev", home: t.TempDir(), cliPath: "box", runner: runner, releasePollInterval: time.Hour}
@@ -313,26 +317,27 @@ func TestReleasePendingDeletionSurvivesTimeoutAndRetries(t *testing.T) {
 		}
 		pending := assertPendingDeletionRetained(t, claim, testDeletionID)
 		runner.outcomes["deletion"] = []commandOutcome{deletionOutcome(testDeletionID, claim.CloudID, "box", "blocked")}
+		runner.outcomes["info"] = []commandOutcome{info, info}
 		commandCount := len(runner.commands)
-		if _, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
-			t.Fatal("blocked operation was treated as completed")
+		if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil || !strings.Contains(err.Error(), "phase=deletion-operation") || !strings.Contains(err.Error(), "last_observed_status=blocked") {
+			t.Fatalf("blocked operation lost its diagnostic or was treated as completed: %v", err)
 		}
 		assertClaimRetained(t, pending)
 		for _, command := range runner.commands[commandCount:] {
-			if strings.Contains(command, " info ") || strings.Contains(command, " list ") || strings.Contains(command, " stop ") || strings.Contains(command, " delete ") || strings.Contains(command, " ssh ") {
-				t.Fatalf("pending retry used Box lookup or mutation: %s", command)
+			if strings.Contains(command, " list ") || strings.Contains(command, " stop ") || strings.Contains(command, " delete ") || strings.Contains(command, " ssh ") {
+				t.Fatalf("pending retry used inventory or mutation: %s", command)
 			}
 		}
 		runner.outcomes["deletion"] = []commandOutcome{deletionOutcome(testDeletionID, claim.CloudID, "box", "completed"), deletionOutcome(testDeletionID, claim.CloudID, "box", "completed")}
-		notFound := commandOutcome{result: LocalCommandResult{Stderr: "box not found (404)"}, err: errors.New("exit status 1")}
-		empty := commandOutcome{result: LocalCommandResult{Stdout: `{"boxes":[]}`}}
+		notFound := commandOutcome{result: core.LocalCommandResult{ExitCode: 1, Stderr: "box not found (404)"}, err: nativeExit}
+		empty := commandOutcome{result: core.LocalCommandResult{Stdout: `{"boxes":[]}`}}
 		runner.outcomes["info"] = []commandOutcome{notFound, notFound}
 		runner.outcomes["list"] = []commandOutcome{empty, empty}
-		lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+		lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
+		if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
 			t.Fatal(err)
 		}
 		if _, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID); err != nil || exists {
@@ -347,7 +352,7 @@ func TestReleaseRejectsUnownedAndChangedClaims(t *testing.T) {
 			b, f, claim, lease := ownedFixture(t)
 			switch name {
 			case "missing snapshot":
-				lease.Server = boxToServer(testConfig(), f.box, claim.LeaseID, claim.Slug, true)
+				lease.Server = recordedBoxServer(testConfig(), f.box, claim)
 			case "wrong lease":
 				lease.LeaseID = "cbx_abcdefabcdef"
 			case "wrong cloud ID":
@@ -387,7 +392,7 @@ func TestReleaseRejectsUnownedAndChangedClaims(t *testing.T) {
 				}
 			}
 			teardown := false
-			err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, LeaseTarget) { teardown = true }})
+			err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, core.LeaseTarget) { teardown = true }})
 			if err == nil || len(f.deletedIDs) != 0 || teardown {
 				t.Fatalf("unsafe release: err=%v deleted=%v teardown=%t", err, f.deletedIDs, teardown)
 			}
@@ -399,7 +404,7 @@ func TestReleaseRejectsUnownedAndChangedClaims(t *testing.T) {
 }
 
 func TestReleaseRetainsUncertainResources(t *testing.T) {
-	for _, name := range []string{"wrong ID", "missing timestamp", "changed timestamp", "lookup 404", "lookup failure", "failed deletion", "bad confirmation", "cancelled", "replacement in inventory"} {
+	for _, name := range []string{"wrong ID", "missing timestamp", "changed timestamp", "lookup 404", "lookup 404 with failed inventory", "lookup 404 with replacement", "lookup failure", "failed deletion", "bad confirmation", "cancelled", "replacement in inventory"} {
 		t.Run(name, func(t *testing.T) {
 			b, f, claim, lease := ownedFixture(t)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -415,7 +420,15 @@ func TestReleaseRetainsUncertainResources(t *testing.T) {
 			case "changed timestamp":
 				f.box.CreatedAt = "2026-08-30T12:00:01Z"
 			case "lookup 404":
-				f.getHook = func(string) (boxData, error) { return boxData{}, fmt.Errorf("404 not found") }
+				f.getHook = func(string) (boxData, error) { return boxData{}, &boxNotFoundError{id: "bx_1"} }
+			case "lookup 404 with failed inventory":
+				f.getHook = func(string) (boxData, error) { return boxData{}, &boxNotFoundError{id: "bx_1"} }
+				f.listHook = func() ([]boxData, error) { return nil, fmt.Errorf("partial inventory") }
+			case "lookup 404 with replacement":
+				f.getHook = func(string) (boxData, error) { return boxData{}, &boxNotFoundError{id: "bx_1"} }
+				replacement := f.box
+				replacement.CreatedAt = "2026-08-30T12:00:01Z"
+				f.listHook = func() ([]boxData, error) { return []boxData{replacement}, nil }
 			case "lookup failure":
 				f.getHook = func(string) (boxData, error) { return boxData{}, fmt.Errorf("network unavailable") }
 			case "failed deletion":
@@ -432,7 +445,7 @@ func TestReleaseRetainsUncertainResources(t *testing.T) {
 			case "cancelled":
 				cancel()
 			}
-			err := b.ReleaseLease(ctx, ReleaseLeaseRequest{Lease: lease})
+			err := b.ReleaseLease(ctx, core.ReleaseLeaseRequest{Lease: lease})
 			if err == nil || (len(f.deletedIDs) > 0) != wantDelete {
 				t.Fatalf("release err=%v deleted=%v", err, f.deletedIDs)
 			}
@@ -445,37 +458,40 @@ func TestReleaseRetainsUncertainResources(t *testing.T) {
 	}
 }
 
-func TestReleaseRetainsAbsentBoxWithoutCompletedDeletion(t *testing.T) {
-	b, f, claim, lease := ownedFixture(t)
-	f.getHook = func(string) (boxData, error) { return boxData{}, fmt.Errorf("404 not found") }
+func TestReleaseReconcilesAbsentBoxWithCompleteInventory(t *testing.T) {
+	b, f, claim, _ := ownedFixture(t)
+	f.getHook = func(string) (boxData, error) { return boxData{}, &boxNotFoundError{id: "bx_1"} }
 	f.listHook = func() ([]boxData, error) { return []boxData{}, nil }
 
-	if _, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
-		t.Fatal("release-only resolution accepted absence without deletion completion")
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
-		t.Fatal("release accepted absence without deletion completion")
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
 	}
 	if len(f.deletedIDs) != 0 {
-		t.Fatalf("deleted=%v, want no unverified native deletion", f.deletedIDs)
+		t.Fatalf("deleted=%v, want claim-only reconciliation", f.deletedIDs)
 	}
-	assertClaimRetained(t, claim)
+	if _, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID); err != nil || exists {
+		t.Fatalf("claim remains after complete absence confirmation: exists=%t err=%v", exists, err)
+	}
 }
 
 func TestReleaseRejectsCancellationDuringAbsenceCheck(t *testing.T) {
 	b, f, claim := completedDeletionFixture(t)
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f.getHook = func(string) (boxData, error) { return boxData{}, fmt.Errorf("404 not found") }
+	f.getHook = func(string) (boxData, error) { return boxData{}, &boxNotFoundError{id: "bx_1"} }
 	f.listHook = func() ([]boxData, error) {
 		cancel()
 		return []boxData{}, nil
 	}
-	if err := b.ReleaseLease(ctx, ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, context.Canceled) {
+	if err := b.ReleaseLease(ctx, core.ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "phase=inventory-confirmation") {
 		t.Fatalf("release err=%v, want cancellation", err)
 	}
 	assertClaimRetained(t, claim)
@@ -483,12 +499,12 @@ func TestReleaseRejectsCancellationDuringAbsenceCheck(t *testing.T) {
 
 func TestReleaseRetriesCompletedDeletionAfterConfirmationFailure(t *testing.T) {
 	b, f, claim := completedDeletionFixture(t)
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	teardown := false
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, LeaseTarget) {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, core.LeaseTarget) {
 		teardown = true
 	}}); err != nil {
 		t.Fatal(err)
@@ -502,27 +518,34 @@ func TestReleaseRetriesCompletedDeletionAfterConfirmationFailure(t *testing.T) {
 }
 
 func TestReleaseRecordsCompletionWhenConfirmationCanceled(t *testing.T) {
-	b, f, claim, lease := ownedFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	f.listHook = func() ([]boxData, error) {
-		cancel()
-		return []boxData{}, nil
-	}
-	if err := b.ReleaseLease(ctx, ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("release err=%v, want canceled confirmation", err)
-	}
-	assertCompletedDeletionRetained(t, claim)
-	f.listHook = nil
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.deletedIDs) != 1 {
-		t.Fatalf("retry duplicated native deletion: %v", f.deletedIDs)
+	for _, failedResponse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failed-response=%t", failedResponse), func(t *testing.T) {
+			b, f, claim, lease := ownedFixture(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f.listHook = func() ([]boxData, error) {
+				cancel()
+				if failedResponse {
+					return nil, errors.New("native inventory call failed after cancellation")
+				}
+				return []boxData{}, nil
+			}
+			if err := b.ReleaseLease(ctx, core.ReleaseLeaseRequest{Lease: lease}); !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "phase=inventory-confirmation") {
+				t.Fatalf("release err=%v, want canceled confirmation", err)
+			}
+			assertCompletedDeletionRetained(t, claim)
+			f.listHook = nil
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.deletedIDs) != 1 {
+				t.Fatalf("retry duplicated native deletion: %v", f.deletedIDs)
+			}
+		})
 	}
 }
 
@@ -530,7 +553,7 @@ func TestReleaseRejectsChangedCompletionWitness(t *testing.T) {
 	for _, name := range []string{"missing", "corrupt", "legacy digest", "owner", "resource", "creation", "scope", "revision"} {
 		t.Run(name, func(t *testing.T) {
 			b, f, claim := completedDeletionFixture(t)
-			lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -570,11 +593,11 @@ func TestReleaseRejectsChangedCompletionWitness(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
+			if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err == nil {
 				t.Fatal("stale release snapshot accepted replacement claim")
 			}
-			if name != "revision" {
-				if _, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
+			if name != "missing" && name != "revision" {
+				if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true}); err == nil {
 					t.Fatal("changed claim retained deletion authority")
 				}
 			}
@@ -590,7 +613,7 @@ func TestReleaseCompletedWitnessRetainsUncertainResource(t *testing.T) {
 	for _, name := range []string{"lookup failure", "observed Box", "incomplete inventory", "matching inventory", "replacement inventory"} {
 		t.Run(name, func(t *testing.T) {
 			b, f, claim := completedDeletionFixture(t)
-			lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -608,7 +631,7 @@ func TestReleaseCompletedWitnessRetainsUncertainResource(t *testing.T) {
 				replacement.CreatedAt = "2026-08-30T12:00:01Z"
 				f.listHook = func() ([]boxData, error) { return []boxData{replacement}, nil }
 			}
-			if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
+			if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err == nil {
 				t.Fatal("uncertain resource finalized")
 			}
 			assertClaimRetained(t, claim)
@@ -619,20 +642,47 @@ func TestReleaseCompletedWitnessRetainsUncertainResource(t *testing.T) {
 	}
 }
 
-func TestReleaseRetainsHiddenPendingDeletion(t *testing.T) {
+func TestReleaseReconcilesHiddenPendingDeletionAfterCompleteAbsence(t *testing.T) {
 	b, f, claim, lease := ownedFixture(t)
 	f.releaseHook = func(string) error {
 		f.deleted = true
 		return errors.New("deletion operation is pending")
 	}
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err == nil {
 		t.Fatal("pending native deletion succeeded")
 	}
 	assertClaimRetained(t, claim)
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
-		t.Fatal("hidden pending deletion was mistaken for completed deletion")
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
 	}
-	assertClaimRetained(t, claim)
+	if len(f.deletedIDs) != 0 {
+		t.Fatalf("claim reconciliation repeated native deletion: %v", f.deletedIDs)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID); err != nil || exists {
+		t.Fatalf("claim remains after complete absence confirmation: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestReleaseReconcilesAbsentBoxWithoutReadingStaleOperation(t *testing.T) {
+	b, f, claim := pendingDeletionFixture(t)
+	f.deletionHook = func(string, string) (boxDeletionOperation, error) {
+		t.Fatal("complete absence reached stale deletion operation")
+		return boxDeletionOperation{}, nil
+	}
+
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.deletedIDs) != 0 {
+		t.Fatalf("claim reconciliation repeated native deletion: %v", f.deletedIDs)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID); err != nil || exists {
+		t.Fatalf("claim remains after complete absence confirmation: exists=%t err=%v", exists, err)
+	}
 }
 
 func TestBoxNotFoundRejectsIdentityErrors(t *testing.T) {
@@ -650,7 +700,7 @@ func TestResolveRequiresExactClaimAndRepositoryOwner(t *testing.T) {
 	for _, name := range []string{"legacy", "foreign endpoint", "foreign organization", "other repository", "missing creation", "creation changed"} {
 		t.Run(name, func(t *testing.T) {
 			b, f, claim, _ := ownedFixture(t)
-			req := ResolveRequest{ID: claim.CloudID, Repo: core.Repo{Root: claim.RepoRoot}}
+			req := core.ResolveRequest{ID: claim.CloudID, Repo: core.Repo{Root: claim.RepoRoot}}
 			switch name {
 			case "foreign endpoint":
 				b.cfg.AsciiBox.BaseURL = "https://other.example"
@@ -699,7 +749,7 @@ func TestLegacyStatusRemainsReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: claim.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: claim.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
 	if err != nil || lease.Server.CloudID != f.box.ID {
 		t.Fatalf("status: err=%v", err)
 	}
@@ -707,7 +757,7 @@ func TestLegacyStatusRemainsReadOnly(t *testing.T) {
 		t.Fatal("status prepared SSH")
 	}
 	assertClaimRetained(t, claim)
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err == nil {
 		t.Fatal("status manufactured cleanup authority")
 	}
 }
@@ -720,7 +770,7 @@ func TestAcquirePublishesBeforeSSHAndRollsBackAfterCancellation(t *testing.T) {
 			withFakeAPI(t, f)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			var observed LeaseClaim
+			var observed core.LeaseClaim
 			f.prepareHook = func(string) error {
 				claims, err := core.ListLeaseClaims()
 				if err != nil || len(claims) != 1 {
@@ -734,7 +784,7 @@ func TestAcquirePublishesBeforeSSHAndRollsBackAfterCancellation(t *testing.T) {
 				return errors.New("SSH setup failed")
 			}
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			_, err := b.Acquire(ctx, AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, Keep: keep})
+			_, err := b.Acquire(ctx, core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, Keep: keep})
 			if err == nil {
 				t.Fatal("setup succeeded")
 			}
@@ -765,7 +815,7 @@ func TestAcquireRollbackRetainsDeletionEvidence(t *testing.T) {
 			withFakeAPI(t, f)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			var published LeaseClaim
+			var published core.LeaseClaim
 			f.prepareHook = func(string) error {
 				claims, err := core.ListLeaseClaims()
 				if err != nil || len(claims) != 1 {
@@ -788,32 +838,34 @@ func TestAcquireRollbackRetainsDeletionEvidence(t *testing.T) {
 				f.listHook = func() ([]boxData, error) { return nil, errors.New("rollback inventory unavailable") }
 			}
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			if _, err := b.Acquire(ctx, AcquireRequest{Repo: core.Repo{Root: t.TempDir()}}); err == nil {
+			if _, err := b.Acquire(ctx, core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}}); err == nil {
 				t.Fatal("failed SSH setup succeeded")
 			}
-			var retained LeaseClaim
+			var retained core.LeaseClaim
 			if completion == "pending" {
 				retained = assertPendingDeletionRetained(t, published, testDeletionID)
+				f.deleted = false
 				f.deletionHook = func(targetID, operationID string) (boxDeletionOperation, error) {
 					return boxDeletionOperation{ID: operationID, Kind: "box", TargetID: targetID, Status: "blocked"}, nil
 				}
-				if _, err := b.Resolve(context.Background(), ResolveRequest{ID: retained.LeaseID, ReleaseOnly: true}); err == nil {
+				if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: retained.LeaseID, ReleaseOnly: true}); err == nil {
 					t.Fatal("blocked rollback operation authorized cleanup")
 				}
 				assertClaimRetained(t, retained)
 				f.deletionHook = func(targetID, operationID string) (boxDeletionOperation, error) {
 					return boxDeletionOperation{ID: operationID, Kind: "box", TargetID: targetID, Status: "completed", CompletedAt: "2026-09-02T09:00:00Z"}, nil
 				}
+				f.deleted = true
 			} else {
 				retained = assertCompletedDeletionRetained(t, published)
 			}
 			f.listHook = nil
-			lease, err := b.Resolve(context.Background(), ResolveRequest{ID: retained.LeaseID, ReleaseOnly: true})
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: retained.LeaseID, ReleaseOnly: true})
 			if err != nil {
 				t.Fatal(err)
 			}
 			teardown := false
-			if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, LeaseTarget) { teardown = true }}); err != nil {
+			if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(context.Context, core.LeaseTarget) { teardown = true }}); err != nil {
 				t.Fatal(err)
 			}
 			if _, exists, err := core.ReadLeaseClaimWithPresence(retained.LeaseID); err != nil || exists {
@@ -901,7 +953,7 @@ func TestReleaseRevalidatesEveryMutation(t *testing.T) {
 	for _, blocked := range []int{1, 2, 3, 4} {
 		t.Run(fmt.Sprint(blocked), func(t *testing.T) {
 			runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{
-				"stop": {snapshotGuardOutcome()}, "delete": {snapshotGuardOutcome(), deletionOutcome(testDeletionID, "bx_guard", "box", "completed")}, "extend": {{result: LocalCommandResult{}}}, "info": {{result: LocalCommandResult{Stdout: `{"box":{"id":"bx_guard","state":"stopped"}}`}}},
+				"stop": {snapshotGuardOutcome()}, "delete": {snapshotGuardOutcome(), deletionOutcome(testDeletionID, "bx_guard", "box", "completed")}, "extend": {{result: core.LocalCommandResult{}}}, "info": {{result: core.LocalCommandResult{Stdout: `{"box":{"id":"bx_guard","state":"stopped"}}`}}},
 			}}
 			c := &client{apiKey: "box_test", apiURL: "https://ascii.dev", home: t.TempDir(), cliPath: "box", runner: runner, releasePollInterval: time.Nanosecond}
 			calls := 0
@@ -934,10 +986,13 @@ func TestCleanupTeardownUsesVerifiedTarget(t *testing.T) {
 		t.Fatal("teardown must run inside ownership fence")
 	}
 	called := false
-	err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(ctx context.Context, got LeaseTarget) {
+	err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease, GuardedRemoteCleanup: func(ctx context.Context, got core.LeaseTarget) {
 		called = true
 		if got.Server.CloudID != claim.CloudID || got.SSH.Host != boxHost(f.box) || ctx.Err() != nil {
 			t.Fatal("wrong teardown target")
+		}
+		if filepath.Base(filepath.Dir(got.SSH.KnownHostsFile)) != claim.LeaseID || got.SSH.Key != boxSSHKey(testConfig()) {
+			t.Fatalf("teardown lost lease host trust or native key: %+v", got.SSH)
 		}
 	}})
 	if err != nil || !called || !f.deleted {
@@ -959,7 +1014,7 @@ func TestEndpointRefreshCannotRetargetOwnership(t *testing.T) {
 			t.Fatalf("accepted changed %s", key)
 		}
 	}
-	server := boxToServer(testConfig(), f.box, claim.LeaseID, claim.Slug, true)
+	server := recordedBoxServer(testConfig(), f.box, claim)
 	delete(server.Labels, boxCreationLabel)
 	updated, err := (Provider{}).PrepareLeaseClaimEndpoint(claim, providerName, claim.Slug, server, false)
 	if err != nil || updated.Labels[boxCreationLabel] != claim.Labels[boxCreationLabel] {
@@ -980,7 +1035,7 @@ func TestEndpointRefreshCannotRetargetOwnership(t *testing.T) {
 
 	t.Run("accepted deletion", func(t *testing.T) {
 		_, f, pending := pendingDeletionFixture(t)
-		server := boxToServer(testConfig(), f.box, pending.LeaseID, pending.Slug, true)
+		server := recordedBoxServer(testConfig(), f.box, pending)
 		updated, err := (Provider{}).PrepareLeaseClaimEndpoint(pending, providerName, pending.Slug, server, false)
 		for _, key := range []string{boxDeletionOperationLabel, boxDeletionOperationBindingLabel} {
 			if err != nil || updated.Labels[key] != pending.Labels[key] {
@@ -996,7 +1051,7 @@ func TestEndpointRefreshCannotRetargetOwnership(t *testing.T) {
 
 	t.Run("completed deletion", func(t *testing.T) {
 		_, f, completed := completedDeletionFixture(t)
-		server := boxToServer(testConfig(), f.box, completed.LeaseID, completed.Slug, true)
+		server := recordedBoxServer(testConfig(), f.box, completed)
 		updated, err := (Provider{}).PrepareLeaseClaimEndpoint(completed, providerName, completed.Slug, server, false)
 		if err != nil || updated.Labels[boxDeletionLabel] != completed.Labels[boxDeletionLabel] {
 			t.Fatalf("refresh lost completed deletion witness: %v", err)
@@ -1016,7 +1071,7 @@ func TestAcquirePreservesUnconfirmedCreateFailureDiagnostic(t *testing.T) {
 	f := &fakeAPI{createErr: errors.New("native quota exhausted (429)")}
 	withFakeAPI(t, f)
 	b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-	_, err := b.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
+	_, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
 	if err == nil {
 		t.Fatal("failed creation succeeded")
 	}
@@ -1056,8 +1111,8 @@ func TestAcquireCallbackFailureUsesOriginalClaim(t *testing.T) {
 			withFakeAPI(t, f)
 			stubSSHWait(t)
 			b := NewBackend(Provider{}.Spec(), testConfig(), testRuntime()).(*backend)
-			var expected LeaseClaim
-			_, err := b.Acquire(context.Background(), AcquireRequest{Keep: mode == "keep", Repo: core.Repo{Root: t.TempDir()}, OnAcquired: func(lease LeaseTarget) error {
+			var expected core.LeaseClaim
+			_, err := b.Acquire(context.Background(), core.AcquireRequest{Keep: mode == "keep", Repo: core.Repo{Root: t.TempDir()}, OnAcquired: func(lease core.LeaseTarget) error {
 				claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
 				if err != nil || !exists {
 					t.Fatal("callback before publication")
@@ -1093,7 +1148,7 @@ func TestAcquireCallbackFailureUsesOriginalClaim(t *testing.T) {
 func TestClientInfoAllowsReadOnlyAliasesButPinsConcreteRequests(t *testing.T) {
 	for _, id := range []string{"current", "self", "friendly-name", "bx_original"} {
 		t.Run(id, func(t *testing.T) {
-			runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{"info": {{result: LocalCommandResult{Stdout: `{"box":{"id":"bx_resolved"}}`}}}}}
+			runner := &releaseCommandRunner{configPath: t.TempDir() + "/config.json", outcomes: map[string][]commandOutcome{"info": {{result: core.LocalCommandResult{Stdout: `{"box":{"id":"bx_resolved"}}`}}}}}
 			c := &client{apiKey: "box_test", apiURL: "https://ascii.dev", home: t.TempDir(), cliPath: "box", runner: runner}
 			box, err := c.GetBox(context.Background(), id)
 			if concreteBoxID(id) {

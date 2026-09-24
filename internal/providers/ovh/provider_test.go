@@ -55,9 +55,26 @@ func TestProviderFlagsApplyNonSecretConfig(t *testing.T) {
 }
 
 func TestProviderServerTypeForConfig(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  core.Config
+		want string
+	}{
+		{name: "unsupported target", cfg: core.Config{Class: "standard", TargetOS: core.TargetWindows}},
+		{name: "unsupported architecture", cfg: core.Config{Class: "standard", TargetOS: core.TargetLinux, Architecture: core.ArchitectureARM64}},
+		{name: "legacy input", cfg: core.Config{Class: " STANDARD "}, want: "b3-8"},
+		{name: "native flavor preserves spelling", cfg: core.Config{Class: "standard", TargetOS: core.TargetWindows, OVH: core.OVHConfig{Flavor: " native-flavor "}}, want: " native-flavor "},
+		{name: "explicit type precedes native", cfg: core.Config{Class: "standard", TargetOS: core.TargetWindows, ServerTypeExplicit: true, ServerType: " custom-type ", OVH: core.OVHConfig{Flavor: "native-flavor"}}, want: " custom-type "},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := (Provider{}).ServerTypeForConfig(test.cfg); got != test.want {
+				t.Fatalf("type=%q want=%q", got, test.want)
+			}
+		})
+	}
 	provider := Provider{}
-	if got := provider.ServerTypeForClass("standard"); got != "b3-8" {
-		t.Fatalf("ServerTypeForClass standard=%q", got)
+	if got := provider.ServerTypeForConfig(core.Config{Class: "standard"}); got != "b3-8" {
+		t.Fatalf("ServerTypeForConfig standard=%q", got)
 	}
 	if got := provider.ServerTypeForConfig(core.Config{ServerType: "b3-16", ServerTypeExplicit: true, OVH: core.OVHConfig{Flavor: "b3-8"}}); got != "b3-16" {
 		t.Fatalf("explicit ServerTypeForConfig=%q", got)
@@ -140,7 +157,7 @@ func TestOVHBindingEndpointAndClassContract(t *testing.T) {
 		}
 	}
 	p := Provider{}
-	if p.ServerTypeForClass("standard") != "b3-8" || p.ServerTypeForClass("unknown-class") != "b3-8" {
+	if p.ServerTypeForConfig(core.Config{Class: "standard"}) != "b3-8" || p.ServerTypeForConfig(core.Config{Class: "unknown-class"}) != "b3-8" {
 		t.Fatal("fixed class policy changed")
 	}
 	for _, tc := range []struct {

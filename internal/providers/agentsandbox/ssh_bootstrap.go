@@ -50,24 +50,27 @@ type sshInitializationRequest struct {
 	PublicKey string `json:"public_key"`
 }
 
-func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim LeaseClaim) (LeaseClaim, error) {
+func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready sandboxReadiness, claim core.LeaseClaim) (core.LeaseClaim, error) {
 	if err := closeClaimSSHMasters(ctx, claim); err != nil {
-		return LeaseClaim{}, fmt.Errorf("close previous SSH transport before recovery: %w", err)
+		return core.LeaseClaim{}, fmt.Errorf("close previous SSH transport before recovery: %w", err)
 	}
 	_, publicKey, err := core.EnsureTestboxKey(claim.LeaseID)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	request, err := sshInitializationInput(claim.LeaseID, publicKey)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
-	execCtx, cancel := b.execContext(ctx)
+	execCtx, cancel, err := b.execContext(ctx)
+	if err != nil {
+		return core.LeaseClaim{}, err
+	}
 	defer cancel()
 	var info sshBootstrapInfo
 	for attempt := 0; ; attempt++ {
 		if ready.ContainerID == "" {
-			return LeaseClaim{}, fmt.Errorf("%w: agent-sandbox-ssh pod %s has no running container identity", errNotReady, ready.PodName)
+			return core.LeaseClaim{}, fmt.Errorf("%w: agent-sandbox-ssh pod %s has no running container identity", errNotReady, ready.PodName)
 		}
 		info, err = b.initializeSSH(execCtx, client, ready, request)
 		if err == nil {
@@ -77,13 +80,13 @@ func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready
 			break
 		}
 		if attempt == 2 || execCtx.Err() != nil {
-			return LeaseClaim{}, err
+			return core.LeaseClaim{}, err
 		}
 		// Retry only an endpoint replacement authenticated under the same
 		// immutable claim. Never replay a workload or accept an SSH-presented key.
 		current, checkErr := b.waitForClaimReadiness(execCtx, client, ready.ClaimName, ready.identity)
 		if checkErr != nil || sameSSHRuntime(ready, current) {
-			return LeaseClaim{}, errors.Join(err, checkErr)
+			return core.LeaseClaim{}, errors.Join(err, checkErr)
 		}
 		ready = current
 	}
@@ -94,16 +97,16 @@ func (b *backend) prepareSSH(ctx context.Context, client kubernetesClient, ready
 	labels[claimLabelSSHSandboxUID] = ready.SandboxUID
 	labels[claimLabelSSHPodUID] = ready.PodUID
 	labels[claimLabelSSHContainerID] = ready.ContainerID
-	updated, err := updateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+	updated, err := core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
 	if err != nil {
-		return LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh publish SSH identity: %w", err)
+		return core.LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh publish SSH identity: %w", err)
 	}
 	target, err := b.sshTarget(updated)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	if err := core.PrepareLeaseSSHTrust(&target, claim.LeaseID); err != nil {
-		return LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh prepare pinned host trust: %w", err)
+		return core.LeaseClaim{}, fmt.Errorf("agent-sandbox-ssh prepare pinned host trust: %w", err)
 	}
 	return updated, nil
 }
@@ -112,7 +115,7 @@ func sameSSHRuntime(a, b sandboxReadiness) bool {
 	return a.SandboxUID == b.SandboxUID && a.PodUID == b.PodUID && a.Container == b.Container && a.ContainerID == b.ContainerID
 }
 
-func validateSSHRuntime(claim LeaseClaim, ready sandboxReadiness) error {
+func validateSSHRuntime(claim core.LeaseClaim, ready sandboxReadiness) error {
 	if ready.ContainerID == "" || claim.Labels[claimLabelSSHSandboxUID] != ready.SandboxUID || claim.Labels[claimLabelSSHPodUID] != ready.PodUID || claim.Labels[claimLabelSSHContainerID] != ready.ContainerID {
 		return fmt.Errorf("agent-sandbox-ssh lease %s endpoint is unverified or its container changed; prepare the lease again through Kubernetes", claim.LeaseID)
 	}
@@ -158,8 +161,8 @@ func (b *backend) initializeSSH(ctx context.Context, client kubernetesClient, re
 	path := dir + "/initialize"
 	// mkdir must create a new private directory. Never follow or reuse a path
 	// supplied by the image, even if it is a dangling symlink.
-	remove := "rm -f " + shellQuote(path) + " && rmdir " + shellQuote(dir)
-	upload := "set -eu; umask 077; mkdir " + shellQuote(dir) + "; trap " + shellQuote(remove) + " 0; cat > " + shellQuote(path) + "; chmod 700 " + shellQuote(path) + "; trap - 0"
+	remove := "rm -f " + core.ShellQuote(path) + " && rmdir " + core.ShellQuote(dir)
+	upload := "set -eu; umask 077; mkdir " + core.ShellQuote(dir) + "; trap " + core.ShellQuote(remove) + " 0; cat > " + core.ShellQuote(path) + "; chmod 700 " + core.ShellQuote(path) + "; trap - 0"
 	if err := b.execPod(ctx, client, ready, podExecRequest{
 		Command: []string{"sh", "-c", upload}, Stdin: payload, Stdout: io.Discard, Stderr: b.rt.Stderr,
 	}); err != nil {

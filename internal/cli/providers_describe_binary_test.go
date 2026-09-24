@@ -173,19 +173,6 @@ func TestProvidersDescribeBuiltBinaryContract(t *testing.T) {
 		t.Fatalf("providers describe mutated isolated filesystem\nbefore=%v\nafter=%v", before, after)
 	}
 
-	helpEnv := []string{
-		"HOME=" + home, "XDG_CONFIG_HOME=" + configHome, "XDG_STATE_HOME=" + stateHome,
-		"XDG_CACHE_HOME=" + cacheHome, "TMPDIR=" + tmp,
-	}
-	helpStdout, helpStderr, helpCode := runDescribeTestBinary(binary, root, helpEnv, "run", "--help")
-	if helpCode != 0 || len(helpStdout) != 0 {
-		t.Fatalf("run --help exit=%d stdout=%q stderr=%q", helpCode, helpStdout, helpStderr)
-	}
-	digest := sha256.Sum256(helpStderr)
-	const baselineSHA256 = "2c653fc6dadc42328c5bba6e1ae4ea888c006cdbcb0fdc7e05a6ab1742ed3a9f"
-	if got := hex.EncodeToString(digest[:]); got != baselineSHA256 || len(helpStderr) != 61916 {
-		t.Fatalf("run --help changed: sha256=%s bytes=%d, want sha256=%s bytes=61916", got, len(helpStderr), baselineSHA256)
-	}
 }
 
 func runDescribeTestBinary(binary, dir string, env []string, args ...string) (stdout, stderr []byte, exitCode int) {

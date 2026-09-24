@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -83,7 +84,7 @@ func TestCoordinatorFreshWindowsBootstrapTargets(t *testing.T) {
 					t.Fatalf("bootstrap lost authoritative host-key pin: %q, %v", pin, err)
 				}
 				// Resolution for subsequent commands still uses the strict selector.
-				reused, err := backend.coordinatorLeaseTargetForConfig(lease, cfg, nil)
+				reused, err := backend.coordinatorLeaseTargetForConfig(lease, cfg, nil, false)
 				if err != nil || reused.SSH.Port != workload.SSH.Port || !slices.Equal(reused.SSH.FallbackPorts, workload.SSH.FallbackPorts) || reused.SSH.User != lease.SSHUser {
 					t.Fatalf("reuse changed its port or user contract: %+v, %v", reused.SSH, err)
 				}
@@ -116,7 +117,7 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 		t.Skip("fake SSH executable requires a POSIX shell")
 	}
 	for _, mode := range []string{windowsModeNormal, windowsModeWSL2} {
-		t.Run(mode, func(t *testing.T) {
+		run := func(t *testing.T) {
 			cfg, lease := freshWindowsBootstrapFixture(t, mode, "2222")
 			backend := &coordinatorLeaseBackend{cfg: cfg}
 			workload, initial, err := backend.prepareCoordinatorLeaseAcquisition(lease, cfg)
@@ -165,7 +166,7 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 				t.Fatalf("bootstrap did not transition from 22 to pinned 2222:\n%s", calls)
 			}
 			payload, err := os.ReadFile(filepath.Join(logDir, "bootstrap.ps1"))
-			if err != nil || string(payload) != windowsBootstrapPowerShell(cfg, "ssh-ed25519 fixture") {
+			if err != nil || string(payload) != WindowsBootstrapPowerShell(cfg, "ssh-ed25519 fixture") {
 				t.Fatalf("bootstrap did not receive the configured final-port script: %v", err)
 			}
 			if mode == windowsModeNormal {
@@ -174,7 +175,7 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 				}
 				t.Setenv("CRABBOX_TEST_WINDOWS_REQUIRE_FRESH", "")
 				t.Setenv("CRABBOX_TEST_WINDOWS_WORKLOAD_FAIL", "1")
-				err := runSSHInput(ctx, workload.SSH, powershellCommand("exit 73"), nil, io.Discard, io.Discard)
+				err := runSSHInput(ctx, workload.SSH, PowershellCommand("exit 73"), nil, io.Discard, io.Discard)
 				var exitErr *exec.ExitError
 				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 73 {
 					t.Fatalf("fake workload failure was lost: %v", err)
@@ -184,7 +185,10 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 					t.Fatalf("failed workload replayed or tried another port: %s, %v", after, readErr)
 				}
 			}
-		})
+		}
+		// Keep the real SSH delivery and all three stability probes, but advance
+		// the two ten-second settling intervals on the virtual test clock.
+		t.Run(mode, func(t *testing.T) { synctest.Test(t, run) })
 	}
 }
 

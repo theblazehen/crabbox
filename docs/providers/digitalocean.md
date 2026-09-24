@@ -146,6 +146,19 @@ explicit VPC. Do not broaden scopes inside scripts.
 7. Delete the Droplet and managed SSH key on `stop`; `cleanup` deletes only
    resources authorized by the exact revisioned account- and Droplet-bound
    local claim. The Droplet is deleted before a provider-managed SSH key.
+   Acquisition rollback uses the same order: a failed Droplet deletion retains
+   its managed SSH key, local credentials, and cleanup claim for a later retry.
+
+When rollback fails, the original acquisition error and cleanup errors remain
+inspectable, and the original exit code keeps precedence. Crabbox reports the
+cleanup failure and does not automatically retry that failed acquisition with
+a fresh allocation. A successful rollback still permits the existing bootstrap
+retry behavior.
+
+The public-IP wait bounds both API reads and polling delays. Its own timeout
+retains exit code 5 and the existing timeout message while preserving deadline
+identity. Caller cancellation retains its original cause and diagnostic, including
+when it interrupts a lookup; completed provider responses keep precedence.
 
 If Droplet creation returns an indeterminate transport or server failure,
 Crabbox retains the SSH credentials and records a pending local recovery claim.
@@ -154,6 +167,30 @@ deletes a late-created Droplet when DigitalOcean exposes it. Empty inventory is
 not treated as proof that creation failed: while the outcome remains
 indeterminate, Crabbox retains the claim and credentials and asks the operator
 to retry rather than risk orphaning a billed Droplet without its SSH key.
+
+Heartbeat reads the current idle policy from the Droplet's remote tags. Ordinary
+touches preserve that policy even when local configuration differs; only an
+explicit `heartbeat --idle-timeout` changes it. A lease without a stored policy
+uses the configured fallback. The creation-based TTL still caps expiry, and a
+failed tag update is reported as a failure rather than a successful heartbeat.
+
+## Fixed operation IDs
+
+Direct leases accept `warmup --provider digitalocean --lease-id cbx_<12 lowercase hex>`.
+Repeating the same command recovers the same Droplet, including after a lost
+create reply or readiness failure. The durable local intent binds the API
+account, create inputs, per-lease SSH key, allocation nonce, and observed
+Droplet ID. Changed inputs, account changes, and replacement Droplets are
+rejected. No coordinator is needed.
+
+DigitalOcean has no create idempotency key: Crabbox records admission before
+the POST and never repeats it on replay. An unresolved attempt retains its
+claim and key, even when inventory is empty. Retry later when the original
+Droplet becomes visible. `stop` uses the existing account-, Droplet-, and
+SSH-key-bound cleanup checks. Successful cleanup retains a terminal tombstone,
+so a released ID cannot allocate another Droplet. Preserve the local state
+directory across invocations; fixed-ID resources cannot be reclaimed without
+their original create intent.
 
 ## Ownership And Cleanup
 

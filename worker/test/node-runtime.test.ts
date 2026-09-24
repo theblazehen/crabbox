@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket as NodeWebSocket } from "ws";
 
+import { AsyncMutex } from "../src/async-mutex";
 import { routeCoordinatorRequest } from "../src/coordinator-entry";
 import type { CoordinatorStorageView } from "../src/coordinator-runtime";
 import { FleetCoordinator } from "../src/fleet";
@@ -61,7 +62,7 @@ vi.mock("../node/postgres-storage", () => ({
 }));
 
 import { NodeCoordinatorRuntime } from "../node/node-runtime";
-import { AsyncMutex, fleetRequestQueue } from "../node/server-support";
+import { fleetRequestQueue } from "../node/server-support";
 
 describe("NodeCoordinatorRuntime", () => {
   beforeEach(() => {
@@ -495,11 +496,17 @@ describe("NodeCoordinatorRuntime", () => {
 
       runtime.beginShutdown();
       expect(close).toHaveBeenCalledOnce();
+      const maintenanceDone = deferred<void>();
+      runtime.ownMaintenance(maintenanceDone.promise);
       const stopped = runtime.stop();
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(mocks.boss.stop).not.toHaveBeenCalled();
       expect(mocks.storage.close).not.toHaveBeenCalled();
       messageDone.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(mocks.boss.stop).not.toHaveBeenCalled();
+      expect(mocks.storage.close).not.toHaveBeenCalled();
+      maintenanceDone.resolve();
       await stopped;
       await mutex.drain();
 

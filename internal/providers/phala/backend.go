@@ -19,6 +19,14 @@ import (
 
 const providerName = "phala"
 
+type leaseAccessMode uint8
+
+const (
+	leaseAccessNone leaseAccessMode = iota
+	leaseAccessPrepare
+	leaseAccessObserve
+)
+
 // defaultComposeYAML is the Compose file crabbox supplies when the lease has no
 // configured compose. The Phala CLI v1.1.19 deploy handler refuses to provision
 // a CVM in non-interactive mode without a Compose file, so a confidential
@@ -39,14 +47,14 @@ const phalaListPageSize = 100
 
 // defaultInstanceType is the smallest confidential TDX shape Phala Cloud
 // advertises. dstack provisions Intel TDX CVMs; tdx.small is the cheapest.
-const defaultInstanceType = "tdx.small"
+const defaultInstanceType = core.PhalaConfigDefaultInstanceType
 
 // defaultWorkRoot is the remote crabbox work root on a leased CVM. The dstack
 // --dev-os guest mounts its root as a read-only squashfs, so the work root must
 // live on a writable mount; /var/volatile is a writable tmpfs present on every
 // dstack guest. The earlier /work/crabbox default sat on the read-only root and
 // failed live at "write sync manifests: exit status 1" (the manifest mkdir).
-const defaultWorkRoot = "/var/volatile/crabbox"
+const defaultWorkRoot = core.PhalaConfigDefaultWorkRoot
 
 // crabboxCVMNamePrefix marks Phala CVMs created by crabbox. Phala's deploy CLI
 // has no arbitrary label facility, so ownership is carried by the CVM name and
@@ -132,7 +140,7 @@ func (i *instance) UnmarshalJSON(data []byte) error {
 // app_id is preferred (confirmed working against live `cvms get/delete
 // --cvm-id`); vm_uuid, instance_id, and name are accepted fallbacks.
 func (i instance) cloudID() string {
-	return firstNonBlank(i.AppID, i.VMUUID, i.ID, i.InstanceID, i.Name)
+	return shared.FirstNonBlankTrimmed(i.AppID, i.VMUUID, i.ID, i.InstanceID, i.Name)
 }
 
 // matchesID reports whether identifier names this CVM under any of the handles
@@ -209,7 +217,7 @@ func applyDefaults(cfg *core.Config) {
 	cfg.SSHPort = "22"
 	cfg.SSHFallbackPorts = nil
 	if cfg.Phala.CLIPath == "" {
-		cfg.Phala.CLIPath = "phala"
+		cfg.Phala.CLIPath = core.PhalaConfigDefaultCLIPath
 	}
 	if cfg.Phala.InstanceType == "" {
 		cfg.Phala.InstanceType = defaultInstanceType
@@ -258,8 +266,7 @@ func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID st
 	if err := core.UseLeaseKnownHosts(&target.SSH, leaseID); err != nil {
 		return err
 	}
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
 func (b *backend) configForRun() core.Config {
@@ -339,7 +346,7 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 		recoveryLabels["recovery"] = recovery
 		recoveryLabels["state"] = "provisioning"
 		item := instance{ID: id, Name: phalaCVMName(leaseID), Labels: recoveryLabels}
-		lease, err := b.lease(item, cfg, leaseID)
+		lease, err := b.lease(item, cfg, leaseID, leaseAccessPrepare)
 		if err != nil {
 			return err
 		}
@@ -397,11 +404,11 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	if slug != "" {
 		item.Labels["slug"] = slug
 	}
-	lease, err := b.lease(item, cfg, leaseID)
+	lease, err := b.lease(item, cfg, leaseID, leaseAccessPrepare)
 	if err != nil {
 		return core.LeaseTarget{}, rollback(err)
 	}
-	if err := b.prepareSSH(ctx, cfg, &lease.SSH); err != nil {
+	if err := shared.PrepareSSHWithBootstrap(ctx, cfg, &lease.SSH, b.rt.Stderr, "Phala CVM", phalaToolBootstrapCommand()); err != nil {
 		return core.LeaseTarget{}, rollback(err)
 	}
 	// TDX attestation gate: the box is reachable, so before trusting it as a
@@ -469,7 +476,13 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 			item.Labels["gateway_host"] = gatewayHost
 		}
 	}
-	lease, err := b.lease(item, cfg, leaseID)
+	access := leaseAccessPrepare
+	if req.ReleaseOnly {
+		access = leaseAccessNone
+	} else if req.StatusOnly || req.NoLocalStateMutations {
+		access = leaseAccessObserve
+	}
+	lease, err := b.lease(item, cfg, leaseID, access)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
@@ -479,17 +492,19 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 	if leaseID == "" {
 		return core.LeaseTarget{}, core.Exit(4, "Phala CVM %s has no Crabbox lease id", item.cloudID())
 	}
-	// prepareSSH re-runs the FULL tool bootstrap over SSH. That belongs ONLY to a
-	// non-status acquire/run resolve. For status checks (StatusOnly, including
-	// `status --wait` which sets ReadyProbe) readiness is decided by the caller's
-	// lightweight probeSSHReady in statusViewFromLeaseTarget -- re-bootstrapping on
-	// every status poll re-runs apt/dnf over SSH and times the poll out. The cached
-	// gateway_host on the lease target keeps that lightweight probe from paying a
-	// per-connection `phala cvms get`.
-	if !req.StatusOnly {
-		if err := b.prepareSSH(ctx, cfg, &lease.SSH); err != nil {
-			return core.LeaseTarget{}, err
+	if req.StatusOnly {
+		return lease, nil
+	}
+	if req.NoLocalStateMutations {
+		if lease.SSH.Host == "" {
+			return core.LeaseTarget{}, core.Exit(4, "Phala lease %s has no prepared SSH access; prepare it through a normal lease operation first", leaseID)
 		}
+		return lease, nil
+	}
+	// Tool bootstrap and first-contact trust belong to explicit access, not
+	// status probes or controller observations before identity acceptance.
+	if err := shared.PrepareSSHWithBootstrap(ctx, cfg, &lease.SSH, b.rt.Stderr, "Phala CVM", phalaToolBootstrapCommand()); err != nil {
+		return core.LeaseTarget{}, err
 	}
 	if req.Repo.Root != "" {
 		// The slug is stored in BOTH the claim.Slug field and the claim labels, but
@@ -499,7 +514,7 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 		// stored one. b.lease()/mergeClaimLabels surfaced the authoritative claim.Slug
 		// onto lease.Server.Labels["slug"], so prefer that, and never overwrite a
 		// non-empty stored slug with a blank.
-		slug := firstNonBlank(lease.Server.Labels["slug"], item.Labels["slug"])
+		slug := shared.FirstNonBlankTrimmed(lease.Server.Labels["slug"], item.Labels["slug"])
 		if err := core.ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, lease.Server, lease.SSH, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
 			return core.LeaseTarget{}, err
 		}
@@ -604,7 +619,7 @@ func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server
 	now := core.ClockNow(b.rt.Clock).UTC()
 	server := req.Lease.Server
 	gatewayHost := strings.TrimSpace(server.Labels["gateway_host"])
-	server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, req.State, now)
+	server.Labels = core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(server.Labels, cfg, req.State, now, req.IdleTimeoutOverride)
 	// gateway_host is local connection metadata, not a provider label. Preserve
 	// its complete DNS value across the generic provider-label timestamp update.
 	if gatewayHost != "" {
@@ -620,19 +635,10 @@ func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server
 		if idleTimeout <= 0 {
 			idleTimeout = cfg.IdleTimeout
 		}
-		// The claim write unconditionally overwrites claim.Slug with the slug arg, so
-		// a blank server.Labels["slug"] (e.g. a lease target whose labels lost it)
-		// would WIPE the stored slug on every idle keepalive. Prefer the existing
-		// claim's slug so Touch never blanks it.
-		slug := firstNonBlank(server.Labels["slug"], claim.Slug)
 		if ok {
-			if claim.RepoRoot != "" {
-				_, err = core.ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, slug, cfg, server, req.Lease.SSH, claim.RepoRoot, idleTimeout, false, claim, true)
-			} else {
-				_, err = core.ClaimLeaseTargetForConfigIfUnchanged(leaseID, slug, cfg, server, req.Lease.SSH, idleTimeout, claim, true)
-			}
+			_, err = core.UpdateLeaseClaimTouchIfUnchanged(ctx, leaseID, claim, server.Labels, now, req.IdleTimeoutOverride)
 		} else {
-			err = core.ClaimLeaseTargetForConfig(leaseID, slug, cfg, server, req.Lease.SSH, idleTimeout)
+			err = core.ClaimLeaseTargetForConfig(leaseID, server.Labels["slug"], cfg, server, req.Lease.SSH, idleTimeout)
 		}
 		if err != nil {
 			return core.Server{}, err
@@ -785,7 +791,7 @@ func (b *backend) createWithCompose(ctx context.Context, cfg core.Config, public
 		if ambiguousPhalaCreateOutcome(result, err) {
 			recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
-			if recovered, recoverErr := b.recoverByLease(recoveryCtx, cfg, leaseID, 30*time.Second); recoverErr == nil {
+			if recovered, recoverErr := shared.RetryLeaseLookup(recoveryCtx, cfg, leaseID, 30*time.Second, b.findByLease); recoverErr == nil {
 				fmt.Fprintf(b.rt.Stderr, "warning: phala deploy returned an error, recovered phala_cvm=%s from lease name\n", recovered.cloudID())
 				return recovered.cloudID(), nil
 			}
@@ -797,7 +803,7 @@ func (b *backend) createWithCompose(ctx context.Context, cfg core.Config, public
 	if parseErr != nil {
 		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if recovered, recoverErr := b.recoverByLease(recoveryCtx, cfg, leaseID, 30*time.Second); recoverErr == nil {
+		if recovered, recoverErr := shared.RetryLeaseLookup(recoveryCtx, cfg, leaseID, 30*time.Second, b.findByLease); recoverErr == nil {
 			fmt.Fprintf(b.rt.Stderr, "warning: recovered phala_cvm=%s after invalid phala deploy output\n", recovered.cloudID())
 			return recovered.cloudID(), nil
 		}
@@ -998,28 +1004,6 @@ func (b *backend) findByLease(ctx context.Context, cfg core.Config, leaseID stri
 	return found[0], nil
 }
 
-func (b *backend) recoverByLease(ctx context.Context, cfg core.Config, leaseID string, timeout time.Duration) (instance, error) {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	var lastErr error
-	for {
-		item, err := b.findByLease(ctx, cfg, leaseID)
-		if err == nil {
-			return item, nil
-		}
-		lastErr = err
-		select {
-		case <-ticker.C:
-		case <-deadline.C:
-			return instance{}, lastErr
-		case <-ctx.Done():
-			return instance{}, ctx.Err()
-		}
-	}
-}
-
 func (b *backend) resolve(ctx context.Context, identifier string, cfg core.Config, allowMissing bool) (instance, string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
@@ -1089,7 +1073,7 @@ func (b *backend) resolve(ctx context.Context, identifier string, cfg core.Confi
 	return instance{}, "", core.Exit(4, "Phala CVM lease not found: %s", identifier)
 }
 
-func (b *backend) lease(item instance, cfg core.Config, leaseID string) (core.LeaseTarget, error) {
+func (b *backend) lease(item instance, cfg core.Config, leaseID string, access leaseAccessMode) (core.LeaseTarget, error) {
 	target := core.SSHTarget{
 		User:            "root",
 		Host:            item.cloudID(),
@@ -1102,12 +1086,6 @@ func (b *backend) lease(item instance, cfg core.Config, leaseID string) (core.Le
 		SSHConfigProxy:  true,
 		ProxyCommand:    proxyCommand(cfg, item.cloudID(), item.Labels["gateway_host"]),
 	}
-	if leaseID != "" {
-		if err := core.UseLeaseKnownHosts(&target, leaseID); err != nil {
-			return core.LeaseTarget{}, err
-		}
-		core.UseStoredTestboxKey(&target, leaseID)
-	}
 	server := b.server(item, cfg)
 	if claim, ok, _ := resolvePhalaClaim(leaseID, cfg); ok {
 		mergeClaimLabels(&server, claim)
@@ -1117,7 +1095,57 @@ func (b *backend) lease(item instance, cfg core.Config, leaseID string) (core.Le
 	if gatewayHost := strings.TrimSpace(item.Labels["gateway_host"]); gatewayHost != "" {
 		server.Labels["gateway_host"] = gatewayHost
 	}
-	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+	lease := core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}
+	if access == leaseAccessPrepare && leaseID != "" {
+		if err := b.RebindResolvedLeaseTarget(&lease, leaseID); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	} else if access == leaseAccessObserve {
+		available, err := observeLeaseAccess(&lease.SSH, leaseID)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if !available {
+			lease.SSH = core.SSHTarget{}
+		}
+	}
+	return lease, nil
+}
+
+func observeLeaseAccess(target *core.SSHTarget, leaseID string) (bool, error) {
+	if leaseID == "" {
+		return false, nil
+	}
+	knownHosts, err := core.ExistingLeaseKnownHostsPath(leaseID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	key, err := core.StoredTestboxKeyPath(leaseID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	for _, path := range []string{key, knownHosts} {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.Mode().IsRegular() {
+			return false, core.Exit(2, "Phala lease %s has non-regular managed SSH material", leaseID)
+		}
+		if info.Size() == 0 {
+			return false, nil
+		}
+	}
+	target.Key, target.KnownHostsFile = key, knownHosts
+	// A readiness probe may verify existing trust, but must never learn keys.
+	target.AuthoritativeKnownHosts = true
+	return true, nil
 }
 
 func cachedGatewayHostNeedsRefresh(host string) bool {
@@ -1125,19 +1153,6 @@ func cachedGatewayHostNeedsRefresh(host string) bool {
 	// sanitizeProviderLabelValue caps values at exactly 63 bytes. Treat that
 	// boundary as suspect; refreshing a legitimately 63-byte hostname is safe.
 	return len(host) == 63
-}
-
-func (b *backend) prepareSSH(ctx context.Context, cfg core.Config, target *core.SSHTarget) error {
-	probe := *target
-	probe.ReadyCheck = "true"
-	if err := core.WaitForSSHReady(ctx, &probe, b.rt.Stderr, "phala cvm ssh", core.BootstrapWaitTimeout(cfg)); err != nil {
-		return err
-	}
-	target.Port = probe.Port
-	if err := core.RunSSHQuiet(ctx, *target, phalaToolBootstrapCommand()); err != nil {
-		return core.Exit(1, "Phala CVM tool bootstrap failed: %v", err)
-	}
-	return core.WaitForSSHReady(ctx, target, b.rt.Stderr, "phala cvm tools", core.BootstrapWaitTimeout(cfg))
 }
 
 // phalaToolBootstrapCommand prepares a leased Phala CVM for crabbox's
@@ -1178,11 +1193,11 @@ func (b *backend) server(item instance, cfg core.Config) core.Server {
 	if labels["state"] == "" {
 		labels["state"] = phalaState(item.Status)
 	}
-	labels["server_type"] = firstNonBlank(labels["server_type"], item.InstanceType, cfg.ServerType)
+	labels["server_type"] = shared.FirstNonBlankTrimmed(labels["server_type"], item.InstanceType, cfg.ServerType)
 	server := core.Server{
 		CloudID:  item.cloudID(),
 		Provider: providerName,
-		Name:     firstNonBlank(labels["slug"], item.Name, item.cloudID()),
+		Name:     shared.FirstNonBlankTrimmed(labels["slug"], item.Name, item.cloudID()),
 		Status:   labels["state"],
 		Labels:   labels,
 	}
@@ -1419,20 +1434,9 @@ func proxyCommand(cfg core.Config, cvmID, gatewayHost string) string {
 	}
 	words = append(words, cvmID)
 	for i := range words {
-		words[i] = quoteProxyWord(words[i])
+		words[i] = shared.QuoteSSHProxyCommandWord(words[i])
 	}
 	return strings.Join(words, " ")
-}
-
-func quoteProxyWord(word string) string {
-	word = strings.ReplaceAll(word, "%", "%%")
-	if word != "" && strings.IndexFunc(word, func(r rune) bool {
-		return !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
-			strings.ContainsRune("_-./:,@%+=", r))
-	}) == -1 {
-		return word
-	}
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "$", `\$`, "`", "\\`").Replace(word) + `"`
 }
 
 // missingCVMResponse reports whether the phala CLI's stdout/stderr unambiguously
@@ -1589,7 +1593,7 @@ func (g *gatewayGetOutput) UnmarshalJSON(data []byte) error {
 // phalaCVM.appID() EXACTLY so the cached host and the proxy-resolved fallback
 // host are identical (the gateway domain preference already matches).
 func (g *gatewayGetOutput) appID() string {
-	id := firstNonBlank(g.AppID, g.AppIDAlt, g.ID, g.InstanceID)
+	id := shared.FirstNonBlankTrimmed(g.AppID, g.AppIDAlt, g.ID, g.InstanceID)
 	if id == "" && g.CVM != nil {
 		id = g.CVM.appID()
 	}
@@ -1600,7 +1604,7 @@ func (g *gatewayGetOutput) appID() string {
 // the nested base_domain/domain, then a top-level gateway_domain, falling
 // through to the nested cvm object. This preference matches resolvePhalaProxyHost.
 func (g *gatewayGetOutput) gatewayDomain() string {
-	domain := firstNonBlank(g.GatewayDomain, g.BaseDomain, g.Domain, g.TopGateway)
+	domain := shared.FirstNonBlankTrimmed(g.GatewayDomain, g.BaseDomain, g.Domain, g.TopGateway)
 	if domain == "" && g.CVM != nil {
 		domain = g.CVM.gatewayDomain()
 	}
@@ -1649,7 +1653,7 @@ func (b *backend) validateDestroyTarget(ctx context.Context, cfg core.Config, id
 	if !ok {
 		return false, core.Exit(4, "refusing to destroy Phala CVM %s: no local claim for lease %s", id, leaseID)
 	}
-	claimedID := firstNonBlank(claim.CloudID, claim.Labels["phala_cvm"])
+	claimedID := shared.FirstNonBlankTrimmed(claim.CloudID, claim.Labels["phala_cvm"])
 	if claimedID != "" && strings.TrimSpace(claimedID) != strings.TrimSpace(id) {
 		return false, core.Exit(4, "refusing to destroy Phala CVM %s: local claim for lease %s points to %s", id, leaseID, claimedID)
 	}
@@ -1694,10 +1698,6 @@ func commandError(action string, result core.LocalCommandResult, err error) erro
 		return core.Exit(result.ExitCode, "%s failed: %v: %s", action, err, detail)
 	}
 	return core.Exit(result.ExitCode, "%s failed: %v", action, err)
-}
-
-func firstNonBlank(values ...string) string {
-	return shared.FirstNonBlankTrimmed(values...)
 }
 
 // jsonObjectPrefix returns the first top-level JSON object/array embedded in a

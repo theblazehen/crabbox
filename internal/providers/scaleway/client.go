@@ -24,6 +24,26 @@ import (
 
 const defaultScalewayAPIURL = "https://api.scaleway.com"
 
+func isScalewayResponseError(err error) bool {
+	// SdkError also marks transport wrappers; only completed response types
+	// may take precedence over an interrupted readiness observation.
+	var response *scw.ResponseError
+	var invalid *scw.InvalidArgumentsError
+	var quota *scw.QuotasExceededError
+	var transient *scw.TransientStateError
+	var missing *scw.ResourceNotFoundError
+	var locked *scw.ResourceLockedError
+	var permission *scw.PermissionsDeniedError
+	var stock *scw.OutOfStockError
+	var expired *scw.ResourceExpiredError
+	var authentication *scw.DeniedAuthenticationError
+	var precondition *scw.PreconditionFailedError
+	return errors.As(err, &response) || errors.As(err, &invalid) || errors.As(err, &quota) ||
+		errors.As(err, &transient) || errors.As(err, &missing) || errors.As(err, &locked) ||
+		errors.As(err, &permission) || errors.As(err, &stock) || errors.As(err, &expired) ||
+		errors.As(err, &authentication) || errors.As(err, &precondition)
+}
+
 const (
 	scalewayRedirectMarkerHeader = "X-Crabbox-Scaleway-Redirect"
 	scalewaySafeRedirectLocation = "/.crabbox-refused-redirect"
@@ -54,6 +74,8 @@ type InstanceAPI interface {
 	CreateServer(req *instance.CreateServerRequest, opts ...scw.RequestOption) (*instance.CreateServerResponse, error)
 	UpdateServer(req *instance.UpdateServerRequest, opts ...scw.RequestOption) (*instance.UpdateServerResponse, error)
 	DeleteServer(req *instance.DeleteServerRequest, opts ...scw.RequestOption) error
+	GetVolume(req *instance.GetVolumeRequest, opts ...scw.RequestOption) (*instance.GetVolumeResponse, error)
+	DeleteVolume(req *instance.DeleteVolumeRequest, opts ...scw.RequestOption) error
 	SetServerUserData(req *instance.SetServerUserDataRequest, opts ...scw.RequestOption) error
 	ServerAction(req *instance.ServerActionRequest, opts ...scw.RequestOption) (*instance.ServerActionResponse, error)
 }
@@ -123,7 +145,7 @@ func newClient(cfg core.Config, rt core.Runtime) (Client, error) {
 	}
 	client, err := scw.NewClient(opts...)
 	if err != nil {
-		return nil, core.Exit(3, "Scaleway SDK client configuration failed: %s", sanitizeSDKError(err, accessKey, secretKey))
+		return nil, shared.ExitErrorWithCause(3, fmt.Sprintf("Scaleway SDK client configuration failed: %s", sanitizeSDKError(err, accessKey, secretKey)), err)
 	}
 	out := &sdkClient{
 		client:         client,
@@ -186,7 +208,7 @@ func (t *scalewayRedirectTransport) RoundTrip(req *http.Request) (*http.Response
 	switch {
 	case parseErr != nil:
 		marker = scalewayRedirectInvalid
-	case !sameScalewayOrigin(t.trusted, target):
+	case !core.SameHTTPOrigin(t.trusted, target):
 		marker = scalewayRedirectCrossOrigin
 	case t.enforceDefaultLimit && scalewayRedirectHop(req.Context()) >= 9:
 		marker = scalewayRedirectLimit
@@ -250,7 +272,7 @@ func secureScalewayHTTPClient(source *http.Client, trusted *url.URL) *http.Clien
 				return errScalewayRedirectLimit
 			}
 		}
-		if !sameScalewayOrigin(trusted, req.URL) {
+		if !core.SameHTTPOrigin(trusted, req.URL) {
 			return errScalewayCrossOriginRedirect
 		}
 		if originalCheckRedirect != nil {
@@ -279,10 +301,6 @@ func isScalewayRedirect(status int) bool {
 	}
 }
 
-func sameScalewayOrigin(a, b *url.URL) bool {
-	return shared.SameOrigin(a, b)
-}
-
 func scalewayProfileFromSDKConfig() (*scw.Profile, error) {
 	cfg, err := scw.LoadConfig()
 	if err != nil {
@@ -290,11 +308,11 @@ func scalewayProfileFromSDKConfig() (*scw.Profile, error) {
 		if errors.As(err, &notFound) {
 			return &scw.Profile{}, nil
 		}
-		return nil, core.Exit(3, "Scaleway SDK config load failed: %s", sanitizeSDKError(err))
+		return nil, shared.ExitErrorWithCause(3, fmt.Sprintf("Scaleway SDK config load failed: %s", sanitizeSDKError(err)), err)
 	}
 	profile, err := cfg.GetActiveProfile()
 	if err != nil {
-		return nil, core.Exit(3, "Scaleway SDK active profile load failed: %s", sanitizeSDKError(err))
+		return nil, shared.ExitErrorWithCause(3, fmt.Sprintf("Scaleway SDK active profile load failed: %s", sanitizeSDKError(err)), err)
 	}
 	return profile, nil
 }

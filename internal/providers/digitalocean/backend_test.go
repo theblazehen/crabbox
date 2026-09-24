@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,6 +28,7 @@ type fakeDigitalOceanAPI struct {
 	accountFn      func() (string, error)
 	nextID         int64
 	createErr      error
+	fixedReplyErr  error
 	getErr         error
 	getFn          func(context.Context, int64) (droplet, error)
 	getCalls       int
@@ -739,11 +741,136 @@ func TestAcquireRetainsLocalKeyWhenRollbackFails(t *testing.T) {
 	}
 }
 
+func TestAcquireCleanupErrorPreservesCausesAndVetoesRetry(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		for _, tc := range []struct {
+			name             string
+			primary, cleanup error
+			wantCode         int
+		}{
+			{name: "timeout", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: errors.New("key cleanup denied"), wantCode: 5},
+			{name: "cancellation", primary: context.Canceled, cleanup: errors.New("key cleanup denied"), wantCode: 1},
+			{name: "primary exit wins", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: core.Exit(9, "key cleanup denied"), wantCode: 5},
+		} {
+			t.Run(tc.name+"/keep="+strconv.FormatBool(keep), func(t *testing.T) {
+				api := &fakeDigitalOceanAPI{keyDeleteErr: tc.cleanup}
+				backend := newTestBackend(t, api)
+				var stderr bytes.Buffer
+				backend.RT.Stderr = &stderr
+				backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error { return tc.primary }
+				_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "cause-retained", Keep: keep})
+				code := 1
+				var exit core.ExitError
+				if core.AsExitError(err, &exit) {
+					code = exit.Code
+				}
+				if !errors.Is(err, tc.primary) || !errors.Is(err, tc.cleanup) || code != tc.wantCode || len(api.createRequests) != 1 {
+					t.Fatalf("err=%v code=%d wantCode=%d attempts=%d", err, code, tc.wantCode, len(api.createRequests))
+				}
+				if !strings.Contains(stderr.String(), "key cleanup denied") || !strings.Contains(stderr.String(), "refusing a fresh lease retry") || strings.Contains(stderr.String(), "retrying with fresh lease") {
+					t.Fatalf("cleanup warning=%q", stderr.String())
+				}
+				claim, ok, claimErr := core.ResolveLeaseClaimForProvider("cause-retained", providerName)
+				if claimErr != nil || !ok || claim.CloudID != "100" {
+					t.Fatalf("claim=%#v exists=%v err=%v", claim, ok, claimErr)
+				}
+				keyPath, pathErr := core.TestboxKeyPath(claim.LeaseID)
+				if pathErr != nil {
+					t.Fatal(pathErr)
+				}
+				if _, statErr := os.Stat(keyPath); statErr != nil {
+					t.Fatalf("retained key missing: %v", statErr)
+				}
+			})
+		}
+	}
+}
+
+func TestAcquireReadinessCancellationWinsSecondaryCleanupTimeout(t *testing.T) {
+	primary := core.Exit(7, "caller stopped acquisition")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	api := &fakeDigitalOceanAPI{deleteErr: context.DeadlineExceeded, getFn: func(observeCtx context.Context, _ int64) (droplet, error) {
+		cancel(primary)
+		return droplet{}, observeCtx.Err()
+	}}
+	backend := newTestBackend(t, api)
+	backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		t.Fatal("canceled IP wait reached SSH bootstrap")
+		return nil
+	}
+	_, err := backend.Acquire(ctx, core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "cancel-cleanup"})
+	if !errors.Is(err, primary) || !errors.Is(err, context.Canceled) || !errors.Is(err, context.DeadlineExceeded) || core.ExitCodeForError(err, 1) != 7 || len(api.createRequests) != 1 || len(api.deletedKeyIDs) != 0 {
+		t.Fatalf("err=%v code=%d creates=%d deletedKeys=%v", err, core.ExitCodeForError(err, 1), len(api.createRequests), api.deletedKeyIDs)
+	}
+	got := core.FinalizeRunResult(core.RunResult{}, err)
+	want := core.FinalizeRunResult(core.RunResult{}, context.Canceled)
+	if got.Status != want.Status || got.ErrorKind != want.ErrorKind {
+		t.Fatalf("outcome=%s/%s want=%s/%s", got.Status, got.ErrorKind, want.Status, want.ErrorKind)
+	}
+}
+
+func TestAcquireStillRetriesAfterSuccessfulRollback(t *testing.T) {
+	api := &fakeDigitalOceanAPI{}
+	backend := newTestBackend(t, api)
+	calls := 0
+	backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		calls++
+		if calls == 1 {
+			return core.Exit(5, "timed out waiting for SSH")
+		}
+		return nil
+	}
+	_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "safe-retry"})
+	if err != nil || calls != 2 || len(api.createRequests) != 2 || len(api.deleted) != 1 || len(api.deletedKeyIDs) != 1 {
+		t.Fatalf("err=%v calls=%d creates=%d deleted=%v keys=%v", err, calls, len(api.createRequests), api.deleted, api.deletedKeyIDs)
+	}
+}
+
+func TestAcquireRetainsManagedKeyWhenDropletRollbackFails(t *testing.T) {
+	deleteErr := errors.New("droplet cleanup failed")
+	api := &fakeDigitalOceanAPI{deleteErr: deleteErr}
+	backend := newTestBackend(t, api)
+	backend.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		return errors.New("ssh unavailable")
+	}
+	_, err := backend.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "rollback-order"})
+	if !errors.Is(err, deleteErr) || len(api.createRequests) != 1 || len(api.created) != 1 || len(api.sshKeys) != 1 || len(api.deletedKeyIDs) != 0 {
+		t.Fatalf("err=%v creates=%d droplets=%d keys=%d deletedKeys=%v", err, len(api.createRequests), len(api.created), len(api.sshKeys), api.deletedKeyIDs)
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProvider("rollback-order", providerName)
+	if err != nil || !ok || claim.CloudID != "100" || claim.Labels[digitalOceanRecoveryKeyIDLabel] != "700" || claim.Labels[digitalOceanKeyOwnedLabel] != "true" {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+	}
+	keyPath, err := core.TestboxKeyPath(claim.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("recovery credentials missing: %v", err)
+	}
+	api.deleteErr = nil
+	lease, err := backend.Resolve(t.Context(), core.ResolveRequest{ID: "rollback-order", ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.created) != 0 || len(api.sshKeys) != 0 || len(api.deletedKeyIDs) != 1 || api.deletedKeyIDs[0] != 700 {
+		t.Fatalf("droplets=%v keys=%v deletedKeys=%v", api.created, api.sshKeys, api.deletedKeyIDs)
+	}
+	if _, ok, err := core.ResolveLeaseClaimForProvider("rollback-order", providerName); err != nil || ok {
+		t.Fatalf("claim remains: exists=%v err=%v", ok, err)
+	}
+	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local key remains: %v", err)
+	}
+}
+
 func TestRollbackRetryRefusesReplacedManagedKey(t *testing.T) {
 	api := &fakeDigitalOceanAPI{
-		deleteErr:      errors.New("droplet cleanup failed"),
-		keyDeleteErr:   errors.New("lost key delete response"),
-		deleteKeyOnErr: true,
+		deleteErr: errors.New("droplet cleanup failed"),
 		sshKeys: []sshKey{{
 			ID:        700,
 			Name:      "original",
@@ -756,14 +883,14 @@ func TestRollbackRetryRefusesReplacedManagedKey(t *testing.T) {
 	}
 
 	_, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "live-rollback"})
-	if err == nil || !strings.Contains(err.Error(), "droplet cleanup failed") || !strings.Contains(err.Error(), "lost key delete response") {
+	if err == nil || !strings.Contains(err.Error(), "droplet cleanup failed") {
 		t.Fatalf("Acquire err=%v", err)
 	}
 	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("live-rollback", providerName)
 	if claimErr != nil || !ok || claim.CloudID != "100" || claim.Labels[digitalOceanRecoveryKeyIDLabel] != "700" {
 		t.Fatalf("cleanup claim=%#v ok=%v err=%v", claim, ok, claimErr)
 	}
-	if len(api.created) != 1 || len(api.sshKeys) != 0 {
+	if len(api.created) != 1 || len(api.sshKeys) != 1 || len(api.deletedKeyIDs) != 0 {
 		t.Fatalf("created=%v sshKeys=%v", api.created, api.sshKeys)
 	}
 
@@ -784,7 +911,7 @@ func TestRollbackRetryRefusesReplacedManagedKey(t *testing.T) {
 	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err == nil || !strings.Contains(err.Error(), "different public key") {
 		t.Fatalf("ReleaseLease err=%v", err)
 	}
-	if len(api.deletedKeyIDs) != 1 || api.deletedKeyIDs[0] != 700 || len(api.deletedKeys) != 0 {
+	if len(api.deletedKeyIDs) != 0 || len(api.deletedKeys) != 0 {
 		t.Fatalf("deletedKeyIDs=%v deletedKeys=%v", api.deletedKeyIDs, api.deletedKeys)
 	}
 	if len(api.sshKeys) != 1 || api.sshKeys[0].ID != 701 {
@@ -1338,6 +1465,10 @@ func TestResolveVisibleDropletIgnoresUnrelatedCorruptClaim(t *testing.T) {
 	item := droplet{ID: 108, Name: core.LeaseProviderName(leaseID, slug), Status: "active", Tags: tagsFromLabels(labels)}
 	api := &fakeDigitalOceanAPI{droplets: []droplet{item}}
 	backend := newTestBackend(t, api)
+	// Prepare this owned synthetic namespace before manually inserting a corrupt claim.
+	if err := core.PreflightLeaseSSHStorage(); err != nil {
+		t.Fatal(err)
+	}
 	stateDir, err := core.CrabboxStateDir()
 	if err != nil {
 		t.Fatal(err)
@@ -1820,6 +1951,10 @@ func TestUnreadableExactClaimBlocksResolveAndRelease(t *testing.T) {
 	item := droplet{ID: 112, Name: core.LeaseProviderName(leaseID, slug), Status: "active", Tags: tagsFromLabels(labels)}
 	api := &fakeDigitalOceanAPI{droplets: []droplet{item}}
 	backend := newTestBackend(t, api)
+	// Prepare this owned synthetic namespace before manually inserting a corrupt claim.
+	if err := core.PreflightLeaseSSHStorage(); err != nil {
+		t.Fatal(err)
+	}
 	stateDir, err := core.CrabboxStateDir()
 	if err != nil {
 		t.Fatal(err)
@@ -2849,20 +2984,107 @@ func claimedDigitalOceanTarget(t *testing.T, server core.Server) core.LeaseTarge
 
 func writeStoredTestboxKey(t *testing.T, leaseID string) string {
 	t.Helper()
-	keyPath, err := core.TestboxKeyPath(leaseID)
+	// Fresh synthetic files need the same owner/privacy preparation as generated keys.
+	keyPath, err := core.PrepareStoredTestboxKeyPath(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+	if err := core.WritePreparedLeaseSSHKeyFile(keyPath, []byte("test-key")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(keyPath+".pub", []byte("ssh-ed25519 test-key"), 0o644); err != nil {
+	if err := core.WritePreparedLeaseSSHKeyFile(keyPath+".pub", []byte("ssh-ed25519 test-key")); err != nil {
 		t.Fatal(err)
 	}
 	return keyPath
+}
+
+func TestTouchIdleTimeoutIntent(t *testing.T) {
+	created := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	now := created.Add(10 * time.Minute)
+	override := 90 * time.Minute
+	for _, tc := range []struct {
+		name     string
+		stored   string
+		legacy   bool
+		fallback time.Duration
+		override *time.Duration
+		want     time.Duration
+		writeErr bool
+	}{
+		{name: "omitted preserves remote policy", stored: "300", fallback: time.Minute, want: 5 * time.Minute},
+		{name: "omitted preserves legacy policy", stored: "300", legacy: true, fallback: time.Minute, want: 5 * time.Minute},
+		{name: "missing policy uses request fallback", fallback: 2 * time.Minute, want: 2 * time.Minute},
+		{name: "explicit policy beats fallback and TTL caps expiry", stored: "300", fallback: time.Minute, override: &override, want: override},
+		{name: "explicit policy without fallback", stored: "300", override: &override, want: override},
+		{name: "failed write does not publish policy", stored: "300", override: &override, writeErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := core.BaseConfig()
+			cfg.Provider = providerName
+			cfg.TargetOS = core.TargetLinux
+			cfg.TTL = time.Hour
+			labels := labelsFromTags(leaseTags(cfg, "cbx_abcdef123456", "touch-me", "ready", false, created))
+			delete(labels, "idle_timeout")
+			delete(labels, "idle_timeout_secs")
+			if tc.stored != "" {
+				key := "idle_timeout_secs"
+				if tc.legacy {
+					key = "idle_timeout"
+				}
+				labels[key] = tc.stored
+			}
+			item := droplet{ID: 99, Name: "touch", Status: "active", Tags: tagsFromLabels(labels)}
+			api := &fakeDigitalOceanAPI{droplets: []droplet{item}}
+			writeErr := errors.New("tag replacement failed")
+			if tc.writeErr {
+				api.replaceErr = writeErr
+			}
+			backend := newTestBackend(t, api)
+			backend.RT.Clock = fixedClock{t: now}
+			server := serverFromDroplet(item, cfg)
+			server.Labels["idle_timeout"] = "7200"
+			server.Labels["idle_timeout_secs"] = "7200"
+			before := maps.Clone(server.Labels)
+			touched, err := backend.Touch(context.Background(), core.TouchRequest{
+				Lease: core.LeaseTarget{Server: server, LeaseID: "cbx_abcdef123456"},
+				State: "running", IdleTimeout: tc.fallback, IdleTimeoutOverride: tc.override,
+			})
+			if !maps.Equal(server.Labels, before) {
+				t.Fatal("input server labels changed")
+			}
+			if api.getCalls != 1 || len(api.replaced) != 1 || api.replaced[0] != item.ID {
+				t.Fatalf("provider calls: reads=%d replacements=%v", api.getCalls, api.replaced)
+			}
+			persisted, readErr := api.GetDroplet(context.Background(), item.ID)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if tc.writeErr {
+				if !errors.Is(err, writeErr) || !reflect.DeepEqual(touched, core.Server{}) || !slices.Equal(persisted.Tags, item.Tags) {
+					t.Fatalf("failed write published a result: error=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			expires := now.Add(tc.want)
+			if cap := created.Add(time.Hour); cap.Before(expires) {
+				expires = cap
+			}
+			for _, got := range []map[string]string{touched.Labels, labelsFromTags(persisted.Tags)} {
+				for key, want := range map[string]string{
+					"idle_timeout": strconv.Itoa(int(tc.want.Seconds())), "idle_timeout_secs": strconv.Itoa(int(tc.want.Seconds())),
+					"created_at": core.LeaseLabelTime(created), "last_touched_at": core.LeaseLabelTime(now),
+					"expires_at": core.LeaseLabelTime(expires), "ttl_secs": "3600", "state": "running",
+				} {
+					if got[key] != want {
+						t.Errorf("%s=%q want %q", key, got[key], want)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestTouchPreservesLiveTailscaleTags(t *testing.T) {
@@ -2894,10 +3116,12 @@ func TestTouchPreservesLiveTailscaleTags(t *testing.T) {
 	backend := newTestBackend(t, api)
 	backend.RT.Clock = fixedClock{t: time.Date(2026, 6, 10, 12, 10, 0, 0, time.UTC)}
 
+	idleTimeout := 20 * time.Minute
 	touched, err := backend.Touch(context.Background(), core.TouchRequest{
-		Lease:       core.LeaseTarget{Server: server, LeaseID: "cbx_abcdef123456"},
-		State:       "running",
-		IdleTimeout: 20 * time.Minute,
+		Lease:               core.LeaseTarget{Server: server, LeaseID: "cbx_abcdef123456"},
+		State:               "running",
+		IdleTimeout:         idleTimeout,
+		IdleTimeoutOverride: &idleTimeout,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3733,4 +3957,59 @@ func (c fixedClock) Now() time.Time { return c.t }
 
 func TestMain(m *testing.M) {
 	os.Exit(testutil.RunWithIsolatedUserDirs(m))
+}
+
+func TestDigitalOceanConfigShowCompletePassiveSection(t *testing.T) {
+	projector, ok := any(Provider{}).(core.ProviderConfigShowProjector)
+	if !ok {
+		t.Fatal("actual provider has no passive config-show projector")
+	}
+	for _, tc := range []struct {
+		name  string
+		input core.DigitalOceanConfig
+		want  map[string]any
+		text  string
+	}{
+		{name: "nil", input: core.DigitalOceanConfig{}, want: map[string]any{"region": "", "image": "", "vpc": "", "sshCIDRs": []string(nil)}, text: "digitalocean region= image= vpc=- ssh_cidrs=-\n"},
+		{name: "empty", input: core.DigitalOceanConfig{SSHCIDRs: []string{}}, want: map[string]any{"region": "", "image": "", "vpc": "", "sshCIDRs": []string{}}, text: "digitalocean region= image= vpc=- ssh_cidrs=-\n"},
+		{name: "raw-references-list", input: core.DigitalOceanConfig{Region: "raw-region", Image: "image reference", VPCUUID: "vpc reference", SSHCIDRs: []string{"second", "first", "second", " "}}, want: map[string]any{"region": "raw-region", "image": "image reference", "vpc": "vpc reference", "sshCIDRs": []string{"second", "first", "second", " "}}, text: "digitalocean region=raw-region image=image reference vpc=vpc reference ssh_cidrs=second,first,second, \n"},
+		{name: "whitespace-empty-elements", input: core.DigitalOceanConfig{Region: " ", Image: " ", VPCUUID: " ", SSHCIDRs: []string{"", ""}}, want: map[string]any{"region": " ", "image": " ", "vpc": " ", "sshCIDRs": []string{"", ""}}, text: "digitalocean region=  image=  vpc=  ssh_cidrs=,\n"},
+	} {
+		for _, selected := range []string{"digitalocean", "static"} {
+			t.Run(tc.name+"/"+selected, func(t *testing.T) {
+				cfg := core.Config{Provider: selected, DigitalOcean: tc.input}
+				before := cfg.DigitalOcean
+				before.SSHCIDRs = slices.Clone(cfg.DigitalOcean.SSHCIDRs)
+				section := projector.ConfigShowSection(cfg)
+				if section.JSONKey != "digitalocean" || section.TextLabel != "digitalocean" || !reflect.DeepEqual(section.Providers, []string{"digitalocean"}) {
+					t.Fatalf("section metadata=%#v", section)
+				}
+				wantOrder := []string{"region", "image", "vpc", "sshCIDRs"}
+				if len(section.Fields) != len(wantOrder) {
+					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
+				}
+				got := map[string]any{}
+				line := section.TextLabel
+				for i, field := range section.Fields {
+					if field.JSONName != wantOrder[i] {
+						t.Fatalf("field %d name=%q want %q", i, field.JSONName, wantOrder[i])
+					}
+					got[field.JSONName] = field.JSONValue
+					if field.TextName != "" {
+						line += " " + field.TextName + "=" + field.TextValue
+					}
+				}
+				line += "\n"
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("public fields=%#v want %#v", got, tc.want)
+				}
+				if line != tc.text {
+					t.Fatalf("text=%q want %q", line, tc.text)
+				}
+				if !reflect.DeepEqual(cfg.DigitalOcean, before) {
+					t.Fatal("projection mutated supplied configuration")
+				}
+			})
+		}
+	}
 }

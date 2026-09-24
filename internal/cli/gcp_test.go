@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -76,7 +78,7 @@ func TestIsCanonicalGCPServer(t *testing.T) {
 	leaseID := "cbx_123456abcdef"
 	slug := "blue-box"
 	canonical := Server{
-		Name: leaseProviderName(leaseID, slug),
+		Name: LeaseProviderName(leaseID, slug),
 		Labels: map[string]string{
 			"crabbox":    "true",
 			"created_by": "crabbox",
@@ -144,9 +146,7 @@ func TestGCPFirewallNameForPolicy(t *testing.T) {
 
 func TestGCPClientDefaultsBlankTags(t *testing.T) {
 	client, err := newGCPClientWithOptions(context.Background(), Config{
-		GCPProject: "project",
-		GCPZone:    "europe-west2-a",
-		GCPTags:    []string{"  "},
+		GCP: GCPConfig{Project: "project", Zone: "europe-west2-a", Tags: []string{"  "}},
 	}, option.WithoutAuthentication(), option.WithEndpoint("http://127.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
@@ -176,16 +176,87 @@ func TestGCPSchedulingAppliesTTLDelete(t *testing.T) {
 	}
 }
 
+func TestGCPGetServerCancellationReachesHTTPTransport(t *testing.T) {
+	received := make(chan string, 1)
+	requestCanceled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case received <- r.Method + " " + r.URL.Path:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			select {
+			case requestCanceled <- struct{}{}:
+			default:
+			}
+			// Keep the response incomplete until cancellation assertions finish.
+			<-release
+		case <-release:
+			_, _ = io.WriteString(w, `{"name":"readiness-instance","status":"RUNNING"}`)
+		}
+	}))
+	defer server.Close()
+	instances, err := gcpcompute.NewInstancesRESTClient(context.Background(), option.WithoutAuthentication(), option.WithEndpoint(server.URL), option.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instances.Close()
+	client := &GCPClient{Project: "project", Zone: "us-central1-b", instances: instances}
+	ctx, cancel := context.WithCancel(context.Background())
+	var got Server
+	var gotErr error
+	done := make(chan struct{})
+	go func() {
+		got, gotErr = client.GetServer(ctx, "readiness-instance")
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("GCP observation did not return during cleanup")
+		}
+	}()
+	select {
+	case request := <-received:
+		if request != "GET /compute/v1/projects/project/zones/us-central1-b/instances/readiness-instance" {
+			t.Fatalf("unexpected request: %s", request)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GCP observation did not reach the local HTTPS server")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GCP observation did not return after caller cancellation")
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local HTTPS request did not observe cancellation")
+	}
+	if !errors.Is(gotErr, context.Canceled) || !reflect.DeepEqual(got, Server{}) {
+		t.Fatalf("server=%+v error=%v, want zero server and cancellation", got, gotErr)
+	}
+	t.Logf("real Google SDK HTTPS request observed cancellation and returned in %s", time.Since(started))
+}
+
 func TestGCPListCrabboxServersAggregatesZones(t *testing.T) {
 	var gotPath string
 	var gotFilter string
 	var gotPartialSuccess string
 	fallbackLeaseID := "cbx_333333333333"
 	fallbackSlug := "fallback-zone"
-	fallbackName := leaseProviderName(fallbackLeaseID, fallbackSlug)
+	fallbackName := LeaseProviderName(fallbackLeaseID, fallbackSlug)
 	otherLeaseID := "cbx_444444444444"
 	otherSlug := "other-zone"
-	otherName := leaseProviderName(otherLeaseID, otherSlug)
+	otherName := LeaseProviderName(otherLeaseID, otherSlug)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotFilter = r.URL.Query().Get("filter")

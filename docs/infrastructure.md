@@ -407,12 +407,17 @@ Grant the Worker AWS principal EC2 launch/list/tag/terminate permissions for
 instances, key pairs, and managed security groups, plus the image lifecycle
 permissions (`CreateImage`, `DeregisterImage`, `RegisterImage`,
 `DescribeSnapshots`, `DeleteSnapshot`, `DescribeFastSnapshotRestores`,
-`EnableFastSnapshotRestores`) and `servicequotas:GetServiceQuota`. The image
+`EnableFastSnapshotRestores`), `ec2:DescribeInstanceTypes`, and
+`servicequotas:GetServiceQuota`. The image
 permissions cover `crabbox image`, native AWS checkpoints, macOS image bake
-validation, and Fast Snapshot Restore promotion. Service Quotas access is
-best-effort: when available, Crabbox skips known quota-impossible instance types
-before calling `RunInstances`; when missing, launch errors are still classified
-after the call.
+validation, and Fast Snapshot Restore promotion. Quota admission and readiness
+use the default vCPU count returned by EC2 for each exact instance type,
+including bare metal. Metadata and Service Quotas reads are best-effort for
+ordinary launches: when both are available, Crabbox skips known quota-impossible
+instance types before calling `RunInstances`; when either is missing, launch
+errors are still classified after the call. Readiness reports unknown metadata
+and recommends only instance types with a known vCPU count. Private workspace
+resource caps still require successful metadata inspection.
 
 Print the baseline provider policy with:
 
@@ -660,11 +665,12 @@ Managed checkpoint caps default to 64 globally
 (`CRABBOX_MAX_CHECKPOINTS_PER_ORG`). Active fork/shard claims default to 16 per
 checkpoint (`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS`), 64 per owner
 (`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER`), and 256 globally
-(`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL`). Production and preview Wrangler
-configuration explicitly use checkpoint caps of 20/10/20 and claim caps of
-16/64/256. Invalid or zero values fall back to their finite defaults. These
-guardrails reject excess requests before provider mutation or claim/event
-creation; each checkpoint also retains only its latest 256 audit events.
+(`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL`). Production Wrangler configuration
+sets all three checkpoint caps to 100; preview checkpoint caps remain
+20/10/20. Both configurations retain claim caps of 16/64/256. Invalid or zero
+values fall back to their finite defaults. These guardrails reject excess
+requests before provider mutation or claim/event creation; each checkpoint
+also retains only its latest 256 audit events.
 
 After deployment, point the CLI at the broker:
 

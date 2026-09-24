@@ -1,12 +1,9 @@
 package digitalocean
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -150,15 +147,7 @@ func newDigitalOceanClient(rt core.Runtime) (*digitalOceanClient, error) {
 }
 
 func (c *digitalOceanClient) do(ctx context.Context, method, path string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		var buf bytes.Buffer
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			return err
-		}
-		reader = &buf
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	req, err := shared.NewJSONRequest(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return err
 	}
@@ -170,30 +159,10 @@ func (c *digitalOceanClient) do(ctx context.Context, method, path string, body a
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body := shared.RedactErrorSecrets(strings.TrimSpace(string(data)), c.token)
-		if len(body) > 400 {
-			body = body[:400]
-		}
-		if readErr != nil {
-			if body != "" {
-				body += "; "
-			}
-			body += "response body read failed: " + readErr.Error()
-		}
-		return &digitalOceanAPIError{Operation: method + " " + path, Status: resp.StatusCode, Body: body}
-	}
-	if readErr != nil {
-		return fmt.Errorf("digitalocean %s %s response body: %w", method, path, readErr)
-	}
-	if out == nil || len(data) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("digitalocean %s %s decode: %w", method, path, err)
-	}
-	return nil
+	return shared.DecodeStatusFirstJSONResponse(resp, out, "digitalocean "+method+" "+path, func(status int, data []byte, readErr error) error {
+		body := shared.RedactedResponseBody(data, readErr, 400, func(value string) string { return shared.RedactErrorSecrets(value, c.token) })
+		return &digitalOceanAPIError{Operation: method + " " + path, Status: status, Body: body}
+	})
 }
 
 func (c *digitalOceanClient) ListCrabboxDroplets(ctx context.Context) ([]droplet, error) {
@@ -296,10 +265,21 @@ func (c *digitalOceanClient) AccountID(ctx context.Context) (string, error) {
 }
 
 func (c *digitalOceanClient) CreateDroplet(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, now time.Time) (droplet, error) {
+	return c.createDroplet(ctx, cfg, publicKey, leaseID, slug, keep, now, nil)
+}
+
+func (c *digitalOceanClient) CreateFixedDroplet(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, now time.Time, labels map[string]string) (droplet, error) {
+	return c.createDroplet(ctx, cfg, publicKey, leaseID, slug, keep, now, labels)
+}
+
+func (c *digitalOceanClient) createDroplet(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, now time.Time, labels map[string]string) (droplet, error) {
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
 		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
 	tags := leaseTags(cfg, leaseID, slug, "provisioning", keep, now)
+	if labels != nil {
+		tags = tagsFromLabels(labels)
+	}
 	leaseTag := encodeTagKV("lease", leaseID)
 	leaseTagResolved := false
 	keyName := providerKeyForLease(leaseID)
@@ -712,7 +692,7 @@ func (c *digitalOceanClient) resolveCreateTagConflict(ctx context.Context, tags 
 		}
 		canonical = append(canonical, name)
 	}
-	return normalizeTags(canonical), leaseTag, changed, nil
+	return shared.NormalizeTags(canonical), leaseTag, changed, nil
 }
 
 func (c *digitalOceanClient) resolveCanonicalLeaseTag(ctx context.Context, leaseID string) (string, error) {
@@ -799,8 +779,8 @@ func (c *digitalOceanClient) EnsureTag(ctx context.Context, tag string, known ma
 }
 
 func (c *digitalOceanClient) ReplaceDropletTags(ctx context.Context, id int64, currentTags, desiredTags []string) error {
-	currentTags = normalizeTags(currentTags)
-	desiredTags = normalizeTags(desiredTags)
+	currentTags = shared.NormalizeTags(currentTags)
+	desiredTags = shared.NormalizeTags(desiredTags)
 	current := make(map[string]bool, len(currentTags))
 	for _, tag := range currentTags {
 		current[strings.ToLower(tag)] = true

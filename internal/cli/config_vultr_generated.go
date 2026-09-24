@@ -2,10 +2,6 @@
 
 package cli
 
-import (
-	"os"
-)
-
 type fileVultrConfig struct {
 	Region        string   `yaml:"region,omitempty"`
 	OS            string   `yaml:"os,omitempty"`
@@ -21,49 +17,19 @@ func defaultVultrConfig() VultrConfig {
 	return VultrConfig{}
 }
 
-func (cfg *VultrConfig) applyFile(file *fileVultrConfig) error {
-	if file == nil {
-		return nil
-	}
-	if file.Region != "" {
-		cfg.Region = file.Region
-	}
-	if file.OS != "" {
-		cfg.OS = file.OS
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-	}
-	if file.Snapshot != "" {
-		cfg.Snapshot = file.Snapshot
-	}
-	if file.FirewallGroup != "" {
-		cfg.FirewallGroup = file.FirewallGroup
-	}
-	if len(file.VPCIDs) > 0 {
-		cfg.VPCIDs = file.VPCIDs
-	}
-	if len(file.SSHCIDRs) > 0 {
-		cfg.SSHCIDRs = file.SSHCIDRs
-	}
-	if file.UserScheme != "" {
-		cfg.UserScheme = file.UserScheme
-	}
-	return nil
+// VultrConfigApplied records accepted assignments during one application.
+type VultrConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *VultrConfig) applyEnv() error {
-	cfg.Region = getenv("CRABBOX_VULTR_REGION", cfg.Region)
-	cfg.OS = getenv("CRABBOX_VULTR_OS", cfg.OS)
-	cfg.Image = getenv("CRABBOX_VULTR_IMAGE", cfg.Image)
-	cfg.Snapshot = getenv("CRABBOX_VULTR_SNAPSHOT", cfg.Snapshot)
-	cfg.FirewallGroup = getenv("CRABBOX_VULTR_FIREWALL_GROUP", cfg.FirewallGroup)
-	if value := os.Getenv("CRABBOX_VULTR_VPC_IDS"); value != "" {
-		cfg.VPCIDs = splitCommaList(value)
-	}
-	if value := os.Getenv("CRABBOX_VULTR_SSH_CIDRS"); value != "" {
-		cfg.SSHCIDRs = splitCommaList(value)
-	}
-	cfg.UserScheme = getenv("CRABBOX_VULTR_USER_SCHEME", cfg.UserScheme)
-	return nil
+func (cfg *VultrConfig) applyFile(file *fileVultrConfig) (VultrConfigApplied, error) {
+	var applied VultrConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "vultr")
+	return applied, err
+}
+
+func (cfg *VultrConfig) applyEnv() (VultrConfigApplied, error) {
+	var applied VultrConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 8)
+	return applied, err
 }

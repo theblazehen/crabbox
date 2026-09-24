@@ -30,51 +30,21 @@ func defaultUpstashBoxConfig() UpstashBoxConfig {
 
 // UpstashBoxConfigApplied records accepted assignments during one application.
 type UpstashBoxConfigApplied struct {
-	APIKey  bool
-	BaseURL bool
+	InputAccepted bool
+	APIKey        bool
+	BaseURL       bool
 }
 
 func (cfg *UpstashBoxConfig) applyFile(file *fileUpstashBoxConfig) (UpstashBoxConfigApplied, error) {
 	var applied UpstashBoxConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.BaseURL != "" {
-		cfg.BaseURL = file.BaseURL
-		applied.BaseURL = true
-	}
-	if file.Runtime != "" {
-		cfg.Runtime = file.Runtime
-	}
-	if file.Size != "" {
-		cfg.Size = file.Size
-	}
-	if file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	if file.KeepAlive != nil {
-		cfg.KeepAlive = *file.KeepAlive
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "upstash-box")
+	return applied, err
 }
 
 func (cfg *UpstashBoxConfig) applyEnv() (UpstashBoxConfigApplied, error) {
 	var applied UpstashBoxConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_UPSTASH_BOX_API_KEY", "UPSTASH_BOX_API_KEY"); ok {
-		cfg.APIKey = value
-		applied.APIKey = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_UPSTASH_BOX_BASE_URL", "UPSTASH_BOX_BASE_URL"); ok {
-		cfg.BaseURL = value
-		applied.BaseURL = true
-	}
-	cfg.Runtime = getenv("CRABBOX_UPSTASH_BOX_RUNTIME", cfg.Runtime)
-	cfg.Size = getenv("CRABBOX_UPSTASH_BOX_SIZE", cfg.Size)
-	cfg.Workdir = getenv("CRABBOX_UPSTASH_BOX_WORKDIR", cfg.Workdir)
-	if value, ok := getenvBool("CRABBOX_UPSTASH_BOX_KEEP_ALIVE"); ok {
-		cfg.KeepAlive = value
-	}
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 6)
+	return applied, err
 }
 
 // UpstashBoxConfigFlagValues holds parsed values; only visited flags are applied.
@@ -88,13 +58,9 @@ type UpstashBoxConfigFlagValues struct {
 
 // RegisterUpstashBoxConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterUpstashBoxConfigFlags(fs *flag.FlagSet, defaults UpstashBoxConfig) UpstashBoxConfigFlagValues {
-	return UpstashBoxConfigFlagValues{
-		BaseURL:   fs.String("upstash-box-base-url", defaults.BaseURL, "Upstash Box API base URL"),
-		Runtime:   fs.String("upstash-box-runtime", defaults.Runtime, "Upstash Box runtime: node, python, golang, ruby, or rust"),
-		Size:      fs.String("upstash-box-size", defaults.Size, "Upstash Box size: small, medium, or large"),
-		Workdir:   fs.String("upstash-box-workdir", defaults.Workdir, "absolute working directory inside the Upstash Box"),
-		KeepAlive: fs.Bool("upstash-box-keep-alive", defaults.KeepAlive, "create Upstash boxes with keepAlive enabled"),
-	}
+	var values UpstashBoxConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // UpstashBoxConfigVisitedFlags records raw flag visits, independently of application.
@@ -104,30 +70,14 @@ type UpstashBoxConfigVisitedFlags struct {
 
 // UpstashBoxConfigFlagPresence reports visits for tracked flag bindings.
 func UpstashBoxConfigFlagPresence(fs *flag.FlagSet) UpstashBoxConfigVisitedFlags {
-	return UpstashBoxConfigVisitedFlags{
-		BaseURL: flagWasSet(fs, "upstash-box-base-url"),
-	}
+	var visited UpstashBoxConfigVisitedFlags
+	recordConfigFlagVisits[UpstashBoxConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values UpstashBoxConfigFlagValues) Apply(cfg *UpstashBoxConfig, fs *flag.FlagSet) UpstashBoxConfigApplied {
+func (values UpstashBoxConfigFlagValues) Apply(cfg *UpstashBoxConfig, fs *flag.FlagSet) (UpstashBoxConfigApplied, error) {
 	var applied UpstashBoxConfigApplied
-	visited := UpstashBoxConfigFlagPresence(fs)
-	if visited.BaseURL {
-		cfg.BaseURL = *values.BaseURL
-		applied.BaseURL = true
-	}
-	if flagWasSet(fs, "upstash-box-runtime") {
-		cfg.Runtime = *values.Runtime
-	}
-	if flagWasSet(fs, "upstash-box-size") {
-		cfg.Size = *values.Size
-	}
-	if flagWasSet(fs, "upstash-box-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "upstash-box-keep-alive") {
-		cfg.KeepAlive = *values.KeepAlive
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

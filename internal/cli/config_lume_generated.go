@@ -28,35 +28,21 @@ func defaultLumeConfig() LumeConfig {
 	}
 }
 
-func (cfg *LumeConfig) applyFile(file *fileLumeConfig, trusted bool) error {
-	if file == nil {
-		return nil
-	}
-	if trusted && file.CLIPath != "" {
-		cfg.CLIPath = file.CLIPath
-	}
-	if trusted && file.Base != "" {
-		cfg.Base = file.Base
-	}
-	if trusted && file.Storage != "" {
-		cfg.Storage = file.Storage
-	}
-	if trusted && file.User != "" {
-		cfg.User = file.User
-	}
-	if file.WorkRoot != "" {
-		cfg.WorkRoot = file.WorkRoot
-	}
-	return nil
+// LumeConfigApplied records accepted assignments during one application.
+type LumeConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *LumeConfig) applyEnv() error {
-	cfg.CLIPath = getenv("CRABBOX_LUME_CLI", cfg.CLIPath)
-	cfg.Base = getenv("CRABBOX_LUME_BASE", cfg.Base)
-	cfg.Storage = getenv("CRABBOX_LUME_STORAGE", cfg.Storage)
-	cfg.User = getenv("CRABBOX_LUME_USER", cfg.User)
-	cfg.WorkRoot = getenv("CRABBOX_LUME_WORK_ROOT", cfg.WorkRoot)
-	return nil
+func (cfg *LumeConfig) applyFile(file *fileLumeConfig, trusted bool) (LumeConfigApplied, error) {
+	var applied LumeConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, trusted, "lume")
+	return applied, err
+}
+
+func (cfg *LumeConfig) applyEnv() (LumeConfigApplied, error) {
+	var applied LumeConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 5)
+	return applied, err
 }
 
 // LumeConfigFlagValues holds parsed values; only visited flags are applied.
@@ -70,30 +56,14 @@ type LumeConfigFlagValues struct {
 
 // RegisterLumeConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterLumeConfigFlags(fs *flag.FlagSet, defaults LumeConfig) LumeConfigFlagValues {
-	return LumeConfigFlagValues{
-		CLIPath:  fs.String("lume-cli", defaults.CLIPath, "path to the Lume CLI"),
-		Base:     fs.String("lume-base", defaults.Base, "stopped Lume VM to clone for each lease"),
-		Storage:  fs.String("lume-storage", defaults.Storage, "optional Lume storage location"),
-		User:     fs.String("lume-user", defaults.User, "guest account prepared for SSH"),
-		WorkRoot: fs.String("lume-work-root", defaults.WorkRoot, "guest work root"),
-	}
+	var values LumeConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values LumeConfigFlagValues) Apply(cfg *LumeConfig, fs *flag.FlagSet) {
-	if flagWasSet(fs, "lume-cli") {
-		cfg.CLIPath = *values.CLIPath
-	}
-	if flagWasSet(fs, "lume-base") {
-		cfg.Base = *values.Base
-	}
-	if flagWasSet(fs, "lume-storage") {
-		cfg.Storage = *values.Storage
-	}
-	if flagWasSet(fs, "lume-user") {
-		cfg.User = *values.User
-	}
-	if flagWasSet(fs, "lume-work-root") {
-		cfg.WorkRoot = *values.WorkRoot
-	}
+func (values LumeConfigFlagValues) Apply(cfg *LumeConfig, fs *flag.FlagSet) (LumeConfigApplied, error) {
+	var applied LumeConfigApplied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

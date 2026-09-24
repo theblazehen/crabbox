@@ -25,42 +25,21 @@ func defaultOpenComputerConfig() OpenComputerConfig {
 	}
 }
 
-func (cfg *OpenComputerConfig) applyFile(file *fileOpenComputerConfig) error {
-	if file == nil {
-		return nil
-	}
-	if file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	if file.CPU != nil {
-		cfg.CPU = *file.CPU
-	}
-	if file.MemoryMB != nil {
-		cfg.MemoryMB = *file.MemoryMB
-	}
-	if file.TimeoutSecs != nil {
-		cfg.TimeoutSecs = *file.TimeoutSecs
-	}
-	if file.ExecTimeoutSecs != nil {
-		cfg.ExecTimeoutSecs = *file.ExecTimeoutSecs
-	}
-	if file.Burst != nil {
-		cfg.Burst = *file.Burst
-	}
-	return nil
+// OpenComputerConfigApplied records accepted assignments during one application.
+type OpenComputerConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *OpenComputerConfig) applyEnv() error {
-	cfg.APIURL = getenv("CRABBOX_OPENCOMPUTER_API_URL", getenv("OPENCOMPUTER_API_URL", cfg.APIURL))
-	cfg.Workdir = getenv("CRABBOX_OPENCOMPUTER_WORKDIR", cfg.Workdir)
-	cfg.CPU = getenvInt("CRABBOX_OPENCOMPUTER_CPU", cfg.CPU)
-	cfg.MemoryMB = getenvInt("CRABBOX_OPENCOMPUTER_MEMORY_MB", cfg.MemoryMB)
-	cfg.TimeoutSecs = getenvInt("CRABBOX_OPENCOMPUTER_TIMEOUT_SECS", cfg.TimeoutSecs)
-	cfg.ExecTimeoutSecs = getenvInt("CRABBOX_OPENCOMPUTER_EXEC_TIMEOUT_SECS", cfg.ExecTimeoutSecs)
-	if value, ok := getenvBool("CRABBOX_OPENCOMPUTER_BURST"); ok {
-		cfg.Burst = value
-	}
-	return nil
+func (cfg *OpenComputerConfig) applyFile(file *fileOpenComputerConfig) (OpenComputerConfigApplied, error) {
+	var applied OpenComputerConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "opencomputer")
+	return applied, err
+}
+
+func (cfg *OpenComputerConfig) applyEnv() (OpenComputerConfigApplied, error) {
+	var applied OpenComputerConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 8)
+	return applied, err
 }
 
 // OpenComputerConfigFlagValues holds parsed values; only visited flags are applied.
@@ -77,42 +56,14 @@ type OpenComputerConfigFlagValues struct {
 
 // RegisterOpenComputerConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterOpenComputerConfigFlags(fs *flag.FlagSet, defaults OpenComputerConfig) OpenComputerConfigFlagValues {
-	return OpenComputerConfigFlagValues{
-		APIURL:          fs.String("opencomputer-api-url", defaults.APIURL, "Trusted OpenComputer API base URL; not accepted from repository config"),
-		Workdir:         fs.String("opencomputer-workdir", defaults.Workdir, "Absolute working directory inside the sandbox (also used as sync target)"),
-		CPU:             fs.Int("opencomputer-cpu", defaults.CPU, "OpenComputer sandbox vCPU count (0 = service default; the service infers memory when omitted)"),
-		MemoryMB:        fs.Int("opencomputer-memory-mb", defaults.MemoryMB, "OpenComputer sandbox memory in MB (0 = service default; the service infers CPU when omitted)"),
-		TimeoutSecs:     fs.Int("opencomputer-timeout-secs", defaults.TimeoutSecs, "OpenComputer sandbox idle timeout in seconds (0 = service default)"),
-		ExecTimeoutSecs: fs.Int("opencomputer-exec-timeout-secs", defaults.ExecTimeoutSecs, "OpenComputer command timeout in seconds (0 = Crabbox default 3600)"),
-		Burst:           fs.Bool("opencomputer-burst", defaults.Burst, "use alpha best-effort burst capacity; filesystem persists but processes may restart"),
-		ForgetMissing:   fs.Bool("opencomputer-forget-missing", defaults.ForgetMissing, "remove the local claim when stop gets 404 (explicit stale-claim cleanup)"),
-	}
+	var values OpenComputerConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values OpenComputerConfigFlagValues) Apply(cfg *OpenComputerConfig, fs *flag.FlagSet) {
-	if flagWasSet(fs, "opencomputer-api-url") {
-		cfg.APIURL = *values.APIURL
-	}
-	if flagWasSet(fs, "opencomputer-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "opencomputer-cpu") {
-		cfg.CPU = *values.CPU
-	}
-	if flagWasSet(fs, "opencomputer-memory-mb") {
-		cfg.MemoryMB = *values.MemoryMB
-	}
-	if flagWasSet(fs, "opencomputer-timeout-secs") {
-		cfg.TimeoutSecs = *values.TimeoutSecs
-	}
-	if flagWasSet(fs, "opencomputer-exec-timeout-secs") {
-		cfg.ExecTimeoutSecs = *values.ExecTimeoutSecs
-	}
-	if flagWasSet(fs, "opencomputer-burst") {
-		cfg.Burst = *values.Burst
-	}
-	if flagWasSet(fs, "opencomputer-forget-missing") {
-		cfg.ForgetMissing = *values.ForgetMissing
-	}
+func (values OpenComputerConfigFlagValues) Apply(cfg *OpenComputerConfig, fs *flag.FlagSet) (OpenComputerConfigApplied, error) {
+	var applied OpenComputerConfigApplied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

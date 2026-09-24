@@ -29,41 +29,21 @@ func defaultModalConfig() ModalConfig {
 	}
 }
 
-func (cfg *ModalConfig) applyFile(file *fileModalConfig, trusted bool) error {
-	if file == nil {
-		return nil
-	}
-	if file.App != "" {
-		cfg.App = file.App
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-	}
-	if file.Workdir != "" {
-		cfg.Workdir = file.Workdir
-	}
-	if file.Python != "" {
-		cfg.Python = file.Python
-	}
-	if trusted && file.Environment != "" {
-		cfg.Environment = file.Environment
-	}
-	if trusted && file.Secrets != nil {
-		cfg.Secrets = append([]string(nil), (*file.Secrets)...)
-	}
-	return nil
+// ModalConfigApplied records accepted assignments during one application.
+type ModalConfigApplied struct {
+	InputAccepted bool
 }
 
-func (cfg *ModalConfig) applyEnv() error {
-	cfg.App = getenv("CRABBOX_MODAL_APP", cfg.App)
-	cfg.Image = getenv("CRABBOX_MODAL_IMAGE", cfg.Image)
-	cfg.Workdir = getenv("CRABBOX_MODAL_WORKDIR", cfg.Workdir)
-	cfg.Python = getenv("CRABBOX_MODAL_PYTHON", cfg.Python)
-	cfg.Environment = getenv("CRABBOX_MODAL_ENVIRONMENT", cfg.Environment)
-	if value, ok := getenvList("CRABBOX_MODAL_SECRETS"); ok {
-		cfg.Secrets = value
-	}
-	return nil
+func (cfg *ModalConfig) applyFile(file *fileModalConfig, trusted bool) (ModalConfigApplied, error) {
+	var applied ModalConfigApplied
+	err := applyConfigFileOverlay(cfg, file, &applied, trusted, "modal")
+	return applied, err
+}
+
+func (cfg *ModalConfig) applyEnv() (ModalConfigApplied, error) {
+	var applied ModalConfigApplied
+	err := applyConfigEnvironment(cfg, &applied, 0, 6)
+	return applied, err
 }
 
 // ModalConfigFlagValues holds parsed values; only visited flags are applied.
@@ -78,36 +58,14 @@ type ModalConfigFlagValues struct {
 
 // RegisterModalConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterModalConfigFlags(fs *flag.FlagSet, defaults ModalConfig) ModalConfigFlagValues {
-	listSecrets := newReplaceAppendListFlag(defaults.Secrets)
-	fs.Var(listSecrets, "modal-secret", "named Modal Secret to inject into the sandbox; repeatable or comma-separated")
-	return ModalConfigFlagValues{
-		App:         fs.String("modal-app", defaults.App, "Modal app name for Crabbox sandboxes"),
-		Image:       fs.String("modal-image", defaults.Image, "Modal sandbox image, as a registry reference"),
-		Workdir:     fs.String("modal-workdir", defaults.Workdir, "Absolute working directory inside the Modal sandbox"),
-		Python:      fs.String("modal-python", defaults.Python, "Python binary used to run the local Modal client"),
-		Environment: fs.String("modal-environment", defaults.Environment, "Modal environment for the sandbox and named Secrets"),
-		Secrets:     listSecrets,
-	}
+	var values ModalConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values ModalConfigFlagValues) Apply(cfg *ModalConfig, fs *flag.FlagSet) {
-	if flagWasSet(fs, "modal-app") {
-		cfg.App = *values.App
-	}
-	if flagWasSet(fs, "modal-image") {
-		cfg.Image = *values.Image
-	}
-	if flagWasSet(fs, "modal-workdir") {
-		cfg.Workdir = *values.Workdir
-	}
-	if flagWasSet(fs, "modal-python") {
-		cfg.Python = *values.Python
-	}
-	if flagWasSet(fs, "modal-environment") {
-		cfg.Environment = *values.Environment
-	}
-	if flagWasSet(fs, "modal-secret") {
-		cfg.Secrets = append([]string(nil), values.Secrets.values...)
-	}
+func (values ModalConfigFlagValues) Apply(cfg *ModalConfig, fs *flag.FlagSet) (ModalConfigApplied, error) {
+	var applied ModalConfigApplied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

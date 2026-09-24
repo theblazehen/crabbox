@@ -35,61 +35,21 @@ func defaultRunpodConfig() RunpodConfig {
 
 // RunpodConfigApplied records accepted assignments during one application.
 type RunpodConfigApplied struct {
-	APIKey bool
-	APIURL bool
+	InputAccepted bool
+	APIKey        bool
+	APIURL        bool
 }
 
 func (cfg *RunpodConfig) applyFile(file *fileRunpodConfig) (RunpodConfigApplied, error) {
 	var applied RunpodConfigApplied
-	if file == nil {
-		return applied, nil
-	}
-	if file.APIURL != "" {
-		cfg.APIURL = file.APIURL
-		applied.APIURL = true
-	}
-	if file.CloudType != "" {
-		cfg.CloudType = file.CloudType
-	}
-	if file.InstanceID != "" {
-		cfg.InstanceID = file.InstanceID
-	}
-	if file.Image != "" {
-		cfg.Image = file.Image
-	}
-	if file.TemplateID != "" {
-		cfg.TemplateID = file.TemplateID
-	}
-	if file.DiskGB != 0 {
-		cfg.DiskGB = file.DiskGB
-	}
-	if file.User != "" {
-		cfg.User = file.User
-	}
-	if file.WorkRoot != "" {
-		cfg.WorkRoot = file.WorkRoot
-	}
-	return applied, nil
+	err := applyConfigFileOverlay(cfg, file, &applied, true, "runpod")
+	return applied, err
 }
 
 func (cfg *RunpodConfig) applyEnv() (RunpodConfigApplied, error) {
 	var applied RunpodConfigApplied
-	if value, ok := firstNonEmptyEnv("CRABBOX_RUNPOD_API_KEY", "RUNPOD_API_KEY"); ok {
-		cfg.APIKey = value
-		applied.APIKey = true
-	}
-	if value, ok := firstNonEmptyEnv("CRABBOX_RUNPOD_API_URL", "RUNPOD_API_URL"); ok {
-		cfg.APIURL = value
-		applied.APIURL = true
-	}
-	cfg.CloudType = getenv("CRABBOX_RUNPOD_CLOUD_TYPE", getenv("RUNPOD_CLOUD_TYPE", cfg.CloudType))
-	cfg.InstanceID = getenv("CRABBOX_RUNPOD_INSTANCE_ID", getenv("RUNPOD_INSTANCE_ID", cfg.InstanceID))
-	cfg.Image = getenv("CRABBOX_RUNPOD_IMAGE", getenv("RUNPOD_IMAGE", cfg.Image))
-	cfg.TemplateID = getenv("CRABBOX_RUNPOD_TEMPLATE_ID", getenv("RUNPOD_TEMPLATE_ID", cfg.TemplateID))
-	cfg.DiskGB = getenvInt("CRABBOX_RUNPOD_DISK_GB", cfg.DiskGB)
-	cfg.User = getenv("CRABBOX_RUNPOD_USER", cfg.User)
-	cfg.WorkRoot = getenv("CRABBOX_RUNPOD_WORK_ROOT", cfg.WorkRoot)
-	return applied, nil
+	err := applyConfigEnvironment(cfg, &applied, 0, 9)
+	return applied, err
 }
 
 // RunpodConfigFlagValues holds parsed values; only visited flags are applied.
@@ -106,16 +66,9 @@ type RunpodConfigFlagValues struct {
 
 // RegisterRunpodConfigFlags registers mechanical bindings without selecting a provider.
 func RegisterRunpodConfigFlags(fs *flag.FlagSet, defaults RunpodConfig) RunpodConfigFlagValues {
-	return RunpodConfigFlagValues{
-		APIURL:     fs.String("runpod-url", defaults.APIURL, "RunPod REST API URL"),
-		CloudType:  fs.String("runpod-cloud-type", defaults.CloudType, "RunPod cloud type: SECURE or COMMUNITY"),
-		InstanceID: fs.String("runpod-instance-id", defaults.InstanceID, "RunPod GPU type ID or CPU flavor ID"),
-		Image:      fs.String("runpod-image", defaults.Image, "Docker image to deploy on the pod"),
-		TemplateID: fs.String("runpod-template-id", defaults.TemplateID, "Optional RunPod template ID"),
-		DiskGB:     fs.Int("runpod-disk-gb", defaults.DiskGB, "Container disk size in GB"),
-		User:       fs.String("runpod-user", defaults.User, "SSH user for runpod pods"),
-		WorkRoot:   fs.String("runpod-work-root", defaults.WorkRoot, "remote Crabbox work root on runpod pods"),
-	}
+	var values RunpodConfigFlagValues
+	registerConfigFlags(fs, defaults, &values)
+	return values
 }
 
 // RunpodConfigVisitedFlags records raw flag visits, independently of application.
@@ -125,39 +78,14 @@ type RunpodConfigVisitedFlags struct {
 
 // RunpodConfigFlagPresence reports visits for tracked flag bindings.
 func RunpodConfigFlagPresence(fs *flag.FlagSet) RunpodConfigVisitedFlags {
-	return RunpodConfigVisitedFlags{
-		APIURL: flagWasSet(fs, "runpod-url"),
-	}
+	var visited RunpodConfigVisitedFlags
+	recordConfigFlagVisits[RunpodConfig](fs, &visited)
+	return visited
 }
 
 // Apply copies explicit flag values. Provider validation must run afterward.
-func (values RunpodConfigFlagValues) Apply(cfg *RunpodConfig, fs *flag.FlagSet) RunpodConfigApplied {
+func (values RunpodConfigFlagValues) Apply(cfg *RunpodConfig, fs *flag.FlagSet) (RunpodConfigApplied, error) {
 	var applied RunpodConfigApplied
-	visited := RunpodConfigFlagPresence(fs)
-	if visited.APIURL {
-		cfg.APIURL = *values.APIURL
-		applied.APIURL = true
-	}
-	if flagWasSet(fs, "runpod-cloud-type") {
-		cfg.CloudType = *values.CloudType
-	}
-	if flagWasSet(fs, "runpod-instance-id") {
-		cfg.InstanceID = *values.InstanceID
-	}
-	if flagWasSet(fs, "runpod-image") {
-		cfg.Image = *values.Image
-	}
-	if flagWasSet(fs, "runpod-template-id") {
-		cfg.TemplateID = *values.TemplateID
-	}
-	if flagWasSet(fs, "runpod-disk-gb") {
-		cfg.DiskGB = *values.DiskGB
-	}
-	if flagWasSet(fs, "runpod-user") {
-		cfg.User = *values.User
-	}
-	if flagWasSet(fs, "runpod-work-root") {
-		cfg.WorkRoot = *values.WorkRoot
-	}
-	return applied
+	err := applyConfigFlags(cfg, values, &applied, fs)
+	return applied, err
 }

@@ -261,8 +261,25 @@ project plus either a complete service-account key pair or
    maintenance `TERMINATE`, automatic restart off, and termination action
    `DELETE`.
 6. Wait for the public IP, then for SSH and the Crabbox ready marker.
+   Public-IP observations and their five-second retry waits share a two-minute
+   budget. Earlier cancellation stops discovery, and API errors fail immediately;
+   this budget does not include the subsequent SSH readiness phase.
+   Readiness cancellation retains the caller's original cause and diagnostic,
+   including interrupted reads, while exposing the canonical cancellation or
+   deadline for run classification. Budget expiry keeps the existing timeout
+   message and CLI exit code 1. Completed ready responses and typed API errors
+   retain precedence when they coincide with cancellation.
 7. Touch labels during active runs.
 8. Delete the VM on release unless the lease is kept.
+
+If acquisition fails after creating a VM, successful rollback also removes the
+lease's generated SSH credentials and host-trust files. Failed remote deletion
+retains those files; a local artifact-cleanup error is reported and prevents an
+automatic fresh-lease retry. Cleanup-client creation and remote deletion
+completion share a fresh three-minute budget, independent of cancellation of the
+acquisition request. [Compute Engine guest shutdown](https://docs.cloud.google.com/compute/docs/instances/suspend-stop-reset-instances-overview#stop_operation)
+can take 120 seconds before resource deletion, so the budget includes time to
+confirm completion. Uncertain creation outcomes are unchanged.
 
 ## Machine classes
 
@@ -283,6 +300,10 @@ Explicit `--type` disables class-candidate fallback. Zone fallback and
 Spot-to-on-demand fallback still apply to the exact requested type when GCP
 returns a quota, capacity, rate-limit, or unavailable-type error. See
 [Capacity and fallback](../features/capacity-fallback.md).
+
+The coordinator classifies retry eligibility from complete API error evidence;
+displayed diagnostics remain bounded and redacted. Shortening a diagnostic does
+not change which configured zone or market candidates may be attempted.
 
 ## Networking
 
@@ -338,6 +359,16 @@ provider key before deletion. Labels and deterministic names remain discovery
 hints, not destructive authority. Claimless or stale-claim resources are
 skipped; recover or remove them through an explicit operator-controlled GCP
 workflow instead of silently adopting cloud metadata.
+
+After deletion or an exact lookup confirming the instance is absent, direct
+release and cleanup remove the lease's generated SSH key and private host-trust
+files before retiring its claim. Both local steps share the unchanged-claim
+lock. A provider-deletion or SSH-artifact cleanup failure retains the claim for retry, and
+`--dry-run` leaves the claim and SSH material untouched. Stale records without
+a cloud resource identity retain their existing claim-only pruning behavior.
+Waiting for the claim lock honors caller cancellation and deadlines. Cancellation
+before lock admission preserves local state and does not begin deletion; after
+confirmed deletion, bounded SSH-artifact cleanup and claim retirement still finish.
 
 Direct cleanup:
 

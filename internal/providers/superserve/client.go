@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
@@ -106,17 +107,17 @@ type superserveAPIError struct {
 func (e *superserveAPIError) Error() string { return e.err.Error() }
 func (e *superserveAPIError) Unwrap() error { return e.err }
 
-func newSuperserveClient(cfg Config, rt Runtime) (superserveClient, error) {
+func newSuperserveClient(cfg core.Config, rt core.Runtime) (superserveClient, error) {
 	baseURL, err := validateSuperserveBaseURL(cfg.Superserve.BaseURL)
 	if err != nil {
 		return nil, err
 	}
-	apiKey := firstNonEmpty(
+	apiKey := shared.FirstNonBlankTrimmed(
 		os.Getenv("CRABBOX_SUPERSERVE_API_KEY"),
 		os.Getenv("SUPERSERVE_API_KEY"),
 	)
 	if apiKey == "" {
-		return nil, exit(2, "provider=superserve needs an API key; load CRABBOX_SUPERSERVE_API_KEY or SUPERSERVE_API_KEY from a secret manager")
+		return nil, core.Exit(2, "provider=superserve needs an API key; load CRABBOX_SUPERSERVE_API_KEY or SUPERSERVE_API_KEY from a secret manager")
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
@@ -183,7 +184,7 @@ func (c *httpSuperserveClient) CreateSandbox(ctx context.Context, req createSand
 		return superserveSandbox{}, err
 	}
 	if sb.ID == "" {
-		return superserveSandbox{}, exit(5, "superserve create returned no sandbox id")
+		return superserveSandbox{}, core.Exit(5, "superserve create returned no sandbox id")
 	}
 	return sb, nil
 }
@@ -255,13 +256,13 @@ func (c *httpSuperserveClient) DeleteSandbox(ctx context.Context, id string) err
 
 func (c *httpSuperserveClient) UploadFile(ctx context.Context, access *sandboxAccess, remotePath string, content io.Reader) error {
 	if strings.TrimSpace(remotePath) == "" || !strings.HasPrefix(remotePath, "/") || strings.Contains(remotePath, "..") {
-		return exit(2, "superserve file path must be absolute and must not contain '..': %q", remotePath)
+		return core.Exit(2, "superserve file path must be absolute and must not contain '..': %q", remotePath)
 	}
 	seeker, canSeek := content.(io.Seeker)
 	return c.withAccessRetry(ctx, access, func(token string) error {
 		if canSeek {
 			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-				return exit(6, "rewind sync archive: %v", err)
+				return core.Exit(6, "rewind sync archive: %v", err)
 			}
 		}
 		target, err := c.dataPlaneTarget(access.Sandbox.ID)
@@ -330,9 +331,9 @@ func (c *httpSuperserveClient) postAccess(ctx context.Context, apiPath string) (
 	if err := c.doJSON(ctx, http.MethodPost, apiPath, nil, &raw); err != nil {
 		return sandboxAccess{}, err
 	}
-	token := blank(raw.AccessToken, raw.Token)
+	token := core.Blank(raw.AccessToken, raw.Token)
 	if token == "" {
-		return sandboxAccess{}, exit(5, "superserve %s returned no access token", apiPath)
+		return sandboxAccess{}, core.Exit(5, "superserve %s returned no access token", apiPath)
 	}
 	sb := raw.Sandbox
 	if sb.ID == "" {
@@ -352,10 +353,10 @@ func (c *httpSuperserveClient) postAccess(ctx context.Context, apiPath string) (
 
 func (c *httpSuperserveClient) withAccessRetry(ctx context.Context, access *sandboxAccess, send func(token string) error) error {
 	if access == nil || strings.TrimSpace(access.Sandbox.ID) == "" {
-		return exit(5, "superserve data-plane request needs an activated sandbox")
+		return core.Exit(5, "superserve data-plane request needs an activated sandbox")
 	}
 	if strings.TrimSpace(access.AccessToken) == "" {
-		return exit(5, "superserve activated sandbox %s returned no access token", access.Sandbox.ID)
+		return core.Exit(5, "superserve activated sandbox %s returned no access token", access.Sandbox.ID)
 	}
 	err := send(access.AccessToken)
 	if !isSuperserveUnauthorized(err) {
@@ -382,7 +383,7 @@ func (c *httpSuperserveClient) dataPlaneTarget(sandboxID string) (dataPlaneTarge
 	if err != nil {
 		return dataPlaneTarget{}, err
 	}
-	if isLoopbackHost(parsed.Hostname()) {
+	if shared.IsLoopbackHost(parsed.Hostname()) {
 		return dataPlaneTarget{
 			baseURL: strings.TrimRight(parsed.String(), "/"),
 			headers: map[string]string{
@@ -392,7 +393,7 @@ func (c *httpSuperserveClient) dataPlaneTarget(sandboxID string) (dataPlaneTarge
 	}
 	sandboxHost, ok := deriveSuperserveSandboxHost(parsed.Hostname())
 	if !ok {
-		return dataPlaneTarget{}, exit(2, "provider=superserve cannot derive a data-plane sandbox host from base URL %s; use the production/staging Superserve API or a loopback development endpoint", c.baseURL)
+		return dataPlaneTarget{}, core.Exit(2, "provider=superserve cannot derive a data-plane sandbox host from base URL %s; use the production/staging Superserve API or a loopback development endpoint", c.baseURL)
 	}
 	if supportsSuperserveSharedHost(sandboxHost) {
 		return dataPlaneTarget{
@@ -437,7 +438,10 @@ func (c *httpSuperserveClient) execBuffered(ctx context.Context, sandboxID, toke
 		return execResult{}, err
 	}
 	var result execResult
-	requestCtx, cancel := superserveExecRequestContext(ctx, body.TimeoutSecs)
+	requestCtx, cancel, err := superserveExecRequestContext(ctx, body.TimeoutSecs)
+	if err != nil {
+		return execResult{}, err
+	}
 	defer cancel()
 	if err := c.doDataPlaneJSON(requestCtx, http.MethodPost, target, "/exec", token, body, &result, envSecretValues(body.Env)...); err != nil {
 		return execResult{}, err
@@ -450,7 +454,10 @@ func (c *httpSuperserveClient) execStream(ctx context.Context, sandboxID, token 
 	if err != nil {
 		return execResult{}, err
 	}
-	requestCtx, cancel := superserveExecRequestContext(ctx, body.TimeoutSecs)
+	requestCtx, cancel, err := superserveExecRequestContext(ctx, body.TimeoutSecs)
+	if err != nil {
+		return execResult{}, err
+	}
 	defer cancel()
 	var reader io.Reader
 	buf, err := json.Marshal(body)
@@ -520,11 +527,27 @@ func (c *httpSuperserveClient) doDataPlaneJSON(ctx context.Context, method strin
 	return nil
 }
 
-func superserveExecRequestContext(ctx context.Context, timeoutSecs int) (context.Context, context.CancelFunc) {
-	if timeoutSecs > 0 {
-		return context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second+5*time.Second)
+func superserveExecTimeout(timeoutSecs int) (time.Duration, error) {
+	if timeoutSecs <= 0 {
+		return 0, nil
 	}
-	return context.WithCancel(ctx)
+	if timeout, ok := shared.SecondsWithGrace(int64(timeoutSecs), 5*time.Second); ok {
+		return timeout, nil
+	}
+	return 0, core.Exit(2, "superserve execution timeout exceeds the supported duration range")
+}
+
+func superserveExecRequestContext(ctx context.Context, timeoutSecs int) (context.Context, context.CancelFunc, error) {
+	timeout, err := superserveExecTimeout(timeoutSecs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if timeout == 0 {
+		child, cancel := context.WithCancel(ctx)
+		return child, cancel, nil
+	}
+	child, cancel := context.WithTimeout(ctx, timeout)
+	return child, cancel, nil
 }
 
 type superserveStreamUnsupportedError struct {
@@ -579,7 +602,7 @@ func consumeSuperserveExecStream(body io.Reader, stdout, stderr io.Writer, secre
 					return execResult{}, fmt.Errorf("superserve write command stderr: %w", err)
 				}
 				if result.ExitCode == 0 {
-					return result, exit(5, "superserve command stream failed: %s", streamErr)
+					return result, core.Exit(5, "superserve command stream failed: %s", streamErr)
 				}
 			}
 		}
@@ -588,7 +611,7 @@ func consumeSuperserveExecStream(body io.Reader, stdout, stderr io.Writer, secre
 		return execResult{}, fmt.Errorf("superserve read /exec/stream: %w", err)
 	}
 	if !sawFinished {
-		return execResult{}, exit(5, "superserve command stream ended without a finished event")
+		return execResult{}, core.Exit(5, "superserve command stream ended without a finished event")
 	}
 	return result, nil
 }
@@ -641,17 +664,17 @@ func (c *httpSuperserveClient) apiError(method, apiPath string, resp *http.Respo
 	if json.Unmarshal(body, &wrapped) == nil {
 		switch value := wrapped.Error.(type) {
 		case string:
-			msg = blank(value, blank(wrapped.Message, msg))
+			msg = core.Blank(value, core.Blank(wrapped.Message, msg))
 		case map[string]any:
 			if message, ok := value["message"].(string); ok {
-				msg = blank(message, blank(wrapped.Message, msg))
+				msg = core.Blank(message, core.Blank(wrapped.Message, msg))
 			}
 		}
 	}
 	msg = redactSuperserveSecrets(msg, append([]string{c.apiKey}, secrets...)...)
 	return &superserveAPIError{
 		StatusCode: resp.StatusCode,
-		err:        exit(5, "superserve %s %s failed: %s: %s", method, apiPath, resp.Status, msg),
+		err:        core.Exit(5, "superserve %s %s failed: %s: %s", method, apiPath, resp.Status, msg),
 	}
 }
 
@@ -685,13 +708,4 @@ func redactJSONSecretField(value, key string) string {
 func superserveEndpointScope(baseURL string) string {
 	digest := sha256.Sum256([]byte(baseURL))
 	return "endpoint-sha256:" + hex.EncodeToString(digest[:])
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }
