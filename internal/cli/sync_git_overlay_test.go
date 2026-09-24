@@ -4353,9 +4353,8 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 	var leaseIDs [2]string
 	providerName := runReadyPoolPreflightTestProvider{}.Spec().Name
 	// Coordinator leases use direct TCP readiness, unlike the provider-local
-	// fixture's SSHConfigProxy path. Use a reachable endpoint and disable the
-	// default :22 fallback so its controlled readiness failure cannot recover
-	// through an unrelated workstation SSH daemon.
+	// fixture's SSHConfigProxy path. Advertise only the fixture's primary port
+	// so the implicit :22 fallback cannot recover its forced readiness failure.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -4384,7 +4383,7 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 		lease := func(id, state string) CoordinatorLease {
 			return CoordinatorLease{
 				ID: id, Provider: providerName, TargetOS: targetLinux, State: state,
-				Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: sshPort, WorkRoot: remoteRoot,
+				Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: sshPort, SSHFallbackPorts: []string{sshPort}, WorkRoot: remoteRoot,
 			}
 		}
 		switch {
@@ -4458,7 +4457,7 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 
 	configPath := filepath.Join(testRoot, "config.yaml")
 	mustWriteTestFile(t, configPath, fmt.Sprintf(
-		"ssh:\n  fallbackPorts: []\ncoordinator: %q\ncoordinatorToken: test-token\nworkRoot: %q\nsync:\n  gitOverlay: true\n  gitSeed: true\n  delete: true\n  fingerprint: true\n",
+		"coordinator: %q\ncoordinatorToken: test-token\nworkRoot: %q\nsync:\n  gitOverlay: true\n  gitSeed: true\n  delete: true\n  fingerprint: true\n",
 		server.URL,
 		remoteRoot,
 	))
