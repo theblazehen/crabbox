@@ -24,6 +24,7 @@ type runCleanupWorkspaceOwnerTransport struct {
 
 	blockInspectAt            int
 	inspectCount              int
+	childOnInspect            int
 	inspectReply              string
 	childMarker               string
 	inspectErr                error
@@ -86,7 +87,8 @@ func (r *runCleanupWorkspaceOwnerTransport) Do(ctx context.Context, req workspac
 	case workspaceOwnerInspect:
 		r.mu.Lock()
 		r.inspectCount++
-		blocked := r.inspectCount == r.blockInspectAt
+		inspectCount := r.inspectCount
+		blocked := inspectCount == r.blockInspectAt
 		r.mu.Unlock()
 		if blocked {
 			r.inspectOnce.Do(func() { close(r.inspectStarted) })
@@ -95,6 +97,9 @@ func (r *runCleanupWorkspaceOwnerTransport) Do(ctx context.Context, req workspac
 				return "", ctx.Err()
 			case <-r.allowInspect:
 			}
+		}
+		if inspectCount == r.childOnInspect {
+			return "CHILD", nil
 		}
 		if r.inspectErr != nil {
 			return r.inspectReply, r.inspectErr
@@ -280,6 +285,7 @@ func TestRunCommandLeaseCleanupQuiescesWorkspaceOwner(t *testing.T) {
 		renewErr              error
 		stopErr               error
 		download              bool
+		childAtCleanup        bool
 		wantExit              int
 		wantStop              bool
 		wantOwnerRelease      bool
@@ -290,6 +296,7 @@ func TestRunCommandLeaseCleanupQuiescesWorkspaceOwner(t *testing.T) {
 		nativeRuntime         bool
 	}{
 		{name: "successful evidence-backed run", command: "renewal-cleanup-success", download: true, wantStop: true},
+		{name: "child appears after evidence collection", command: "renewal-cleanup-success", download: true, childAtCleanup: true, wantExit: 7, wantOwnerRelease: true},
 		{name: "native runtime terminal handoff", command: "renewal-cleanup-success", wantStop: true, nativeRuntime: true},
 		{name: "native runtime retained workspace cleanup", command: "renewal-cleanup-success", preservesSSHWorkspace: true, wantStop: true, wantOwnerRelease: true, nativeRuntime: true},
 		{name: "renewal fails before stop", command: "renewal-cleanup-success", renewErr: errors.New("renew response lost"), wantExit: 7, wantOwnerRelease: true},
@@ -318,6 +325,9 @@ func TestRunCommandLeaseCleanupQuiescesWorkspaceOwner(t *testing.T) {
 				inspectAt = 2
 			}
 			remote := newRunCleanupWorkspaceOwnerTransport(inspectAt, test.renewErr)
+			if test.childAtCleanup {
+				remote.childOnInspect = inspectAt
+			}
 			remote.releaseReply, remote.releaseErr = test.releaseReply, test.releaseErr
 			runEnvProfileTestPreservesSSHWorkspace = test.preservesSSHWorkspace
 			var cancelParent context.CancelFunc
@@ -407,19 +417,25 @@ func TestRunCommandLeaseCleanupQuiescesWorkspaceOwner(t *testing.T) {
 				}
 			}
 			remote.unblockInspect()
-			select {
-			case <-releaseStarted:
-				t.Fatal("destructive stop overtook workspace-owner renewal quiescence")
-			case <-time.After(runCleanupTestTimeout):
-				t.Fatal("workspace-owner renewal was not asked to quiesce")
-			case <-owner.stop:
+			if test.childAtCleanup {
+				// The collection inspection succeeded; the cleanup inspection now
+				// witnesses a child, so no destructive stop or renewal quiescence.
+				remote.unblockRenewal()
+			} else {
+				select {
+				case <-releaseStarted:
+					t.Fatal("destructive stop overtook workspace-owner renewal quiescence")
+				case <-time.After(runCleanupTestTimeout):
+					t.Fatal("workspace-owner renewal was not asked to quiesce")
+				case <-owner.stop:
+				}
+				select {
+				case <-releaseStarted:
+					t.Fatal("destructive stop began while renewal transport was still in flight")
+				default:
+				}
+				remote.unblockRenewal()
 			}
-			select {
-			case <-releaseStarted:
-				t.Fatal("destructive stop began while renewal transport was still in flight")
-			default:
-			}
-			remote.unblockRenewal()
 
 			runErr := result.wait(t)
 			if test.nativeRuntime && (runtimeRemovals.Load() == 1) != test.preservesSSHWorkspace {
@@ -429,6 +445,14 @@ func TestRunCommandLeaseCleanupQuiescesWorkspaceOwner(t *testing.T) {
 				t.Fatal("backend release observed renewal still in flight")
 			}
 			assertRunCleanupExitCode(t, runErr, test.wantExit, stdout.String(), stderr.String())
+			if test.childAtCleanup {
+				remote.mu.Lock()
+				inspections := remote.inspectCount
+				remote.mu.Unlock()
+				if inspections != 2 || !strings.Contains(stderr.String(), "lease cleanup skipped while workspace owner remains ambiguous") || !strings.Contains(stderr.String(), "child") {
+					t.Fatalf("cleanup child gate: inspections=%d stderr=%s", inspections, stderr.String())
+				}
+			}
 			if test.command == "renewal-cleanup-exit-23" {
 				wantRecovery := test.stopErr != nil || test.renewErr != nil
 				if got := strings.Contains(stderr.String(), "next: crabbox ssh "); got != wantRecovery {
