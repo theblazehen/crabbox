@@ -1,5 +1,8 @@
+import { AzureSKUAvailability } from "./azure-skus";
 import { azureWindowsBootstrapPowerShell, cloudInit } from "./bootstrap";
 import {
+  azureFullCachingSeriesEligible,
+  normalizeAzureOSDiskMode,
   azureSupportsEphemeralFullCaching,
   azureSupportsEphemeralOS,
   azureVMSizeCandidatesForTargetClass,
@@ -10,15 +13,24 @@ import {
   validatedCIDRs,
   type LeaseConfig,
 } from "./config";
+import { measureCreationStep, recordCreationStep } from "./creation-events";
 import { sha256Hex } from "./encoding";
 import { ExpiringTokenCache, type ExpiringToken } from "./expiring-token-cache";
+import {
+  ProviderRequestTimeoutError,
+  providerFetch,
+  providerRequestSignal,
+  providerRequestTimeoutMs,
+  providerSleep,
+  waitForProviderSignal,
+} from "./provider-deadline";
 import { leaseProviderLabels, providerLabelsOwnedByLease } from "./provider-labels";
 import {
   ProviderProvisioningCleanupError,
   ProviderResourceUnresolvedError,
   providerProvisioningCleanupClaim,
 } from "./provider-provisioning";
-import { ProvisioningAttemptHistory } from "./provisioning-attempts";
+import { ProvisioningAttemptHistory, ProvisioningAttemptsError } from "./provisioning-attempts";
 import { leaseProviderName } from "./slug";
 import type {
   Env,
@@ -39,12 +51,13 @@ const API_VERSIONS = {
   compute: "2024-07-01",
   disks: "2024-03-02",
 };
-const COMPUTE_FULL_CACHING_PREVIEW_API_VERSION = "2025-04-01";
+const COMPUTE_FULL_CACHING_API_VERSION = "2026-04-01";
 const DELETE_RETRY_ATTEMPTS = 13;
 const DELETE_RETRY_DELAY_MS = 15_000;
 const MIN_LRO_POLL_INTERVAL_MS = 15_000;
 const DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS = 60_000;
 const DEFAULT_AZURE_VM_CREATE_TIMEOUT_MS = 180_000;
+const AZURE_CREATE_BUDGET_MS = 25 * 60_000;
 const DEFAULT_AZURE_SPOT_FALLBACK_MS = 120_000;
 const DEFAULT_AZURE_LINUX_IMAGE = "Canonical:ubuntu-26_04-lts:server:latest";
 const DEFAULT_AZURE_LINUX_ARM64_IMAGE = "Canonical:ubuntu-26_04-lts:server-arm64:latest";
@@ -55,11 +68,11 @@ const LEGACY_AZURE_NOBLE_GEN2_IMAGE =
   "Canonical:0001-com-ubuntu-server-noble:24_04-lts-gen2:latest";
 const DEFAULT_AZURE_WINDOWS_IMAGE =
   "MicrosoftWindowsServer:windowsserver2022:2022-datacenter-smalldisk-g2:latest";
-const AZURE_TRUFFLEHOG_VERSION = "3.95.9";
+const AZURE_TRUFFLEHOG_VERSION = "3.99.4";
 const AZURE_TRUFFLEHOG_AMD64_SHA256 =
-  "f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e";
+  "5ae9b313342d1bfa96404064c0f59e77a2cbd1824d797ca7b11e6655aa8fd9d1";
 const AZURE_TRUFFLEHOG_ARM64_SHA256 =
-  "9d9c2ec4ea36a089a9c5aaafe1969d176013ddf9f44d68e8cd75291aed8c83ed";
+  "e6285aff62e692131255dca91ad300a62a479330e0b72e4eb1d60ae58908f8d5";
 
 export function azureLinuxCloudInit(config: LeaseConfig): string {
   return cloudInit(config, azureLinuxTruffleHogBootstrap());
@@ -403,18 +416,58 @@ interface AzureSharedInfraNames {
 
 interface AzureARMOptions {
   lroTimeoutMs?: number;
+  pollIntervalMs?: number;
   terminalResourceState?: { path: string; apiVersion: string };
   headers?: Record<string, string>;
 }
 
 export class AzureHTTPError extends Error {
+  readonly code?: string;
+  readonly detail?: string;
   constructor(
     readonly method: string,
     readonly path: string,
     readonly status: number,
     readonly body: string,
   ) {
-    super(`azure ${method} ${path}: http ${status}: ${body}`);
+    super(`azure ${method} ${path}: http ${status}: ${summarizeAzureErrorBody(body)}`);
+    try {
+      const error = (JSON.parse(body) as { error?: { code?: unknown; message?: unknown } }).error;
+      if (typeof error?.code === "string") this.code = error.code;
+      if (typeof error?.message === "string") this.detail = error.message;
+    } catch {
+      // Only structured ARM responses can establish rejection evidence.
+    }
+  }
+}
+
+export function azureDefiniteAllocationRejection(
+  status: number,
+  code: string | undefined,
+  message = "",
+): boolean {
+  if (![400, 403, 409].includes(status)) return false;
+  return (
+    [
+      "SkuNotAvailable",
+      "AllocationFailed",
+      "OverconstrainedAllocationRequest",
+      "ZonalAllocationFailed",
+      "InvalidParameter",
+      "QuotaExceeded",
+      "InvalidTemplate",
+    ].includes(code ?? "") ||
+    (code === "OperationNotAllowed" && /\bquota\b/i.test(message))
+  );
+}
+
+// Every attempted VM was definitively rejected and its owned fragments were deleted.
+export class AzureProvisioningRejectedError extends ProvisioningAttemptsError {
+  constructor(error: Error) {
+    super(error.message, error instanceof ProvisioningAttemptsError ? error.attempts : [], {
+      cause: error,
+    });
+    this.name = "AzureProvisioningRejectedError";
   }
 }
 
@@ -442,13 +495,36 @@ export class AzureClient {
   readonly image: string;
   readonly sshCIDRs: string[];
   readonly defaultLocation: string;
-  private readonly tokenCache = new ExpiringTokenCache();
+  private tokenCache = new ExpiringTokenCache();
   private ephemeralOSSupport?: Map<string, boolean>;
+  private skuAvailability = new AzureSKUAvailability();
+  private createDeadline: number | undefined;
   private readonly deferredCleanup:
     | ((request: AzureDeferredCleanupRequest) => Promise<void>)
     | undefined;
   private readonly ownedDeleteClaimStorage: AzureOwnedDeleteClaimStorage | undefined;
-  fetcher: typeof fetch = (input, init) => fetch(input, init);
+  fetcher: typeof fetch = (input, init) =>
+    providerFetch(
+      input,
+      init,
+      this.requestSignal(
+        "request",
+        init?.signal ?? (input instanceof Request ? input.signal : undefined),
+      ),
+    );
+
+  private requestSignal(operation: string, callerSignal?: AbortSignal | null): AbortSignal {
+    if (this.createDeadline !== undefined) {
+      const remaining = this.createDeadline - Date.now();
+      const budget = new AbortController();
+      const expire = () =>
+        budget.abort(new Error("Azure provisioning deadline exceeded after 25m"));
+      if (remaining <= 0) expire();
+      else AbortSignal.timeout(remaining).addEventListener("abort", expire, { once: true });
+      callerSignal = callerSignal ? AbortSignal.any([callerSignal, budget.signal]) : budget.signal;
+    }
+    return providerRequestSignal(providerRequestTimeoutMs, callerSignal, "azure", operation);
+  }
 
   constructor(
     env: Env,
@@ -703,9 +779,11 @@ export class AzureClient {
   }> {
     const locations = azureRegionCandidates(config, this.env, this.defaultLocation);
     const multiRegion = locations.length > 1;
+    const deadline = Date.now() + AZURE_CREATE_BUDGET_MS;
     const history = new ProvisioningAttemptHistory();
+    let allRejected = true;
     for (const location of locations) {
-      const client = this.clientForLocation(location, multiRegion);
+      const client = this.clientForLocation(location, multiRegion, deadline);
       try {
         // oxlint-disable-next-line eslint/no-await-in-loop -- region fallback must preserve operator preference order.
         const result = await client.createServerWithFallbackInLocation(
@@ -714,6 +792,7 @@ export class AzureClient {
           leaseID,
           slug,
           owner,
+          multiRegion,
         );
         const server = {
           ...result.server,
@@ -723,6 +802,7 @@ export class AzureClient {
         return { ...result, server, ...history.result(result.attempts) };
       } catch (error) {
         if (providerProvisioningCleanupClaim(error)) throw error;
+        allRejected &&= error instanceof AzureProvisioningRejectedError;
         const message = error instanceof Error ? error.message : String(error);
         history.recordFailure(
           error,
@@ -738,11 +818,16 @@ export class AzureClient {
         if (!isRetryableProvisioningError(message)) break;
       }
     }
-    throw history.error();
+    const failure = history.error();
+    throw allRejected ? new AzureProvisioningRejectedError(failure) : failure;
   }
 
-  private clientForLocation(location: string, multiRegion: boolean): AzureClient {
-    if (location === this.defaultLocation && !multiRegion) return this;
+  private clientForLocation(
+    location: string,
+    multiRegion: boolean,
+    deadline?: number,
+  ): AzureClient {
+    if (location === this.defaultLocation && !multiRegion && deadline === undefined) return this;
     const options: {
       location: string;
       vnet: string;
@@ -764,7 +849,19 @@ export class AzureClient {
     if (this.ownedDeleteClaimStorage) {
       options.ownedDeleteClaimStorage = this.ownedDeleteClaimStorage;
     }
-    return new AzureClient(this.env, options);
+    const client = new AzureClient(this.env, options);
+    client.tokenCache = this.tokenCache;
+    client.createDeadline = deadline;
+    client.fetcher = (input, init) => {
+      const signal = client.requestSignal(
+        "request",
+        init?.signal ?? (input instanceof Request ? input.signal : undefined),
+      );
+      signal.throwIfAborted();
+      return this.fetcher(input, { ...init, signal });
+    };
+    client.skuAvailability = this.skuAvailability;
+    return client;
   }
 
   private async createServerWithFallbackInLocation(
@@ -773,73 +870,71 @@ export class AzureClient {
     leaseID: string,
     slug: string,
     owner: string,
+    multiRegion: boolean,
   ): Promise<{
     server: ProviderMachine;
     serverType: string;
     market: string;
     attempts?: ProvisioningAttempt[];
   }> {
-    const candidates = azureProvisioningCandidatesForConfig(config);
+    if (!config.azureSnapshot) normalizeAzureOSDiskMode(config.azureOSDisk);
+    const availability = await measureCreationStep("azure.sku_availability", () =>
+      this.skuAvailability.get(this.subscription, location, () => this.token(), this.fetcher),
+    );
+    const rank = (size: string) => {
+      const available = availability.get(size.toLowerCase());
+      return available === true ? 0 : available === undefined ? 1 : 2;
+    };
+    const candidates = azureProvisioningCandidatesForConfig(config).toSorted(
+      (a, b) => rank(a) - rank(b),
+    );
+    const markets = [config.capacityMarket];
+    if (config.capacityMarket === "spot" && config.capacityFallback.startsWith("on-demand"))
+      markets.push("on-demand");
     const history = new ProvisioningAttemptHistory();
+    let allRejected = true;
     let infra: AzureSharedInfraNames | undefined;
-    for (let index = 0; index < candidates.length; index += 1) {
-      const vmSize = candidates[index] ?? config.serverType;
-      const nextConfig = { ...config, serverType: vmSize };
-      if (!nextConfig.azureSnapshot) {
-        // Validate preview-only OS disk requirements before allocating network resources.
-        // oxlint-disable-next-line eslint/no-await-in-loop -- SKU fallback must stay sequential.
-        await this.validateOSDiskMode(nextConfig, location);
-      }
-      try {
-        if (!infra) {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- shared infra is created once, after config validation.
-          infra = await this.ensureSharedInfra(location, config);
-        }
-        // oxlint-disable-next-line eslint/no-await-in-loop -- SKU fallback must stay sequential.
-        const server = await this.createVM(
-          nextConfig,
-          location,
-          leaseID,
-          slug,
-          owner,
-          infra,
-          azureAttemptNameSeed(leaseID, location, config.capacityMarket, index),
-        );
-        return { server, serverType: vmSize, market: config.capacityMarket, ...history.result() };
-      } catch (error) {
-        if (providerProvisioningCleanupClaim(error)) throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        history.record(
-          {
-            region: location,
-            serverType: vmSize,
-            market: config.capacityMarket,
-            category: azureProvisioningErrorCategory(message) || "fatal",
-            message: conciseAzureProvisioningMessage(message),
-          },
-          `${vmSize}: ${message}`,
-        );
-        if (!isRetryableProvisioningError(message)) break;
-      }
-    }
-    if (config.capacityMarket === "spot" && config.capacityFallback.startsWith("on-demand")) {
+    for (const market of markets) {
       for (let index = 0; index < candidates.length; index += 1) {
         const vmSize = candidates[index] ?? config.serverType;
-        const nextConfig: LeaseConfig = {
-          ...config,
-          capacityMarket: "on-demand",
-          serverType: vmSize,
-        };
+        if (this.createDeadline !== undefined && Date.now() >= this.createDeadline) {
+          // Preserve previous ambiguous failures; elapsed time is never rejection evidence.
+          const failure = history.error("Azure provisioning deadline exceeded after 25m; ");
+          throw allRejected ? new AzureProvisioningRejectedError(failure) : failure;
+        }
+        const nextConfig = { ...config, capacityMarket: market, serverType: vmSize };
+        const cacheKey = `azure-capacity:${encodeURIComponent(this.providerScope().toLowerCase())}:${location.toLowerCase()}:${vmSize.toLowerCase()}:${market}`;
+        // Capacity hints never establish allocation or cleanup facts for this request.
+        // oxlint-disable-next-line eslint/no-await-in-loop -- persisted hints are read before each ordered attempt.
+        const cachedUntil = await this.ownedDeleteClaimStorage
+          ?.get<number>(cacheKey)
+          .catch(() => undefined);
+        if (typeof cachedUntil === "number" && cachedUntil > Date.now()) {
+          history.record(
+            {
+              region: location,
+              serverType: vmSize,
+              market,
+              category: "capacity-cache",
+              message: "SkuNotAvailable: skipping recently rejected capacity",
+            },
+            `${vmSize}: cached SkuNotAvailable`,
+          );
+          continue;
+        }
         if (!nextConfig.azureSnapshot) {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- market fallback must preserve ordered capacity preference.
+          // oxlint-disable-next-line eslint/no-await-in-loop -- validate before allocating network resources.
           await this.validateOSDiskMode(nextConfig, location);
         }
+        const startedAt = Date.now();
         try {
+          if (availability.get(vmSize.toLowerCase()) === false)
+            throw new Error(`NotAvailableForSubscription: ${vmSize} is restricted in ${location}`);
           if (!infra) {
-            // oxlint-disable-next-line eslint/no-await-in-loop -- shared infra is created once, after config validation.
+            // oxlint-disable-next-line eslint/no-await-in-loop -- shared infra is created once after validation.
             infra = await this.ensureSharedInfra(location, config);
           }
-          // oxlint-disable-next-line eslint/no-await-in-loop -- market fallback must preserve ordered capacity preference.
+          // oxlint-disable-next-line eslint/no-await-in-loop -- no next attempt before this attempt settles.
           const server = await this.createVM(
             nextConfig,
             location,
@@ -847,27 +942,42 @@ export class AzureClient {
             slug,
             owner,
             infra,
-            azureAttemptNameSeed(leaseID, location, "on-demand", index),
+            azureAttemptNameSeed(leaseID, location, market, index),
           );
-          return { server, serverType: vmSize, market: "on-demand", ...history.result() };
+          recordCreationStep("azure.attempt", Date.now() - startedAt);
+          return { server, serverType: vmSize, market, ...history.result() };
         } catch (error) {
+          const durationMs = Date.now() - startedAt;
+          recordCreationStep("azure.attempt", durationMs, true);
           if (providerProvisioningCleanupClaim(error)) throw error;
+          allRejected &&= error instanceof AzureProvisioningRejectedError;
           const message = error instanceof Error ? error.message : String(error);
+          const category = azureProvisioningErrorCategory(message) || "fatal";
           history.record(
             {
               region: location,
               serverType: vmSize,
-              market: "on-demand",
-              category: azureProvisioningErrorCategory(message) || "fatal",
+              market,
+              category,
               message: conciseAzureProvisioningMessage(message),
+              durationMs,
             },
-            `on-demand ${vmSize}: ${message}`,
+            `${market} ${vmSize}: ${message}`,
           );
-          if (!isRetryableProvisioningError(message)) break;
+          if (category === "capacity" && error instanceof AzureProvisioningRejectedError) {
+            // Only definite rejection plus verified cleanup can populate this hint.
+            // oxlint-disable-next-line eslint/no-await-in-loop -- publish the hint before moving to another candidate.
+            await this.ownedDeleteClaimStorage
+              ?.put(cacheKey, Date.now() + 5 * 60_000)
+              .catch(() => undefined);
+          }
+          if (!isRetryableProvisioningError(message) || (multiRegion && category === "capacity"))
+            break;
         }
       }
     }
-    throw history.error();
+    const failure = history.error();
+    throw allRejected ? new AzureProvisioningRejectedError(failure) : failure;
   }
 
   async deleteServer(name: string): Promise<void> {
@@ -2474,7 +2584,7 @@ export class AzureClient {
         tags,
         properties: { securityRules: rules },
       },
-      { lroTimeoutMs: DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS },
+      { lroTimeoutMs: DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS, pollIntervalMs: 5_000 },
     );
     return infra;
   }
@@ -2588,6 +2698,14 @@ export class AzureClient {
             cleanupError,
           );
         }
+        if (
+          error instanceof AzureHTTPError &&
+          error.method === "PUT" &&
+          error.path === vmPath(this.resourceGroup, name) &&
+          azureDefiniteAllocationRejection(error.status, error.code, error.detail)
+        ) {
+          throw new AzureProvisioningRejectedError(error);
+        }
       }
       throw error;
     }
@@ -2617,7 +2735,7 @@ export class AzureClient {
         sku: { name: "Standard" },
         properties: { publicIPAllocationMethod: "Static" },
       },
-      { lroTimeoutMs: DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS },
+      { lroTimeoutMs: DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS, pollIntervalMs: 5_000 },
     );
     const subnetID = `/subscriptions/${this.subscription}/resourceGroups/${this.resourceGroup}/providers/Microsoft.Network/virtualNetworks/${infra.vnet}/subnets/${this.subnet}`;
     const nsgID = `/subscriptions/${this.subscription}/resourceGroups/${this.resourceGroup}/providers/Microsoft.Network/networkSecurityGroups/${infra.nsg}`;
@@ -2644,7 +2762,7 @@ export class AzureClient {
           networkSecurityGroup: { id: nsgID },
         },
       },
-      { lroTimeoutMs: DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS },
+      { lroTimeoutMs: DEFAULT_AZURE_NETWORK_LRO_TIMEOUT_MS, pollIntervalMs: 5_000 },
     );
     const customData = btoa(
       config.target === "windows"
@@ -2676,18 +2794,13 @@ export class AzureClient {
         name: `${name}-osdisk`,
         createOption: "FromImage",
       };
-      if (await this.useEphemeralOSDisk(config, location)) {
+      if (await this.validateOSDiskMode(config, location)) {
         osDisk["caching"] = "ReadOnly";
-        const diffDiskSettings: Record<string, unknown> = { option: "Local" };
-        if (azureOSDiskUsesFullCaching(config.azureOSDisk)) {
-          diffDiskSettings["enableFullCaching"] = true;
-          osDisk["managedDisk"] = { storageAccountType: "StandardSSD_LRS" };
-        }
-        osDisk["diffDiskSettings"] = diffDiskSettings;
+        osDisk["diffDiskSettings"] = { option: "Local", enableFullCaching: true };
       } else {
         osDisk["caching"] = "ReadWrite";
-        osDisk["managedDisk"] = { storageAccountType: "StandardSSD_LRS" };
       }
+      osDisk["managedDisk"] = { storageAccountType: "StandardSSD_LRS" };
       storageProfile["imageReference"] = image;
       storageProfile["osDisk"] = osDisk;
       vmProperties["osProfile"] = this.osProfile(config, name, leaseID, customData);
@@ -2701,13 +2814,15 @@ export class AzureClient {
     await this.arm(
       "PUT",
       vmPath(this.resourceGroup, name),
-      azureComputeAPIVersionForOSDisk(config.azureSnapshot ? "managed" : config.azureOSDisk),
+      !config.azureSnapshot && config.azureOSDisk === "ephemeral"
+        ? COMPUTE_FULL_CACHING_API_VERSION
+        : API_VERSIONS.compute,
       {
         location,
         tags,
         properties: vmProperties,
       },
-      vmLROTimeoutMs === undefined ? undefined : { lroTimeoutMs: vmLROTimeoutMs },
+      { lroTimeoutMs: vmLROTimeoutMs, pollIntervalMs: 5_000 },
     );
     const configuredOSDisk = storageProfile["osDisk"] as
       | { diffDiskSettings?: { option?: string } }
@@ -3063,7 +3178,7 @@ export class AzureClient {
     if (body !== undefined) init.body = JSON.stringify(body);
     const response = await this.fetcher(url, init);
     if (!response.ok && response.status !== 201 && response.status !== 202) {
-      const failure = new AzureHTTPError(method, path, response.status, await safeBody(response));
+      const failure = new AzureHTTPError(method, path, response.status, await response.text());
       if (opts?.headers?.["if-none-match"] === "*" && response.status === 412) {
         Object.defineProperty(failure, "checkpointResourceMayExist", { value: false });
       }
@@ -3102,22 +3217,18 @@ export class AzureClient {
     return this.ephemeralOSSupport.get(vmSize) ?? azureSupportsEphemeralOS(vmSize);
   }
 
-  private async useEphemeralOSDisk(config: LeaseConfig, location: string): Promise<boolean> {
-    return await this.validateOSDiskMode(config, location);
-  }
-
   private async validateOSDiskMode(config: LeaseConfig, location: string): Promise<boolean> {
-    const mode = config.azureOSDisk;
-    if (!azureOSDiskIsEphemeral(mode)) return false;
+    const mode = normalizeAzureOSDiskMode(config.azureOSDisk);
+    if (mode !== "ephemeral") return false;
     const supported = await this.supportsEphemeralOS(config.serverType, location);
     if (!supported) {
       throw new Error(
-        `azureOSDisk=${mode} requires an Azure VM size with ephemeral OS disk support; ${config.serverType} is not supported`,
+        `azureOSDisk=${mode} requires ephemeral OS disk support and at least 8 vCPUs; ${config.serverType} is not supported; choose a supported --type or use --azure-os-disk managed`,
       );
     }
-    if (azureOSDiskUsesFullCaching(mode) && !azureSupportsEphemeralFullCaching(config.serverType)) {
+    if (!azureFullCachingSeriesEligible(config.serverType)) {
       throw new Error(
-        `azureOSDisk=ephemeral-preview requires a full-caching preview Azure VM size; ${config.serverType} is not supported because preview full caching requires more than 4 vCPUs and local storage larger than 2x the OS disk plus 1 GiB`,
+        `azureOSDisk=${mode} requires at least 8 vCPUs and a supported Azure VM series (N/L/M/H, D/DC/E/Eb/EC v5-v7, or F v6-v7); ${config.serverType} is not supported; choose a supported --type or use --azure-os-disk managed`,
       );
     }
     return supported;
@@ -3151,10 +3262,12 @@ export class AzureClient {
     const asyncOperationURL = response.headers.get("azure-asyncoperation");
     const asyncURL = asyncOperationURL ?? response.headers.get("location");
     if (!asyncURL) return;
-    const interval = azureLROPollIntervalMS(response.headers.get("retry-after"));
+    const pollInterval = (reply: Response) =>
+      azureLROPollIntervalMS(reply.headers.get("retry-after"), opts?.pollIntervalMs);
+    let interval = pollInterval(response);
     const timeoutMs = opts?.lroTimeoutMs;
     const lroTimeoutMs = timeoutMs && timeoutMs > 0 ? timeoutMs : 20 * 60_000;
-    const deadline = Date.now() + lroTimeoutMs;
+    const deadline = Math.min(Date.now() + lroTimeoutMs, this.createDeadline ?? Infinity);
     for (;;) {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
@@ -3172,6 +3285,7 @@ export class AzureClient {
       }
       // oxlint-disable-next-line eslint/no-await-in-loop -- reading the LRO status payload is part of polling.
       const text = await poll.text();
+      interval = pollInterval(poll);
       const body = text
         ? (JSON.parse(text) as {
             status?: string;
@@ -3207,6 +3321,9 @@ export class AzureClient {
         }
       }
     }
+    if (this.createDeadline !== undefined && Date.now() >= this.createDeadline) {
+      throw new Error("Azure provisioning deadline exceeded after 25m");
+    }
     throw new Error(
       timeoutMs && timeoutMs > 0
         ? `azure long-running operation timed out after ${Math.round(timeoutMs / 1000)}s`
@@ -3228,7 +3345,10 @@ export class AzureClient {
   }
 
   private async token(): Promise<string> {
-    return this.tokenCache.get(Date.now() + 30_000, () => this.loadToken());
+    const signal = this.requestSignal("token acquisition");
+    return waitForProviderSignal(signal, () =>
+      this.tokenCache.get(Date.now() + 30_000, () => this.loadToken()),
+    );
   }
 
   private async loadToken(): Promise<ExpiringToken> {
@@ -4619,6 +4739,7 @@ function errorMessage(error: unknown): string {
 }
 
 export function isRetryableDeleteError(error: unknown): boolean {
+  if (error instanceof ProviderRequestTimeoutError) return true;
   const message = errorMessage(error);
   return (
     message.includes("NicReservedForAnotherVm") ||
@@ -4681,18 +4802,14 @@ function nextNSGPriority(used: Set<number>): number {
   throw new Error("azure nsg: no available security rule priorities");
 }
 
-export function azureLROPollIntervalMS(retryAfter: string | null): number {
-  const seconds = Number.parseInt(retryAfter ?? "", 10);
-  if (!Number.isFinite(seconds) || seconds <= 0) return MIN_LRO_POLL_INTERVAL_MS;
-  return Math.max(seconds * 1000, MIN_LRO_POLL_INTERVAL_MS);
-}
-
-function azureOSDiskIsEphemeral(mode: string): boolean {
-  return mode === "ephemeral" || mode === "ephemeral-preview";
-}
-
-function azureOSDiskUsesFullCaching(mode: string): boolean {
-  return mode === "ephemeral-preview";
+export function azureLROPollIntervalMS(
+  retryAfter: string | null,
+  minimumMS = MIN_LRO_POLL_INTERVAL_MS,
+): number {
+  if (!retryAfter?.trim()) return minimumMS;
+  const value = retryAfter.trim();
+  const delay = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(delay) ? Math.max(delay, minimumMS) : minimumMS;
 }
 
 export function azureProvisioningCandidatesForConfig(
@@ -4722,7 +4839,7 @@ export function azureProvisioningCandidatesForConfig(
   if (candidates.length === 0 && isCanonicalProviderClass(config.class)) {
     const storedType = concreteStoredServerType(config.serverType, config.class);
     if (!storedType) return [];
-    return azureOSDiskUsesFullCaching(azureOSDisk) && !azureSupportsEphemeralFullCaching(storedType)
+    return azureOSDisk === "ephemeral" && !azureSupportsEphemeralFullCaching(storedType)
       ? []
       : [storedType];
   }
@@ -4730,18 +4847,12 @@ export function azureProvisioningCandidatesForConfig(
   if (!storedType || storedType === candidates[0]) {
     return candidates;
   }
-  if (azureOSDiskUsesFullCaching(azureOSDisk)) {
+  if (azureOSDisk === "ephemeral") {
     return azureSupportsEphemeralFullCaching(storedType)
       ? uniqueProviderMachineCandidates([storedType, ...candidates])
       : candidates;
   }
   return uniqueProviderMachineCandidates([storedType, ...candidates]);
-}
-
-function azureComputeAPIVersionForOSDisk(mode: string): string {
-  return azureOSDiskUsesFullCaching(mode)
-    ? COMPUTE_FULL_CACHING_PREVIEW_API_VERSION
-    : API_VERSIONS.compute;
 }
 
 function azureSKUCapabilityTrue(
@@ -4943,5 +5054,5 @@ function truncateAzureBody(text: string): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return providerSleep(ms, providerRequestSignal(ms + 1_000, undefined, "azure", "poll wait"));
 }

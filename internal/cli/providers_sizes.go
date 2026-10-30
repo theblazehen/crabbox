@@ -31,7 +31,7 @@ func (a App) providerSizes(ctx context.Context, args []string) error {
 	if *withContext && provider.Spec().SizeSelection == "" {
 		return Exit(2, "provider=%s does not expose native size selection", provider.Spec().Name)
 	}
-	cfg, err := loadConfigWithOverrides("", provider.Spec().Name)
+	cfg, err := loadConfigWithFlagOverrides("", provider.Spec().Name, fs)
 	if err != nil {
 		return err
 	}
@@ -71,6 +71,9 @@ func (a App) providerSizes(ctx context.Context, args []string) error {
 		sizes = filtered
 	}
 	if *jsonOut {
+		if sizes == nil {
+			sizes = []ProviderSize{}
+		}
 		if *withContext {
 			return json.NewEncoder(a.Stdout).Encode(struct {
 				Sizes     []ProviderSize        `json:"sizes"`

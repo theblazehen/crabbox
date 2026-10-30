@@ -25,6 +25,7 @@ type providerMatrixEntry struct {
 	Evidence      []string             `json:"evidence,omitempty"`
 	Lifecycle     []string             `json:"lifecycle,omitempty"`
 	Coordinator   string               `json:"coordinator"`
+	BrokeredOnly  bool                 `json:"brokeredOnly,omitempty"`
 	Classes       []ClassSpec          `json:"classes,omitempty"`
 	ClassCatalog  ProviderClassCatalog `json:"classCatalog"`
 	SizeSelection ProviderSizeSelector `json:"sizeSelection,omitempty"`
@@ -97,6 +98,7 @@ func (a App) providers(ctx context.Context, args []string) error {
 	}
 	fs := newFlagSet("providers", a.Stderr)
 	jsonOut := fs.Bool("json", false, "print JSON")
+	configured := fs.Bool("configured", false, "include features enabled by trusted configuration (loads config)")
 	filterFlags := registerProviderMatrixFilterFlags(fs)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -105,6 +107,13 @@ func (a App) providers(ctx context.Context, args []string) error {
 		return Exit(2, "usage: crabbox providers [--json] [--kind KIND] [--category CATEGORY] [--target TARGET] [--feature FEATURE] [--runtime CAPABILITY] [--reachability CAPABILITY] [--workspace CAPABILITY] [--evidence CAPABILITY] [--lifecycle CAPABILITY] OR crabbox providers filters [--json] OR crabbox providers recommend <use-case> [--limit N] [--json]")
 	}
 	entries := providerMatrix()
+	if *configured {
+		var err error
+		entries, err = configuredProviderMatrix()
+		if err != nil {
+			return err
+		}
+	}
 	filters := filterFlags.filters()
 	if err := validateProviderMatrixFilters(filters, entries); err != nil {
 		return err
@@ -211,8 +220,30 @@ func providerMatrix() []providerMatrixEntry {
 	return entries
 }
 
+func configuredProviderMatrix() ([]providerMatrixEntry, error) {
+	cfg, err := loadConfigInputs()
+	if err != nil {
+		return nil, err
+	}
+	providers := registeredProviders()
+	entries := make([]providerMatrixEntry, 0, len(providers))
+	for _, provider := range providers {
+		spec := provider.Spec()
+		spec.Features = ProviderFeaturesForConfig(provider, cfg)
+		entry := providerMatrixEntryForSpec(provider, spec)
+		if _, ok := provider.(ProviderConfiguredFeatures); ok {
+			entry.MetadataKind = "configured"
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
 func providerMatrixEntryFor(provider Provider) providerMatrixEntry {
-	spec := provider.Spec()
+	return providerMatrixEntryForSpec(provider, provider.Spec())
+}
+
+func providerMatrixEntryForSpec(provider Provider, spec ProviderSpec) providerMatrixEntry {
 	name := spec.Name
 	category := benchmarkProviderCategories[name]
 	targets := formatProviderTargets(spec.Targets)
@@ -231,13 +262,34 @@ func providerMatrixEntryFor(provider Provider) providerMatrixEntry {
 		Evidence:             evidenceCapabilitiesForFeatures(spec.Features),
 		Lifecycle:            lifecycleCapabilitiesForProvider(spec.Coordinator, spec.Features),
 		Coordinator:          string(spec.Coordinator),
+		BrokeredOnly:         spec.BrokeredOnly,
 		ClassCatalog:         ProviderClassCatalogFor(provider),
 		SizeSelection:        spec.SizeSelection,
 	}
 	if classProvider, ok := provider.(ProviderClassSpecProvider); ok {
 		entry.Classes = append([]ClassSpec(nil), classProvider.ClassSpecs()...)
 	}
+	if providerSupportsFixedLeaseID(provider) && !FeatureSet(entry.Features).Has(FeatureFixedLeaseID) {
+		entry.Features = append(entry.Features, FeatureFixedLeaseID)
+	}
 	return entry
+}
+
+func providerSupportsFixedLeaseID(provider Provider) bool {
+	spec := provider.Spec()
+	if spec.Kind != ProviderKindSSHLease && spec.Kind != ProviderKindDelegatedRun {
+		return false
+	}
+	// Brokered SSH leases use the wrapper's capability, not the direct adapter's.
+	if spec.Kind == ProviderKindSSHLease && spec.Coordinator == CoordinatorSupported {
+		return (&coordinatorLeaseBackend{}).SupportsRequestedLeaseID()
+	}
+	source, ok := provider.(ProviderBackendCapabilitySource)
+	if !ok {
+		return false
+	}
+	capable, ok := source.BackendCapabilities().(IdempotentLeaseIDBackend)
+	return ok && capable.SupportsRequestedLeaseID()
 }
 
 func registerProviderMatrixFilterFlags(fs *flag.FlagSet) *providerMatrixFilterFlagValues {
@@ -1688,7 +1740,11 @@ func printProviderMatrix(out io.Writer, entries []providerMatrixEntry) {
 		if len(entry.Lifecycle) > 0 {
 			fmt.Fprintf(out, "  lifecycle: %s\n", commaOrDash(entry.Lifecycle))
 		}
-		fmt.Fprintf(out, "  coordinator: %s\n", blank(entry.Coordinator, "never"))
+		mode := blank(entry.Coordinator, "never")
+		if entry.BrokeredOnly {
+			mode = "required"
+		}
+		fmt.Fprintf(out, "  coordinator: %s\n", mode)
 		if len(entry.Aliases) > 0 {
 			fmt.Fprintf(out, "  aliases: %s\n", strings.Join(entry.Aliases, ","))
 		}

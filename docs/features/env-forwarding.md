@@ -91,10 +91,39 @@ and value. If it is not set, nothing is forwarded — Crabbox does not invent
 values. Variables that match the allowlist but are unset locally simply do not
 appear in the forwarded set.
 
-Inline-allowlisted variables (those resolved from the local environment) are
-passed through the provider's remote-command transport. SSH-backed providers
-pass them as part of the SSH command itself, with quoting and escaping handled
-automatically so values containing shell metacharacters pass through safely.
+SSH-backed providers upload allowlisted values over SSH stdin into a private
+per-command file under `.crabbox/env-<random>/` in the workspace. The remote
+session loads that file; neither the SSH command nor the workspace-owner
+launcher contains the values, even encoded. POSIX targets (including WSL2) use
+a mode `0600` shell file inside a mode `0700` directory. Native Windows uses a
+PowerShell file in a directory restricted to the SSH account. Quoting, Unicode,
+empty strings, and multiline values are preserved. The file and its directory
+are removed after the command, including failure and cancellation. Cleanup has
+a cancellation-independent 15-second budget. If it fails or times out, one
+verification probe has its own 10-second budget to check the file and directory.
+Confirmed absence of both is silent success. If only the directory remains,
+cleanup emits a warning naming that directory and preserves a successful exit.
+If the forwarded file is still present or its removal cannot be confirmed, an
+otherwise successful run exits 7 and identifies the file to remove before
+reusing the host. The diagnostic distinguishes a present file from unconfirmed
+removal and never includes remote output or environment values. A workload
+failure keeps its own status, error kind, and exit code as primary. If workspace
+ownership is lost, cleanup and verification are refused; clean up with verified
+ownership before reuse, or release the lease. Preflight and `cache warm` use the
+same transport.
+
+Values containing a NUL byte are rejected before temporary command-env upload,
+because native process environments cannot represent them. The error names the
+variable without printing its value. Other values still obey the target OS's
+environment-size limits.
+
+These temporary values remain separate from reusable `--env-helper` profiles
+and are never retained by helper mode. Forwarding summaries report names and
+presence, with lengths for secret-shaped names. Crabbox does not add the
+transport contents to timing JSON, proof files, or failure-bundle metadata.
+Workloads can still expose their own environment through output or artifacts;
+inspect those before sharing.
+
 Delegated-run providers may use a provider-specific transport instead; for
 example, Docker Sandbox writes the selected values to a temporary local env file
 and passes only that file path to `sbx exec --env-file` so the values do not

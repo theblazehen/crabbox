@@ -6,7 +6,6 @@ import { PgBoss } from "pg-boss";
 import { WebSocket as NodeWebSocket, WebSocketServer, type RawData } from "ws";
 
 import {
-  controlMessageOwnsTransaction,
   earliestProvisioningWake,
   legacyAlarmKey,
   mergedCoordinatorWake,
@@ -25,6 +24,7 @@ const alarmQueue = "coordinator-alarm";
 const alarmTimeStorageKey = "node-runtime:alarm-time";
 const reconcileQueue = "coordinator-reconcile";
 const bridgeDataAttachmentKinds = new Set([
+  "serve-relay",
   "webvnc-agent",
   "webvnc-viewer",
   "code-agent",
@@ -219,14 +219,11 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     });
     nodeSocket.on("message", (data, isBinary) => {
       const message = webSocketData(data, isBinary);
-      void this.runSocketOperation(
-        nodeSocket,
-        attachment,
-        () => handlers.message(message),
-        message,
-      ).catch((error) => {
-        this.failSocket(nodeSocket, "message", error);
-      });
+      void this.runSocketOperation(nodeSocket, attachment, () => handlers.message(message)).catch(
+        (error) => {
+          this.failSocket(nodeSocket, "message", error);
+        },
+      );
     });
     nodeSocket.on("close", (code, reason) => {
       this.sockets.delete(nodeSocket);
@@ -245,8 +242,12 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     });
   }
 
-  acceptEphemeralWebSocket(socket: WebSocket, handlers: CoordinatorSocketHandlers): void {
-    this.acceptWebSocket(socket, { kind: "workspace-terminal" }, [], handlers);
+  acceptEphemeralWebSocket(
+    socket: WebSocket,
+    handlers: CoordinatorSocketHandlers,
+    kind = "workspace-terminal",
+  ): void {
+    this.acceptWebSocket(socket, { kind }, [], handlers);
   }
 
   async getAlarm(): Promise<number | undefined> {
@@ -386,17 +387,15 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     socket: NodeWebSocket,
     attachment: unknown,
     callback: () => Promise<T> | T,
-    message?: string | ArrayBuffer,
   ): Promise<T> {
     const operation = async () => callback();
     const kind = socketAttachmentKind(attachment);
-    if (kind === "control" && controlMessageOwnsTransaction(message)) {
-      // Heartbeats own the lifecycle transaction in shared fleet code.
+    if (kind === "control") {
+      // Shared control handlers fence their mutations after network authorization.
       return this.activeSocketOperations.track(operation());
     }
     // Data-plane frames and code-agent replies must be able to complete an HTTP
-    // request that currently owns the lifecycle queue. Control frames mutate
-    // lease state and stay serialized with HTTP requests and alarms.
+    // request that currently owns the lifecycle queue.
     if (!kind || !bridgeDataAttachmentKinds.has(kind)) {
       return this.activeSocketOperations.track(this.operationRunner(operation));
     }

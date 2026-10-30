@@ -80,8 +80,9 @@ func (p SSHProvider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.Doc
 	return doctor, nil
 }
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
+func (Provider) Name() string                      { return providerName }
+func (Provider) Aliases() []string                 { return nil }
+func (Provider) BackendCapabilities() core.Backend { return &backend{} }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{

@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +37,7 @@ type CoordinatorClient struct {
 	checkpointSupported    bool
 }
 
-// Only a recorder-owned admission client retains this in-memory header binding.
+// Admission and original-finish recovery retain this in-memory header binding.
 type coordinatorAdmissionAuth struct {
 	captured bool
 	headers  http.Header
@@ -48,7 +48,8 @@ func (c *CoordinatorClient) hasConfiguredAuth() bool {
 	return c != nil && (strings.TrimSpace(c.Token) != "" || len(c.TokenCommand) > 0)
 }
 
-const coordinatorHTTPTimeout = 30 * time.Minute
+// Allow the coordinator's 30-minute provisioning budget plus a response margin.
+const coordinatorHTTPTimeout = 31 * time.Minute
 const coordinatorControlTimeout = 30 * time.Second
 const coordinatorTokenCommandTimeout = 15 * time.Second
 const maxCoordinatorTokenBytes = 16 * 1024
@@ -59,6 +60,9 @@ type CoordinatorHTTPError struct {
 	StatusCode int
 	Message    string
 	retryAfter time.Duration
+	// Diagnostics alone cannot authorize creation-rejection output.
+	responseComplete     bool
+	responseUnredirected bool
 }
 
 func (e CoordinatorHTTPError) Error() string {
@@ -82,7 +86,21 @@ func coordinatorResponseErrorCode(err error, status int) string {
 	return body.Error
 }
 
+type CoordinatorLeasePolicy struct {
+	DefaultTTLSeconds         int    `json:"defaultTTLSeconds"`
+	DefaultIdleTimeoutSeconds int    `json:"defaultIdleTimeoutSeconds"`
+	MaxTTLSeconds             int    `json:"maxTTLSeconds"`
+	Extension                 string `json:"extension"`
+	AutoExtend                string `json:"autoExtend"`
+	RuntimeExtension          bool   `json:"runtimeExtension"`
+}
+
 type CoordinatorLease struct {
+	LeasePolicy                  *CoordinatorLeasePolicy        `json:"leasePolicy,omitempty"`
+	PolicyNotice                 string                         `json:"policyNotice,omitempty"`
+	ImageEvidence                *ImageEvidence                 `json:"imageEvidence,omitempty"`
+	LifetimePolicy               *LeaseLifetimePolicy           `json:"lifetimePolicy,omitempty"`
+	CreationEvents               []CreationEvent                `json:"creationEvents,omitempty"`
 	ID                           string                         `json:"id"`
 	Slug                         string                         `json:"slug,omitempty"`
 	Provider                     string                         `json:"provider"`
@@ -123,6 +141,7 @@ type CoordinatorLease struct {
 	Host                         string                         `json:"host"`
 	SSHUser                      string                         `json:"sshUser"`
 	SSHPort                      string                         `json:"sshPort"`
+	SSHJump                      *SSHJump                       `json:"sshJump,omitempty"`
 	SSHHostKey                   string                         `json:"sshHostKey,omitempty"`
 	ProviderAccessExpiresAt      string                         `json:"providerAccessExpiresAt,omitempty"`
 	SSHFallbackPorts             []string                       `json:"sshFallbackPorts,omitempty"`
@@ -141,11 +160,17 @@ type CoordinatorLease struct {
 	CleanupStatus                string                         `json:"cleanupStatus,omitempty"`
 	ProviderCleanup              *ProviderCleanupEvidence       `json:"providerCleanup,omitempty"`
 	CleanupStartedAt             string                         `json:"cleanupStartedAt,omitempty"`
+	CleanupClaimExpiresAt        string                         `json:"cleanupClaimExpiresAt,omitempty"`
+	CleanupFailedAt              string                         `json:"cleanupFailedAt,omitempty"`
 	CleanupCompletedAt           string                         `json:"cleanupCompletedAt,omitempty"`
 	CleanupError                 string                         `json:"cleanupError,omitempty"`
 	CleanupRetryAt               string                         `json:"cleanupRetryAt,omitempty"`
+	ProviderKeyCleanupPending    bool                           `json:"providerKeyCleanupPending,omitempty"`
+	ProviderKeyCleanupID         string                         `json:"providerKeyCleanupID,omitempty"`
+	ProvisioningRequestStartedAt string                         `json:"provisioningRequestStartedAt,omitempty"`
 	ReleaseDeletesServer         *bool                          `json:"releaseDeletesServer,omitempty"`
 	FailureError                 string                         `json:"failureError,omitempty"`
+	ProvisioningPhase            string                         `json:"provisioningPhase,omitempty"`
 	ProvisioningResourceMayExist *bool                          `json:"provisioningResourceMayExist,omitempty"`
 	ProvisioningFailureRetryable *bool                          `json:"provisioningFailureRetryable,omitempty"`
 	ProviderMetadata             map[string]any                 `json:"providerMetadata,omitempty"`
@@ -313,6 +338,7 @@ type CoordinatorShare struct {
 }
 
 type ProvisioningAttempt struct {
+	DurationMS int64  `json:"durationMs,omitempty"`
 	Region     string `json:"region,omitempty"`
 	ServerType string `json:"serverType"`
 	Market     string `json:"market,omitempty"`
@@ -375,6 +401,25 @@ type CoordinatorCapacityResponse struct {
 	ActiveLeases   int    `json:"activeLeases"`
 	EffectiveLimit int    `json:"effectiveLimit"`
 	ObservedAt     string `json:"observedAt"`
+	*CoordinatorCapacityAdmission
+}
+
+// A nil extension preserves the response from coordinators with owner-only capacity.
+type CoordinatorCapacityAdmission struct {
+	Fleet      CoordinatorCapacityDimension `json:"fleet"`
+	Org        CoordinatorOrgCapacity       `json:"org"`
+	Admissible bool                         `json:"admissible"`
+	BlockedBy  *string                      `json:"blockedBy"`
+}
+
+type CoordinatorCapacityDimension struct {
+	ActiveLeases int  `json:"activeLeases"`
+	Limit        *int `json:"limit"`
+}
+
+type CoordinatorOrgCapacity struct {
+	Key string `json:"key"`
+	CoordinatorCapacityDimension
 }
 
 type CoordinatorMarketplaceStatusResponse struct {
@@ -416,6 +461,7 @@ type CoordinatorImage struct {
 	AccountID            string                           `json:"accountId,omitempty"`
 	Project              string                           `json:"project,omitempty"`
 	ResourceID           string                           `json:"resourceID,omitempty"`
+	ResourceUniqueID     string                           `json:"resourceUniqueId,omitempty"`
 	SnapshotIDs          []string                         `json:"snapshotIds,omitempty"`
 	Snapshots            []string                         `json:"snapshots,omitempty"`
 	Direct               bool                             `json:"direct,omitempty"`
@@ -431,6 +477,7 @@ type CoordinatorImage struct {
 	CatalogOnly          bool                             `json:"catalogOnly,omitempty"`
 	VariantSelectors     *imageVariantSelectors           `json:"variantSelectors,omitempty"`
 	managedCheckpoint    *coordinatorCheckpoint
+	captureEstablished   bool
 }
 
 type CoordinatorImageDefaultState struct {
@@ -628,6 +675,7 @@ type CoordinatorRunLeaseOwner struct {
 }
 
 type CoordinatorRun struct {
+	EventAppendIdempotent     bool                       `json:"eventAppendIdempotent,omitempty"`
 	AdmissionFailedBeforeWork bool                       `json:"admissionFailedBeforeWork,omitempty"`
 	ID                        string                     `json:"id"`
 	LeaseID                   string                     `json:"leaseID"`
@@ -820,6 +868,7 @@ type CoordinatorRunEvent struct {
 }
 
 type CoordinatorRunEventInput struct {
+	ID          string `json:"id,omitempty"`
 	Type        string `json:"type,omitempty"`
 	Phase       string `json:"phase,omitempty"`
 	Stream      string `json:"stream,omitempty"`
@@ -901,19 +950,24 @@ type CoordinatorUsageSummary struct {
 	RuntimeSeconds int64                   `json:"runtimeSeconds"`
 	EstimatedUSD   float64                 `json:"estimatedUSD"`
 	ReservedUSD    float64                 `json:"reservedUSD"`
+	CommittedUSD   *float64                `json:"committedUSD,omitempty"`
 	ByOwner        []CoordinatorUsageGroup `json:"byOwner"`
 	ByOrg          []CoordinatorUsageGroup `json:"byOrg"`
 	ByProvider     []CoordinatorUsageGroup `json:"byProvider"`
 	ByServerType   []CoordinatorUsageGroup `json:"byServerType"`
+	ByMachine      []CoordinatorUsageGroup `json:"byMachine"`
 }
 
 type CoordinatorUsageGroup struct {
-	Key            string  `json:"key"`
-	Leases         int     `json:"leases"`
-	ActiveLeases   int     `json:"activeLeases"`
-	RuntimeSeconds int64   `json:"runtimeSeconds"`
-	EstimatedUSD   float64 `json:"estimatedUSD"`
-	ReservedUSD    float64 `json:"reservedUSD"`
+	Key            string   `json:"key"`
+	Label          string   `json:"label,omitempty"`
+	CPUSeconds     *int64   `json:"cpuSeconds,omitempty"`
+	Leases         int      `json:"leases"`
+	ActiveLeases   int      `json:"activeLeases"`
+	RuntimeSeconds int64    `json:"runtimeSeconds"`
+	EstimatedUSD   float64  `json:"estimatedUSD"`
+	ReservedUSD    float64  `json:"reservedUSD"`
+	CommittedUSD   *float64 `json:"committedUSD,omitempty"`
 }
 
 type CoordinatorCostLimits struct {
@@ -1040,6 +1094,13 @@ func newCoordinatorClient(cfg Config) (*CoordinatorClient, bool, error) {
 		return nil, true, Exit(2, "CRABBOX_COORDINATOR must be an absolute URL")
 	}
 	base.Path = strings.TrimRight(base.Path, "/")
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	dialContext := dialer.DialContext
+	if cfg.Provider == "aws" {
+		// Public AWS SSH uses IPv4. Let the broker observe that source family
+		// for HTTP and WebSocket access refreshes without changing its CIDR policy.
+		dialContext = coordinatorIPv4FirstDialer(dialer)
+	}
 	return &CoordinatorClient{
 		BaseURL:          strings.TrimRight(base.String(), "/"),
 		Token:            cfg.CoordToken,
@@ -1049,11 +1110,8 @@ func newCoordinatorClient(cfg Config) (*CoordinatorClient, bool, error) {
 		Client: &http.Client{
 			Timeout: coordinatorHTTPTimeout,
 			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   5 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
+				Proxy:               http.ProxyFromEnvironment,
+				DialContext:         dialContext,
 				TLSHandshakeTimeout: 10 * time.Second,
 				// Custom dialing otherwise disables HTTP/2 and its independent streams.
 				ForceAttemptHTTP2:     true,
@@ -1062,6 +1120,25 @@ func newCoordinatorClient(cfg Config) (*CoordinatorClient, bool, error) {
 			},
 		},
 	}, true, nil
+}
+
+func coordinatorIPv4FirstDialer(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" {
+			return dialer.DialContext(ctx, network, address)
+		}
+		ctx, cancel := context.WithTimeout(ctx, dialer.Timeout)
+		defer cancel()
+		// Match net.Dialer's default fallback delay; IPv6-only coordinators and
+		// proxies remain reachable. No HTTP request is sent until dialing succeeds.
+		preferredCtx, preferredCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		conn, err := dialer.DialContext(preferredCtx, "tcp4", address)
+		preferredCancel()
+		if err == nil {
+			return conn, nil
+		}
+		return dialer.DialContext(ctx, network, address)
+	}
 }
 
 func (c *CoordinatorClient) CreateLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug string) (CoordinatorLease, error) {
@@ -1085,10 +1162,19 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 		return CoordinatorLease{}, err
 	}
 	cfg.Provider = provider.Spec().Name
+	if err := validateResourceRequirements(cfg); err != nil {
+		return CoordinatorLease{}, err
+	}
 	if slug == "" {
 		slug = NewLeaseSlug(leaseID)
 	}
 	capacity := map[string]any{}
+	if cfg.Capacity.MinVCPUs > 0 {
+		capacity["minVCPUs"] = cfg.Capacity.MinVCPUs
+	}
+	if cfg.Capacity.MinMemoryMiB > 0 {
+		capacity["minMemoryMiB"] = cfg.Capacity.MinMemoryMiB
+	}
 	if cfg.Capacity.Market != "" && cfg.Capacity.Market != "spot" {
 		capacity["market"] = cfg.Capacity.Market
 	}
@@ -1112,6 +1198,7 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 		"slug":                            slug,
 		"profile":                         cfg.Profile,
 		"provider":                        cfg.Provider,
+		"serveMachine":                    cfg.Serve.Machine,
 		"target":                          cfg.TargetOS,
 		"windowsMode":                     cfg.WindowsMode,
 		"desktop":                         cfg.Desktop,
@@ -1155,7 +1242,14 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 	if !fixed {
 		req["createAttemptID"] = createAttemptID
 	}
-	if cfg.Provider != "daytona" || cfg.architectureExplicit {
+	if cfg.LifetimePolicy != nil {
+		req["lifetimePolicy"] = cfg.LifetimePolicy
+	}
+	nativePlacement := false
+	if policy, ok := provider.(CoordinatorArchitecturePolicy); ok {
+		nativePlacement = policy.CoordinatorSelectsArchitecture()
+	}
+	if cfg.architectureExplicit || (!nativePlacement && cfg.Provider != "daytona") {
 		req["architecture"] = effectiveArchitectureForConfig(cfg)
 	}
 	if len(capacity) > 0 {
@@ -1166,6 +1260,14 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 	}
 	if cfg.osImageExplicit {
 		req["os"] = cfg.OSImage
+	}
+	if cfg.Provider == "aws" && cfg.AWSStockImage {
+		req["awsUseStockImage"] = true
+	}
+	if contributor, ok := provider.(ProviderCoordinatorRequest); ok {
+		for key, value := range contributor.CoordinatorRequestFields(cfg) {
+			req[key] = value
+		}
 	}
 	addCoordinatorAzureFields(req, cfg)
 	addCoordinatorGCPFields(req, cfg)
@@ -1178,6 +1280,15 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 	} else if !imageRequirementsEmpty(cfg.imageRequirements) {
 		// Older coordinators do not have this route, so mixed-version use fails closed.
 		path = "/v1/leases/capability-aware"
+	}
+	if hasCapacityMinimums(cfg) {
+		if checkpointBacked {
+			return CoordinatorLease{}, Exit(2, "resource requirements are unsupported for checkpoint forks")
+		}
+		path = "/v1/leases/resource-constrained"
+		if fixed {
+			path = "/v1/leases/" + url.PathEscape(leaseID) + "/resource-constrained"
+		}
 	}
 	if checkpointBacked {
 		switch cfg.Provider {
@@ -1402,7 +1513,7 @@ func (c *CoordinatorClient) UpdateLeaseIdleTimeoutWithTelemetryForProvider(ctx c
 	return c.heartbeatLease(ctx, id, expectedProvider, &idleTimeout, telemetry)
 }
 
-func (c *CoordinatorClient) heartbeatLease(ctx context.Context, id, expectedProvider string, idleTimeout *time.Duration, telemetry *LeaseTelemetry) (CoordinatorLease, error) {
+func (c *CoordinatorClient) heartbeatLease(ctx context.Context, id, expectedProvider string, idleTimeout *time.Duration, telemetry *LeaseTelemetry, extendWhileRunning ...bool) (CoordinatorLease, error) {
 	var res struct {
 		Lease CoordinatorLease `json:"lease"`
 	}
@@ -1411,12 +1522,15 @@ func (c *CoordinatorClient) heartbeatLease(ctx context.Context, id, expectedProv
 		return res.Lease, err
 	}
 	// A heartbeat can wait for provider access changes; callers bound periodic touches.
-	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/heartbeat", heartbeatRequestBody(expectedProvider, idleTimeout, telemetry), &res)
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/heartbeat", heartbeatRequestBody(expectedProvider, idleTimeout, telemetry, extendWhileRunning...), &res)
 	return res.Lease, err
 }
 
-func heartbeatRequestBody(expectedProvider string, idleTimeout *time.Duration, telemetry *LeaseTelemetry) map[string]any {
+func heartbeatRequestBody(expectedProvider string, idleTimeout *time.Duration, telemetry *LeaseTelemetry, extendWhileRunning ...bool) map[string]any {
 	body := map[string]any{}
+	if len(extendWhileRunning) > 0 && extendWhileRunning[0] {
+		body["extendWhileRunning"] = true
+	}
 	if expectedProvider != "" {
 		body["expectedProvider"] = expectedProvider
 	}
@@ -1450,6 +1564,21 @@ func (c *CoordinatorClient) Pool(ctx context.Context, cfg Config) ([]Coordinator
 
 func (c *CoordinatorClient) Leases(ctx context.Context, state string, limit int) ([]CoordinatorLease, error) {
 	return c.listLeases(ctx, state, limit, "", "")
+}
+
+// CurrentLeases negotiates bounded summary pages. Older coordinators keep their
+// existing newest-first list contract; report its actual 500-row server cap.
+func (c *CoordinatorClient) CurrentLeases(ctx context.Context, provider string) ([]CoordinatorLease, bool, error) {
+	var leases []CoordinatorLease
+	truncated, err := c.visitLeasePages(ctx, coordinatorLeaseQuery{provider: provider, current: true}, func(page []CoordinatorLease, _ bool) error {
+		leases = append(leases, page...)
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	slices.SortStableFunc(leases, func(a, b CoordinatorLease) int { return strings.Compare(b.CreatedAt, a.CreatedAt) })
+	return leases, truncated, nil
 }
 
 func (c *CoordinatorClient) listLeases(ctx context.Context, state string, limit int, view, provider string) ([]CoordinatorLease, error) {
@@ -1650,6 +1779,7 @@ func (c *CoordinatorClient) Capacity(ctx context.Context) (CoordinatorCapacityRe
 		ActiveLeases   *int   `json:"activeLeases"`
 		EffectiveLimit *int   `json:"effectiveLimit"`
 		ObservedAt     string `json:"observedAt"`
+		*CoordinatorCapacityAdmission
 	}
 	if err := c.do(ctx, http.MethodGet, "/v1/capacity", nil, &payload); err != nil {
 		var httpErr CoordinatorHTTPError
@@ -1666,6 +1796,7 @@ func (c *CoordinatorClient) Capacity(ctx context.Context) (CoordinatorCapacityRe
 	return CoordinatorCapacityResponse{
 		Owner: payload.Owner, ActiveLeases: *payload.ActiveLeases,
 		EffectiveLimit: *payload.EffectiveLimit, ObservedAt: payload.ObservedAt,
+		CoordinatorCapacityAdmission: payload.CoordinatorCapacityAdmission,
 	}, nil
 }
 
@@ -1821,6 +1952,20 @@ func (c *CoordinatorClient) EgressStatus(ctx context.Context, leaseID string) (C
 	var res CoordinatorEgressStatus
 	err := c.do(ctx, http.MethodGet, "/v1/leases/"+url.PathEscape(leaseID)+"/egress/status", nil, &res)
 	return res, err
+}
+
+// ActiveAdminLeases reads every active lease for pool orphan detection.
+// The bool reports a possibly truncated response from a legacy coordinator.
+func (c *CoordinatorClient) ActiveAdminLeases(ctx context.Context) ([]CoordinatorLease, bool, error) {
+	var leases []CoordinatorLease
+	truncated, err := c.visitLeasePages(ctx, coordinatorLeaseQuery{admin: true, state: "active"}, func(page []CoordinatorLease, _ bool) error {
+		leases = append(leases, page...)
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return leases, truncated, err
 }
 
 func (c *CoordinatorClient) AdminLeases(ctx context.Context, state, owner, org string, limit int) ([]CoordinatorLease, error) {
@@ -2305,14 +2450,19 @@ func runAdmissionBody(leaseID string, cfg Config, command []string, label string
 
 func (c *CoordinatorClient) CreateRun(ctx context.Context, runID, leaseID string, cfg Config, command []string, label string) (CoordinatorRun, error) {
 	body := runAdmissionBody(leaseID, cfg, command, label)
-	// Only identity-bound admission is replayed, within the caller's original budget.
-	ctx, cancel := context.WithTimeout(ctx, runRecorderRequestTimeout)
+	// Only identity-bound admission is replayed, within the caller's deadline.
+	ctx, cancel := context.WithTimeout(ctx, runAdmissionBudget)
 	defer cancel()
 	if binding := c.admissionAuth; binding != nil {
 		if !binding.captured {
 			binding.captured = true
 			binding.headers = make(http.Header)
-			binding.err = c.resolveRequestHeaders(ctx, binding.headers)
+			authCtx, stopAuth := context.WithTimeout(ctx, runRecorderRequestTimeout)
+			binding.err = c.resolveRequestHeaders(authCtx, binding.headers)
+			if authCtx.Err() != nil {
+				binding.err = authCtx.Err()
+			}
+			stopAuth()
 		}
 		if binding.err != nil {
 			if ctx.Err() != nil {
@@ -2322,9 +2472,11 @@ func (c *CoordinatorClient) CreateRun(ctx context.Context, runID, leaseID string
 		}
 	}
 	var err error
-	for attempt := 0; attempt < 2 && ctx.Err() == nil; attempt++ {
+	for attempt := 1; attempt <= runAdmissionAttempts && ctx.Err() == nil; attempt++ {
 		var res CoordinatorRunResponse
-		err = c.do(ctx, http.MethodPut, "/v1/runs/"+url.PathEscape(runID), body, &res)
+		attemptCtx, stopAttempt := context.WithTimeout(ctx, runRecorderRequestTimeout)
+		err = c.do(attemptCtx, http.MethodPut, "/v1/runs/"+url.PathEscape(runID), body, &res)
+		stopAttempt()
 		if err == nil {
 			if ctx.Err() != nil {
 				return CoordinatorRun{}, ctx.Err()
@@ -2334,8 +2486,27 @@ func (c *CoordinatorClient) CreateRun(ctx context.Context, runID, leaseID string
 			}
 			return res.Run, nil
 		}
-		if !runRecorderFinishRetryable(err) {
+		if !runRecorderFinishRetryable(err) || attempt == runAdmissionAttempts || ctx.Err() != nil {
 			break
+		}
+		delay := runAdmissionRetryDelay(attempt, err)
+		deadline, _ := ctx.Deadline()
+		if delay >= time.Until(deadline) {
+			break
+		}
+		if attempt == 1 {
+			reason := coordinatorReadRetryReason(err)
+			if reason == "" {
+				reason = "transient_error"
+			}
+			writer := c.readRetryWriter
+			if writer == nil {
+				writer = os.Stderr
+			}
+			fmt.Fprintf(writer, "coordinator run admission retry %d/%d reason=%s\n", attempt, runAdmissionAttempts-1, reason)
+		}
+		if sleepErr := sleepContext(ctx, delay); sleepErr != nil {
+			return CoordinatorRun{}, sleepErr
 		}
 	}
 	if ctx.Err() != nil {
@@ -2362,7 +2533,15 @@ func (c *CoordinatorClient) FailRunAdmission(ctx context.Context, runID, leaseID
 }
 
 func (c *CoordinatorClient) FinishRun(ctx context.Context, runID string, exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, telemetry *RunTelemetrySummary, classification FailureClassification, receipt *terminalRunReceipt) (CoordinatorRun, error) {
-	var res CoordinatorRunResponse
+	data, err := encodeRunFinish(exitCode, sync, command, log, truncated, results, telemetry, classification, receipt)
+	if err != nil {
+		return CoordinatorRun{}, err
+	}
+	return c.finishRunBytes(ctx, runID, data)
+}
+
+// Encode once: retries and recovery must submit the original finish, not rebuild it.
+func encodeRunFinish(exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, telemetry *RunTelemetrySummary, classification FailureClassification, receipt *terminalRunReceipt) ([]byte, error) {
 	log, changed := retainedRunLogText(log, maxRunLogBytes)
 	truncated = truncated || changed
 	logChunks := splitRunLogChunks(log)
@@ -2387,7 +2566,13 @@ func (c *CoordinatorClient) FinishRun(ctx context.Context, runID string, exitCod
 	if receipt != nil {
 		body["receipt"] = receipt
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/finish", body, &res)
+	return json.Marshal(body)
+}
+
+func (c *CoordinatorClient) finishRunBytes(ctx context.Context, runID string, data []byte) (CoordinatorRun, error) {
+	var res CoordinatorRunResponse
+	// Use the ordinary authenticated, redirect-checked transport without re-encoding.
+	err := c.doHTTP(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/finish", data, true, &res)
 	return res.Run, err
 }
 
@@ -2401,7 +2586,11 @@ func (c *CoordinatorClient) AppendRunTelemetry(ctx context.Context, runID string
 
 func (c *CoordinatorClient) AppendRunEvent(ctx context.Context, runID string, input CoordinatorRunEventInput) (CoordinatorRunEvent, error) {
 	var res CoordinatorRunEventResponse
-	err := c.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/events", input, &res)
+	method := http.MethodPost
+	if input.ID != "" {
+		method = http.MethodPut
+	}
+	err := c.do(ctx, method, "/v1/runs/"+url.PathEscape(runID)+"/events", input, &res)
 	return res.Event, err
 }
 
@@ -2411,12 +2600,16 @@ func (c *CoordinatorClient) CreateArtifactUploads(ctx context.Context, input Coo
 	return res, err
 }
 
-func (c *CoordinatorClient) SyncExternalRunners(ctx context.Context, provider string, runners []CoordinatorExternalRunner) (CoordinatorExternalRunnerSyncResponse, error) {
+func (c *CoordinatorClient) SyncExternalRunners(ctx context.Context, provider string, runners []CoordinatorExternalRunner, inventoryScope string) (CoordinatorExternalRunnerSyncResponse, error) {
 	var res CoordinatorExternalRunnerSyncResponse
-	err := c.do(ctx, http.MethodPost, "/v1/runners/sync", map[string]any{
+	input := map[string]any{
 		"provider": provider,
 		"runners":  runners,
-	}, &res)
+	}
+	if inventoryScope != "" {
+		input["inventoryScope"] = inventoryScope
+	}
+	err := c.do(ctx, http.MethodPost, "/v1/runners/sync", input, &res)
 	return res, err
 }
 
@@ -2496,8 +2689,8 @@ func (c *CoordinatorClient) Health(ctx context.Context) error {
 	return c.doRead(ctx, "/v1/health", &res)
 }
 
-// Control requests share one deadline across authentication, HTTP response bodies,
-// and eligible curl fallback. Provisioning and image operations keep their budget.
+// Control requests share one deadline across authentication and HTTP response bodies.
+// Provisioning and image operations keep their budget.
 func (c *CoordinatorClient) doControl(ctx context.Context, method, path string, body any, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, coordinatorControlTimeout)
 	defer cancel()
@@ -2520,16 +2713,7 @@ func (c *CoordinatorClient) doWithHeaders(ctx context.Context, method, path stri
 			return err
 		}
 	}
-	err = c.doHTTPWithHeaders(ctx, method, path, data, body != nil, out, headers)
-	if err == nil || !shouldUseCoordinatorCurlFallback(ctx, method, body != nil, err) {
-		return err
-	}
-	if curlErr := c.doCurl(ctx, method, path, data, body != nil, out); curlErr == nil {
-		return nil
-	} else {
-		// Keep both diagnostics and the typed fallback status for read retry policy.
-		return fmt.Errorf("%w; curl fallback failed: %w", err, curlErr)
-	}
+	return c.doHTTPWithHeaders(ctx, method, path, data, body != nil, out, headers)
 }
 
 func (c *CoordinatorClient) doHTTP(ctx context.Context, method, path string, data []byte, hasBody bool, out any) error {
@@ -2550,7 +2734,14 @@ func (c *CoordinatorClient) doHTTPWithHeaders(ctx context.Context, method, path 
 	if err := c.addRequestHeaders(ctx, req.Header); err != nil {
 		return err
 	}
-	resp, err := c.secureHTTPClient().Do(req)
+	client := c.secureHTTPClient()
+	redirected := false
+	checkRedirect := client.CheckRedirect
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		redirected = true
+		return checkRedirect(next, via)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -2559,6 +2750,7 @@ func (c *CoordinatorClient) doHTTPWithHeaders(ctx context.Context, method, path 
 	var response CoordinatorHTTPError
 	if errors.As(err, &response) {
 		response.retryAfter = coordinatorReadRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		response.responseUnredirected = !redirected
 		return response
 	}
 	return err
@@ -2646,119 +2838,6 @@ func (c *CoordinatorClient) authorizationToken(ctx context.Context) (string, err
 	return token, nil
 }
 
-func (c *CoordinatorClient) doCurl(ctx context.Context, method, path string, data []byte, hasBody bool, out any) error {
-	config, cleanup, err := c.curlConfig(ctx, method, path, data, hasBody)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	// Retain response metadata for read retries without mixing headers into logs.
-	headers, err := os.CreateTemp("", "crabbox-curl-headers-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(headers.Name())
-	defer headers.Close()
-	var extra strings.Builder
-	curlConfigValue(&extra, "dump-header", headers.Name())
-	config += extra.String()
-
-	// -q must be curl's first argument so ambient curlrc settings cannot
-	// re-enable redirects or otherwise change credential handling.
-	cmd := exec.CommandContext(ctx, "curl", "-q", "--config", "-")
-	c.applyChildEnvironment(cmd)
-	cmd.Stdin = strings.NewReader(config)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg != "" {
-			return fmt.Errorf("%v: %s", err, msg)
-		}
-		return err
-	}
-	body, status, err := splitCurlResponse(stdout.Bytes())
-	if err != nil {
-		return err
-	}
-	err = decodeCoordinatorResponse(method, path, status, bytes.NewReader(body), out)
-	var response CoordinatorHTTPError
-	if errors.As(err, &response) {
-		scanner := bufio.NewScanner(io.LimitReader(headers, 64*1024))
-		var retryAfter string
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "HTTP/") {
-				retryAfter = "" // Ignore proxy and informational response headers.
-			}
-			if name, value, ok := strings.Cut(line, ":"); ok && strings.EqualFold(name, "Retry-After") {
-				retryAfter = strings.TrimSpace(value)
-			}
-		}
-		response.retryAfter = coordinatorReadRetryAfter(retryAfter, time.Now())
-		return response
-	}
-	return err
-}
-
-func (c *CoordinatorClient) curlConfig(ctx context.Context, method, path string, data []byte, hasBody bool) (string, func(), error) {
-	var bodyPath string
-	cleanup := func() {}
-	if hasBody {
-		file, err := os.CreateTemp("", "crabbox-curl-body-*")
-		if err != nil {
-			return "", cleanup, err
-		}
-		bodyPath = file.Name()
-		cleanup = func() { _ = os.Remove(bodyPath) }
-		if _, err := file.Write(data); err != nil {
-			_ = file.Close()
-			cleanup()
-			return "", func() {}, err
-		}
-		if err := file.Close(); err != nil {
-			cleanup()
-			return "", func() {}, err
-		}
-	}
-
-	var cfg strings.Builder
-	curlConfigValue(&cfg, "url", c.BaseURL+path)
-	curlConfigValue(&cfg, "request", method)
-	curlConfigValue(&cfg, "connect-timeout", "10")
-	curlConfigValue(&cfg, "max-time", strconv.Itoa(int(coordinatorHTTPTimeout/time.Second)))
-	curlConfigFlag(&cfg, "silent")
-	curlConfigFlag(&cfg, "show-error")
-	curlConfigValue(&cfg, "output", "-")
-	curlConfigValue(&cfg, "write-out", "\n%{http_code}")
-	if hasBody {
-		curlConfigValue(&cfg, "header", "Content-Type: application/json")
-		curlConfigValue(&cfg, "data-binary", "@"+bodyPath)
-	}
-	token, err := c.authorizationToken(ctx)
-	if err != nil {
-		cleanup()
-		return "", func() {}, err
-	}
-	if token != "" {
-		curlConfigValue(&cfg, "header", "Authorization: Bearer "+token)
-	}
-	c.addCurlAccessHeaders(&cfg)
-	if owner := c.localCoordinatorOwner(ctx); owner != "" {
-		curlConfigValue(&cfg, "header", "X-Crabbox-Owner: "+owner)
-	}
-	if org := os.Getenv("CRABBOX_ORG"); org != "" {
-		curlConfigValue(&cfg, "header", "X-Crabbox-Org: "+org)
-	}
-	if err := ctx.Err(); err != nil {
-		cleanup()
-		return "", func() {}, err
-	}
-	return cfg.String(), cleanup, nil
-}
-
 func (c *CoordinatorClient) addAccessHeaders(header http.Header) {
 	if c.Access.ClientID != "" && c.Access.ClientSecret != "" {
 		header.Set("CF-Access-Client-Id", c.Access.ClientID)
@@ -2769,45 +2848,19 @@ func (c *CoordinatorClient) addAccessHeaders(header http.Header) {
 	}
 }
 
-func (c *CoordinatorClient) addCurlAccessHeaders(cfg *strings.Builder) {
-	if c.Access.ClientID != "" && c.Access.ClientSecret != "" {
-		curlConfigValue(cfg, "header", "CF-Access-Client-Id: "+c.Access.ClientID)
-		curlConfigValue(cfg, "header", "CF-Access-Client-Secret: "+c.Access.ClientSecret)
-	}
-	if c.Access.Token != "" {
-		curlConfigValue(cfg, "header", "cf-access-token: "+c.Access.Token)
-	}
-}
-
-func curlConfigValue(out *strings.Builder, key, value string) {
-	fmt.Fprintf(out, "%s = %s\n", key, strconv.Quote(value))
-}
-
-func curlConfigFlag(out *strings.Builder, key string) {
-	fmt.Fprintln(out, key)
-}
-
-func splitCurlResponse(data []byte) ([]byte, int, error) {
-	idx := bytes.LastIndexByte(data, '\n')
-	if idx < 0 || idx+1 >= len(data) {
-		return nil, 0, fmt.Errorf("curl response missing status")
-	}
-	status, err := strconv.Atoi(strings.TrimSpace(string(data[idx+1:])))
-	if err != nil {
-		return nil, 0, fmt.Errorf("curl response invalid status: %w", err)
-	}
-	return data[:idx], status, nil
-}
-
 func decodeCoordinatorResponse(method, path string, statusCode int, body io.Reader, out any) error {
 	if statusCode < 200 || statusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(body, 600))
+		// Do not wait beyond the existing diagnostic cap. Reaching it cannot
+		// establish EOF, so cap-sized bodies remain diagnostic-only.
+		data, readErr := io.ReadAll(io.LimitReader(body, 600))
+		complete := readErr == nil && len(data) < 600
 		msg := strings.TrimSpace(string(data))
 		return CoordinatorHTTPError{
-			Method:     method,
-			Path:       path,
-			StatusCode: statusCode,
-			Message:    msg,
+			Method:           method,
+			Path:             path,
+			StatusCode:       statusCode,
+			Message:          msg,
+			responseComplete: complete,
 		}
 	}
 	if out != nil {
@@ -2829,27 +2882,14 @@ func isCoordinatorTransportError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	// TLS identity and trust rejections are final, including hardened verifier policy.
+	// A different transport or CA store must not override that decision.
+	var verification *tls.CertificateVerificationError
+	if errors.As(err, &verification) {
+		return false
+	}
 	var urlErr *url.Error
 	return errors.As(err, &urlErr)
-}
-
-func shouldUseCoordinatorCurlFallback(ctx context.Context, method string, hasBody bool, err error) bool {
-	if ctx.Err() != nil || hasBody || errors.Is(err, context.Canceled) {
-		return false
-	}
-	switch method {
-	case http.MethodGet, http.MethodHead:
-	default:
-		return false
-	}
-	if isCoordinatorTransportError(err) {
-		return true
-	}
-	// A dial timeout can match DeadlineExceeded while the request budget is live.
-	var urlErr *url.Error
-	var dialErr *net.OpError
-	return errors.As(err, &urlErr) && errors.As(urlErr.Err, &dialErr) &&
-		dialErr.Op == "dial" && dialErr.Timeout()
 }
 
 func (c *CoordinatorClient) applyChildEnvironment(cmd *exec.Cmd) {
@@ -2903,12 +2943,14 @@ func leaseToServerTarget(lease CoordinatorLease, cfg Config) (Server, SSHTarget,
 		provider = strings.TrimSpace(cfg.Provider)
 	}
 	server := Server{
-		Provider: provider,
-		CloudID:  lease.CloudID,
-		HostID:   hostID,
-		ID:       lease.ServerID,
-		Name:     lease.ServerName,
-		Status:   lease.State,
+		LifetimePolicy: lease.LifetimePolicy,
+		ImageEvidence:  CloneImageEvidence(lease.ImageEvidence),
+		Provider:       provider,
+		CloudID:        lease.CloudID,
+		HostID:         hostID,
+		ID:             lease.ServerID,
+		Name:           lease.ServerName,
+		Status:         lease.State,
 		Labels: map[string]string{
 			"lease":             lease.ID,
 			"slug":              lease.Slug,
@@ -2952,8 +2994,7 @@ func leaseToServerTarget(lease CoordinatorLease, cfg Config) (Server, SSHTarget,
 		cfg.WindowsMode = lease.WindowsMode
 	}
 	cfg.Provider = provider
-	target := sshTargetForLease(cfg, lease.Host, lease.SSHUser, lease.SSHPort)
-	target.SSHHostKey = lease.SSHHostKey
+	target := sshTargetForLeaseConnection(cfg, lease.Host, lease.SSHUser, lease.SSHPort, lease.SSHHostKey, lease.SSHJump)
 	if server.Provider == "daytona" {
 		target.Key = ""
 		target.ReadyCheck = "command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null"
@@ -2965,4 +3006,25 @@ func leaseToServerTarget(lease CoordinatorLease, cfg Config) (Server, SSHTarget,
 
 func coordinatorLeaseHostID(lease CoordinatorLease) string {
 	return firstNonBlank(lease.HostID, lease.HostIDCompat)
+}
+
+func (c *CoordinatorClient) ExtendLease(ctx context.Context, id, expectedProvider string, req LeaseExtendRequest) (CoordinatorLease, error) {
+	var response struct {
+		Lease CoordinatorLease `json:"lease"`
+	}
+	provider, err := canonicalCoordinatorMutationProvider(expectedProvider)
+	if err != nil {
+		return response.Lease, err
+	}
+	body := map[string]any{"expectedProvider": provider}
+	if req.TTL > 0 {
+		body["ttlSeconds"] = int(req.TTL / time.Second)
+	} else {
+		body["extendBySeconds"] = int(req.By / time.Second)
+	}
+	if req.Reason != "" {
+		body["reason"] = req.Reason
+	}
+	err = c.do(ctx, http.MethodPost, "/v1/leases/"+url.PathEscape(id)+"/extend", body, &response)
+	return response.Lease, err
 }

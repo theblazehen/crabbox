@@ -1,10 +1,26 @@
+import { lifetimeRuntimeMs } from "./lease-lifetime";
 import type { LeaseRecord } from "./types";
 
 export function clearLeaseCleanupCompletion(lease: LeaseRecord): void {
   delete lease.cleanupCompletedAt;
+  delete lease.cleanupConfirmedBy;
+  delete lease.retainedReconcileDeleteClaim;
+  delete lease.retainedReconcileDeleteCredentialFingerprint;
+  delete lease.retainedReconcileObservation;
 }
 
 export function completeLeaseProviderCleanup(lease: LeaseRecord, completedAt: string): void {
+  if (lease.lifetimePolicy?.compute) {
+    lease.lifetimePolicy.compute = {
+      state: "stopped",
+      accumulatedMs: lifetimeRuntimeMs(lease, Date.parse(completedAt))!,
+    };
+  }
+  if (lease.lifetimePolicy && lease.lifetimePolicy.status !== "complete") {
+    // Explicit deletion retires the policy; a stale stopping phase would keep warning the owner.
+    lease.lifetimePolicy.status = "complete";
+    delete lease.lifetimePolicy.nextCheckAt;
+  }
   lease.cleanupCompletedAt = completedAt;
   lease.provisioningResourceMayExist = false;
   delete lease.provisioningFailureRetryable;

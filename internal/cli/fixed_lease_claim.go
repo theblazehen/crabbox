@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -14,8 +15,8 @@ type FixedLeaseKind struct {
 	IntentVersion           int
 	Label                   string
 	// DeletionState retains native validators' existing on-disk cleanup marker.
-	// Empty preserves the claim at admission unless the release policy requests
-	// binding persistence.
+	// Empty leaves the legacy state unchanged; supplied cleanup bindings are
+	// still journaled before native deletion.
 	DeletionState  string
 	ResourcePlural string
 	// AfterTerminal cleans local lease-owned artifacts under the claim fence,
@@ -32,6 +33,7 @@ func (k FixedLeaseKind) IsFixedClaim(claim LeaseClaim) bool {
 
 func (k FixedLeaseKind) TerminalClaim(claim LeaseClaim, now time.Time) LeaseClaim {
 	intent := *claim.FixedCreateIntent
+	intent.Journal = cloneFixedJournal(intent.Journal)
 	intent.State = "released"
 	terminalFixedJournal(&intent)
 	intent.Attempt = nil
@@ -44,6 +46,11 @@ func (k FixedLeaseKind) TerminalClaim(claim LeaseClaim, now time.Time) LeaseClai
 		ClaimedAt:         claim.ClaimedAt,
 		LastUsedAt:        now.Format(time.RFC3339),
 		FixedCreateIntent: &intent,
+		// A registered adapter completes coordinator deletion after release and
+		// needs the lease's registration binding and generation to do so.
+		CoordinatorRegistrationURL:          claim.CoordinatorRegistrationURL,
+		RuntimeAdapterRegistrationID:        claim.RuntimeAdapterRegistrationID,
+		RuntimeAdapterPendingRegistrationID: claim.RuntimeAdapterPendingRegistrationID,
 	}
 	if len(k.TerminalIdentityLabels) != 0 {
 		terminal.CloudID = claim.CloudID
@@ -63,6 +70,9 @@ func (k FixedLeaseKind) TerminalClaim(claim LeaseClaim, now time.Time) LeaseClai
 }
 
 func (k FixedLeaseKind) FinalizeAfterCleanup(claim LeaseClaim, action func() error) error {
+	if claim.RecoveryHold != nil {
+		return Exit(4, "recovery_required: lease %s is held for salvage", claim.LeaseID)
+	}
 	if !k.IsFixedClaim(claim) {
 		return RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, action)
 	}
@@ -114,8 +124,13 @@ func (k FixedLeaseKind) ValidateTerminalClaim(claim, previous LeaseClaim, leaseI
 				return Exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed resource identity", k.Label, leaseID)
 			}
 		}
+		if claim.CoordinatorRegistrationURL != previous.CoordinatorRegistrationURL ||
+			claim.RuntimeAdapterRegistrationID != previous.RuntimeAdapterRegistrationID ||
+			claim.RuntimeAdapterPendingRegistrationID != previous.RuntimeAdapterPendingRegistrationID {
+			return Exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed coordinator registration", k.Label, leaseID)
+		}
 		if previous.LeaseID != leaseID ||
-			previousIntent.Version != intent.Version ||
+			previousIntent.Version != intent.Version || !reflect.DeepEqual(previousIntent.Retention, intent.Retention) ||
 			previousIntent.Fingerprint != intent.Fingerprint ||
 			previousIntent.ProviderScope != intent.ProviderScope ||
 			previousIntent.CheckpointID != intent.CheckpointID ||

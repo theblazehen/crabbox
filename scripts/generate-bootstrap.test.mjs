@@ -62,6 +62,26 @@ test("generation is reproducible and every checked-in output is current", async 
   for (const [path, source] of first) assert.equal(await readFile(resolve(repoRoot, path), "utf8"), source, path);
 });
 
+test("bootstrap package hooks cannot restart cloud-init, even with inherited automatic mode", async (t) => {
+  const directory = await temporary(t);
+  await writeFile(join(directory, "apt-get"), `#!/bin/sh
+if [ "$1" = install ]; then
+  # Model needrestart's APT hook: Ubuntu defaults to automatic restarts.
+  if [ "\${NEEDRESTART_MODE:-a}" != l ]; then
+    echo 'cloud-init-main.service restarted' >&2
+    exit 1
+  fi
+  echo 'pending service restarts reported'
+fi
+`, { mode: 0o755 });
+  for (const inherited of ["", "a"]) {
+    const output = run("bash", ["-euc", shared.sharedLinuxBootstrapPrelude() + "\napt-get install -y jq"], {
+      env: { ...process.env, PATH: directory + ":" + process.env.PATH, NEEDRESTART_MODE: inherited },
+    });
+    assert.match(output, /pending service restarts reported/);
+  }
+});
+
 test("artifact and catalog schemas reject malformed or ambiguous data", () => {
   for (const mutate of [
     (d) => { d.artifacts.extra = {}; },
@@ -86,6 +106,10 @@ test("artifact and catalog schemas reject malformed or ambiguous data", () => {
     (d) => { d.supported = [d.default, d.default]; },
     (d) => { d.aliases.test = "missing"; },
     (d) => { d.aliases[d.default] = d.default; },
+    (d) => { d.images.find((image) => image.Target === "windows").Provider = "azure"; },
+    (d) => { d.images.find((image) => image.Target === "windows").ContainerName = d.images[0].ContainerName; },
+    (d) => { d.images.find((image) => image.Target === "windows").AWSName = ""; },
+
   ]) {
     const document = structuredClone(sources.catalog); mutate(document);
     assert.throws(() => validateCatalog(document));
@@ -123,9 +147,10 @@ test("compiled Go and TypeScript agree exactly for every shared fragment and fix
   }
   const constants = Object.keys(sources.constants).map((name) => `${JSON.stringify(name)}:${name},`);
   await writeFile(join(directory, "bootstrap.go"), (await readFile(resolve(repoRoot, "internal/cli/bootstrap_generated.go"), "utf8")).replace("package cli", "package main"));
+  await writeFile(join(directory, "quote.go"), (await readFile(resolve(repoRoot, "internal/cli/powershell_quote.go"), "utf8")).replace("package cli", "package main"));
   await writeFile(join(directory, "catalog.go"), (await readFile(resolve(repoRoot, "internal/cli/os_image.go"), "utf8")).replace("package cli", "package main"));
   await writeFile(join(directory, "main.go"), `package main\nimport("encoding/json";"os")\nfunc main(){json.NewEncoder(os.Stdout).Encode(map[string]any{"fragments":map[string]string{${entries.join("\n")}},"constants":map[string]string{${constants.join("\n")}},"images":osImageSpecs,"aliases":osImageAliases,"default":defaultOSImage})}\n`);
-  const actual = JSON.parse(run("go", ["run", join(directory, "main.go"), join(directory, "bootstrap.go"), join(directory, "catalog.go")]));
+  const actual = JSON.parse(run("go", ["run", join(directory, "main.go"), join(directory, "bootstrap.go"), join(directory, "catalog.go"), join(directory, "quote.go")]));
   for (const [key, value] of Object.entries(expected)) assert.ok(actual.fragments[key] === value, `fragment differs: ${key}`);
   assert.deepEqual(actual.constants, sources.constants);
   for (const name of Object.keys(sources.constants)) assert.equal(shared[name], sources.constants[name]);
@@ -137,7 +162,7 @@ test("compiled Go and TypeScript agree exactly for every shared fragment and fix
 
 test("shell and PowerShell literals preserve quoting-sensitive data without evaluation", async (t) => {
   const directory = await temporary(t);
-  for (const value of ["alice's $HOME `id` \\\" 🦀", "line\nREADY\nprintf injected\r", "", "{{user}} ${value}"]) {
+  for (const value of ["alice's $HOME `id` \\\" 🦀", "line\nREADY\nprintf injected\r", "", "{{user}} ${value}", "‘’‚‛“”„", "a’;throw 'injected';‘", "\n'@\n\"@\n"]) {
     assert.equal(run("bash", ["-c", `printf '%s' ${shellQuote(value)}`]), value);
     const header = shared.sharedWindowsHeader(value, value, value, [value]);
     const assignments = header.slice(header.indexOf("$user ="), header.indexOf('$base ='));

@@ -51,7 +51,7 @@ func syntheticBlacksmithCommand(t *testing.T, req core.LocalCommandRequest) stri
 	if len(args) >= 2 && args[0] == "testbox" && args[1] == "run" {
 		for args = args[2:]; len(args) > 0; {
 			switch args[0] {
-			case "--id", "--ssh-private-key":
+			case "--id", "--ssh-private-key", "--wait-timeout":
 				if len(args) < 2 {
 					t.Fatal("missing native option value")
 				}
@@ -398,7 +398,7 @@ func TestBlacksmithArtifactPreflightsSCPBeforeWorkload(t *testing.T) {
 			childPATH := os.Getenv("PATH")
 			prepareBlacksmithGuestKey(t, "tbx_preflight")
 			parentBin := t.TempDir()
-			for _, name := range []string{"blacksmith", "ps"} {
+			for _, name := range []string{"blacksmith", "ps", "ssh"} {
 				path, err := exec.LookPath(name)
 				if err != nil {
 					t.Fatal(err)
@@ -756,7 +756,7 @@ func TestBlacksmithArtifactRunBudgets(t *testing.T) {
 	requireBlacksmithArtifactShell(t)
 	for _, kind := range []string{"workload-outlives-budget", "local-collection-stall", "remote-collection-timeout", "sync-stall", "startup-failure", "missing-timeout", "unsupported-timeout"} {
 		for _, code := range []int{0, 1, 23} {
-			t.Run(fmt.Sprintf("%s/%d", kind, code), func(t *testing.T) {
+			runTest := func(t *testing.T) {
 				isolateArtifactOwnership(t)
 				repo := t.TempDir()
 				t.Chdir(repo)
@@ -843,7 +843,7 @@ func TestBlacksmithArtifactRunBudgets(t *testing.T) {
 				} else if kind == "remote-collection-timeout" {
 					var ee core.ExitError
 					if got != code || ended.IsZero() || !errors.As(err, &ee) || ee.Code != 7 || ee.Message != "collection exited 124" || len(artifacts) != 0 {
-						t.Fatalf("remote collection timeout lost workload result: code=%d ended=%v artifacts=%+v err=%v", got, ended, artifacts, err)
+						t.Fatalf("remote collection timeout result: code=%d ended=%v artifacts=%+v err=%v", got, ended, artifacts, err)
 					}
 					assertNoBlacksmithArtifactPublication(t, repo, "tbx_budget")
 				} else {
@@ -883,6 +883,16 @@ func TestBlacksmithArtifactRunBudgets(t *testing.T) {
 				if time.Since(begin) > budget+3*time.Second {
 					t.Fatal("unbounded collection wait")
 				}
+			}
+			t.Run(fmt.Sprintf("%s/%d", kind, code), func(t *testing.T) {
+				if kind == "remote-collection-timeout" {
+					// Buffered receipt replay must finish before the local timer,
+					// independent of host scheduling and native launcher cleanup.
+					// The subprocess still exercises the real remote timeout.
+					synctest.Test(t, runTest)
+					return
+				}
+				runTest(t)
 			})
 		}
 	}
@@ -1189,6 +1199,13 @@ func TestBlacksmithArtifactFailureCleanupAndClassification(t *testing.T) {
 				var ee core.ExitError
 				if !errors.As(err, &ee) || ee.Code != want || result.ExitCode != want {
 					t.Fatalf("result=%+v err=%v", result, err)
+				}
+				wantKind := core.RunErrorCommandExit
+				if code == 0 {
+					wantKind = core.RunErrorProvider
+				}
+				if result.Status != core.RunStatusFailed || result.ErrorKind != wantKind {
+					t.Errorf("collection/cleanup replaced observed workload outcome: %+v", result)
 				}
 				if mode == "lease-cleanup" {
 					assertArtifactTransferCalls(t, runner.calls, 1)

@@ -107,6 +107,28 @@ func validImageDigest(digest string) bool {
 // the requested one. Verify the created configuration before start, which uses
 // that stored image and does not resolve the registry reference again.
 func (b *backend) createPinnedContainer(ctx context.Context, cfg core.Config, args []string, name, leaseID, slug, digest string) (string, error) {
+	return b.createPinnedContainerWithStart(ctx, cfg, args, name, leaseID, slug, digest, func(observed imageContainerObservation) error {
+		return core.WithDurableLeaseClaimLock(leaseID, func(_ *core.LeaseClaim, exists bool, _ func() error) error {
+			if exists {
+				return core.Exit(2, "Apple Container claim appeared before verified image start")
+			}
+			return b.startVerifiedPinnedContainer(ctx, cfg, observed, leaseID, slug)
+		})
+	}, func(observed imageContainerObservation) error {
+		return b.rollbackImageContainer(cfg, observed, leaseID, slug)
+	})
+}
+
+// createPinnedContainerUnderLeaseLock completes the pinned-image transition
+// without reacquiring leaseID's durable claim lock. Its caller must hold that
+// lock across this entire call.
+func (b *backend) createPinnedContainerUnderLeaseLock(ctx context.Context, cfg core.Config, args []string, name, leaseID, slug, digest string) (string, error) {
+	return b.createPinnedContainerWithStart(ctx, cfg, args, name, leaseID, slug, digest, func(observed imageContainerObservation) error {
+		return b.startVerifiedPinnedContainer(ctx, cfg, observed, leaseID, slug)
+	}, nil)
+}
+
+func (b *backend) createPinnedContainerWithStart(ctx context.Context, cfg core.Config, args []string, name, leaseID, slug, digest string, start, rollback func(imageContainerObservation) error) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -129,29 +151,34 @@ func (b *backend) createPinnedContainer(ctx context.Context, cfg core.Config, ar
 	}
 	if observed.container.Configuration.Image.Descriptor.Digest != digest {
 		cause := core.Exit(5, "Apple Container created image digest differs from the reviewed default; bootstrap refused")
-		if err := b.rollbackImageContainer(cfg, observed, leaseID, slug); err != nil {
+		// Fixed acquisition owns the claim lock and a durable attempt. Keep the
+		// unverified target instead of reentering ordinary unclaimed rollback.
+		if rollback == nil {
+			return retained(cause)
+		}
+		if err := rollback(observed); err != nil {
 			return retained(errors.Join(cause, err))
 		}
 		return "", cause
 	}
-	err = core.WithDurableLeaseClaimLock(leaseID, func(_ *core.LeaseClaim, exists bool, _ func() error) error {
-		if exists {
-			return core.Exit(2, "Apple Container claim appeared before verified image start")
-		}
-		fresh, err := b.inspectImageContainer(ctx, cfg, name)
-		if err != nil {
-			return err
-		}
-		if !ownedStoppedImageContainer(fresh.container, cfg.AppleContainer.Image, leaseID, slug) || !reflect.DeepEqual(fresh.configuration, observed.configuration) {
-			return core.Exit(2, "Apple Container configuration changed before verified image start")
-		}
-		_, err = b.imageControl(ctx, cfg, []string{"start", name}, 2*time.Minute)
-		return err
-	})
+	err = start(observed)
 	if err != nil {
 		return retained(err)
 	}
 	return name, nil
+}
+
+func (b *backend) startVerifiedPinnedContainer(ctx context.Context, cfg core.Config, observed imageContainerObservation, leaseID, slug string) error {
+	name := observed.container.id()
+	fresh, err := b.inspectImageContainer(ctx, cfg, name)
+	if err != nil {
+		return err
+	}
+	if !ownedStoppedImageContainer(fresh.container, cfg.AppleContainer.Image, leaseID, slug) || !reflect.DeepEqual(fresh.configuration, observed.configuration) {
+		return core.Exit(2, "Apple Container configuration changed before verified image start")
+	}
+	_, err = b.imageControl(ctx, cfg, []string{"start", name}, 2*time.Minute)
+	return err
 }
 
 func (b *backend) rollbackImageContainer(cfg core.Config, observed imageContainerObservation, leaseID, slug string) error {

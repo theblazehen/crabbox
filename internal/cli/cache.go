@@ -27,7 +27,7 @@ func (a App) cacheVolumes(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(cfg.Cache.Volumes)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(cfg.Cache.Volumes))
 	}
 	if len(cfg.Cache.Volumes) == 0 {
 		fmt.Fprintln(a.Stdout, "no cache volumes configured")
@@ -124,7 +124,7 @@ func (a App) cachePurge(ctx context.Context, args []string) error {
 	return nil
 }
 
-func (a App) cacheWarm(ctx context.Context, args []string) error {
+func (a App) cacheWarm(ctx context.Context, args []string) (err error) {
 	fs := newFlagSet("cache warm", a.Stderr)
 	id := fs.String("id", "", "lease id or slug")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
@@ -151,15 +151,25 @@ func (a App) cacheWarm(ctx context.Context, args []string) error {
 	}
 	workdir := remoteJoin(cfg, leaseID, repo.Name)
 	actionsEnvFile := ""
-	if state, err := readActionsHydrationState(ctx, target, leaseID); err == nil && state.Workspace != "" {
+	state, err := readActionsWorkspace(ctx, target, leaseID, cfg, repo)
+	if err != nil {
+		return err
+	}
+	if state.Workspace != "" {
 		workdir = state.Workspace
 		actionsEnvFile = state.EnvFile
 		fmt.Fprintf(a.Stderr, "using GitHub Actions workspace %s\n", workdir)
 	}
 	remoteEnv := allowedRemoteEnvForTarget(cfg, target)
-	remote := remoteCacheWarmCommand(workdir, remoteEnv, actionsEnvFile, command)
+	commandEnv, err := stageSSHCommandEnv(ctx, target, workdir, remoteEnv, a.Stderr)
+	if err != nil {
+		return err
+	}
+	defer commandEnv.closeAfter(&err)
+	envFiles := remoteRunEnvFiles(actionsEnvFile, commandEnv.File)
+	remote := remoteCommandWithEnvFiles(workdir, nil, envFiles, command)
 	if isWindowsNativeTarget(target) {
-		remote = windowsRemoteCommandWithEnvFile(workdir, remoteEnv, actionsEnvFile, command)
+		remote = windowsRemoteCommandWithEnvFiles(workdir, nil, envFiles, command)
 	}
 	code := runSSHStream(ctx, target, remote, a.Stdout, a.Stderr)
 	if code != 0 {
@@ -226,10 +236,6 @@ func remoteCacheStats(enabled map[string]bool) string {
 		return "true"
 	}
 	return b.String()
-}
-
-func remoteCacheWarmCommand(workdir string, env map[string]string, envFile string, command []string) string {
-	return remoteCommandWithEnvFiles(workdir, env, singleEnvFile(envFile), command)
 }
 
 func remoteCachePurge(kind string, enabled map[string]bool) string {

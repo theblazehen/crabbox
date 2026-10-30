@@ -23,10 +23,13 @@ type proxmoxClient interface {
 	ListCrabboxServersCluster(context.Context) ([]core.Server, error)
 	CreateServer(context.Context, core.Config, string, string, string, bool) (core.Server, error)
 	NextVMID(context.Context) (int, error)
+	ListVMIDsInCluster(context.Context) ([]int, error)
 	CreateServerWithVMID(context.Context, core.Config, string, string, string, bool, int, map[string]string, func(core.Server) error) (core.Server, error)
 	GetServer(context.Context, string) (core.Server, error)
 	GetServerOnNode(context.Context, string, string) (core.Server, error)
 	VMExistsInCluster(context.Context, string) (bool, error)
+	VMIdentityExistsInCluster(context.Context, string, string) (bool, error)
+	VerifyNoActiveCloneTasks(context.Context) error
 	DeleteServer(context.Context, string) error
 	DeleteServerOnNode(context.Context, string, string) error
 	DeleteServerOnNodeChecked(context.Context, string, string, func(core.Server) error) error
@@ -35,19 +38,27 @@ type proxmoxClient interface {
 }
 
 func NewLeaseBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
+	cfg = withProxmoxGuestAccess(cfg)
 	cfg.Provider = "proxmox"
+	return &leaseBackend{DirectSSHBackend: shared.DirectSSHBackend{SpecValue: spec, Cfg: cfg, RT: rt, StoredLeaseKeys: true}}
+}
+
+func withProxmoxGuestAccess(cfg core.Config) core.Config {
 	if cfg.Proxmox.User != "" {
 		cfg.SSHUser = cfg.Proxmox.User
 	}
 	if cfg.Proxmox.WorkRoot != "" {
 		cfg.WorkRoot = cfg.Proxmox.WorkRoot
 	}
-	return &leaseBackend{DirectSSHBackend: shared.DirectSSHBackend{SpecValue: spec, Cfg: cfg, RT: rt, StoredLeaseKeys: true}}
+	return cfg
 }
 
 func (b *leaseBackend) SupportsRequestedLeaseID() bool { return true }
 
 func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	if err := (Provider{}).ValidateRequestedCapabilities(b.Cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	if strings.TrimSpace(req.RequestedLeaseID) != "" {
 		return b.acquireFixed(ctx, req)
 	}
@@ -370,7 +381,7 @@ func (b *leaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.Rel
 		if label := proxmoxClaimLabelLeaseID(req.Lease.Server); label != "" && label != leaseID {
 			return core.ReleaseLeaseOutcome{}, core.Exit(4, "lease_id_conflict: fixed Proxmox release lease label %s does not match %s", label, leaseID)
 		}
-		err := b.releaseFixed(ctx, req, false)
+		err := b.releaseFixed(ctx, req, false, false)
 		return core.ReleaseLeaseOutcome{Terminal: err == nil}, err
 	}
 	if req.Lease.Server.Labels["fixed_intent_sha256"] != "" || exists && claim.Provider == core.FixedProxmoxClaimProvider {
@@ -489,7 +500,7 @@ func (b *leaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) err
 				fmt.Fprintf(b.RT.Stderr, "would delete server id=%s name=%s\n", server.DisplayID(), server.Name)
 				continue
 			}
-			if err := b.releaseFixed(ctx, core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: fixedClaim.LeaseID, Server: server}}, true); err != nil {
+			if err := b.releaseFixed(ctx, core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: fixedClaim.LeaseID, Server: server}}, true, false); err != nil {
 				return err
 			}
 			fmt.Fprintf(b.RT.Stderr, "delete server id=%s name=%s fixed=true key_retained=true\n", server.DisplayID(), server.Name)
@@ -711,7 +722,13 @@ func proxmoxClaimLabelLeaseID(server core.Server) string {
 	return ""
 }
 
-var newClient = func(cfg core.Config) (proxmoxClient, error) { return core.NewProxmoxClient(cfg) }
+var newClient = func(cfg core.Config) (proxmoxClient, error) {
+	client, err := core.NewProxmoxClient(cfg)
+	if err == nil {
+		client.GuestBootstrap = preparedTemplateBootstrap
+	}
+	return client, err
+}
 
 var waitForSSHReadyFunc = core.WaitForSSHReady
 

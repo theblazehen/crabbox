@@ -42,6 +42,9 @@ type fakeAzureClient struct {
 	createCfg         core.Config
 	createErr         error
 	fixedReplyErr     error
+	fixedCapacityErr  error
+	fixedSettleErr    error
+	fixedSettled      []core.AzureFixedCompanions
 	createFunc        func(core.Server) core.Server
 	waitFunc          func(core.Server) (core.Server, error)
 	waitCalls         int
@@ -146,6 +149,10 @@ func (c *fakeAzureClient) PrepareCleanupServer(_ context.Context, server core.Se
 	return server, nil
 }
 
+func (c *fakeAzureClient) PrepareCleanupRecoveryServer(ctx context.Context, server core.Server, now time.Time) (core.Server, error) {
+	return c.PrepareCleanupServer(ctx, server, now)
+}
+
 func (c *fakeAzureClient) DeleteOwnedServer(_ context.Context, server core.Server) error {
 	c.ownedExpected = append(c.ownedExpected, server)
 	if c.deleteOwnedFunc != nil {
@@ -212,7 +219,7 @@ func TestAzureTouchUsesProviderClientBestEffort(t *testing.T) {
 			t.Cleanup(func() { newAzureClient = oldClient })
 			var stderr bytes.Buffer
 			backend := NewAzureLeaseBackend(core.ProviderSpec{Name: "azure"}, core.Config{}, core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
-			server := core.Server{CloudID: tc.cloudID, Name: "fallback-name", Provider: "azure", Labels: map[string]string{"idle_timeout_secs": "1800"}}
+			server := core.Server{CloudID: tc.cloudID, Name: "fallback-name", Provider: "azure", Labels: map[string]string{"idle_timeout_secs": "1800", "ttl_secs": "7200"}}
 			got, err := backend.Touch(context.Background(), core.TouchRequest{Lease: core.LeaseTarget{Server: server}, State: "ready", IdleTimeoutOverride: tc.override})
 			if err != nil || got.Labels["state"] != "ready" {
 				t.Fatalf("server=%+v err=%v", got, err)
@@ -278,6 +285,26 @@ func TestAzureAcquireCleansUpCreatedServerOnIPFailure(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Dir(key)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("SSH artifacts remain after successful rollback: %v", err)
+	}
+}
+
+func TestAzureAcquireRejectsVMWithoutRequiredIdentityAtReadiness(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fake := &fakeAzureClient{}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+	cfg := azureAcquireTestConfig()
+	cfg.Azure.UserAssignedIdentityResourceID = "/subscriptions/sub/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/worker"
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	_, err := backend.acquireOnce(t.Context(), false, "")
+	if err == nil || !strings.Contains(err.Error(), "missing required user-assigned identity") {
+		t.Fatalf("readiness error=%v", err)
+	}
+	if len(fake.deleted) != 1 {
+		t.Fatalf("identity-less VM cleanup=%v, want one owned rollback", fake.deleted)
 	}
 }
 
@@ -1196,6 +1223,8 @@ func TestAzureConfigShowCompletePassiveSection(t *testing.T) {
 		{name: "raw-references-list", input: core.Config{Azure: core.AzureConfig{Location: "raw-location", ResourceGroup: "group-reference", Image: "image-reference", OSDisk: "raw-disk", SnapshotSKU: "raw-snapshot-sku", OSDiskSKU: "raw-disk-sku", Network: "network-reference", SSHCIDRs: []string{"second", "first", "second", " "}}}, want: map[string]any{"location": "raw-location", "resourceGroup": "group-reference", "image": "image-reference", "osDisk": "raw-disk", "snapshotSKU": "raw-snapshot-sku", "osDiskSKU": "raw-disk-sku", "network": "network-reference", "sshCIDRs": []string{"second", "first", "second", " "}}, text: "azure location=raw-location resource_group=group-reference os_disk=raw-disk snapshot_sku=raw-snapshot-sku os_disk_sku=raw-disk-sku network=network-reference ssh_cidrs=second,first,second, \n"},
 		{name: "whitespace-empty-elements", input: core.Config{Azure: core.AzureConfig{Location: " ", ResourceGroup: " ", Image: " ", OSDisk: " ", SnapshotSKU: " ", OSDiskSKU: " ", Network: " ", SSHCIDRs: []string{"", ""}}}, want: map[string]any{"location": " ", "resourceGroup": " ", "image": " ", "osDisk": " ", "snapshotSKU": " ", "osDiskSKU": " ", "network": " ", "sshCIDRs": []string{"", ""}}, text: "azure location=  resource_group=  os_disk=  snapshot_sku=  os_disk_sku=  network=  ssh_cidrs=,\n"},
 	} {
+		tc.want["userAssignedIdentityResourceId"] = ""
+		tc.text = strings.TrimSuffix(tc.text, "\n") + " user_assigned_identity_resource_id=-\n"
 		for _, selected := range []string{"azure", "static"} {
 			t.Run(tc.name+"/"+selected, func(t *testing.T) {
 				cfg := tc.input
@@ -1206,7 +1235,7 @@ func TestAzureConfigShowCompletePassiveSection(t *testing.T) {
 				if section.JSONKey != "azure" || section.TextLabel != "azure" || !reflect.DeepEqual(section.Providers, []string{"azure"}) {
 					t.Fatalf("section metadata=%#v", section)
 				}
-				wantOrder := []string{"location", "resourceGroup", "image", "osDisk", "snapshotSKU", "osDiskSKU", "network", "sshCIDRs"}
+				wantOrder := []string{"location", "resourceGroup", "image", "osDisk", "snapshotSKU", "osDiskSKU", "network", "sshCIDRs", "userAssignedIdentityResourceId"}
 				if len(section.Fields) != len(wantOrder) {
 					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
 				}

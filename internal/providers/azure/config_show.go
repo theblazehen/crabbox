@@ -6,6 +6,13 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
+func (Provider) NormalizeConfigForShow(cfg core.Config) core.Config {
+	if mode, err := core.NormalizeAzureOSDiskMode(cfg.Azure.OSDisk); err == nil {
+		cfg.Azure.OSDisk = mode
+	}
+	return cfg
+}
+
 // ConfigShowSection reports the established fields without cloud discovery.
 func (Provider) ConfigShowSection(cfg core.Config) core.ProviderConfigShowSection {
 	return core.ProviderConfigShowSection{
@@ -19,6 +26,7 @@ func (Provider) ConfigShowSection(cfg core.Config) core.ProviderConfigShowSectio
 			{JSONName: "osDiskSKU", JSONValue: cfg.Azure.OSDiskSKU, TextName: "os_disk_sku", TextValue: core.Blank(cfg.Azure.OSDiskSKU, "-")},
 			{JSONName: "network", JSONValue: cfg.Azure.Network, TextName: "network", TextValue: core.Blank(cfg.Azure.Network, "-")},
 			{JSONName: "sshCIDRs", JSONValue: cfg.Azure.SSHCIDRs, TextName: "ssh_cidrs", TextValue: core.Blank(strings.Join(cfg.Azure.SSHCIDRs, ","), "-")},
+			{JSONName: "userAssignedIdentityResourceId", JSONValue: cfg.Azure.UserAssignedIdentityResourceID, TextName: "user_assigned_identity_resource_id", TextValue: core.Blank(cfg.Azure.UserAssignedIdentityResourceID, "-")},
 		},
 	}
 }

@@ -12,9 +12,124 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestProvidersFixedLeaseIDBuiltBinary(t *testing.T) {
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	env := []string{"CRABBOX_CONFIG=" + filepath.Join(root, "missing.yaml")}
+	stdout, stderr, code := runDescribeTestBinary(binary, root, env, "providers", "--json")
+	if code != 0 {
+		t.Fatalf("providers --json exit=%d stderr=%s", code, stderr)
+	}
+	var entries []providerMatrixEntry
+	if err := json.Unmarshal(stdout, &entries); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		provider string
+		want     bool
+	}{
+		{"digitalocean", true},
+		{"tenki", true},
+		{"gcp", true},           // Fixed IDs are supported by the coordinator wrapper.
+		{"agent-sandbox", true}, // Runtime routing settings are not needed for discovery.
+		{"apple-container", true},
+		{"ascii-box", true},
+		{"aws", true},
+		{"azure", true},
+		{"azure-sandbox", true},
+		{"daytona", true},
+		{"incus", true},
+		{"local-container", true},
+		{"machine0", true},
+		{"parallels", true},
+		{"proxmox", true},
+		{"external", false}, // Requires an explicit runtime contract opt-in.
+		{"linode", true},
+		{"runpod", true},
+		{"scaleway", true},
+		{"boxd", false},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			index := slices.IndexFunc(entries, func(entry providerMatrixEntry) bool { return entry.Provider == tc.provider })
+			if index < 0 {
+				t.Fatalf("provider %s missing from matrix", tc.provider)
+			}
+			if got := slices.Contains(entries[index].Features, FeatureFixedLeaseID); got != tc.want {
+				t.Errorf("matrix fixed-lease-id=%t, want %t", got, tc.want)
+			}
+			stdout, stderr, code := runDescribeTestBinary(binary, root, env, "providers", "describe", tc.provider, "--json")
+			if code != 0 {
+				t.Fatalf("describe exit=%d stderr=%s", code, stderr)
+			}
+			var description providerDescription
+			if err := json.Unmarshal(stdout, &description); err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.Contains(description.Capabilities.Features, "fixed-lease-id"); got != tc.want {
+				t.Errorf("describe fixed-lease-id=%t, want %t", got, tc.want)
+			}
+			assertSortedStrings(t, "features", description.Capabilities.Features)
+		})
+	}
+}
+
+func TestAzureConfigShowBuiltBinaryMigration(t *testing.T) {
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{"config", "env"} {
+		for _, mode := range []string{"auto", "ephemeral", "ephemeral-preview"} {
+			t.Run(source+"/"+mode, func(t *testing.T) {
+				root := t.TempDir()
+				path := filepath.Join(root, "config.yaml")
+				env := []string{"CRABBOX_CONFIG=" + path, "XDG_CONFIG_HOME=" + root, "XDG_STATE_HOME=" + root}
+				content := "provider: azure\nazure:\n  subscriptionId: test-sub\n"
+				if source == "config" {
+					content += "  osDisk: " + mode + "\n"
+				} else {
+					env = append(env, "CRABBOX_AZURE_OS_DISK="+mode)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				stdout, stderr, code := runDescribeTestBinary(binary, root, env, "config", "show", "--json")
+				if mode == "ephemeral-preview" {
+					if code != 2 || !strings.Contains(string(stderr), "has been removed; use ephemeral") {
+						t.Fatalf("exit=%d stderr=%s", code, stderr)
+					}
+					return
+				}
+				if code != 0 {
+					t.Fatalf("exit=%d stderr=%s", code, stderr)
+				}
+				var view struct {
+					Azure struct {
+						OSDisk string `json:"osDisk"`
+					} `json:"azure"`
+				}
+				if err := json.Unmarshal(stdout, &view); err != nil {
+					t.Fatal(err)
+				}
+				want := mode
+				if mode == "auto" {
+					want = "managed"
+				}
+				if view.Azure.OSDisk != want {
+					t.Fatalf("shown mode=%q, want %q", view.Azure.OSDisk, want)
+				}
+			})
+		}
+	}
+}
 
 func TestProvidersDescribeBuiltBinaryContract(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
@@ -132,8 +247,9 @@ func TestProvidersDescribeBuiltBinaryContract(t *testing.T) {
 	localFlags := descriptionFlagMap(local.ProviderFlags)
 	wantLocal := []string{
 		"local-container-cpus", "local-container-docker-socket", "local-container-image",
-		"local-container-memory", "local-container-network", "local-container-runtime",
-		"local-container-user", "local-container-volume", "local-container-work-root",
+		"local-container-memory", "local-container-network", "local-container-oci-runtime",
+		"local-container-runtime", "local-container-user", "local-container-volume",
+		"local-container-work-root",
 	}
 	if got := sortedDescriptionFlagNames(local.ProviderFlags); !reflect.DeepEqual(got, wantLocal) {
 		t.Fatalf("local-container flags=%v want %v", got, wantLocal)
@@ -228,4 +344,58 @@ func sortedDescriptionFlagNames(flags []providerDescriptionFlag) []string {
 		names = append(names, item.Name)
 	}
 	return names
+}
+
+func TestProxmoxConfiguredCatalogBuiltBinary(t *testing.T) {
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	workDir := filepath.Join(root, "work")
+	if err := os.Mkdir(workDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(root, "config.yaml")
+	data := "provider: proxmox\ntarget: linux\nproxmox:\n  templateId: 9401\n  desktopTemplateId: 9401\n  browserTemplateId: 9401\n"
+	if err := os.WriteFile(config, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"CRABBOX_CONFIG=" + config, "XDG_CONFIG_HOME=" + root, "XDG_STATE_HOME=" + root}
+	for _, configured := range []bool{false, true} {
+		args := []string{"providers", "--json"}
+		if configured {
+			args = append(args, "--configured")
+		}
+		stdout, stderr, code := runDescribeTestBinary(binary, workDir, env, args...)
+		if code != 0 {
+			t.Fatalf("configured=%v exit=%d stderr=%s", configured, code, stderr)
+		}
+		var entries []providerMatrixEntry
+		if err := json.Unmarshal(stdout, &entries); err != nil {
+			t.Fatal(err)
+		}
+		index := slices.IndexFunc(entries, func(e providerMatrixEntry) bool { return e.Provider == "proxmox" })
+		if index < 0 {
+			t.Fatal("Proxmox absent")
+		}
+		entry := entries[index]
+		if slices.Contains(entry.Features, FeatureDesktop) != configured || slices.Contains(entry.Features, FeatureBrowser) != configured {
+			t.Fatalf("configured=%v features=%v", configured, entry.Features)
+		}
+		want := "static"
+		if configured {
+			want = "configured"
+		}
+		if entry.MetadataKind != want || entry.Readiness != "unchecked" {
+			t.Fatalf("configured=%v metadata=%+v", configured, entry.providerStaticStatus)
+		}
+	}
+	if err := os.WriteFile(config, []byte("[invalid yaml\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, code := runDescribeTestBinary(binary, workDir, env, "providers", "--configured", "--json")
+	if code == 0 {
+		t.Fatal("explicit configured discovery accepted malformed configuration")
+	}
 }

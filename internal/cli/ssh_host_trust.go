@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	xssh "golang.org/x/crypto/ssh"
@@ -48,6 +49,18 @@ func prepareLeaseSSHTrust(target *SSHTarget, leaseID string) error {
 		}
 		target.HostKeyAlias = alias
 	}
+	if target.SSHJump != nil {
+		jump := *target.SSHJump
+		target.SSHJump = &jump
+		alias, err := leaseHostKeyAlias(leaseID)
+		if err != nil {
+			return err
+		}
+		jump.HostKeyAlias = strings.Replace(alias, "crabbox-lease-", "crabbox-serve-", 1)
+		if err := prepareSSHJump(target); err != nil {
+			return err
+		}
+	}
 	return installAuthoritativeSSHHostKey(target)
 }
 
@@ -73,6 +86,17 @@ func installAuthoritativeSSHHostKey(target *SSHTarget) error {
 		return Exit(2, "authoritative SSH host key requires an absolute isolated known_hosts path")
 	}
 	entry := knownhosts.Line([]string{token}, publicKey) + "\n"
+	if jump := target.SSHJump; jump != nil {
+		key, err := parseAuthoritativeSSHHostKey(jump.HostKey)
+		if err != nil {
+			return err
+		}
+		token := jump.HostKeyAlias
+		if token == "" {
+			token = net.JoinHostPort(jump.Host, strconv.Itoa(jump.Port))
+		}
+		entry += knownhosts.Line([]string{token}, key) + "\n"
+	}
 	if err := writeAuthoritativeKnownHosts(path, []byte(entry)); err != nil {
 		return Exit(2, "install authoritative SSH host key in %s: %v", path, err)
 	}
@@ -231,4 +255,56 @@ func removeStoredTestboxConnectionArtifacts(ctx context.Context, leaseID string)
 		return fmt.Errorf("remove lease SSH directory: %w", err)
 	}
 	return nil
+}
+
+// Build the hop only once the per-lease identity and trust paths have been selected.
+// OpenSSH invokes ProxyCommand through a shell; quote every exact argument and
+// escape its percent expansion before it reaches that shell.
+func prepareSSHJump(target *SSHTarget) error {
+	jump := target.SSHJump
+	if net.ParseIP(jump.Host) == nil || jump.Port < 1 || jump.Port > 65535 || target.Key == "" {
+		return Exit(2, "invalid SSH jump endpoint or missing lease identity")
+	}
+	key, err := parseAuthoritativeSSHHostKey(jump.HostKey)
+	if err != nil {
+		return err
+	}
+	if key.Type() != xssh.KeyAlgoED25519 || (jump.Fingerprint != "" && jump.Fingerprint != xssh.FingerprintSHA256(key)) {
+		return Exit(2, "invalid SSH jump host key or fingerprint")
+	}
+	if err := selectSSHJumpCandidate(target, key); err != nil {
+		return err
+	}
+	proxy, err := sshJumpProxyCommand(target, "")
+	if err != nil {
+		return err
+	}
+	target.ProxyCommand = proxy
+	target.NoControlMaster = true
+	return nil
+}
+
+func sshJumpProxyCommand(target *SSHTarget, controlPath string) (string, error) {
+	jump := target.SSHJump
+	args := []string{"ssh", "-F", os.DevNull, "-i", target.Key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + sshConfigFileValue(target.KnownHostsFile), "-o", "GlobalKnownHostsFile=none", "-o", "KnownHostsCommand=none", "-o", "VerifyHostKeyDNS=no", "-o", "UpdateHostKeys=no", "-o", "HostKeyAlgorithms=ssh-ed25519", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=" + relaySSHConnectTimeout("10", jump.useRelay), "-o", "ServerAliveInterval=15", "-p", strconv.Itoa(jump.Port), "-W", net.JoinHostPort(target.Host, target.Port), "crabbox@" + jump.Host}
+	if controlPath != "" {
+		args = append(args[:1], append([]string{"-S", controlPath}, args[1:]...)...)
+	}
+	if jump.useRelay {
+		proxy, err := prepareServeRelayProxy(target)
+		if err != nil {
+			return "", err
+		}
+		args = append(args[:1], append([]string{"-o", "ProxyCommand=" + proxy}, args[1:]...)...)
+	}
+	if jump.HostKeyAlias != "" {
+		if _, err := authoritativeKnownHostToken(SSHTarget{HostKeyAlias: jump.HostKeyAlias}); err != nil {
+			return "", err
+		}
+		args = append(args[:1], append([]string{"-o", "HostKeyAlias=" + jump.HostKeyAlias}, args[1:]...)...)
+	}
+	for i, arg := range args {
+		args[i] = ShellQuote(strings.ReplaceAll(arg, "%", "%%"))
+	}
+	return strings.Join(args, " "), nil
 }

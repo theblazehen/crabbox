@@ -53,7 +53,7 @@ func TestCloudInitUsesRetryingBootstrap(t *testing.T) {
 		"test -f /var/lib/crabbox/bootstrapped",
 		"test -w '/work/crabbox'",
 		"      Port 2222\n      Port 22",
-		"systemctl enable ssh || true",
+		"systemctl is-enabled --quiet ssh || systemctl enable --no-reload ssh || true",
 		"touch /var/lib/crabbox/bootstrapped",
 	} {
 		if !strings.Contains(got, want) {
@@ -73,9 +73,28 @@ func TestCloudInitUsesRetryingBootstrap(t *testing.T) {
 	}
 }
 
+func TestCloudInitStartsBootstrapBeforeCloudFinal(t *testing.T) {
+	got := cloudInit(baseConfig(), "ssh-ed25519 fixture")
+	for _, want := range []string{
+		"bootcmd:",
+		"cloud-init-per instance crabbox-bootstrap-start",
+		"After=cloud-config.service network-online.target",
+		"Before=cloud-final.service",
+		"systemctl start --no-block crabbox-bootstrap.service",
+		"/usr/local/lib/crabbox-bootstrap.sh",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing early bootstrap contract %q", want)
+		}
+	}
+	if strings.Contains(got, "multi-user.target") {
+		t.Fatal("minimal bootstrap must not wait for multi-user.target")
+	}
+}
+
 func TestLinuxReadinessGeneratedContract(t *testing.T) {
 	got := cloudInit(baseConfig(), "ssh-ed25519 test")
-	embedded := indentCloudInitRuncmd(linuxMinimalReadinessBootstrap)
+	embedded := indentCloudInitScriptFile(indentCloudInitRuncmd(linuxMinimalReadinessBootstrap))
 	if !strings.Contains(got, embedded) {
 		t.Fatal("cloudInit() must embed the complete generated Linux readiness fragment")
 	}
@@ -127,13 +146,13 @@ func TestCloudInitGCPInstallsExpiryGuard(t *testing.T) {
 	cfg.Provider = "gcp"
 	got := cloudInit(cfg, "ssh-ed25519 test")
 	for _, want := range []string{
-		"/usr/local/sbin/crabbox-gcp-expiry-guard",
+		"/usr/local/sbin/crabbox-expiry-guard",
 		"computeMetadata/v1/$1",
 		"compute/v1/projects/$project/zones/$zone/instances/$name",
-		"crabbox-gcp-expiry-guard.service",
-		"crabbox-gcp-expiry-guard.timer",
+		"crabbox-expiry-guard.service",
+		"crabbox-expiry-guard.timer",
 		"OnUnitActiveSec=2min",
-		"systemctl enable --now crabbox-gcp-expiry-guard.timer",
+		"systemctl enable --now crabbox-expiry-guard.timer",
 		"expires_at",
 		"failed|released|expired",
 		"running|provisioning",
@@ -142,6 +161,11 @@ func TestCloudInitGCPInstallsExpiryGuard(t *testing.T) {
 			t.Fatalf("cloudInit(gcp) missing %q", want)
 		}
 	}
+	early, final, found := strings.Cut(got, "\nruncmd:")
+	if !found || !strings.Contains(early, "touch /var/lib/crabbox/bootstrapped") || strings.Contains(final, "crabbox-expiry-guard.timer") {
+		t.Fatal("default GCP expiry guard must be armed before early readiness")
+	}
+
 }
 
 func TestCloudInitStartsSSHBeforeOptionalDesktopBootstrap(t *testing.T) {
@@ -273,7 +297,7 @@ func TestCloudInitWaylandDesktopProfile(t *testing.T) {
 	cfg.Browser = true
 	cfg.DesktopEnv = "wayland"
 	got := cloudInit(cfg, "ssh-ed25519 test")
-	if !strings.Contains(got, "    retry crabbox-ready\n") {
+	if !strings.Contains(got, "    retry /usr/local/lib/crabbox-ready-checks\n") {
 		t.Fatal("Wayland bootstrap must wait for the compositor and VNC listener")
 	}
 	for _, want := range []string{
@@ -464,9 +488,9 @@ func TestCloudInitCodeProfile(t *testing.T) {
 	cfg.Code = true
 	got := cloudInit(cfg, "ssh-ed25519 test")
 	for _, want := range []string{
-		"CS_VERSION='4.126.0'",
-		"x86_64) CS_ARCH=amd64; CS_SHA256='54b648d010c02b6583aa06bd8d2aaf109fc624479b9bc2ff71cb94807ac39afa'",
-		"aarch64|arm64) CS_ARCH=arm64; CS_SHA256='441614708ae81b13f14b26db41da8f46f88d7d092c08343a42a0c6c52c51a69d'",
+		"CS_VERSION='4.143.1'",
+		"x86_64) CS_ARCH=amd64; CS_SHA256='614877cf71005f14ea252bd2d9b1c12237cf7d73681ef150f0dff7f13849fdb5'",
+		"aarch64|arm64) CS_ARCH=arm64; CS_SHA256='51481a891754dc2585b86d007aec24ac675453fc5ef6cfa346c4462449277384'",
 		"https://github.com/coder/code-server/releases/download/v${CS_VERSION}/code-server-${CS_VERSION}-linux-${CS_ARCH}.tar.gz",
 		"sha256sum -c -",
 		"/usr/local/lib/code-server",
@@ -744,7 +768,7 @@ func TestAWSUserDataWindowsProfile(t *testing.T) {
 		"sshd_config",
 		"Port $port",
 		"crabbox-sshd-$port",
-		"Git-2.52.0-64-bit.exe",
+		"Git-2.56.0.3-64-bit.exe",
 		gitForWindowsSetupSHA256,
 		"tightvnc-2.8.85-gpl-setup-64bit.msi",
 		tightVNCMSISHA256,
@@ -817,7 +841,7 @@ func TestAWSUserDataWindowsCoreProfileSkipsDesktop(t *testing.T) {
 		"function Assert-CrabboxFileSHA256",
 		"OpenSSH-Win64.zip",
 		openSSHWin64ZipSHA256,
-		"Git-2.52.0-64-bit.exe",
+		"Git-2.56.0.3-64-bit.exe",
 		gitForWindowsSetupSHA256,
 		"$passwordPath = $windowsPasswordPath",
 		"$credentialPaths = @($passwordPath)",
@@ -861,7 +885,7 @@ func TestAWSUserDataWindowsWSL2Profile(t *testing.T) {
 	cfg.TargetOS = targetWindows
 	cfg.WindowsMode = windowsModeWSL2
 	cfg.WorkRoot = `/work/crabbox`
-	got := WindowsBootstrapPowerShell(cfg, "ssh-ed25519 test")
+	got := decodedWSLBootstrapPowerShell(t, cfg)
 	for _, want := range []string{
 		`$workRoot = 'C:\crabbox'`,
 		`C:\ProgramData\crabbox\windows.password`,
@@ -889,7 +913,7 @@ func TestAWSUserDataWindowsWSL2Profile(t *testing.T) {
 		"WriteAllText($wslSetup",
 		"wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh",
 		"apt-get install -y --no-install-recommends ca-certificates curl git jq python3 rsync sudo",
-		"trufflehog_version='3.95.9'",
+		"trufflehog_version='3.99.4'",
 		"trufflehog_${trufflehog_version}_linux_amd64.tar.gz",
 		wslTruffleHogAMD64SHA256,
 		"sha256sum -c -",
@@ -942,9 +966,9 @@ func TestManagedWindowsWSL2BootstrapInstallsNodeBeforeReadiness(t *testing.T) {
 				}
 				return
 			}
-			setupStart := strings.Index(script, "$linuxSetup = @'")
+			setupStart := strings.Index(script, "$linuxSetup = ")
 			installIndex := strings.Index(script, install)
-			readyIndex := strings.Index(script, "cat >/usr/local/bin/crabbox-ready <<'READY'")
+			readyIndex := strings.Index(script, "cat >/usr/local/bin/crabbox-ready <<")
 			if setupStart < 0 || installIndex <= setupStart || readyIndex <= installIndex {
 				t.Fatal("WSL distro must install the shared Node baseline before readiness")
 			}
@@ -1183,10 +1207,13 @@ func TestCloudInitReadinessWithoutBash(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(cloudInit(cfg, "ssh-ed25519 fixture")), &document); err != nil {
 		t.Fatal(err)
 	}
-	var script string
+	var script, checks string
 	for _, file := range document.Files {
 		if file.Path == "/usr/local/bin/crabbox-ready" {
 			script = file.Content
+		}
+		if file.Path == "/usr/local/lib/crabbox-ready-checks" {
+			checks = file.Content
 		}
 	}
 	if !strings.HasPrefix(script, "#!/bin/sh\nset -eu\n") {
@@ -1218,14 +1245,20 @@ func TestCloudInitReadinessWithoutBash(t *testing.T) {
 				t.Fatal(err)
 			}
 			candidate := script
+			candidateChecks := checks
 			if failure == "marker" {
 				if err := os.Remove(marker); err != nil {
 					t.Fatal(err)
 				}
 			}
 			if failure == "workroot" {
-				candidate = strings.ReplaceAll(candidate, cfg.WorkRoot, filepath.Join(fixture, "missing"))
+				candidateChecks = strings.ReplaceAll(candidateChecks, cfg.WorkRoot, filepath.Join(fixture, "missing"))
 			}
+			checksPath := filepath.Join(fixture, "ready-checks")
+			if err := os.WriteFile(checksPath, []byte(candidateChecks), 0755); err != nil {
+				t.Fatal(err)
+			}
+			candidate = strings.ReplaceAll(candidate, "/usr/local/lib/crabbox-ready-checks", shellQuote(checksPath))
 			cmd := exec.Command("/bin/sh", "-c", candidate)
 			cmd.Env = []string{"PATH=" + fixture, "FAIL_TOOL=" + failure}
 			if failure == "socket" {
@@ -1234,6 +1267,89 @@ func TestCloudInitReadinessWithoutBash(t *testing.T) {
 			out, err := cmd.CombinedOutput()
 			if (err == nil) != (failure == "") {
 				t.Fatalf("readiness result: %v; %s", err, out)
+			}
+		})
+	}
+}
+
+func TestCloudInitEarlyBootstrapComposition(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fixture")
+	}
+	for _, optional := range []bool{false, true} {
+		t.Run(map[bool]string{false: "minimal", true: "browser"}[optional], func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Browser = optional
+			var doc struct {
+				Bootcmd []string                         `yaml:"bootcmd"`
+				Runcmd  []string                         `yaml:"runcmd"`
+				Files   []struct{ Path, Content string } `yaml:"write_files"`
+			}
+			if err := yaml.Unmarshal([]byte(cloudInit(cfg, "ssh-ed25519 fixture")), &doc); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{}
+			for _, file := range doc.Files {
+				files[file.Path] = file.Content
+			}
+			core := files["/usr/local/lib/crabbox-bootstrap.sh"]
+			final := strings.Join(doc.Runcmd, "\n")
+			if !strings.Contains(core, sharedLinuxBootstrapPrelude()) {
+				t.Fatal("early package hooks must inherit the restart policy")
+			}
+			if optional && !strings.Contains(final, sharedLinuxBootstrapPrelude()) {
+				t.Fatal("cloud-final package hooks must inherit the restart policy")
+			}
+			if !strings.Contains(core, "retry apt-get") || strings.Contains(final, "crabbox_readiness_packages=") {
+				t.Fatal("baseline packages must run in the early unit")
+			}
+			if !strings.Contains(final, "systemctl start crabbox-bootstrap.service") {
+				t.Fatal("cloud-final must observe bootstrap failure")
+			}
+			completion := "touch /var/lib/crabbox/bootstrapped"
+			if strings.Contains(core, completion) == optional || strings.Contains(final, completion) != optional {
+				t.Fatal("only the last required phase may publish readiness")
+			}
+			workspace := files["/etc/systemd/system/crabbox-workspace-ready.service"]
+			if strings.Contains(workspace, " cloud-final.service") != optional {
+				t.Fatal("workspace observation must wait for required optional setup")
+			}
+			if !strings.Contains(files["/usr/local/bin/crabbox-ready"], "test -f /var/lib/crabbox/bootstrapped") {
+				t.Fatal("readiness must retain marker requirement")
+			}
+			for name, script := range map[string]string{"bootcmd": strings.Join(doc.Bootcmd, "\n"), "core": core, "final": final, "checks": files["/usr/local/lib/crabbox-ready-checks"]} {
+				cmd := exec.Command("bash", "-n")
+				cmd.Stdin = strings.NewReader(script)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%s syntax: %v: %s", name, err, out)
+				}
+			}
+			publisher := core
+			if optional {
+				publisher = final
+			}
+			start := strings.Index(publisher, "retry /usr/local/lib/crabbox-ready-checks")
+			end := strings.Index(publisher[start:], completion) + start + len(completion)
+			for _, fails := range []bool{false, true} {
+				marker := filepath.Join(t.TempDir(), "bootstrapped")
+				checks := filepath.Join(t.TempDir(), "checks")
+				code := "0"
+				if fails {
+					code = "1"
+				}
+				if err := os.WriteFile(checks, []byte("#!/bin/sh\nexit "+code+"\n"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				script := strings.ReplaceAll(publisher[start:end], "/usr/local/lib/crabbox-ready-checks", shellQuote(checks))
+				script = strings.ReplaceAll(script, "/var/lib/crabbox/bootstrapped", shellQuote(marker))
+				out, err := exec.Command("bash", "-euc", "retry() { \"$@\"; }\n"+script).CombinedOutput()
+				if (err != nil) != fails {
+					t.Fatalf("checks fails=%v: %v %s", fails, err, out)
+				}
+				_, statErr := os.Stat(marker)
+				if (statErr == nil) == fails {
+					t.Fatalf("checks fails=%v: marker must exist only after success", fails)
+				}
 			}
 		})
 	}

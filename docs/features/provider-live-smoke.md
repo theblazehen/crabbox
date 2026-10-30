@@ -155,14 +155,14 @@ hermetic lifecycle tests, `scripts/live-smoke.sh`, dedicated live runners, and
 `//go:build smoke` tests. Regenerate it with
 `node scripts/generate-provider-matrix.mjs`; docs CI rejects drift.
 
-Current coverage: 82 providers; 10 with convention-named hermetic lifecycle tests, 61 with a live runner, 8 with tagged Go smoke tests, and 19 with none of those lifecycle surfaces.
+Current coverage: 85 providers; 11 with convention-named hermetic lifecycle tests, 61 with a live runner, 8 with tagged Go smoke tests, and 22 with none of those lifecycle surfaces.
 
 | Provider | Hermetic lifecycle | Live runner | Tagged Go smoke |
 | --- | --- | --- | --- |
 | [agent-sandbox](../providers/agent-sandbox.md) | — | dedicated + matrix | — |
 | [agent-sandbox-ssh](../providers/agent-sandbox.md) | — | — | — |
 | [anthropic-sandbox-runtime](../providers/anthropic-sandbox-runtime.md) | — | dedicated + matrix | — |
-| [apple-container](../providers/apple-container.md) | — | matrix | yes |
+| [apple-container](../providers/apple-container.md) | yes (`applecontainer`) | matrix | yes |
 | [apple-machine](../providers/apple-machine.md) | — | — | — |
 | [apple-vm](../providers/apple-vm.md) | — | matrix | yes |
 | [ascii-box](../providers/ascii-box.md) | — | — | — |
@@ -170,6 +170,7 @@ Current coverage: 82 providers; 10 with convention-named hermetic lifecycle test
 | [aws-lambda-microvm](../providers/aws-lambda-microvm.md) | — | dedicated + matrix | — |
 | [azure](../providers/azure.md) | — | matrix | — |
 | [azure-dynamic-sessions](../providers/azure-dynamic-sessions.md) | — | — | — |
+| [azure-sandbox](../providers/azure-sandbox.md) | — | — | — |
 | [blacksmith-testbox](../providers/blacksmith-testbox.md) | — | matrix | — |
 | [blaxel](../providers/blaxel.md) | — | dedicated | — |
 | [boxd](../providers/boxd.md) | yes (`boxd`) | matrix | — |
@@ -225,9 +226,11 @@ Current coverage: 82 providers; 10 with convention-named hermetic lifecycle test
 | [scaleway](../providers/scaleway.md) | yes (`scaleway`) | dedicated + matrix | — |
 | [sealos-devbox](../providers/sealos-devbox.md) | — | matrix | — |
 | [semaphore](../providers/semaphore.md) | — | matrix | — |
+| [serve](../providers/serve.md) | — | — | — |
 | [smolvm](../providers/smolvm.md) | — | dedicated + matrix | — |
 | [sprites](../providers/sprites.md) | yes (`sprites`) | matrix | — |
 | [ssh](../providers/ssh.md) | yes (`ssh`) | — | — |
+| [ssh-host](../providers/ssh-host.md) | — | — | — |
 | [superserve](../providers/superserve.md) | — | dedicated + matrix | — |
 | [tart](../providers/tart.md) | — | matrix | — |
 | [tencentcloud](../providers/tencentcloud.md) | — | dedicated + matrix | — |

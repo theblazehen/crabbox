@@ -95,7 +95,8 @@ func TestProviderSSHProxyDispatchesRawStreamsDirectly(t *testing.T) {
 				fmt.Fprintln(rt.Stdout, "configuration diagnostic")
 				return &providerSSHProxyTestBackend{spec: p.Spec(), proxy: func(gotCtx context.Context, lease string, in io.Reader, out, errOut io.Writer) error {
 					called = true
-					if gotCtx != ctx || lease != "lease-123" || out != &stdout || errOut != &stderr {
+					// App.Run may attach values, but must not add its own cancellation.
+					if gotCtx.Done() != ctx.Done() || lease != "lease-123" || out != &stdout || errOut != &stderr {
 						t.Fatal("proxy context, lease, or streams were not forwarded")
 					}
 					fmt.Fprintln(errOut, "transport diagnostic")

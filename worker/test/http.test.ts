@@ -10,6 +10,7 @@ import {
   githubUserGrantIsCurrent,
   issueUserToken,
   requestWithAuthContext,
+  requestGitHubCredential,
 } from "../src/auth";
 import { codeOriginForLease } from "../src/code-origin";
 import { prepareCoordinatorRequest } from "../src/coordinator-entry";
@@ -31,6 +32,27 @@ function proxyIdentityRequest(secret?: string): Request {
 const allowGitHubMembership = {
   githubMembership: async (): Promise<void> => {},
 };
+
+describe("coordinator health", () => {
+  it.each([undefined, { id: "version-id", tag: "commit-sha", timestamp: "2026-10-13T00:00:00Z" }])(
+    "returns public, uncached health with available version metadata: %j",
+    async (version) => {
+      const prepared = await prepareCoordinatorRequest(
+        new Request("https://example.test/v1/health"),
+        { CF_VERSION_METADATA: version } as Env,
+      );
+      if (!("response" in prepared)) throw new Error("expected direct health response");
+      expect(prepared.authenticated).toBe(false);
+      expect(prepared.response.status).toBe(200);
+      expect(prepared.response.headers.get("cache-control")).toBe("no-store");
+      expect(await prepared.response.json()).toEqual({
+        ok: true,
+        service: "crabbox-coordinator",
+        ...(version ? { version: { id: version.id, tag: version.tag } } : {}),
+      });
+    },
+  );
+});
 
 describe("coordinator auth", () => {
   it("keeps colliding org labels distinct after coordinator authentication", async () => {
@@ -602,6 +624,62 @@ describe("coordinator auth", () => {
     ).resolves.toBeUndefined();
   });
 
+  it.each(["x-crabbox-github-sealed-credential", "x-crabbox-github-credential-token"])(
+    "reads a rolling-deployment grant from %s",
+    (header) => {
+      expect(
+        requestGitHubCredential(
+          new Request("https://example.test", {
+            headers: { [header]: "encrypted-grant" },
+          }),
+        ),
+      ).toBe("encrypted-grant");
+    },
+  );
+
+  it("prefers an old writer's authoritative grant over a forwarded new-name header", () => {
+    const incoming = new Request("https://example.test", {
+      headers: {
+        "x-crabbox-github-sealed-credential": "authoritative-grant",
+        "x-crabbox-github-credential-token": "caller-supplied-grant",
+      },
+    });
+    expect(requestGitHubCredential(incoming)).toBe("authoritative-grant");
+  });
+
+  it.each([true, false])("keeps stage A compatible with old readers: %s", (hasGrant) => {
+    const routed = requestWithAuthContext(
+      new Request("https://example.test", {
+        headers: {
+          "x-crabbox-github-sealed-credential": "forged-old",
+          "x-crabbox-github-credential-token": "forged-new",
+        },
+      }),
+      {
+        authorized: true,
+        admin: false,
+        auth: "github",
+        owner: "alice@example.com",
+        org: "example-org",
+        ...(hasGrant
+          ? {
+              githubGrant: {
+                tokenID: "test-id",
+                sealedCredential: "encrypted-grant",
+                expiresAt: "2099-01-01T00:00:00Z",
+              },
+            }
+          : {}),
+      },
+    );
+    // This legacy reader is the transport contract of the pre-migration DO.
+    expect(routed.headers.get("x-crabbox-github-sealed-credential")).toBe(
+      hasGrant ? "encrypted-grant" : null,
+    );
+    expect(requestGitHubCredential(routed)).toBe(hasGrant ? "encrypted-grant" : undefined);
+    expect(routed.headers.get("x-crabbox-github-credential-token")).toBeNull();
+  });
+
   it("strips trusted headers from unauthenticated pass-through routes", async () => {
     const requests = [
       new Request("https://example.test/v1/auth/github/callback", {
@@ -626,6 +704,7 @@ describe("coordinator auth", () => {
       request.headers.set("x-crabbox-admin-grant-version", "a".repeat(64));
       request.headers.set("x-crabbox-github-token-id", "forged-token-id");
       request.headers.set("x-crabbox-github-sealed-credential", "forged-credential");
+      request.headers.set("x-crabbox-github-credential-token", "forged-new-credential");
     });
 
     const routedRequests = await Promise.all(
@@ -658,6 +737,9 @@ describe("coordinator auth", () => {
     ).toEqual([null, null, null, null]);
     expect(
       routedRequests.map((request) => request.headers.get("x-crabbox-github-sealed-credential")),
+    ).toEqual([null, null, null, null]);
+    expect(
+      routedRequests.map((request) => request.headers.get("x-crabbox-github-credential-token")),
     ).toEqual([null, null, null, null]);
   });
 

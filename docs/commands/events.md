@@ -36,6 +36,14 @@ The exact set depends on the run: an Actions-hydrated run emits the
 `actions.hydrate.*` events, a run that swaps a dead box mid-flight emits the
 `lease.replace.*` events, and so on.
 
+`lease.released` records an accepted release, which may leave cleanup unconfirmed
+or intentionally retain the lease. Its phase is `cleanup` with a
+`leaseStopped=false` message in those cases. The phase is `released` with a
+`leaseStopped=true` message only when the release owner confirms that lease
+recovery has ended. `--type lease.released` includes both outcomes; `--phase released`
+selects confirmed outcomes from current clients. Older clients emitted that phase
+without confirmation, so historical events alone do not prove cleanup completed.
+
 ## Output
 
 Human-readable output prints the sequence number, type, phase, stream, and
@@ -51,7 +59,7 @@ timestamp followed by the message (falling back to the event's data text):
 0007 command.started    phase=command    stream=- at=2026-05-07T07:43:08Z pnpm test
 0008 stdout             phase=command    stream=stdout at=2026-05-07T07:43:09Z > vitest run
 ...
-0043 lease.released     phase=release    stream=- at=2026-05-07T07:45:34Z
+0043 lease.released     phase=cleanup    stream=- at=2026-05-07T07:45:34Z leaseStopped=false; lease retained or cleanup unconfirmed
 ```
 
 `--json` emits the raw event records (sequence, type, phase, stream,
@@ -98,3 +106,80 @@ without replaying the whole event log.
 - [attach](attach.md)
 - [results](results.md)
 - [History and logs](../features/history-logs.md)
+
+## Creation timeline
+
+`crabbox events cbx_abcdef123456 --json` reads the lease's creation observations.
+The same `creationEvents` array is additive in lease JSON and in brokered Linux
+`run --timing-json` and `warmup --timing-json`. Older clients ignore these fields;
+new clients work with older brokers, retaining locally observed readiness events.
+Run event pagination and filters apply only to run IDs, not lease timelines.
+
+Each event has `phase`, RFC 3339 `at`, and `source`. Admission start/completion
+belong to the coordinator; AWS, GCP and Hetzner adapters record successful create
+request/response and `instance_running` when an existing provider read observes
+running. The latter is the first observation, not the provider's boot transition.
+Unobserved milestones and failed provider request/response milestones are absent,
+never inferred from a duration.
+
+The creating Linux client reports `ssh_tcp_accept`, `ssh_authenticated`, and
+`workspace_ready` through the existing owner-authorized heartbeat. These are the
+first successful probes, not exact server transition times. Proxied connections
+may omit TCP observations. `bootstrap_complete` uses the guest's current-boot
+`/run/crabbox/workspace-ready` marker after cloud-final and readiness checks;
+images without that marker omit it. One bounded SSH metadata read and a best-effort
+heartbeat add at most two seconds each. Reporting failure never fails creation.
+`workspace_ready` means bootstrap readiness, before repository sync/hydration.
+
+Sources are `coordinator`, `provider_observation`, `client`, or `guest`. Compare
+intervals only on the same clock; cross-host skew and one-second marker precision
+prevent exact subtraction across sources. The coordinator bounds submitted
+observations to the lease lifetime with one minute of skew, keeps the first value
+per client phase, and never uses these untrusted observations for authorization,
+readiness, expiry, or cleanup. Existing duration fields retain their semantics.
+
+
+### Coordinator step durations
+
+Ordinary brokered creates also emit `coordinator_step` events. Both
+`crabbox events <lease>` and `--json` show these; Linux `--timing-json` preserves
+them in `creationEvents`. Each has a static `step` name, `durationMs`, `count`,
+and `errors`, with `source: "coordinator"`. For example:
+
+```json
+{"phase":"coordinator_step","at":"2026-09-28T12:00:03.000Z","source":"coordinator","step":"aws.image","durationMs":420,"count":2,"errors":0}
+```
+
+`durationMs` sums measured elapsed milliseconds for that step; `count` counts
+completed measurements, including failures, and `errors` counts thrown errors.
+A measured step can take zero milliseconds. An unexecuted step is absent.
+`at` is the last measurement's completion on the coordinator's clock. Nested
+steps and parallel preparations overlap, so **do not sum the buckets to compute
+total creation time**. These are coordinator observations of calls, including
+network latency and existing retries, not provider-side execution durations.
+
+| Prefix | Measured boundaries |
+| --- | --- |
+| `admission` | Lifecycle lock wait, configuration preparation, pricing, usage counting, limit checks, access snapshot, provider preparation, ready-pool inventory reads when executed, and reservation/preparation record publication |
+| `aws` | Existing diagnostic buckets for key pair, image, ingress/lifecycle waits, security group and ingress operations, quota, instance types, instance create and image cleanup; plus user-data/request rendering |
+| `gcp` | Token mint on cache miss, image and zone selection, root-disk image/snapshot minimum lookup on cache miss (`gcp.image_minimum`), firewall GET/PUT/insert and operation wait, user-data rendering, combined boot-disk/instance insert and instance operation wait |
+| `hetzner` | SSH key registration, image selection, user-data rendering and server create |
+| `azure` | SKU availability and existing attempt duration, including network setup and checked cleanup for failed attempts |
+
+GCP validates quota during insertion and creates the boot disk with the instance;
+there is no separate quota lookup or disk-insert request in this path. GCP and
+Hetzner image selection can be a local choice of an already configured reference.
+A ready-pool bucket is absent when admission does not read ready-pool inventory.
+Azure attempt timings retain their existing boundary and do not include capacity
+cache skips. Durable provisioning continuations are outside this request-local
+step timeline.
+
+A request keeps at most 64 step buckets, aggregating repeated calls and fallback
+attempts without recording resource identifiers, request/response bodies, or
+error messages. Snapshots ride existing admission and settlement writes; reads
+while provisioning can show only the last saved snapshot. Failures retain steps
+when the normal failure path saves the same lease incarnation. An admission
+rejection before a lease is recorded has no lease timeline. No extra provider
+calls or storage writes are issued for diagnostics. Client heartbeat submissions
+cannot add or replace coordinator steps. These measurements never decide
+admission, provider selection, readiness, ownership, expiry, retries, or cleanup.

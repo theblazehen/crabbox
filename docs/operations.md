@@ -309,6 +309,75 @@ cutover.
 
 ### Cloudflare Worker
 
+The `Deploy Coordinator` workflow deploys Worker runtime, configuration, and
+deployment-helper changes on `main` and can also run manually. Changes limited
+to `worker/test/**` do not trigger deployment; mixed changes still deploy when
+another changed path matches the workflow filters. A missing `coordinator`
+environment API token fails the job.
+Each upload is tagged with the full commit SHA. After all deployment steps,
+verification requires one Cloudflare version receiving 100% of traffic and
+an uncached public `/v1/health` response with that version ID and SHA tag.
+Health verification polls every five seconds for up to three minutes to allow
+edge propagation. If it expires, the error includes the last reported version ID
+and tag. Each request still has a timeout of at most ten seconds.
+The deployment must remain unchanged across the check. A gradual rollout,
+stale route, unavailable API, or missing version metadata fails visibly.
+Verification only reads deployment metadata and health; it creates no lease.
+If manually clearing the Daytona snapshot creates a new untagged version,
+verification fails too; inspect the final version before rerunning the deploy.
+
+#### GitHub credential header migration
+
+The private Worker-to-Durable-Object grant header is moving from
+`x-crabbox-github-sealed-credential` to `x-crabbox-github-credential-token`.
+Cloudflare's [header redaction](https://developers.cloudflare.com/workers/runtime-apis/handlers/tail/#tailrequest)
+recognizes the new token-named header. This does not change stored grants or CLI tokens.
+
+Deploy in separate releases; Worker and Durable Object versions can overlap:
+
+1. **Stage A (reader compatibility):** read both names, prefer the legacy name,
+   and keep writing only the legacy name. Strip caller-supplied new-name values.
+   Verify the existing deployment proof shows Stage A at 100% and record its
+   version ID and source SHA before advancing. The health route verifies the
+   Worker version only; also verify an actual Fleet Durable Object invocation
+   runs Stage A before advancing. Existing logs remain unredacted until Stage B.
+2. **Stage B (redacted writer):** only after that receipt, write only the new name,
+   strip legacy caller input, and keep both readers. Never ship both headers.
+   Verify Stage B's version and an authenticated grant-bearing invocation shows
+   `REDACTED` for the new header; do not copy the grant into the receipt.
+3. Remove the legacy reader in a later release only after Stage B has converged
+   and no old writers or pre-Stage-A rollback targets remain. Until then, roll
+   Stage B back only to Stage A or a later compatible reader.
+
+Do not combine Stage A and Stage B into one deployment. A source commit or
+successful upload alone is not the Stage A convergence receipt.
+
+Before deployment, the workflow compares the live `CRABBOX_LEASE_POLICY_OVERRIDES`
+binding with the production value in `worker/wrangler.jsonc`. The guard takes no
+arguments and compares the complete documents, treating an absent binding, `{}`,
+and empty `owners`/`orgs` groups as equivalent. A difference stops deployment
+before upload and reports only the affected groups and keys, without policy
+values. Source policies must pass the same field, type, and range validation as
+the runtime. Unreadable bindings, invalid document shapes, and Cloudflare API
+errors always stop deployment.
+
+Production source declares no individual memberships or lease policy overrides;
+every owner uses the global lease defaults (30-minute TTL and idle timeout,
+4-hour maximum). Individual memberships and exceptions belong in runtime
+configuration managed outside the repository, not in source-controlled vars.
+
+For an intentional one-time replacement of a known live override document,
+dispatch the **Deploy Coordinator** workflow (`coordinator-deploy.yml`) with
+`replace_live_lease_policy: true`. This sets
+`CRABBOX_ACKNOWLEDGE_LEASE_POLICY_REPLACEMENT=1` for the guard step only: it
+prints the same key summary and permits replacement, including repair of readable,
+shape-valid live policies with invalid fields or values. The source must still be
+valid; unreadable bindings, invalid document shapes, and API errors fail closed.
+Push-triggered deployments never acknowledge replacement. When removing
+existing overrides from source, the first push-triggered deployment therefore
+fails by design until a maintainer
+reviews the difference and dispatches that acknowledged replacement once.
+
 Worker source lives in `worker/`. Run the gate, then deploy:
 
 ```sh
@@ -335,6 +404,13 @@ CRABBOX_DEPLOY_SMOKE_URLS="https://$BROKER_HOST/v1/health" \
   CRABBOX_LIVE_REPO=/path/to/my-app \
   scripts/deploy-worker-smoke.sh
 ```
+
+The AWS smoke pins Linux/amd64, class `tiny`, and On-Demand `t3.small` (2 vCPU,
+2 GiB), the smallest instance in Crabbox's supported AWS amd64 class catalog.
+Both warmup and run override inherited target, architecture, and machine sizing.
+The smoke fails if that exact type is unavailable;
+it does not fall back to a larger instance. The smoke runs without repository sync
+and attempts to stop its lease after the command or on failure, with a 20-minute TTL as a backstop.
 
 ### Node.js And PostgreSQL
 
@@ -404,6 +480,15 @@ retry scheduling. Node tracks and drains that task during shutdown. Manual
 admin sweep endpoints still await their actual operation. `waitUntil` and
 pg-boss do not replace the durable operation/claim records.
 
+Repeated overdue maintenance records produce a `maintenance alarm made no
+progress` warning when their backoff starts or increases, up to 60 seconds. The
+warning includes a source label, a truncated SHA-256 of the storage key, and the
+delay; it omits record contents. Use these labels to locate the maintenance owner
+when investigating unexpectedly frequent alarms. New request wakes and durable
+provisioning deadlines bypass this maintenance-tail guard. Pool maintenance
+persists a 15-second retry before checking its owner records so missing bindings
+or interrupted work cannot leave its shared provisioning wake immediately due.
+
 Keep `CRABBOX_DURABLE_PROVISIONING_ADMISSION` unset or `false` until the
 journal-aware version and a stable existing `CRABBOX_SESSION_SECRET` are ready.
 Setting the gate to `false` stops new admissions but resumes existing journals.
@@ -468,6 +553,7 @@ AWS_SESSION_TOKEN                  optional
 CRABBOX_HOST_ID                    optional; admin-only except owner reactivation of a retained Mac instance
 CRABBOX_AWS_MAC_HOST_ID            optional legacy AWS alias for CRABBOX_HOST_ID
 CRABBOX_SHARED_OWNER              optional fixed owner identity for shared-token automation
+CRABBOX_SERVE_ALLOWED_OWNERS      comma-separated owner IDs (e.g. github:12345); * allows all authenticated owners; unset/empty disables serve
 CRABBOX_ADMIN_TOKEN               required for admin routes and image promotion
 CRABBOX_WORKSPACE_SSH_PUBLIC_KEY  required for SSH-based /v1/workspaces provisioning; unused by private AWS mode
 CRABBOX_WORKSPACE_SSH_PRIVATE_KEY required for SSH-based terminal attachment; unused by private AWS mode
@@ -511,6 +597,10 @@ CRABBOX_ARTIFACTS_SECRET_ACCESS_KEY required when artifact backend is enabled
 CRABBOX_ARTIFACTS_SESSION_TOKEN   optional
 CRABBOX_ARTIFACTS_UPLOAD_EXPIRES_SECONDS optional
 CRABBOX_ARTIFACTS_URL_EXPIRES_SECONDS    optional
+CRABBOX_LEASE_LIFETIME_MODE       optional; off (default), report, or enforce for newly admitted leases
+CRABBOX_BATCH_MAX_AGE_SECONDS     optional; default 86400
+CRABBOX_INTERACTIVE_MAX_AGE_SECONDS optional; default 604800
+CRABBOX_STOPPED_RETENTION_SECONDS optional; default 604800 after confirmed stop
 CRABBOX_AWS_ORPHAN_SWEEP_ENABLED  optional; defaults on when AWS broker credentials exist
 CRABBOX_AWS_ORPHAN_SWEEP_DELETE   optional; set 1 to terminate coordinator-owned orphan EC2 instances
 CRABBOX_AWS_ORPHAN_SWEEP_INTERVAL_SECONDS optional; default 3600

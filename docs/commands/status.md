@@ -30,7 +30,14 @@ Several delegated and direct providers resolve their own native identifiers in
 addition to the Crabbox lease ID and local slug:
 
 - `blacksmith-testbox` — accepts a `tbx_...` ID or local slug; derives a
-  normalized status view from `blacksmith testbox list --all`.
+  normalized status view from exact `blacksmith testbox status --id`, including
+  terminal rows absent from inventory. `--json` without `--wait` returns one
+  snapshot with native `state` and command-readiness `ready`; `completed` does
+  not establish GitHub settlement. `providerMetadata.runURL` exposes the valid
+  exact native GitHub association and `providerMetadata.remoteSettlement` is
+  `complete`, `pending`, or `unknown` (see [remote settlement](../providers/blacksmith-testbox.md#read-only-remote-settlement)).
+  Its readiness wait fails with code 5 on
+  `completed` or `hydration_failed`.
 - `blaxel` — accepts a Crabbox lease ID (`blx_<sandbox-id>`) or local slug,
   verifies the local claim against Blaxel ownership labels, and reports the
   sandbox state, endpoint, pond, and readiness.
@@ -60,6 +67,12 @@ addition to the Crabbox lease ID and local slug:
   `worker-runtime`, not a Linux host.
 
 ## Waiting for readiness
+
+For SSH leases, readiness uses the recorded target OS and Windows mode, even
+when the current configuration defaults to a different platform. You do not
+need to repeat the allocation's `--target` or `--windows-mode` flags. Explicit
+flags that contradict the recorded platform are rejected before guest probes.
+Linux leases retain their provider's bootstrap readiness gate.
 
 Plain status never modifies the lease. With `--wait`, status polls every five
 seconds until the box is ready or reaches a terminal state
@@ -118,6 +131,15 @@ coordinator has retained recent samples (bounded to the latest 60 per lease) for
 portal trend charts. Under `--wait`, JSON is printed once the lease is ready or
 terminal rather than on every poll.
 
+An enrolled coordinator lease also includes its `lifetimePolicy`: mode,
+`source` (including `admin-canary`), effective compute stop deadline,
+confirmed-stop root-disk deletion deadline, retention duration, status,
+readiness, and owner-visible warnings. Text output appends the same lifetime
+summary. `lifetime_delete_after=-` means the retained-disk deadline has not yet
+been established by a confirmed stop. A distinct `DELETION:` warning describes
+permanent root-disk removal. See [lifecycle cleanup](../features/lifecycle-cleanup.md)
+and [`admin extend-lifetime`](admin.md#extend-lifetime).
+
 For Local Container, non-wait JSON status includes fresh read-only
 `diagnostic.memory.*` labels, as described in
 [`inspect`](inspect.md). These optional observations are not requested by
@@ -128,3 +150,9 @@ For Local Container, non-wait JSON status includes fresh read-only
 - [`inspect`](inspect.md) — fuller lease and provider detail.
 - [`list`](list.md) — all machines for a provider.
 - [`warmup`](warmup.md) — lease a box and wait until ready.
+
+Lifetime output includes `remaining_lifetime`, `max_lifetime`, and the provider
+`runtime_extension` capability when known. JSON uses `remainingLifetime`,
+`maxLifetime`, and `leasePolicy`. `inspect` exposes the same policy. A provider
+with `runtimeExtension: false` requires choosing a longer `--ttl` at creation;
+[extend](extend.md) cannot move its native deadline.

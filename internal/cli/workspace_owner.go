@@ -22,11 +22,14 @@ const (
 	workspaceOwnerPollInterval, workspaceOwnerSSHConnectTimeoutOption, workspaceOwnerSSHConnectionAttemptsOption = time.Second, "10", "3"
 )
 
+// Unconfirmed renewals with no response or RENEWED are retried up to this many times,
+// the first after this backoff; the owner TTL leaves room for that many more calls.
+const workspaceOwnerRenewRetries, workspaceOwnerRenewBackoff = 2, 250 * time.Millisecond
+
 var (
-	workspaceOwnerCallTimeout         = sshTransportCallBudget(SSHTarget{}, sshControlMetadataLimit, sshCommandLimit{execution: workspaceOwnerRemoteTimeout, control: true})
-	workspaceOwnerTTL                 = workspaceOwnerRenewInterval + workspaceOwnerCallTimeout + workspaceOwnerRenewMargin
-	workspaceOwnerCloseQuiesceTimeout = 2*workspaceOwnerCallTimeout + workspaceOwnerRenewMargin
-	workspaceOwnerWaitTimeout         = workspaceOwnerTTL + workspaceOwnerPollInterval + workspaceOwnerCallTimeout + workspaceOwnerRenewMargin
+	workspaceOwnerCallTimeout = sshTransportCallBudget(SSHTarget{}, sshControlMetadataLimit, sshCommandLimit{execution: workspaceOwnerRemoteTimeout, control: true})
+	workspaceOwnerTTL         = workspaceOwnerRenewInterval + (1+workspaceOwnerRenewRetries)*workspaceOwnerCallTimeout + workspaceOwnerRenewMargin
+	workspaceOwnerWaitTimeout = workspaceOwnerTTL + workspaceOwnerPollInterval + workspaceOwnerCallTimeout + workspaceOwnerRenewMargin
 )
 
 func workspaceOwnerTransportCallBudget(transport workspaceOwnerTransport) time.Duration {
@@ -118,6 +121,12 @@ func (t sshWorkspaceOwnerTransport) Do(ctx context.Context, req workspaceOwnerRe
 		script := remoteWorkspaceOwnerWindows(req)
 		input = []byte(script)
 		remote = windowsPowerShellStdinScriptCommand(len([]byte(script)))
+	} else if t.target.ownerControlPath != "" {
+		// Large argv envelopes exceed Darwin's mux descriptor-message limit.
+		// Consume and verify the entire frame before executing the same script.
+		script := remoteWorkspaceOwnerPOSIX(req)
+		input = []byte(base64.StdEncoding.EncodeToString([]byte(script)))
+		remote = remoteWorkspaceOwnerPOSIXInputLauncher(req.Key, req.Token, len(script))
 	}
 	limit := workspaceOwnerCommandLimit(t.target, req.Action)
 	for attempt := 0; ; attempt++ {
@@ -152,16 +161,21 @@ func runWorkspaceOwnerSSHProtocol(ctx context.Context, target SSHTarget, remote 
 }
 
 type workspaceOwner struct {
-	target    SSHTarget
-	transport workspaceOwnerTransport
-	key       string
-	token     string
-	ttl       time.Duration
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stop      chan struct{}
-	done      chan struct{}
-	closeOnce sync.Once
+	target         SSHTarget
+	transport      workspaceOwnerTransport
+	key            string
+	token          string
+	ttl            time.Duration
+	ctx            context.Context
+	cancel         context.CancelFunc
+	stop           chan struct{}
+	done           chan struct{}
+	closeOnce      sync.Once
+	closeTransport func() error
+
+	// confirmed is when the last acknowledged acquire or renewal was sent: the remote
+	// state cannot expire before confirmed + ttl. Only the renewal goroutine updates it.
+	confirmed time.Time
 
 	mu       sync.Mutex
 	renewErr error
@@ -200,6 +214,10 @@ func prepareWorkspaceOwnerRemote(ctx context.Context, target SSHTarget, remote s
 	owner := workspaceOwnerFromContext(ctx)
 	if owner == nil {
 		return workspaceOwnerRemotePreparation{command: remote}, nil
+	}
+	// A fresh cleanup context must not restore authority after renewal failed.
+	if err := owner.Err(); err != nil {
+		return workspaceOwnerRemotePreparation{}, err
 	}
 	if !isWindowsNativeTarget(target) {
 		nonce, err := randomHex(16)
@@ -317,11 +335,20 @@ func acquiredRunMayRetainLease(keep, keepOnFailure bool, stopAfter string) bool 
 }
 
 func acquireWorkspaceOwner(ctx context.Context, target SSHTarget, leaseID string, stderr io.Writer) (*workspaceOwner, error) {
-	transport := sshWorkspaceOwnerTransport{target: target}
+	controlTarget, closeTransport, err := startWorkspaceOwnerControl(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	transport := sshWorkspaceOwnerTransport{target: controlTarget}
 	call := workspaceOwnerTransportCallBudget(transport)
-	ttl := workspaceOwnerRenewInterval + call + workspaceOwnerRenewMargin
+	ttl := workspaceOwnerRenewInterval + (1+workspaceOwnerRenewRetries)*call + workspaceOwnerRenewMargin
 	wait := ttl + workspaceOwnerPollInterval + call + workspaceOwnerRenewMargin
-	return acquireWorkspaceOwnerWithTransport(ctx, target, leaseID, stderr, transport, wait, ttl, workspaceOwnerRenewInterval)
+	owner, err := acquireWorkspaceOwnerWithTransport(ctx, target, leaseID, stderr, transport, wait, ttl, workspaceOwnerRenewInterval)
+	if err != nil {
+		return nil, errors.Join(err, closeTransport())
+	}
+	owner.closeTransport = closeTransport
+	return owner, nil
 }
 
 func acquireWorkspaceOwnerWithTransport(ctx context.Context, target SSHTarget, leaseID string, stderr io.Writer, transport workspaceOwnerTransport, waitTimeout, ttl, renewInterval time.Duration) (*workspaceOwner, error) {
@@ -355,12 +382,14 @@ func acquireWorkspaceOwnerWithTransport(ctx context.Context, target SSHTarget, l
 	started := time.Now()
 	nextProgress := workspaceOwnerProgressEvery
 	for {
+		sent := time.Now()
 		response, callErr := callWorkspaceOwnerTransport(waitCtx, owner.callTimeout(), transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerAcquire, Key: owner.key, Token: owner.token, TTL: ttl})
 		if callErr != nil {
-			return nil, Exit(7, "acquire remote workspace owner: ambiguous remote state: %v", callErr)
+			return nil, workspaceOwnerCallError("acquire remote workspace owner", callErr)
 		}
 		switch response {
 		case "ACQUIRED", "RECOVERED":
+			owner.confirmed = sent
 			owner.ctx, owner.cancel = context.WithCancel(ctx)
 			go owner.renewLoop(renewInterval)
 			fmt.Fprintf(stderr, "workspace owner acquired wait=%s recovered=%t\n", time.Since(started).Round(time.Millisecond), response == "RECOVERED")
@@ -411,20 +440,74 @@ func (o *workspaceOwner) renewLoopWithTicks(ticks <-chan time.Time, callTimeout 
 		case <-o.ctx.Done():
 			return
 		case <-ticks:
-			response, err := callWorkspaceOwnerTransport(context.WithoutCancel(o.ctx), callTimeout, o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerRenew, Key: o.key, Token: o.token, TTL: o.ttl})
-			if err == nil && response == "RENEWED" {
+			err := o.renewWithinOwnership(callTimeout)
+			if err == nil {
 				continue
 			}
-			if err == nil {
-				err = errors.New("unexpected protocol response")
+			if errors.Is(err, errWorkspaceOwnerRenewStopped) {
+				return
 			}
-			err = workspaceOwnerProtocolError(response, err)
 			o.mu.Lock()
 			o.renewErr = Exit(7, "remote workspace owner renewal failed closed: %v", err)
 			o.mu.Unlock()
 			o.cancel()
 			return
 		}
+	}
+}
+
+var errWorkspaceOwnerRenewStopped = errors.New("workspace owner renewal stopped")
+
+// workspaceOwnerRenewAfterBackoffHook runs after a retry backoff wait; tests use it to
+// simulate a late wake (scheduling delay or host suspension). It is nil in production.
+var workspaceOwnerRenewAfterBackoffHook func()
+
+// renewWithinOwnership renews once. A transport failure with no response or RENEWED
+// is retried, with backoff, while the retry can still finish before the ownership
+// the last acknowledged request proved can lapse; past that point a second
+// owner could be admitted, so it fails closed. A protocol answer other than RENEWED is
+// final and is never retried. Only error-free RENEWED confirms ownership.
+// An owner with no confirmed time never retries.
+func (o *workspaceOwner) renewWithinOwnership(callTimeout time.Duration) error {
+	confirmedUntil := o.confirmed.Add(o.ttl - workspaceOwnerRenewMargin)
+	backoff := workspaceOwnerRenewBackoff
+	for attempt := 0; ; attempt++ {
+		sent := time.Now()
+		response, err := callWorkspaceOwnerTransport(context.WithoutCancel(o.ctx), callTimeout, o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerRenew, Key: o.key, Token: o.token, TTL: o.ttl})
+		if err == nil && response == "RENEWED" {
+			o.confirmed = sent
+			return nil
+		}
+		if err == nil {
+			err = errors.New("unexpected protocol response")
+		}
+		if (response != "" && response != "RENEWED") || attempt == workspaceOwnerRenewRetries || o.confirmed.IsZero() {
+			return workspaceOwnerProtocolError(response, err)
+		}
+		if time.Now().Add(backoff + callTimeout).After(confirmedUntil) {
+			return workspaceOwnerProtocolError(response, fmt.Errorf("no retry fits before the confirmed ownership lapses: %w", err))
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-o.stop:
+			timer.Stop()
+			return errWorkspaceOwnerRenewStopped
+		case <-o.ctx.Done():
+			timer.Stop()
+			return errWorkspaceOwnerRenewStopped
+		case <-timer.C:
+		}
+		if workspaceOwnerRenewAfterBackoffHook != nil {
+			workspaceOwnerRenewAfterBackoffHook()
+		}
+		// Rechecked after the wait: a late wake (scheduling delay, host suspension)
+		// must not dispatch a retry that could finish after the confirmed ownership
+		// lapses. Each call is bounded by callTimeout, so a retry dispatched here
+		// always ends before confirmedUntil.
+		if time.Now().Add(callTimeout).After(confirmedUntil) {
+			return workspaceOwnerProtocolError(response, fmt.Errorf("the confirmed ownership lapsed while waiting to retry: %w", err))
+		}
+		backoff *= 2
 	}
 }
 
@@ -464,7 +547,7 @@ func (o *workspaceOwner) inspectChild(ctx context.Context) (workspaceOwnerInspec
 	response, err := callWorkspaceOwnerTransport(ctx, o.callTimeout(), o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerInspect, Key: o.key, Token: o.token, TTL: o.ttl})
 	if err != nil {
 		err = workspaceOwnerProtocolError(response, err)
-		return workspaceOwnerQuiescent, Exit(7, "confirm remote workspace owner child state: ambiguous remote state: %v", err)
+		return workspaceOwnerQuiescent, workspaceOwnerCallError("confirm remote workspace owner child state", err)
 	}
 	switch response {
 	case "OWNED":
@@ -485,7 +568,7 @@ func (o *workspaceOwner) WaitForChild(ctx context.Context, timeout time.Duration
 		response, err := callWorkspaceOwnerTransport(ctx, min(o.callTimeout(), time.Until(deadline)), o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerInspect, Key: o.key, Token: o.token, TTL: o.ttl})
 		if err != nil {
 			err = workspaceOwnerProtocolError(response, err)
-			return Exit(7, "confirm remote workspace phase witness: ambiguous remote state: %v", err)
+			return workspaceOwnerCallError("confirm remote workspace phase witness", err)
 		}
 		switch response {
 		case "CHILD":
@@ -507,6 +590,37 @@ func (o *workspaceOwner) WaitForChild(ctx context.Context, timeout time.Duration
 		case <-timer.C:
 		}
 	}
+}
+
+// Stage a single-word rsync entry point: openrsync tokenizes --rsync-path and
+// discards its shell quoting, unlike GNU rsync. Never put a shell program there.
+func stageRsyncWorkspaceReceiver(ctx context.Context, target SSHTarget, owner *workspaceOwner) (workspaceOwnerRemotePreparation, error) {
+	nonce, err := randomHex(16)
+	if err != nil {
+		return workspaceOwnerRemotePreparation{}, err
+	}
+	name := owner.key + ".rsync." + owner.token + "." + nonce
+	path := `"$HOME/.crabbox/workspace-owners/` + name + `"`
+	script := "#!/bin/sh\n" + `trap 'rm -f -- "$0"' 0` + "\n" + remoteWorkspaceOwnerPOSIXWitnessScript(owner.key, owner.token, `exec rsync "$@"`, "")
+	prepared := workspaceOwnerRemotePreparation{
+		command: "~/.crabbox/workspace-owners/" + name,
+		cleanup: "exec /bin/sh -c " + shellQuote("rm -f -- "+path),
+	}
+	stage := `set -eu
+umask 077
+root="$HOME/.crabbox/workspace-owners"
+[ -d "$root" ] && [ ! -L "$root" ]
+[ "$(sed -n '2p' "$root/` + owner.key + `.owner")" = ` + shellQuote(owner.token) + ` ]
+[ "$(sed -n '3p' "$root/` + owner.key + `.owner")" -gt "$(date +%s)" ]
+(set -C; cat > ` + path + `)
+[ "$(wc -c < ` + path + ` | tr -d '[:space:]')" = ` + strconv.Itoa(len(script)) + ` ]
+chmod 700 ` + path
+	// Staging bypasses witnessing, but still needs the login-shell-safe launcher.
+	stage = remoteWorkspaceOwnerPOSIXLauncher(owner.key, owner.token, stage)
+	if err := runSSHInput(contextWithoutWorkspaceOwner(ctx), target, stage, strings.NewReader(script), io.Discard, io.Discard); err != nil {
+		return workspaceOwnerRemotePreparation{}, errors.Join(fmt.Errorf("stage rsync workspace receiver %q: %w", prepared.command, err), prepared.close(ctx, target))
+	}
+	return prepared, nil
 }
 
 func (o *workspaceOwner) rsyncGuardPayload(destination string) string {
@@ -538,20 +652,46 @@ func (o *workspaceOwner) rsyncPrepareCommand() string {
 	return `rm -f "$HOME/` + path + `"`
 }
 
-func (o *workspaceOwner) Close(ctx context.Context) error {
+func finishRsyncWorkspaceWitness(ctx context.Context, target SSHTarget, owner *workspaceOwner) error {
+	rawCtx := contextWithoutWorkspaceOwner(ctx)
+	if err := runSSHQuiet(rawCtx, target, owner.rsyncStopCommand()); err != nil {
+		return err
+	}
+	if err := waitWorkspaceOwnerNoChild(rawCtx, owner, owner.callTimeout()); err != nil {
+		// A slow receiver can outlive local cancellation. Keep the stop request
+		// so its witness retires when the receiver exits, without waiting for TTL.
+		return err
+	}
+	return runSSHQuiet(rawCtx, target, owner.rsyncPrepareCommand())
+}
+
+func (o *workspaceOwner) Close(ctx context.Context) (err error) {
 	if o == nil {
 		return nil
 	}
 	o.stopRenewal()
+	if o.closeTransport != nil {
+		defer func() { err = errors.Join(err, o.closeTransport()) }()
+	}
 	renewErr := o.Err()
 	response, releaseErr := callWorkspaceOwnerTransport(ctx, o.callTimeout(), o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerRelease, Key: o.key, Token: o.token, TTL: o.ttl})
-	if releaseErr != nil {
+	if response == "CHILD" && ctx.Err() == nil && (releaseErr == nil || exitCode(releaseErr) == 75) {
+		releaseErr = errors.Join(Exit(7, "release remote workspace owner failed closed: remote phase is still active (protocol state CHILD); owner retained; wait for the phase to finish, or use the printed stop_command and retry on a fresh lease"), releaseErr)
+	} else if releaseErr != nil {
 		releaseErr = workspaceOwnerProtocolError(response, releaseErr)
-		releaseErr = Exit(7, "release remote workspace owner: ambiguous remote state: %v", releaseErr)
+		releaseErr = workspaceOwnerCallError("release remote workspace owner", releaseErr)
 	} else if response != "RELEASED" {
 		releaseErr = Exit(7, "release remote workspace owner failed closed: %s", strings.ToLower(firstNonBlank(response, "ambiguous")))
 	}
 	return errors.Join(renewErr, releaseErr)
+}
+
+func workspaceOwnerCallError(operation string, err error) error {
+	var preparation sshPreparationError
+	if errors.As(err, &preparation) {
+		return Exit(7, "%s: SSH connection preparation failed: %v", operation, err)
+	}
+	return Exit(7, "%s: ambiguous remote state: %v", operation, err)
 }
 
 func (o *workspaceOwner) QuiesceForLeaseRelease(ctx context.Context) error {
@@ -562,6 +702,10 @@ func (o *workspaceOwner) QuiesceForLeaseRelease(ctx context.Context) error {
 		return err
 	}
 	o.stopRenewal()
+	// Destructive release may discard this owner without calling Close.
+	if o.closeTransport != nil {
+		return errors.Join(o.Err(), o.closeTransport())
+	}
 	return o.Err()
 }
 
@@ -652,18 +796,33 @@ const workspaceOwnerPOSIXProcess = `owner_process_status() {
 
 // The directory gate is deliberately never stolen on a timeout: a suspended
 // writer can resume after its deadline. Ambiguous gates require lease cleanup.
+// BusyBox retries lock the same inode and execute the body once, independently
+// of the body's exit code. Keep generated scripts small for Windows SSH limits.
+// The portable mkdir gate also requires a creation receipt: some implementations
+// return success after an EEXIST race.
 func workspaceOwnerPOSIXGate(timeout string) string {
 	return `run_owner_gate() {
   if command -v flock >/dev/null 2>&1; then
-    flock -x -w ` + timeout + ` "$gate" /bin/sh -c "$1"
+    case "$(flock -h 2>&1)" in
+      *' -w'*) flock -x -w ` + timeout + ` "$gate" /bin/sh -c "$1"; return ;;
+    esac
+    (
+      exec 9>"$gate" || exit 74
+      left=` + timeout + `
+      while :; do
+        flock -x -n 9 && exec /bin/sh -c "$1"
+        rc=$?
+        [ "$rc" -eq 1 ] || exit "$rc"
+        [ "$left" -gt 0 ] || exit 1
+        sleep 1; left=$((left - 1))
+      done
+    )
   elif command -v lockf >/dev/null 2>&1; then
     lockf -k -t ` + timeout + ` "$gate" /bin/sh -c "$1"
   else
     /bin/sh -c '
       gate_dir="$1.portable"
       remaining="$2"
-      # Some mkdir implementations return success after an EEXIST race.
-      # Require the verbose creation receipt as well as a successful exit.
       while ! { created=$(mkdir -m 700 -v "$gate_dir" 2>/dev/null) && [ -n "$created" ]; }; do
         # A successful contender may already have removed the gate.
         [ ! -f "$gate_dir" ] && [ ! -L "$gate_dir" ] || exit 74
@@ -914,12 +1073,22 @@ func remoteWorkspaceOwnerPOSIXLauncher(key, token, script string, setupMarker ..
 }
 
 func remoteWorkspaceOwnerPOSIXEncodedLauncher(key, token, encoded string, decodedSize int, setupMarker ...string) string {
+	return remoteWorkspaceOwnerPOSIXPayloadLauncher(key, token, `"`+encoded+`"`, decodedSize, setupMarker...)
+}
+
+func remoteWorkspaceOwnerPOSIXInputLauncher(key, token string, decodedSize int) string {
+	// Check encoded length too: permissive decoders can accept missing padding.
+	payload := "$(cat) || { cleanup_launcher; exit 74; }; [ \"${#payload_b64}\" -eq " + strconv.Itoa(base64.StdEncoding.EncodedLen(decodedSize)) + " ] || { cleanup_launcher; exit 74; }"
+	return remoteWorkspaceOwnerPOSIXPayloadLauncher(key, token, payload, decodedSize)
+}
+
+func remoteWorkspaceOwnerPOSIXPayloadLauncher(key, token, payload string, decodedSize int, setupMarker ...string) string {
 	// Private staging must not impose its creation policy on the launched script.
-	launcher := `set -u; command_umask=$(umask); umask 077; root="$HOME/.crabbox/workspace-owners"; run_dir="$root/` + key + `.launcher.` + token + `.$$"; script="$run_dir/script"; cleanup_launcher() { rm -f "$script" 2>/dev/null; rmdir "$run_dir" 2>/dev/null || true; }; decoded_size_ok() { set -- $(wc -c <"$script"); [ "$#" -eq 1 ] && [ "$1" = ` + strconv.Itoa(decodedSize) + ` ]; }; mkdir -p "$root" 2>/dev/null || exit 74; chmod 700 "$HOME/.crabbox" "$root" 2>/dev/null || true; mkdir -m 700 "$run_dir" 2>/dev/null || exit 74; payload_b64="` + encoded + `"; decoded=; if command -v base64 >/dev/null 2>&1; then if printf %s "$payload_b64" | base64 --decode 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; elif printf %s "$payload_b64" | base64 -d 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; elif printf %s "$payload_b64" | base64 -D 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; fi; fi; if [ -z "$decoded" ] && command -v openssl >/dev/null 2>&1; then if printf %s "$payload_b64" | openssl base64 -d -A 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; fi; fi; if [ -z "$decoded" ]; then cleanup_launcher; exit 74; fi; umask "$command_umask"; /bin/sh "$script"; code=$?; cleanup_launcher; exit "$code"`
+	launcher := `set -u; command_umask=$(umask); umask 077; root="$HOME/.crabbox/workspace-owners"; run_dir="$root/` + key + `.launcher.` + token + `.$$"; script="$run_dir/script"; cleanup_launcher() { rm -f "$script" 2>/dev/null; rmdir "$run_dir" 2>/dev/null || true; }; decoded_size_ok() { set -- $(wc -c <"$script"); [ "$#" -eq 1 ] && [ "$1" = ` + strconv.Itoa(decodedSize) + ` ]; }; mkdir -p "$root" 2>/dev/null || exit 74; chmod 700 "$HOME/.crabbox" "$root" 2>/dev/null || true; mkdir -m 700 "$run_dir" 2>/dev/null || exit 74; payload_b64=` + payload + `; decoded=; if command -v base64 >/dev/null 2>&1; then if printf %s "$payload_b64" | base64 --decode 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; elif printf %s "$payload_b64" | base64 -d 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; elif printf %s "$payload_b64" | base64 -D 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; fi; fi; if [ -z "$decoded" ] && command -v openssl >/dev/null 2>&1; then if printf %s "$payload_b64" | openssl base64 -d -A 2>/dev/null >"$script" && decoded_size_ok; then decoded=1; fi; fi; if [ -z "$decoded" ]; then cleanup_launcher; exit 74; fi; umask "$command_umask"; /bin/sh "$script" "$@"; code=$?; cleanup_launcher; exit "$code"`
 	if len(setupMarker) > 0 && setupMarker[0] != "" {
 		launcher = remoteWorkspaceOwnerPOSIXSetupDiagnostic(setupMarker[0]) + strings.ReplaceAll(launcher, "exit 74", "setup_failed staging")
 	}
-	return "exec /bin/sh -c " + shellQuote(launcher)
+	return "exec /bin/sh -c " + shellQuote(launcher) + " cbx"
 }
 
 func remoteWorkspaceOwnerPOSIXWitness(key, token, remote string, preserveInput ...bool) string {
@@ -995,7 +1164,8 @@ rm -f "$child"`
     case "$owner_fd" in ""|*[!0-9]*|0|1|2) continue ;; esac
     eval "exec $owner_fd>&-"
   done
-  exec /bin/sh -c "$1"' owner-command "$owner_command"` + inputRedirect + `
+  owner_command=$1; shift
+  exec /bin/sh -c "$owner_command" cbx "$@"' cbx "$owner_command" "$@"` + inputRedirect + `
 fi
 `
 	registrar := diagnostic + `set -u
@@ -1013,7 +1183,7 @@ printf '%s\n%s\n' "$child_pid" "$child_identity" >&3 || setup_failed handoff
 exec 3>&-
 umask "$command_umask"
 ` + started + `owner_command=` + shellQuote(remote) + `
-` + macExec + `exec sh -c "$owner_command"` + inputRedirect + `
+` + macExec + `exec sh -c "$owner_command" cbx "$@"` + inputRedirect + `
 `
 	return diagnostic + `set -u
 command_umask=$(umask)
@@ -1032,7 +1202,7 @@ mkdir -m 700 "$run_dir" 2>/dev/null || setup_failed staging
 exec 4>&1
 trap : INT QUIT
 set +e
-identity=$(exec /bin/sh -c ` + shellQuote(registrar) + ` 3>&1 1>&4 4>&-)
+identity=$(exec /bin/sh -c ` + shellQuote(registrar) + ` cbx "$@" 3>&1 1>&4 4>&-)
 code=$?
 trap - INT QUIT
 exec 4>&-

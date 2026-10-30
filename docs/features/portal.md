@@ -9,9 +9,10 @@ Read this when:
 The browser portal is a server-rendered web UI hosted by the same coordinator
 that backs the Crabbox API. It is not a separate frontend or single-page app:
 every page is HTML rendered by the coordinator, with light
-client-side JavaScript only for filtering, sorting, clipboard copy, theme
-switching, and the live VNC viewer. Because the portal and the API use the same
-`FleetCoordinator` state, the two surfaces cannot drift apart.
+client-side JavaScript for filtering, sorting, clipboard copy, theme switching,
+and the live VNC viewer. The portal and API read the same `FleetCoordinator`
+state. For an end-to-end access workflow, start with the
+[desktop, VNC, browser, and Code guide](interactive-desktop-vnc.md).
 
 ## URL map
 
@@ -120,7 +121,7 @@ Existing GitHub Portal sessions remain unchanged.
 
 ```text
 session  authenticated GitHub user (owner / org embedded in the token)
-admin    sessions whose token carries the admin role
+admin    authenticated sessions granted admin authority by coordinator policy
 ```
 
 - Lease index, lease detail, run detail: a user sees their own leases and
@@ -156,9 +157,19 @@ kinds:
 - **External runners** — visibility-only rows for Blacksmith Testboxes synced
   from `crabbox list` output. They render as muted, disabled rows with status
   badges, inferred GitHub Actions run/workflow links, `stuck` markers for
-  long-queued or long-running Actions, a copyable local stop command, and
-  `stale` markers when a previously visible runner no longer appears in the
-  next sync.
+  long-queued or long-running Actions, and a copyable local stop command.
+  Org-wide inventory sync marks missing runners stale across owners.
+  The portal excludes stale rows, including runners last seen more than two
+  hours ago (`EXTERNAL_RUNNER_FRESHNESS`), and selects at most 200 visible runners
+  by newest `updatedAt`. Duplicate provider/ID/org rows use the newest
+  `lastSeenAt` within the caller's visibility before status or stale filters are
+  applied. Listing uses exactly two uncached streaming scans: the first retains
+  only each identity's decisive storage key and recency; the second keeps at most
+  the requested limit of full records (up to 200). Stale rows remain available through
+  the runner list API and runner detail pages, independently of this cap.
+  Rows last seen more than seven days
+  ago, and stale rows older than seven days since `updatedAt`, are pruned in
+  bounded maintenance batches.
 - **Dedicated hosts** — when AWS credentials and a region are configured, admins
   see EC2 Mac Dedicated Host inventory as capacity rows. Normal users see only
   hosts attached to active leases already visible to them. Each visible row
@@ -174,6 +185,16 @@ Default view rules:
 Clicking a lease opens its detail page; clicking an external runner or visible
 dedicated host opens the matching visibility-only detail page. Unattached host
 details and host-pinned launch commands require admin authentication.
+
+Owners enabled for [serve](../providers/serve.md) also see a **Machines** section
+below the fleet and a **machines available** readout when they have donated machines.
+It counts online, non-draining machines whose availability permits new leases.
+The section shows availability and reasons, measured host CPU, console idle time,
+power source, connection and draining status, last heartbeat age, used/offered and
+free CPU and memory, allocated lease links and limits, runtime and agent versions,
+labels, and the advertised SSH front door. Search and status filters apply only
+to this section. Machine visibility is owner- and organization-scoped, including
+for admins; disabled owners and owners without machines see no serve section.
 
 ## Lease detail `/portal/leases/{id-or-slug}`
 
@@ -211,8 +232,10 @@ workspace rather than only removing coordinator metadata.
 `/portal/leases/{id-or-slug}/vnc` and `/portal/leases/{id-or-slug}/code/` are
 not ordinary pages. VNC opens a noVNC viewer that talks to the lease's desktop
 over a WebSocket; the code path proxies code-server HTTP and WebSocket traffic
-straight through. Both remove the need for a local SSH tunnel to reach the
-desktop or editor. If browser clipboard permission is unavailable, WebVNC uses
+through the CLI bridge. Browser viewers do not need their own SSH client, but
+the local `crabbox webvnc` or `crabbox code` process still maintains the SSH
+tunnel and must stay running. The coordinator does not dial the runner over SSH.
+If browser clipboard permission is unavailable, WebVNC uses
 an in-page text dialog for manual paste input. Mediated egress has no portal
 page — it is operator-driven and never opens an HTML view, so it lives under the ticketed
 `/v1/leases/{id-or-slug}/egress/...` routes instead. See

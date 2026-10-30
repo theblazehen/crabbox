@@ -1,3 +1,4 @@
+import { lifetimeOwnsCompute, lifetimeRuntimeMs } from "./lease-lifetime";
 import { isRegisteredLease, leaseIsLive } from "./lease-state";
 import { orgLabelForDisplay, orgMatchesForAccounting, orgMatchesForFilter } from "./org-identity";
 import type { Env, LeaseRecord, Provider } from "./types";
@@ -14,6 +15,7 @@ export interface CostLimits {
   maxActiveLeasesPerOwner: number;
   maxActiveLeasesPerOrg: number;
   capacityAdminOwners: string[];
+  sharedCapacityOverrideOwners: string[];
   maxActiveLeasesPerCapacityAdmin: number;
   maxMonthlyUSD: number;
   maxMonthlyUSDPerOwner: number;
@@ -27,9 +29,9 @@ export interface CostLimitUsage {
   activeLeases: number;
   ownerActiveLeases: number;
   orgActiveLeases: number;
-  reservedUSD: number;
-  ownerReservedUSD: number;
-  orgReservedUSD: number;
+  committedUSD: number;
+  ownerCommittedUSD: number;
+  orgCommittedUSD: number;
 }
 
 export interface OwnerCapacity {
@@ -37,6 +39,10 @@ export interface OwnerCapacity {
   activeLeases: number;
   effectiveLimit: number;
   observedAt: string;
+  fleet: { activeLeases: number; limit: number | null };
+  org: { key: string; activeLeases: number; limit: number | null };
+  admissible: boolean;
+  blockedBy: "fleet" | "owner" | "org" | null;
 }
 
 export interface UsageFilter {
@@ -56,19 +62,24 @@ export interface UsageSummary {
   runtimeSeconds: number;
   estimatedUSD: number;
   reservedUSD: number;
+  committedUSD: number;
   byOwner: UsageGroup[];
   byOrg: UsageGroup[];
   byProvider: UsageGroup[];
   byServerType: UsageGroup[];
+  byMachine: UsageGroup[];
 }
 
 export interface UsageGroup {
   key: string;
+  label?: string;
+  cpuSeconds?: number;
   leases: number;
   activeLeases: number;
   runtimeSeconds: number;
   estimatedUSD: number;
   reservedUSD: number;
+  committedUSD: number;
 }
 
 interface UsageAccumulator {
@@ -77,6 +88,7 @@ interface UsageAccumulator {
   runtimeSeconds: number;
   estimatedUSD: number;
   reservedUSD: number;
+  committedUSD: number;
 }
 
 const defaultHourlyUSD: Record<string, number> = {
@@ -103,10 +115,23 @@ export function leaseCost(
   providerHourlyUSD?: number,
 ): LeaseCost {
   const hourlyUSD = hourlyRateUSD(env, provider, serverType, providerHourlyUSD);
+  return leaseCostForHourlyRate(ttlSeconds, hourlyUSD);
+}
+
+function leaseCostForHourlyRate(ttlSeconds: number, hourlyUSD: number): LeaseCost {
   return {
     hourlyUSD,
     maxUSD: roundUSD((Math.max(1, ttlSeconds) / 3600) * hourlyUSD),
   };
+}
+
+export function leaseExtensionReservationUSD(
+  lease: Pick<LeaseRecord, "estimatedHourlyUSD" | "maxEstimatedUSD">,
+  ttlSeconds: number,
+): number {
+  const cost = leaseCostForHourlyRate(ttlSeconds, lease.estimatedHourlyUSD);
+  // Policy tightening must not release an existing reservation during extension.
+  return Math.max(lease.maxEstimatedUSD, cost.maxUSD);
 }
 
 export function costLimits(env: Env): CostLimits {
@@ -114,8 +139,12 @@ export function costLimits(env: Env): CostLimits {
     maxActiveLeases: envInt(env.CRABBOX_MAX_ACTIVE_LEASES),
     maxActiveLeasesPerOwner: envInt(env.CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER),
     maxActiveLeasesPerOrg: envInt(env.CRABBOX_MAX_ACTIVE_LEASES_PER_ORG),
-    capacityAdminOwners: envList(env.CRABBOX_CAPACITY_ADMIN_OWNERS).map((owner) =>
-      owner.toLowerCase(),
+    capacityAdminOwners: [
+      ...envList(env.CRABBOX_CAPACITY_ADMIN_OWNERS),
+      ...envList(env.CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS),
+    ].map((owner) => owner.toLowerCase()),
+    sharedCapacityOverrideOwners: envList(env.CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS).map(
+      (owner) => owner.toLowerCase(),
     ),
     maxActiveLeasesPerCapacityAdmin: envInt(env.CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN),
     maxMonthlyUSD: envFloat(env.CRABBOX_MAX_MONTHLY_USD),
@@ -135,10 +164,27 @@ export function createCostLimitUsage(
     activeLeases: 0,
     ownerActiveLeases: 0,
     orgActiveLeases: 0,
-    reservedUSD: 0,
-    ownerReservedUSD: 0,
-    orgReservedUSD: 0,
+    committedUSD: 0,
+    ownerCommittedUSD: 0,
+    orgCommittedUSD: 0,
   };
+}
+
+export function addLeaseToActiveLimitUsage(usage: CostLimitUsage, lease: LeaseRecord): void {
+  if (isRegisteredLease(lease)) {
+    return;
+  }
+  // A live record still owns provider capacity after its heartbeat deadline
+  // until cleanup commits a terminal state.
+  if (leaseIsLive(lease) || lifetimeOwnsCompute(lease)) {
+    usage.activeLeases += 1;
+    if (lease.owner === usage.owner) {
+      usage.ownerActiveLeases += 1;
+    }
+    if (orgMatchesForAccounting(lease.org, usage.org)) {
+      usage.orgActiveLeases += 1;
+    }
+  }
 }
 
 export function addLeaseToCostLimitUsage(
@@ -149,30 +195,36 @@ export function addLeaseToCostLimitUsage(
   if (isRegisteredLease(lease)) {
     return;
   }
-  // A live record still owns provider capacity after its heartbeat deadline
-  // until cleanup commits a terminal state.
-  if (leaseIsLive(lease)) {
-    usage.activeLeases += 1;
-    if (lease.owner === usage.owner) {
-      usage.ownerActiveLeases += 1;
-    }
-    if (orgMatchesForAccounting(lease.org, usage.org)) {
-      usage.orgActiveLeases += 1;
-    }
-  }
+  addLeaseToActiveLimitUsage(usage, lease);
   // A live lease still reserves provider spend in the active budget window,
   // even when its creation month has rolled over.
-  if (!leaseIsLive(lease) && monthKey(new Date(lease.createdAt)) !== usage.month) {
+  if (!leaseReservesBudget(lease) && monthKey(new Date(lease.createdAt)) !== usage.month) {
     return;
   }
-  const reservedUSD = leaseUsage(lease, now).reservedUSD;
-  usage.reservedUSD = roundUSD(usage.reservedUSD + reservedUSD);
+  const committedUSD = leaseUsage(lease, now).committedUSD;
+  usage.committedUSD = roundUSD(usage.committedUSD + committedUSD);
   if (lease.owner === usage.owner) {
-    usage.ownerReservedUSD = roundUSD(usage.ownerReservedUSD + reservedUSD);
+    usage.ownerCommittedUSD = roundUSD(usage.ownerCommittedUSD + committedUSD);
   }
   if (orgMatchesForAccounting(lease.org, usage.org)) {
-    usage.orgReservedUSD = roundUSD(usage.orgReservedUSD + reservedUSD);
+    usage.orgCommittedUSD = roundUSD(usage.orgCommittedUSD + committedUSD);
   }
+}
+
+export function activeLeaseLimitBlocker(
+  usage: CostLimitUsage,
+  limits: ReturnType<typeof activeLeaseLimitsForOwner>,
+): OwnerCapacity["blockedBy"] {
+  if (limits.fleet > 0 && usage.activeLeases + 1 > limits.fleet) {
+    return "fleet";
+  }
+  if (limits.owner > 0 && usage.ownerActiveLeases + 1 > limits.owner) {
+    return "owner";
+  }
+  if (limits.org > 0 && usage.orgActiveLeases + 1 > limits.org) {
+    return "org";
+  }
+  return null;
 }
 
 export function enforceCostLimitUsage(
@@ -180,70 +232,110 @@ export function enforceCostLimitUsage(
   candidate: LeaseRecord,
   limits: CostLimits,
 ): string {
-  if (limits.maxActiveLeases > 0 && usage.activeLeases + 1 > limits.maxActiveLeases) {
-    return `active lease limit exceeded: ${usage.activeLeases + 1}/${limits.maxActiveLeases}`;
-  }
-  const ownerLimit = activeLeaseLimitForOwner(limits, candidate.owner);
-  if (ownerLimit > 0 && usage.ownerActiveLeases + 1 > ownerLimit) {
-    return `active lease limit for owner exceeded: ${usage.ownerActiveLeases + 1}/${ownerLimit}`;
-  }
-  if (
-    limits.maxActiveLeasesPerOrg > 0 &&
-    usage.orgActiveLeases + 1 > limits.maxActiveLeasesPerOrg
-  ) {
-    return `active lease limit for org exceeded: ${usage.orgActiveLeases + 1}/${limits.maxActiveLeasesPerOrg}`;
+  const activeLimits = activeLeaseLimitsForOwner(limits, candidate.owner);
+  switch (activeLeaseLimitBlocker(usage, activeLimits)) {
+    case "fleet":
+      return `fleet active lease limit exceeded: ${usage.activeLeases + 1}/${activeLimits.fleet}`;
+    case "owner":
+      return `active lease limit for owner exceeded: ${usage.ownerActiveLeases + 1}/${activeLimits.owner}`;
+    case "org":
+      return `active lease limit for org exceeded: ${usage.orgActiveLeases + 1}/${activeLimits.org}`;
   }
 
-  if (overBudget(usage.reservedUSD + candidate.maxEstimatedUSD, limits.maxMonthlyUSD)) {
-    return `monthly budget exceeded: ${formatUSD(usage.reservedUSD + candidate.maxEstimatedUSD)}/${formatUSD(limits.maxMonthlyUSD)}`;
+  return enforceBudgetLimitUsage(usage, candidate, limits);
+}
+
+export function enforceBudgetLimitUsage(
+  usage: CostLimitUsage,
+  candidate: Pick<LeaseRecord, "maxEstimatedUSD">,
+  limits: CostLimits,
+  existingReservationUSD?: number,
+): string {
+  const headroom = (used: number, limit: number): string =>
+    existingReservationUSD === undefined
+      ? ""
+      : `; remaining headroom ${formatUSD(Math.max(0, limit - used - existingReservationUSD))}`;
+
+  if (overBudget(usage.committedUSD + candidate.maxEstimatedUSD, limits.maxMonthlyUSD)) {
+    return `monthly budget exceeded: ${formatUSD(usage.committedUSD + candidate.maxEstimatedUSD)}/${formatUSD(limits.maxMonthlyUSD)}${headroom(usage.committedUSD, limits.maxMonthlyUSD)}`;
   }
   if (
-    overBudget(usage.ownerReservedUSD + candidate.maxEstimatedUSD, limits.maxMonthlyUSDPerOwner)
+    overBudget(usage.ownerCommittedUSD + candidate.maxEstimatedUSD, limits.maxMonthlyUSDPerOwner)
   ) {
-    return `monthly budget for owner exceeded: ${formatUSD(usage.ownerReservedUSD + candidate.maxEstimatedUSD)}/${formatUSD(limits.maxMonthlyUSDPerOwner)}`;
+    return `monthly budget for owner exceeded: ${formatUSD(usage.ownerCommittedUSD + candidate.maxEstimatedUSD)}/${formatUSD(limits.maxMonthlyUSDPerOwner)}${headroom(usage.ownerCommittedUSD, limits.maxMonthlyUSDPerOwner)}`;
   }
-  if (overBudget(usage.orgReservedUSD + candidate.maxEstimatedUSD, limits.maxMonthlyUSDPerOrg)) {
-    return `monthly budget for org exceeded: ${formatUSD(usage.orgReservedUSD + candidate.maxEstimatedUSD)}/${formatUSD(limits.maxMonthlyUSDPerOrg)}`;
+  if (overBudget(usage.orgCommittedUSD + candidate.maxEstimatedUSD, limits.maxMonthlyUSDPerOrg)) {
+    return `monthly budget for org exceeded: ${formatUSD(usage.orgCommittedUSD + candidate.maxEstimatedUSD)}/${formatUSD(limits.maxMonthlyUSDPerOrg)}${headroom(usage.orgCommittedUSD, limits.maxMonthlyUSDPerOrg)}`;
   }
   return "";
 }
 
-export function usageSummary(leases: LeaseRecord[], filter: UsageFilter, now: Date): UsageSummary {
-  const selected = leases.filter(
-    (lease) => !isRegisteredLease(lease) && leaseMatchesUsageFilter(lease, filter),
-  );
+export function usageSummary(
+  leases: Iterable<LeaseRecord>,
+  filter: UsageFilter,
+  now: Date,
+): UsageSummary {
+  const accumulator = createUsageSummary(filter, now);
+  for (const lease of leases) accumulator.add(lease);
+  return accumulator.finish();
+}
+
+export function createUsageSummary(filter: UsageFilter, now: Date) {
   const total = newAccumulator();
   const byOwner = new Map<string, UsageAccumulator>();
   const byOrg = new Map<string, UsageAccumulator>();
   const byProvider = new Map<string, UsageAccumulator>();
   const byServerType = new Map<string, UsageAccumulator>();
-  for (const lease of selected) {
+  const byMachine = new Map<string, UsageAccumulator>();
+  const machineCPUSeconds = new Map<string, number>();
+  const add = (lease: LeaseRecord) => {
+    if (isRegisteredLease(lease) || !leaseMatchesUsageFilter(lease, filter)) return;
     const item = leaseUsage(lease, now);
     addUsage(total, item);
     addUsage(mapAccumulator(byOwner, lease.owner || "unknown"), item);
     addUsage(mapAccumulator(byOrg, lease.org || "unknown"), item);
     addUsage(mapAccumulator(byProvider, lease.provider), item);
     addUsage(mapAccumulator(byServerType, lease.serverType || "unknown"), item);
-  }
-  const summary: UsageSummary = {
-    month: filter.month,
-    scope: filter.scope,
-    ...finalize(total),
-    byOwner: finalizeGroups(byOwner),
-    byOrg: finalizeGroups(byOrg).map((group) => ({
-      ...group,
-      key: orgLabelForDisplay(group.key),
-    })),
-    byProvider: finalizeGroups(byProvider),
-    byServerType: finalizeGroups(byServerType),
+    if (lease.provider === "serve") {
+      const machineID =
+        lease.serve?.machineID ||
+        (lease.cloudID?.includes("/") ? lease.cloudID.split("/")[0] : "") ||
+        "unknown";
+      addUsage(mapAccumulator(byMachine, machineID), item);
+      const cpus = lease.serve?.cpus ?? 0;
+      machineCPUSeconds.set(
+        machineID,
+        (machineCPUSeconds.get(machineID) ?? 0) +
+          item.runtimeSeconds * (Number.isFinite(cpus) && cpus > 0 ? cpus : 0),
+      );
+    }
   };
-  if (filter.owner) {
-    summary.owner = filter.owner;
-  }
-  if (filter.org) {
-    summary.org = orgLabelForDisplay(filter.org);
-  }
-  return summary;
+  const finish = (): UsageSummary => {
+    const summary: UsageSummary = {
+      month: filter.month,
+      scope: filter.scope,
+      ...finalize(total),
+      byOwner: finalizeGroups(byOwner),
+      byOrg: finalizeGroups(byOrg).map((group) => ({
+        ...group,
+        key: orgLabelForDisplay(group.key),
+      })),
+      byProvider: finalizeGroups(byProvider),
+      byServerType: finalizeGroups(byServerType),
+      byMachine: finalizeGroups(byMachine).map((group) => ({
+        ...group,
+        cpuSeconds: machineCPUSeconds.get(group.key) ?? 0,
+      })),
+    };
+    if (filter.owner) {
+      summary.owner = filter.owner;
+    }
+    if (filter.org) {
+      summary.org = orgLabelForDisplay(filter.org);
+    }
+    return summary;
+  };
+  return { add, finish };
 }
 
 function hourlyRateUSD(
@@ -299,18 +391,59 @@ function leaseMatchesUsageFilter(lease: LeaseRecord, filter: UsageFilter): boole
   return true;
 }
 
+function leaseReservesBudget(lease: LeaseRecord): boolean {
+  if (leaseIsLive(lease) || lifetimeOwnsCompute(lease)) return true;
+  // Failed or canceled provisioning can still own an unresolved provider resource.
+  if (lease.provisioningResourceMayExist && !lease.cleanupCompletedAt) return true;
+  // Retained legacy resources may still run without enrollment in a lifetime policy.
+  const stopped = lease.lifetimePolicy?.compute
+    ? lease.lifetimePolicy.compute.state === "stopped"
+    : Boolean(lease.lifetimePolicy?.stoppedAt);
+  return Boolean(
+    lease.releaseDeletesServer === false &&
+    !lease.cleanupCompletedAt &&
+    (lease.cloudID || lease.serverID || lease.providerResourceID) &&
+    !stopped,
+  );
+}
+
 function leaseUsage(lease: LeaseRecord, now: Date): UsageAccumulator {
+  const live = leaseIsLive(lease) || lifetimeOwnsCompute(lease);
   const created = parseTime(lease.createdAt, now);
-  const ended = parseTime(lease.endedAt || lease.releasedAt || "", now);
-  const stop = leaseIsLive(lease) ? now : ended;
-  const runtimeSeconds = Math.max(0, Math.trunc((stop.getTime() - created.getTime()) / 1000));
+  // Legacy terminal rows may lack endedAt. Their last persisted observation,
+  // rather than query time, bounds runtime until lifecycle evidence is available.
+  const ended = parseTime(
+    lease.endedAt || lease.releasedAt || lease.cleanupCompletedAt || lease.updatedAt,
+    created,
+  );
+  const stopped = parseTime(lease.lifetimePolicy?.stoppedAt ?? "", ended);
+  const stop = live ? now : stopped;
+  const neverAllocated = !live && !lease.cloudID && lease.provisioningResourceMayExist === false;
+  const runtimeSeconds = Math.max(
+    0,
+    Math.trunc(
+      (lifetimeRuntimeMs(lease, stop.getTime()) ??
+        (neverAllocated ? 0 : stop.getTime() - created.getTime())) / 1000,
+    ),
+  );
   const estimatedUSD = roundUSD((runtimeSeconds / 3600) * (lease.estimatedHourlyUSD || 0));
+  const reservedUSD = roundUSD(lease.maxEstimatedUSD ?? estimatedUSD);
+  // Failed admissions have timestamps and a reservation but no billable resource.
+  const provisioned = Boolean(
+    lease.cloudID || lease.serverID || lease.providerResourceID || lease.lifetimePolicy?.compute,
+  );
+  const committedUSD = leaseReservesBudget(lease)
+    ? reservedUSD
+    : provisioned
+      ? Math.min(reservedUSD, estimatedUSD)
+      : 0;
   return {
     leases: 1,
-    activeLeases: leaseIsLive(lease) ? 1 : 0,
+    activeLeases: live ? 1 : 0,
     runtimeSeconds,
     estimatedUSD,
-    reservedUSD: roundUSD(lease.maxEstimatedUSD || estimatedUSD),
+    reservedUSD,
+    committedUSD,
   };
 }
 
@@ -331,6 +464,7 @@ function newAccumulator(): UsageAccumulator {
     runtimeSeconds: 0,
     estimatedUSD: 0,
     reservedUSD: 0,
+    committedUSD: 0,
   };
 }
 
@@ -340,17 +474,17 @@ function addUsage(total: UsageAccumulator, item: UsageAccumulator): void {
   total.runtimeSeconds += item.runtimeSeconds;
   total.estimatedUSD = roundUSD(total.estimatedUSD + item.estimatedUSD);
   total.reservedUSD = roundUSD(total.reservedUSD + item.reservedUSD);
+  total.committedUSD = roundUSD(total.committedUSD + item.committedUSD);
 }
 
-function finalize(
-  group: UsageAccumulator,
-): Omit<UsageSummary, "month" | "scope" | "byOwner" | "byOrg" | "byProvider" | "byServerType"> {
+function finalize(group: UsageAccumulator): UsageAccumulator {
   return {
     leases: group.leases,
     activeLeases: group.activeLeases,
     runtimeSeconds: group.runtimeSeconds,
     estimatedUSD: roundUSD(group.estimatedUSD),
     reservedUSD: roundUSD(group.reservedUSD),
+    committedUSD: roundUSD(group.committedUSD),
   };
 }
 
@@ -377,14 +511,19 @@ function envList(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export function activeLeaseLimitForOwner(limits: CostLimits, owner: string): number {
-  if (
+export function activeLeaseLimitsForOwner(limits: CostLimits, owner: string) {
+  const capacityAdmin =
     limits.maxActiveLeasesPerCapacityAdmin > 0 &&
-    limits.capacityAdminOwners.includes(owner.toLowerCase())
-  ) {
-    return Math.max(limits.maxActiveLeasesPerOwner, limits.maxActiveLeasesPerCapacityAdmin);
-  }
-  return limits.maxActiveLeasesPerOwner;
+    limits.capacityAdminOwners.includes(owner.toLowerCase());
+  const sharedOverride =
+    capacityAdmin && limits.sharedCapacityOverrideOwners.includes(owner.toLowerCase());
+  return {
+    fleet: sharedOverride ? 0 : limits.maxActiveLeases,
+    owner: capacityAdmin
+      ? Math.max(limits.maxActiveLeasesPerOwner, limits.maxActiveLeasesPerCapacityAdmin)
+      : limits.maxActiveLeasesPerOwner,
+    org: sharedOverride ? 0 : limits.maxActiveLeasesPerOrg,
+  };
 }
 
 function overBudget(value: number, limit: number): boolean {

@@ -32,6 +32,8 @@ import {
   leaseConfig,
   type LeaseConfig,
 } from "../src/config";
+import { appendCreationSteps, withCreationSteps } from "../src/creation-events";
+import type { LeaseRecord } from "../src/types";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -40,6 +42,38 @@ afterEach(() => {
 });
 
 describe("aws provider", () => {
+  it("projects existing AWS preparation measurements into coordinator steps", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const { client, config } = awsMarketFallbackHarness("");
+    await withCreationSteps(async () => {
+      await client.createServerWithFallback(
+        config,
+        "cbx_abcdef123456",
+        "test",
+        "alice@example.com",
+      );
+      const lease: Pick<LeaseRecord, "creationEvents"> = {};
+      appendCreationSteps(lease);
+      const steps = lease.creationEvents?.map((event) => event.step);
+      expect(steps).toEqual(
+        expect.arrayContaining([
+          "aws.key_pair",
+          "aws.image",
+          "aws.security_group",
+          "aws.quota",
+          "aws.instance_types",
+          "aws.user_data_render",
+          "aws.instance_create",
+        ]),
+      );
+      expect(
+        lease.creationEvents?.every(
+          (event) => event.source === "coordinator" && event.durationMs! >= 0,
+        ),
+      ).toBe(true);
+    });
+  });
+
   it("bounds repeated diagnostic buckets and records failures without error payloads", async () => {
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const diagnostics = createAWSProvisioningDiagnostics("x".repeat(10_000), "r".repeat(10_000));
@@ -146,6 +180,11 @@ describe("aws provider", () => {
           ]);
         }
         if (action) actions.push(action);
+        if (action === "DescribeSecurityGroups") {
+          return ec2XMLResponse(
+            `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-fixture</groupId><ipPermissions>${["22", "443"].map((port) => `<item><ipProtocol>tcp</ipProtocol><fromPort>${port}</fromPort><toPort>${port}</toPort><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp></item></ipRanges></item>`).join("")}</ipPermissions></item></securityGroupInfo></DescribeSecurityGroupsResponse>`,
+          );
+        }
         if (action === "AuthorizeSecurityGroupIngress" || action === "RevokeSecurityGroupIngress") {
           const authorize = action === "AuthorizeSecurityGroupIngress";
           if (authorize) {
@@ -448,7 +487,7 @@ describe("aws provider", () => {
     },
   );
 
-  it("uses described vCPUs for readiness and omits candidates whose cost is unknown", async () => {
+  it("uses described vCPUs without claiming available capacity", async () => {
     const { client, config, metadataReads } = awsMarketFallbackHarness(
       "",
       "on-demand",
@@ -467,7 +506,17 @@ describe("aws provider", () => {
     expect(warning).toMatchObject({ status: "warning", details: { default_needed_vcpus: "192" } });
     expect(warning?.details).not.toHaveProperty("recommended_type");
     quota = 192;
-    expect(await client.capacityReadinessChecks(config)).toMatchObject([{ status: "ok" }]);
+    const [check] = await client.capacityReadinessChecks(config);
+    const details = {
+      capacity: "unknown",
+      quota_limit: "sufficient",
+      usage: "unchecked",
+      hint: "check_regional_quota_usage",
+    };
+    expect(check).toMatchObject({ status: "ok", details });
+    for (const [key, value] of Object.entries(details)) {
+      expect(check?.message).toContain(`${key}=${value}`);
+    }
     expect(metadataReads).toHaveLength(2);
   });
 
@@ -531,8 +580,33 @@ describe("aws provider", () => {
     expect(submitted?.get("TagSpecification.2.Tag.5.Value")).toBe("cbx_abcdef123456");
   });
 
+  it("records a stock AMI honestly even when stale promoted identity is present", () => {
+    const config = leaseConfig({
+      provider: "aws",
+      awsUseStockImage: true,
+      sshPublicKey: "ssh-ed25519 test",
+    });
+    config.selectedImage = {
+      id: "ami-stock",
+      source: "promoted",
+      provider: "aws",
+      kind: "aws-ami",
+      region: "eu-west-1",
+      revision: "stale",
+    };
+    config.awsPromotedAMIs.stale = "ami-stock";
+    expect(awsLeaseImageIdentity(config, "ami-stock", "eu-west-1")).toEqual({
+      id: "ami-stock",
+      source: "stock",
+      provider: "aws",
+      kind: "aws-ami",
+      region: "eu-west-1",
+    });
+  });
+
   it("uses the launched fallback AMI for provider image labels", () => {
     const config = leaseConfig({
+      awsRootGB: 400,
       provider: "aws",
       sshPublicKey: "ssh-ed25519 test",
     });
@@ -735,6 +809,7 @@ describe("aws provider", () => {
     await expect(
       client.createServerWithFallback(
         leaseConfig({
+          awsRootGB: 400,
           provider: "aws",
           providerKey: "crabbox-cbx-abcdef123456",
           sshPublicKey: "ssh-ed25519 requested-key",
@@ -824,6 +899,7 @@ describe("aws provider", () => {
 
     await client.refreshSSHIngress(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         providerKey: "crabbox-workspace-0123456789ab",
         awsSSHCIDRs: ["0.0.0.0/0"],
@@ -884,6 +960,7 @@ describe("aws provider", () => {
 
     await client.refreshSSHIngress(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         awsSSHCIDRs: ["198.51.100.77/32"],
         sshPublicKey: "ssh-ed25519 test",
@@ -947,6 +1024,7 @@ describe("aws provider", () => {
 
     await client.refreshSSHIngress(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         awsSSHCIDRs: ["198.51.100.77/32"],
         sshPublicKey: "ssh-ed25519 test",
@@ -1289,6 +1367,7 @@ describe("aws provider", () => {
       await expect(
         client.refreshSSHIngress(
           leaseConfig({
+            awsRootGB: 400,
             provider: "aws",
             sshPublicKey: "ssh-ed25519 test",
           }),
@@ -1558,6 +1637,7 @@ describe("aws provider", () => {
 
     await client.refreshSSHIngress(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "windows",
         awsSSHCIDRs: ["198.51.100.77/32"],
@@ -1633,6 +1713,7 @@ describe("aws provider", () => {
 
     await client.refreshSSHIngress(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "windows",
         awsSSHCIDRs: ["198.51.100.77/32"],
@@ -1712,6 +1793,7 @@ describe("aws provider", () => {
 
     await client.refreshSSHIngress(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "linux",
         awsSSHCIDRs: ["198.51.100.77/32"],
@@ -1790,6 +1872,7 @@ describe("aws provider", () => {
     await expect(
       client.refreshSSHIngress(
         leaseConfig({
+          awsRootGB: 400,
           provider: "aws",
           target: "linux",
           awsSSHCIDRs: ["198.51.100.77/32"],
@@ -2239,6 +2322,156 @@ describe("aws provider", () => {
     ]);
   });
 
+  it.each([
+    { minimum: undefined, failures: 5, expected: "t3.small", attempts: 6 },
+    {
+      minimum: { minVCPUs: 4, minMemoryMiB: 15360 },
+      failures: 4,
+      expected: "c7a.4xlarge",
+      attempts: 5,
+    },
+    {
+      minimum: { minVCPUs: 4, minMemoryMiB: 15360 },
+      failures: 5,
+      expected: undefined,
+      attempts: 5,
+    },
+  ])(
+    "enforces opt-in minimums through standard class fallback ($expected)",
+    async ({ minimum, failures, expected, attempts }) => {
+      const types = [
+        "c7a.8xlarge",
+        "c7i.8xlarge",
+        "m7a.8xlarge",
+        "m7i.8xlarge",
+        "c7a.4xlarge",
+        "t3.small",
+      ];
+      const { client, attempted } = awsMarketFallbackHarness(
+        Array(failures).fill("VcpuLimitExceeded"),
+        "on-demand",
+        types,
+        Object.fromEntries(
+          types.map((type, index) => [type, index < 4 ? 32 : index === 4 ? 16 : 2]),
+        ),
+        Object.fromEntries(
+          types.map((type, index) => [type, index < 4 ? 65536 : index === 4 ? 32768 : 2048]),
+        ),
+      );
+      const config = leaseConfig({
+        provider: "aws",
+        target: "linux",
+        class: "standard",
+        awsRootGB: 400,
+        sshPublicKey: "ssh-ed25519 test",
+        providerKey: "test-key",
+        capacity: { market: "on-demand", ...minimum },
+      });
+      const creating = client.createServerWithFallback(
+        config,
+        "cbx_abcdef123456",
+        "capacity-test",
+        "alice@example.com",
+      );
+      const outcome = await creating.then(
+        (result) => `${result.serverType}:${result.server.serverType}`,
+        (error: unknown) => String(error),
+      );
+      expect(outcome).toMatch(
+        expected ? new RegExp(`^${expected}:${expected}$`) : /VcpuLimitExceeded/,
+      );
+      expect(attempted).toEqual(types.slice(0, attempts).map((type) => `on-demand:${type}`));
+    },
+  );
+
+  it.each([
+    { name: "missing", cpu: {}, memory: {}, minimum: { minVCPUs: 4 }, succeeds: false },
+    { name: "denied", cpu: "denied", memory: {}, minimum: { minVCPUs: 4 }, succeeds: false },
+    {
+      name: "unknown memory",
+      cpu: { "c7a.4xlarge": 16 },
+      memory: {},
+      minimum: { minMemoryMiB: 15360 },
+      succeeds: false,
+    },
+    {
+      name: "invalid memory",
+      cpu: { "c7a.4xlarge": 16 },
+      memory: { "c7a.4xlarge": "32768.5" },
+      minimum: { minMemoryMiB: 15360 },
+      succeeds: false,
+    },
+    {
+      name: "CPU only",
+      cpu: { "c7a.4xlarge": 16 },
+      memory: {},
+      minimum: { minVCPUs: 4 },
+      succeeds: true,
+    },
+    {
+      name: "memory only",
+      cpu: { "c7a.4xlarge": "unknown" },
+      memory: { "c7a.4xlarge": 32768 },
+      minimum: { minMemoryMiB: 15360 },
+      succeeds: true,
+    },
+  ])(
+    "verifies requested dimensions before provisioning: $name",
+    async ({ cpu, memory, minimum, succeeds }) => {
+      const { client, config, attempted } = awsMarketFallbackHarness(
+        "",
+        "on-demand",
+        ["c7a.4xlarge"],
+        cpu as Record<string, number | string> | "denied",
+        memory,
+      );
+      config.capacityRequirements = minimum;
+      const creating = client.createServerWithFallback(
+        config,
+        "cbx_abcdef123456",
+        "capacity-test",
+        "alice@example.com",
+      );
+      const outcome = await creating.then(
+        (result) => result.serverType,
+        (error: unknown) => String(error),
+      );
+      expect(outcome).toMatch(succeeds ? /^c7a\.4xlarge$/ : /AWS capacity unavailable/);
+      const requests = vi
+        .mocked(fetch)
+        .mock.calls.map(([input, init]) =>
+          input instanceof Request ? input : new Request(input, init),
+        );
+      const actions = await Promise.all(
+        requests.map(async (request) =>
+          new URLSearchParams(await request.clone().text()).get("Action"),
+        ),
+      );
+      // A failed capacity check must precede every resource mutation.
+      expect(!succeeds && actions.some((action) => action !== "DescribeInstanceTypes")).toBe(false);
+      expect(attempted).toHaveLength(succeeds ? 1 : 0);
+    },
+  );
+
+  it("keeps constrained market fallback within eligible candidates", async () => {
+    const { client, config, attempted } = awsMarketFallbackHarness(
+      "InsufficientInstanceCapacity",
+      "spot",
+      ["c7a.4xlarge", "t3.small"],
+      { "c7a.4xlarge": 16, "t3.small": 2 },
+    );
+    config.capacityRequirements = { minVCPUs: 4 };
+    await expect(
+      client.createServerWithFallback(
+        config,
+        "cbx_abcdef123456",
+        "capacity-test",
+        "alice@example.com",
+      ),
+    ).resolves.toMatchObject({ serverType: "c7a.4xlarge", market: "on-demand" });
+    expect(attempted).toEqual(["spot:c7a.4xlarge", "on-demand:c7a.4xlarge"]);
+  });
+
   it("adds a small policy fallback for class requests but not exact types", () => {
     expect(
       awsLaunchCandidates({
@@ -2287,7 +2520,23 @@ describe("aws provider", () => {
         { CRABBOX_AWS_REGION: "eu-central-1", CRABBOX_CAPACITY_REGIONS: "us-west-2, us-east-1" },
         "eu-west-2",
       ),
-    ).toEqual(["eu-west-2", "eu-west-1", "eu-central-1", "us-west-2", "us-east-1"]);
+    ).toEqual(["eu-west-1", "eu-west-2", "eu-central-1", "us-west-2", "us-east-1"]);
+    for (const awsRegion of ["", "eu-west-1"]) {
+      expect(
+        awsRegionCandidates(
+          { awsRegion, capacityRegions: ["us-east-1", "eu-west-1"] },
+          { CRABBOX_AWS_REGION: "eu-west-1", CRABBOX_CAPACITY_REGIONS: "us-west-2" },
+          "eu-west-1",
+        ),
+      ).toEqual(["eu-west-1", "us-west-2", "us-east-1"]);
+    }
+    expect(
+      awsRegionCandidates(
+        { awsPrivate: true, awsRegion: "us-west-1", capacityRegions: ["us-east-1"] },
+        { CRABBOX_AWS_REGION: "eu-west-1", CRABBOX_CAPACITY_REGIONS: "us-west-2" },
+        "eu-central-1",
+      ),
+    ).toEqual(["us-west-1"]);
     expect(
       awsAvailabilityZoneForRegion(
         { capacityAvailabilityZones: ["us-east-1a", "eu-west-1b"] },
@@ -2487,6 +2736,7 @@ describe("aws provider", () => {
       await client.createServerWithFallback(
         {
           ...leaseConfig({
+            awsRootGB: 400,
             provider: "aws",
             target: "linux",
             class: "standard",
@@ -2576,6 +2826,7 @@ describe("aws provider", () => {
       "eu-west-1",
     );
     const config = leaseConfig({
+      awsRootGB: 400,
       provider: "aws",
       target: "linux",
       serverType: "t3.small",
@@ -2706,6 +2957,7 @@ describe("aws provider", () => {
     );
     const creating = client.createServerWithFallback(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "macos",
         capacity: { market: "on-demand" },
@@ -2853,6 +3105,7 @@ describe("aws provider", () => {
     );
     const result = await client.createServerWithFallback(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "macos",
         capacity: { market: "on-demand" },
@@ -2943,6 +3196,7 @@ describe("aws provider", () => {
     await expect(
       client.createServerWithFallback(
         leaseConfig({
+          awsRootGB: 400,
           provider: "aws",
           target: "macos",
           capacity: { market: "on-demand" },
@@ -3039,6 +3293,7 @@ describe("aws provider", () => {
     );
     const result = await client.createServerWithFallback(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "macos",
         capacity: { market: "on-demand" },
@@ -3145,6 +3400,7 @@ describe("aws provider", () => {
     );
     const result = await client.createServerWithFallback(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "macos",
         capacity: { market: "on-demand" },
@@ -3247,6 +3503,7 @@ describe("aws provider", () => {
       "eu-west-1",
     );
     const config = leaseConfig({
+      awsRootGB: 400,
       provider: "aws",
       target: "macos",
       capacity: { market: "on-demand" },
@@ -3334,6 +3591,7 @@ describe("aws provider", () => {
       "us-west-2",
     );
     const config = leaseConfig({
+      awsRootGB: 400,
       provider: "aws",
       target: "macos",
       capacity: { market: "on-demand" },
@@ -3455,6 +3713,7 @@ describe("aws provider", () => {
     );
     const result = await client.createServerWithFallback(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         target: "macos",
         capacity: { market: "on-demand" },
@@ -3545,6 +3804,7 @@ describe("aws provider", () => {
 
     await client.createServerWithFallback(
       leaseConfig({
+        awsRootGB: 400,
         provider: "aws",
         serverType: "t3.small",
         serverTypeExplicit: true,
@@ -3599,6 +3859,7 @@ describe("aws provider", () => {
     await expect(
       client.createServerWithFallback(
         leaseConfig({
+          awsRootGB: 400,
           provider: "aws",
           serverType: "t3.small",
           serverTypeExplicit: true,
@@ -3927,6 +4188,7 @@ function ec2XMLResponse(body: string, status = 200): Response {
 function ec2InstanceTypesResponse(
   params: URLSearchParams,
   metadata: Record<string, number | string>,
+  memory: Record<string, number | string> = {},
 ): Response {
   const requested = [...params]
     .filter(([key]) => key.startsWith("InstanceType."))
@@ -3937,7 +4199,7 @@ function ec2InstanceTypesResponse(
         metadata[name] === undefined
           ? []
           : [
-              `<item><instanceType>${name}</instanceType><vCpuInfo><defaultVCpus>${metadata[name]}</defaultVCpus></vCpuInfo></item>`,
+              `<item><instanceType>${name}</instanceType><vCpuInfo><defaultVCpus>${metadata[name]}</defaultVCpus></vCpuInfo>${memory[name] === undefined ? "" : `<memoryInfo><sizeInMiB>${memory[name]}</sizeInMiB></memoryInfo>`}</item>`,
             ],
       )
       .join("")}</instanceTypeSet></DescribeInstanceTypesResponse>`,
@@ -3954,6 +4216,7 @@ function awsMarketFallbackHarness(
     "c7a.metal-48xl": 192,
     "g4dn.metal": 96,
   },
+  memory: Record<string, number | string> = {},
 ) {
   const metadataReads: string[][] = [];
   const markets: string[] = [];
@@ -3982,7 +4245,7 @@ function awsMarketFallbackHarness(
           .map(([, value]) => value);
         metadataReads.push(requested);
         if (metadata === "denied") return ec2XMLResponse("<Response />", 403);
-        return ec2InstanceTypesResponse(params, metadata);
+        return ec2InstanceTypesResponse(params, metadata, memory);
       }
       if (action === "RunInstances") {
         const market = params.has("InstanceMarketOptions.MarketType") ? "spot" : "on-demand";
@@ -4001,7 +4264,7 @@ function awsMarketFallbackHarness(
           );
         }
         return ec2XMLResponse(
-          "<RunInstancesResponse><instancesSet><item><instanceId>i-fallback</instanceId><instanceType>t3.small</instanceType><ipAddress>203.0.113.44</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>",
+          `<RunInstancesResponse><instancesSet><item><instanceId>i-fallback</instanceId><instanceType>${instanceType}</instanceType><ipAddress>203.0.113.44</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`,
         );
       }
       return ec2XMLResponse(
@@ -4022,6 +4285,7 @@ function awsMarketFallbackHarness(
       "eu-west-1",
     ),
     config: leaseConfig({
+      awsRootGB: 400,
       provider: "aws",
       serverType: instanceTypes[0] ?? "t3.small",
       serverTypeExplicit: instanceTypes.length === 1,

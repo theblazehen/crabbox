@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"math/bits"
 	"net"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -826,6 +828,254 @@ func TestTypeRFBTextHonorsCanceledContextDuringInputReady(t *testing.T) {
 	}
 }
 
+func TestTypeRFBTextReleasesPressedKeyWhenInterrupted(t *testing.T) {
+	errInjected := errors.New("injected key-up failure")
+	for _, tt := range []struct {
+		name          string
+		afterKeyEvent func(client net.Conn, cancel context.CancelFunc, down bool) error
+		wantErr       error
+		wantRelease   string
+		wantEvents    []string
+	}{
+		{
+			name: "canceled after key down with expired deadline",
+			afterKeyEvent: func(client net.Conn, cancel context.CancelFunc, down bool) error {
+				if down {
+					cancel()
+					_ = client.SetDeadline(time.Now())
+				}
+				return nil
+			},
+			wantErr:    context.Canceled,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "canceled after key down with closed transport",
+			afterKeyEvent: func(client net.Conn, cancel context.CancelFunc, down bool) error {
+				if down {
+					cancel()
+					_ = client.Close()
+				}
+				return nil
+			},
+			wantErr:     context.Canceled,
+			wantRelease: "release RFB key",
+			wantEvents:  []string{"down a"},
+		},
+		{
+			name: "deadline expires before key up",
+			afterKeyEvent: func(client net.Conn, _ context.CancelFunc, down bool) error {
+				if down {
+					_ = client.SetWriteDeadline(time.Now())
+				}
+				return nil
+			},
+			wantErr:    os.ErrDeadlineExceeded,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "complete key down write with error is released",
+			afterKeyEvent: func(_ net.Conn, _ context.CancelFunc, down bool) error {
+				if down {
+					return errInjected
+				}
+				return nil
+			},
+			wantErr:    errInjected,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "canceled after key up confirms without double release",
+			afterKeyEvent: func(_ net.Conn, cancel context.CancelFunc, down bool) error {
+				if !down {
+					cancel()
+				}
+				return nil
+			},
+			wantErr:    context.Canceled,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "complete key up write with error confirms without double release",
+			afterKeyEvent: func(_ net.Conn, _ context.CancelFunc, down bool) error {
+				if !down {
+					return errInjected
+				}
+				return nil
+			},
+			wantErr:    errInjected,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			useRFBInputReadySettle(t, 0)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+
+			type serverResult struct {
+				events []string
+				err    error
+			}
+			serverDone := make(chan serverResult, 1)
+			go func() {
+				events, err := serveTestTypeRFBRecordingInput(server, "ec2-user", "example-pass")
+				serverDone <- serverResult{events: events, err: err}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			conn := &rfbKeyEventHookConn{Conn: client, afterKeyEvent: func(down bool) error {
+				return tt.afterKeyEvent(client, cancel, down)
+			}}
+			err := typeRFBTextFromConn(ctx, conn, rfbCredentials{
+				Username: "ec2-user",
+				Password: "example-pass",
+			}, localWebVNCAuthARD, "ab")
+			_ = client.Close()
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error=%v, want %v", err, tt.wantErr)
+			}
+			if tt.wantRelease == "" && strings.Contains(err.Error(), "release") {
+				t.Fatalf("error=%v, want no release failure", err)
+			}
+			if tt.wantRelease != "" && !strings.Contains(err.Error(), tt.wantRelease) {
+				t.Fatalf("error=%v, want %q", err, tt.wantRelease)
+			}
+			result := <-serverDone
+			if result.err != nil {
+				t.Fatalf("fake RFB server: %v", result.err)
+			}
+			if !slices.Equal(result.events, tt.wantEvents) {
+				t.Fatalf("client input=%q, want %q", result.events, tt.wantEvents)
+			}
+		})
+	}
+}
+
+func TestTypeRFBTextCompletesPartialKeyRelease(t *testing.T) {
+	for _, written := range []int{0, 1, 4, 7} {
+		t.Run(fmt.Sprintf("written=%d", written), func(t *testing.T) {
+			useRFBInputReadySettle(t, 0)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			type serverResult struct {
+				events []string
+				err    error
+			}
+			serverDone := make(chan serverResult, 1)
+			go func() {
+				events, err := serveTestTypeRFBRecordingInput(server, "ec2-user", "example-pass")
+				serverDone <- serverResult{events, err}
+			}()
+			conn := &rfbPartialKeyUpConn{Conn: client, written: written}
+			err := typeRFBTextFromConn(context.Background(), conn, rfbCredentials{
+				Username: "ec2-user", Password: "example-pass",
+			}, localWebVNCAuthARD, "ab")
+			_ = client.Close()
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("error=%v, want deadline exceeded", err)
+			}
+			result := <-serverDone
+			if result.err != nil {
+				t.Fatalf("fake RFB server: %v (events=%q)", result.err, result.events)
+			}
+			if want := []string{"down a", "up a", "frame"}; !slices.Equal(result.events, want) {
+				t.Fatalf("client input=%q, want %q", result.events, want)
+			}
+		})
+	}
+}
+
+type rfbPartialKeyUpConn struct {
+	net.Conn
+	written int
+	failed  bool
+}
+
+func (c *rfbPartialKeyUpConn) Write(p []byte) (int, error) {
+	if !c.failed && len(p) == 8 && p[0] == 4 && p[1] == 0 {
+		c.failed = true
+		if c.written > 0 {
+			if n, err := c.Conn.Write(p[:c.written]); err != nil {
+				return n, err
+			}
+		}
+		_ = c.Conn.SetWriteDeadline(time.Now())
+		return c.written, os.ErrDeadlineExceeded
+	}
+	return c.Conn.Write(p)
+}
+
+func TestReleaseRFBKeyAfterErrorBoundsCleanup(t *testing.T) {
+	for _, acceptRelease := range []bool{false, true} {
+		t.Run(fmt.Sprintf("acceptRelease=%t", acceptRelease), func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			if acceptRelease {
+				go func() {
+					// Accept the release and framebuffer request, but never reply.
+					_, _ = io.ReadFull(server, make([]byte, 8+10))
+				}()
+			}
+			started := time.Now()
+			err := releaseRFBKeyAfterError(client, 'a', 0, 2, 1, context.Canceled)
+			if !errors.Is(err, context.Canceled) || !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("error=%v, want cancellation and cleanup timeout", err)
+			}
+			if elapsed := time.Since(started); elapsed > rfbKeyReleaseTimeout+time.Second {
+				t.Fatalf("cleanup took %s, want bounded release", elapsed)
+			}
+			want := "release RFB key"
+			if acceptRelease {
+				want = "confirm RFB key release"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error=%v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestRFBKeyReleaseTunnelContextOutlivesCancellationByGrace(t *testing.T) {
+	const grace = 100 * time.Millisecond
+	cause := errors.New("caller stopped")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	tunnelCtx, stopTunnel := rfbKeyReleaseTunnelContext(ctx, grace)
+	defer stopTunnel()
+
+	started := time.Now()
+	cancel(cause)
+	select {
+	case <-tunnelCtx.Done():
+		t.Fatal("tunnel context ended with the caller context")
+	case <-time.After(grace / 2):
+	}
+	select {
+	case <-tunnelCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel context outlived its grace")
+	}
+	if elapsed := time.Since(started); elapsed < grace {
+		t.Fatalf("tunnel context ended after %s, want >= %s", elapsed, grace)
+	}
+	if !errors.Is(context.Cause(tunnelCtx), cause) {
+		t.Fatalf("tunnel cause=%v, want %v", context.Cause(tunnelCtx), cause)
+	}
+}
+
+func TestRFBKeyReleaseTunnelContextStopsImmediately(t *testing.T) {
+	tunnelCtx, stopTunnel := rfbKeyReleaseTunnelContext(context.Background(), time.Hour)
+	stopTunnel()
+	select {
+	case <-tunnelCtx.Done():
+	default:
+		t.Fatal("stopped tunnel context is still live")
+	}
+}
+
 func TestRFBKeysymForRuneRejectsUnsupportedControl(t *testing.T) {
 	if _, err := rfbKeysymForRune(0x1b); err == nil {
 		t.Fatal("Escape control character should be rejected")
@@ -1101,29 +1351,10 @@ func serveTestTypeRFB(conn net.Conn, username, password string, wantKeys []uint3
 		}
 		return nil
 	}
-	if err := serveTestARDHandshakeWithSecurityResult(conn, username, password, true); err != nil {
+	if err := serveTestTypeRFBInit(conn, username, password); err != nil {
 		return err
 	}
-	clientInit := []byte{0}
-	if _, err := io.ReadFull(conn, clientInit); err != nil {
-		return err
-	}
-	if clientInit[0] != 1 {
-		return errUnexpectedTestBytes("client init", clientInit)
-	}
-	const width, height = 2, 1
-	serverInit := make([]byte, 24)
-	binary.BigEndian.PutUint16(serverInit[0:2], width)
-	binary.BigEndian.PutUint16(serverInit[2:4], height)
-	serverInit[4] = 32
-	serverInit[5] = 24
-	serverInit[7] = 1
-	if _, err := conn.Write(serverInit); err != nil {
-		return err
-	}
-	if err := readTestRFBReadySetup(conn); err != nil {
-		return err
-	}
+	const width, height = testTypeRFBWidth, testTypeRFBHeight
 	if mode == testTypeRFBNoReadyFrame {
 		return conn.Close()
 	}
@@ -1148,6 +1379,91 @@ func serveTestTypeRFB(conn net.Conn, username, password string, wantKeys []uint3
 		return conn.Close()
 	}
 	return writeTestRFBRawFrame(conn, width, height, []byte{255, 0, 0, 255, 0, 0, 255, 255})
+}
+
+const testTypeRFBWidth, testTypeRFBHeight = 2, 1
+
+func serveTestTypeRFBInit(conn net.Conn, username, password string) error {
+	if err := serveTestARDHandshakeWithSecurityResult(conn, username, password, true); err != nil {
+		return err
+	}
+	clientInit := []byte{0}
+	if _, err := io.ReadFull(conn, clientInit); err != nil {
+		return err
+	}
+	if clientInit[0] != 1 {
+		return errUnexpectedTestBytes("client init", clientInit)
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], testTypeRFBWidth)
+	binary.BigEndian.PutUint16(serverInit[2:4], testTypeRFBHeight)
+	serverInit[4] = 32
+	serverInit[5] = 24
+	serverInit[7] = 1
+	if _, err := conn.Write(serverInit); err != nil {
+		return err
+	}
+	return readTestRFBReadySetup(conn)
+}
+
+// serveTestTypeRFBRecordingInput serves a ready typing session and records
+// key events and answered framebuffer requests until the client disconnects.
+func serveTestTypeRFBRecordingInput(conn net.Conn, username, password string) ([]string, error) {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := serveTestTypeRFBInit(conn, username, password); err != nil {
+		return nil, err
+	}
+	frame := []byte{0, 0, 255, 255, 0, 255, 0, 255}
+	if err := writeTestRFBRawFrame(conn, testTypeRFBWidth, testTypeRFBHeight, frame); err != nil {
+		return nil, err
+	}
+	var events []string
+	for {
+		messageType := []byte{0}
+		if _, err := io.ReadFull(conn, messageType); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+				return events, nil
+			}
+			return events, err
+		}
+		switch messageType[0] {
+		case 4:
+			event := make([]byte, 7)
+			if _, err := io.ReadFull(conn, event); err != nil {
+				return events, err
+			}
+			direction := "up"
+			if event[0] == 1 {
+				direction = "down"
+			}
+			events = append(events, fmt.Sprintf("%s %c", direction, rune(binary.BigEndian.Uint32(event[3:7]))))
+		case 3:
+			if _, err := io.ReadFull(conn, make([]byte, 9)); err != nil {
+				return events, err
+			}
+			if err := writeTestRFBRawFrame(conn, testTypeRFBWidth, testTypeRFBHeight, frame); err != nil {
+				return events, err
+			}
+			events = append(events, "frame")
+		default:
+			return events, errUnexpectedTestBytes("client message", messageType)
+		}
+	}
+}
+
+// rfbKeyEventHookConn runs afterKeyEvent once each RFB KeyEvent has been
+// written; a non-nil hook error is reported as the write error.
+type rfbKeyEventHookConn struct {
+	net.Conn
+	afterKeyEvent func(down bool) error
+}
+
+func (c *rfbKeyEventHookConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err == nil && len(p) == 8 && p[0] == 4 {
+		err = c.afterKeyEvent(p[1] == 1)
+	}
+	return n, err
 }
 
 func serveTestARDHandshakeWithSecurityResult(conn net.Conn, username, password string, success bool) error {
@@ -1533,4 +1849,12 @@ func errUnexpectedTestBytes(label string, got []byte) error {
 
 func errUnexpectedTestString(label, got string) error {
 	return testError(label + " mismatch: " + got)
+}
+
+func preflightRFBAuthenticationFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials) error {
+	return preflightRFBAuthenticationFromConnWithMode(ctx, conn, creds, localWebVNCAuthAuto)
+}
+
+func negotiateRFBSecurityType(conn net.Conn, creds rfbCredentials) (byte, error) {
+	return negotiateRFBSecurityTypeForMode(conn, creds, localWebVNCAuthAuto)
 }

@@ -3,6 +3,7 @@ package tencentcloud
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -118,7 +119,7 @@ func (b *Backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 			cleanupErr := client.TerminateInstance(cleanupCtx, createdID)
 			cancel()
 			if cleanupErr != nil {
-				err = fmt.Errorf("%v; tencentcloud cleanup failed: %w", err, cleanupErr)
+				err = shared.JoinAcquireCleanupError(err, fmt.Errorf("tencentcloud cleanup failed: %w", cleanupErr))
 			}
 		}
 		core.RemoveStoredTestboxKey(leaseID)
@@ -171,6 +172,10 @@ func buildRunInstanceRequest(cfg core.Config, leaseID, slug, publicKey string, t
 	if err != nil {
 		return runInstanceRequest{}, err
 	}
+	userData, err := tencentCloudUserData(core.WithGuestLeaseExpiry(cfg, labelsFromTags(tags)), publicKey)
+	if err != nil {
+		return runInstanceRequest{}, err
+	}
 	req := runInstanceRequest{
 		InstanceChargeType: chargeType,
 		Placement:          placement{Zone: zoneForConfig(cfg)},
@@ -178,7 +183,7 @@ func buildRunInstanceRequest(cfg core.Config, leaseID, slug, publicKey string, t
 		InstanceType:       serverTypeForConfig(cfg),
 		InstanceCount:      1,
 		InstanceName:       core.LeaseProviderName(leaseID, slug),
-		UserData:           base64.StdEncoding.EncodeToString([]byte(core.CloudInitUserData(cfg, publicKey))),
+		UserData:           userData,
 		ClientToken:        strings.ReplaceAll(core.ProviderKeyForLease(leaseID), "_", "-"),
 		TagSpecification: []tagSpecification{{
 			ResourceType: "instance",
@@ -202,6 +207,20 @@ func buildRunInstanceRequest(cfg core.Config, leaseID, slug, publicKey string, t
 		req.SecurityGroupIDs = []string{cfg.TencentCloud.SecurityGroupID}
 	}
 	return req, nil
+}
+
+func tencentCloudUserData(cfg core.Config, publicKey string) (string, error) {
+	compressed, err := core.GzipCloudInit(core.CloudInitUserData(cfg, publicKey))
+	if err != nil {
+		return "", fmt.Errorf("gzip Tencent Cloud user data: %w", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(compressed)
+	// Keep even the encoded field within CVM's documented 16 KB user-data limit.
+	// https://www.tencentcloud.com/document/api/213/15730
+	if len(encoded) > 16*1024 {
+		return "", fmt.Errorf("Tencent Cloud user-data limit is 16 KiB; compressed base64 cloud-init is %d bytes", len(encoded))
+	}
+	return encoded, nil
 }
 
 func tencentCloudChargeType(cfg core.Config) (string, error) {
@@ -510,31 +529,24 @@ func (b *Backend) deleteServer(ctx context.Context, _ core.Config, server core.S
 }
 
 func (b *Backend) waitForInstanceIP(ctx context.Context, client tencentCloudAPI, id string) (instance, error) {
-	deadline := b.clockNow().Add(5 * time.Minute)
-	result, err := shared.Poll(context.WithoutCancel(ctx), 0, 3*time.Second,
-		func(context.Context, time.Duration) error {
-			if err := shared.SleepContext(ctx, 3*time.Second); err != nil {
-				return ctx.Err()
-			}
-			return nil
+	return shared.PollReadiness(ctx, shared.ReadinessOptions[instance]{
+		Timeout: 5 * time.Minute, Interval: 3 * time.Second,
+		IsResponseError: func(err error) bool {
+			var responseErr *apiError
+			return errors.As(err, &responseErr)
 		},
-		func(context.Context) (instance, error) { return client.GetInstance(ctx, id) },
-		func(_ context.Context, item instance, fetchErr error) (bool, error) {
-			if fetchErr != nil {
-				return false, fetchErr
+		Check: func(item instance, err error) (bool, error) {
+			return err == nil && publicIPv4(item) != "", err
+		},
+		Diagnostic: func(stop shared.ReadinessStop) error {
+			if stop.BudgetExpired {
+				return core.Exit(5, "timed out waiting for Tencent Cloud instance IP")
 			}
-			if publicIPv4(item) != "" {
-				return true, nil
-			}
-			if b.clockNow().After(deadline) {
-				return false, core.Exit(5, "timed out waiting for Tencent Cloud instance IP")
-			}
-			return false, nil
-		}, nil)
-	if err != nil {
-		return instance{}, err
-	}
-	return result.Value, nil
+			return stop.Err
+		},
+	}, func(observeCtx context.Context) (instance, error) {
+		return client.GetInstance(observeCtx, id)
+	})
 }
 
 func (b *Backend) clockNow() time.Time {

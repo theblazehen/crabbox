@@ -1542,23 +1542,6 @@ func TestResolveReadOnlyIgnoresStaleDropletClaim(t *testing.T) {
 	}
 }
 
-func TestStatusTouchClaimRequiresMatchingAccount(t *testing.T) {
-	backend := &digitalOceanLeaseBackend{}
-	claim := core.LeaseClaim{Labels: map[string]string{digitalOceanAccountLabel: "team:account-a"}}
-	lease := core.LeaseTarget{Server: core.Server{Labels: map[string]string{digitalOceanAccountLabel: "team:account-a"}}}
-	if !backend.StatusTouchClaimMatches(lease, claim) {
-		t.Fatal("matching account identity was rejected")
-	}
-	lease.Server.Labels[digitalOceanAccountLabel] = "team:account-b"
-	if backend.StatusTouchClaimMatches(lease, claim) {
-		t.Fatal("mismatched account identity was accepted")
-	}
-	delete(claim.Labels, digitalOceanAccountLabel)
-	if backend.StatusTouchClaimMatches(lease, claim) {
-		t.Fatal("missing claim account identity was accepted")
-	}
-}
-
 func TestResolveNumericIdentifierPrefersDropletIDOverSlug(t *testing.T) {
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
@@ -3014,8 +2997,8 @@ func TestTouchIdleTimeoutIntent(t *testing.T) {
 		{name: "omitted preserves remote policy", stored: "300", fallback: time.Minute, want: 5 * time.Minute},
 		{name: "omitted preserves legacy policy", stored: "300", legacy: true, fallback: time.Minute, want: 5 * time.Minute},
 		{name: "missing policy uses request fallback", fallback: 2 * time.Minute, want: 2 * time.Minute},
-		{name: "explicit policy beats fallback and TTL caps expiry", stored: "300", fallback: time.Minute, override: &override, want: override},
-		{name: "explicit policy without fallback", stored: "300", override: &override, want: override},
+		{name: "explicit policy beats fallback and TTL caps idle", stored: "300", fallback: time.Minute, override: &override, want: time.Hour},
+		{name: "explicit policy without fallback", stored: "300", override: &override, want: time.Hour},
 		{name: "failed write does not publish policy", stored: "300", override: &override, writeErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3883,8 +3866,8 @@ func TestApplyDigitalOceanDefaultsUseProviderDefaults(t *testing.T) {
 
 	applyDigitalOceanDefaults(&cfg)
 
-	if cfg.DigitalOcean.Region != "nyc3" {
-		t.Fatalf("DigitalOcean.Region=%q want %q", cfg.DigitalOcean.Region, "nyc3")
+	if cfg.DigitalOcean.Region != "" {
+		t.Fatalf("DigitalOcean.Region=%q want automatic selection", cfg.DigitalOcean.Region)
 	}
 	if cfg.DigitalOcean.Image != "ubuntu-24-04-x64" {
 		t.Fatalf("DigitalOcean.Image=%q want %q", cfg.DigitalOcean.Image, "ubuntu-24-04-x64")
@@ -3892,7 +3875,7 @@ func TestApplyDigitalOceanDefaultsUseProviderDefaults(t *testing.T) {
 	if cfg.SSHUser != "root" || cfg.SSHPort != "22" || len(cfg.SSHFallbackPorts) != 0 {
 		t.Fatalf("effective ssh defaults=%s@:%s fallback=%v", cfg.SSHUser, cfg.SSHPort, cfg.SSHFallbackPorts)
 	}
-	if cfg.ServerType != "s-1vcpu-1gb" {
+	if cfg.ServerType != "g-32vcpu-128gb" {
 		t.Fatalf("ServerType=%q want digitalocean default", cfg.ServerType)
 	}
 }

@@ -57,6 +57,31 @@ the coordinator. The dedicated
 SSM-only workspace API path. See [Architecture](../architecture.md) for the full
 topology.
 
+Legacy create failures use an optional synchronous `provisioningFailureEvidence`
+provider capability. AWS and Hetzner report facts from their own failure markers,
+resource identities, and owned key evidence against the current read-only lease
+snapshot. The coordinator calls it only after the lease reread, generation check,
+and existing cleanup-custody and unresolved-resource guards. This hook is pure:
+it performs no I/O, state writes, or recovery scheduling. Core retains generic
+typed cleanup claims and uncertain outcomes, and owns all state transitions,
+retention decisions, cleanup custody, completion, and retry scheduling.
+Provider-private errors do not acquire another adapter's cleanup authority.
+
+Cancellation after provisioning starts remains uncertain until resource evidence
+resolves it; a missing cloud ID alone never proves that allocation did not happen.
+Core can schedule immediate cleanup for an owned pending key when there is no
+remaining allocation uncertainty or recorded resource. Otherwise cleanup keeps
+the normal five-minute retry delay and the unresolved allocation evidence.
+
+Alarm reconciliation, maintenance discovery, provider-access collection, live
+slug lookup, and registration conflicts use a durable maintenance-candidate
+index after bounded backfill. Membership is updated beside every lease write;
+terminal history without pending work is excluded. A daily bounded audit repairs
+missing entries, and version changes restore the full-history fallback until
+backfill finishes. History, accounting, and resource-ownership scans continue to
+read all leases. See the [overload audit](../diagnostics/coordinator-overload.md)
+for coverage, completion logs, and remaining work.
+
 ## Durable Azure provisioning
 
 `CRABBOX_DURABLE_PROVISIONING_ADMISSION=true` opts new eligible creates into the
@@ -108,8 +133,9 @@ resource and deletion evidence are preserved independently.
 Read-only lease lookups (including authoritative provider metadata), lease
 lists and audits, pool inventory, run history/events/logs, health, identity, and
 provider readiness use a 60-second total read budget. Each attempt allows
-30 seconds, including authentication, response-body reads, and any eligible
-read-only curl fallback.
+30 seconds, including authentication and response-body reads.
+HTTP and HTTPS targets retain the native transport, proxy configuration and
+verifier on every attempt; the CLI never switches automatically to external curl.
 An earlier caller deadline always wins, and cancellation interrupts both requests
 and backoff waits.
 
@@ -215,6 +241,11 @@ unauthenticated, rejects `/v1/internal/*` externally, and otherwise
 authenticates and forwards to the fleet. Cloudflare cron or pg-boss
 reconciliation runs maintenance.
 
+Health is public and uncached. On Cloudflare it includes `version.id` and
+`version.tag` from the existing version metadata binding, so deployment checks
+can match the serving version to the uploaded commit. Other runtimes omit
+`version` when that binding is unavailable. Health does not access fleet storage.
+
 Public and user-scoped routes:
 
 ```text
@@ -304,15 +335,84 @@ missing receipt endpoint makes the new CLI fail visibly. Legacy CLIs may still
 finish without receipts. Roll out the coordinator before distributing a
 receipt-bearing CLI.
 
+Run-history finish retries transient HTTP 5xx, HTTP 429, and transport failures
+up to three times, with 250 ms between attempts within one 60-second budget.
+Each attempt sends the same terminal payload; the coordinator fingerprints it,
+returns the existing result on an identical replay, and rejects conflicting
+finishes with HTTP 409. The terminal record, receipt, log reference, and final
+event commit together. If the commit acknowledgement fails, an uncached
+transactional reread can confirm that exact finish without adding another event.
+Referenced logs are preserved; an unreadable result retains staged logs and
+returns the original error for client recovery. Exhausting the retry budget
+still reports terminal recording failure with the run ID and receipt recovery
+command. A successful lease release alone does not confirm run-history finish.
+
+Legacy create admission commits the bound attempt, canonical provisioning lease,
+and recovery wake together. Publication likewise commits the active lease,
+attempt's cloud identity, access bookkeeping, and wake in one storage transaction.
+Provider calls remain outside those transactions. Only explicitly retryable
+storage failures receive up to three transaction attempts with jitter, with no
+new attempt started after the 500 ms retry budget. An ambiguous commit triggers
+an uncached, transactional reread of the exact lease, attempt, and wake. Missing,
+changed, or unreadable evidence retains uncertainty; it never authorizes another
+provider allocation. The existing token/owner/org/generation and cancellation
+fences still apply.
+
+Lease create admission has a 30-second deadline, including time waiting for the
+coordinator lifecycle mutex and durable provider preparation. If admission has
+not begun committing by then, the coordinator returns HTTP 503
+`lease_admission_timeout` with `retryable: true` and `Retry-After: 2`. Expired
+admission work cannot later write a lease; clients can retry the same lease ID
+and create-attempt token. Once the admission commit begins, it finishes normally,
+and this deadline does not limit subsequent provider provisioning. For
+`POST /v1/leases/from-checkpoint`, binding the checkpoint use claim is the
+commit point: a bound claim cannot be reopened for a same-token retry, so the
+deadline no longer applies after it.
+
+The Cloudflare Worker retries an ordinary token-bound `POST /v1/leases` or
+`POST /v1/leases/resource-constrained` once against a fresh Durable Object stub
+after a thrown runtime-reset error. Unbound
+POSTs, other mutations, and returned HTTP 5xx responses do not receive this
+boundary replay. Request/response fields and status contracts are unchanged.
+This does not enable durable provisioning admission or repair absent ownership
+records. Same-runtime unsettled creates retain the existing protection against
+age-only cleanup; reconstruction uses a fresh runtime generation.
+
+Pending legacy creates retain a maintenance wake at most one minute away. On the
+first tick that observes lost runtime ownership, a hostless interrupted create
+becomes `failed` with `provisioningFailureRetryable=true` and
+`provisioningResourceMayExist=true`. Polling clients stop waiting immediately;
+same-attempt replay returns the terminal lease and its interruption cause.
+Retryable recovery is not permission to allocate again: AWS legacy attempts do
+not retain frozen launch inputs, so recovery never reissues `RunInstances`.
+The five-minute settle and thirty-minute absence-confirmation windows apply only
+to resource recovery and cleanup. A late resource is recovered for cleanup,
+and an empty inventory read does not immediately establish absence.
+
+Lease views expose the nonsecret `provisioningPhase`: `preparing`,
+`provider-request` (the provider call has started; submission is not confirmed),
+`awaiting-instance` (a cloud identity is recorded), or `interrupted-recovering`.
+CLI status/inspect output and create progress include the latest observed phase.
+Before the first create response, progress reports `awaiting-response`.
+
 The fixed-ID `PUT` route is fail-closed and does not replace legacy `POST`.
 It atomically reserves a versioned normalized immutable request hash before
 provider work. An identical owner-scoped replay returns an active lease or the
 same provisioning record; the same request against its terminal record returns
-`fixed_lease_terminal`, while request drift and terminal-ID reuse by a different
+`fixed_lease_terminal` (or the definite failure described below), while request drift and terminal-ID reuse by a different
 request return `lease_id_conflict`. Neither terminal response invokes the
 provider. CLIs using `--lease-id` poll a provisioning replay until it becomes
 active or terminal. Coordinators that predate this route return not found before
 any create side effect.
+When the coordinator records a create as failed with no possible provider
+resource, creation returns HTTP 422 `provisioning_failed` with a diagnostic
+`message`, regardless of provider. A token-bound POST replay or matching fixed-ID
+PUT returns the same failure without provisioning again. The CLI stops immediately
+and skips create cancellation, including when that reply resolves an earlier lost
+response. Unknown allocation outcomes remain server errors and retain recovery and
+cleanup custody; a timeout, failed persistence, or missing instance ID is not
+rejection evidence. Provider-owned key cleanup can continue after a definite
+machine rejection.
 If the PUT response is ambiguous, the CLI repeats the full identical PUT until
 the coordinator atomically confirms the same stored intent or returns a
 conflict/definite error. Public GET is used only after that PUT confirmation,
@@ -394,6 +494,8 @@ Admin-scoped routes:
 ```text
 GET    /v1/pool
 GET    /v1/admin/leases
+GET    /v1/admin/leases/{id}/retire-create
+POST   /v1/admin/leases/{id}/retire-create
 GET    /v1/admin/lease-audit
 GET    /v1/admin/aws-identity
 GET    /v1/admin/providers/identity
@@ -441,6 +543,43 @@ runner leases stay visible without leaking to normal users. External runner rows
 Actions links and stale markers; clicking one opens its visibility-only detail
 page at `/portal/runners/{provider}/{runner-id}`.
 
+Portal home includes at most 200 visible, non-stale external runners. Both the
+portal and `GET /v1/runners` deduplicate visible rows by provider, runner ID, and
+organization, keeping the newest `lastSeenAt` before filtering. Non-admin callers
+still see only their own owner/org rows. A row whose `lastSeenAt` is more than two
+hours old (`EXTERNAL_RUNNER_FRESHNESS`) is treated as stale for display and API
+filters, without changing storage. Exactly two hours old remains fresh.
+`GET /v1/runners` applies its provider, status, and stale filters before selecting
+results by newest `updatedAt`, with non-stale runners first;
+it defaults to 100 results and caps `limit` at 200. The response keeps its
+`runners` array and includes `truncated: true` when more matching rows exist.
+Runner detail lookup is independent of this cap. Reads and deduplication use
+bounded batches and uncached storage pages of at most 128 records. Maintenance
+deletes runners whose `lastSeenAt` is more than seven days old, regardless of the
+stored stale flag, and stale runners whose `updatedAt` is more than seven days
+old. It scans at most 128 records per alarm with a durable cursor and hourly
+repeat scans, transactionally rechecking each deletion against concurrent sync.
+
+`POST /v1/runners/sync` accepts optional `inventoryScope: "org"` for a complete
+provider/org inventory. Missing runners are then marked stale across all owners
+in that provider/org. Without the field, sync retains the legacy caller-owner/org
+scope; any other field value is rejected. The CLI sets this field for its
+`blacksmith testbox list --all` inventory only when `blacksmith.org` is configured
+explicitly; otherwise the listing may reflect the login's default org, and the
+sync stays caller-scoped. Incoming rows remain owned by
+the caller, and other providers and organizations are untouched. Non-admin sync
+responses include only the caller's rows, even when staling other owners' copies.
+
+Runner synchronization scans historical records in uncached pages and settles bounded
+write batches before returning. It preserves the complete visible `runners` and
+newly `stale` response arrays, including their order and legacy record identities.
+Working memory no longer grows with unrelated or already-stale history; response
+memory still grows with the number and size of newly stale records returned.
+The scan still visits historical runner keys to preserve legacy key compatibility.
+After that read pass, org-wide sync marks other owners' copies stale in bounded
+transactions at their existing keys, rechecking for newer observations before
+writing. Only caller-visible rows are retained for the response.
+
 The CLI's best-effort external-runner sync has a single five-second budget
 covering inventory, optional Actions enrichment, credential resolution, and the
 HTTP request/response. Earlier caller deadlines still apply. Once canceled, the
@@ -455,6 +594,39 @@ stop action. `/portal/runs/{run-id}` shows the command, owner, lease, exit
 status, JUnit summary, an event table, and a log tail. The portal run pages mirror
 the `/v1/runs/...` resources but authenticate via the session cookie, so logs and
 events are inspectable without pasting a bearer token into the browser.
+
+## Lease listing paths
+
+`GET /v1/leases` and `GET /v1/admin/leases` share the same selection rules.
+`state=active` or `state=provisioning` reads `lease-maintenance:` once that index
+is ready. Otherwise `view=current` reads `lease-current:` once ready. Other
+queries, and queries whose selected index has not completed backfill, scan
+`lease:` history. Provider, owner, org and visibility filters still apply to the
+freshly loaded lease; index membership never grants access. Legacy requests keep
+their newest-first ordering and existing result limit.
+
+`pagination=keyset-v1&limit=100&projection=summary` reads at most one storage
+page per request, omits large histories, and returns an opaque `nextCursor` even
+when a page contains no visible matches. Continue until the cursor is absent.
+The sealed cursor binds the storage source: raw cursors continue scanning history
+even if an index becomes ready. An index cursor used with filters selecting a
+different source returns `400 invalid_lease_cursor`; an index cursor whose index
+is no longer ready returns `409 lease_cursor_expired`, requiring a fresh listing.
+These are keyset walks, not snapshots of concurrent lease updates.
+
+The CLI uses current summary pages for `crabbox list` and active admin summary
+pages for the orphan lookup in `crabbox list --all`. Older coordinators retain
+the legacy listing fallback. If the active lookup reaches its legacy 500-row limit, the
+CLI warns that orphan status may be incomplete; lookup failures keep the
+existing unavailable-status warning.
+
+Both indexes are maintained with lease writes and deletes. Each has independent
+bounded backfill (32 pages of 128 records per maintenance pass), a daily repair
+audit, and an immediate audit on runtime-generation changes. The current index
+uses the existing definition: live leases, or retained leases (`keep=true` or
+`releaseDeletesServer=false`) without confirmed provider cleanup. Legacy kept
+leases can therefore remain current until cleanup or a retention policy resolves
+them. The maintenance index's state key and version remain unchanged.
 
 ## Lease lifecycle through the broker
 
@@ -582,7 +754,12 @@ Late close, error, and queued message callbacks for a retired notification
 socket are ignored without rereading its attachment; a replacement socket with
 the same client ID is unaffected.
 Subscription relevance is checked before asynchronous grant revalidation;
-both run access and a current grant are still required before sending. Receipt
+both run access and a current grant are still required before sending. Non-admin
+controls bind to the opening shared-token hash or encrypted GitHub user grant,
+including Portal logout when applicable. Rotated, revoked, expired, or
+unverifiable grants close the control socket; restored legacy controls must
+reconnect. Queued heartbeats recheck authorization before mutating leases.
+GitHub membership changes follow the configured positive-cache window. Receipt
 validation, storage, and grant-validation errors remain errors. Identical finish
 replays are idempotent; conflicting terminal evidence still returns `409`.
 
@@ -603,3 +780,30 @@ bake/promote, Mac-host management, identity) are invoked through admin routes.
 - [CLI](../cli.md)
 - [Browser portal](portal.md)
 - [usage command](../commands/usage.md)
+
+## Isolate reset recovery and memory
+
+Legacy lease admission records the owning runtime before provider preparation.
+If that runtime disappears, the next maintenance tick publishes an inspectable
+failure, including when a resource ID arrived before readiness. Captured
+resources keep provider-owned cleanup; requests whose allocation outcome is
+unknown keep settlement and absence-confirmation checks. Replaying the same
+create attempt cannot allocate a replacement for that failed lease.
+
+Usage and lease-history consumers scan bounded uncached storage pages. Log
+downloads stream stored chunks and stop reading on cancellation; active readers
+defer retention pruning until they close. Portal run
+previews retain only their displayed tail. See the
+[fleet memory audit](../diagnostics/coordinator-memory.md) for measured scan
+bounds, remaining memory risks, and production telemetry needed for attribution.
+
+Pool entries and fill claims, image catalogs, checkpoint ownership and use claims,
+and dynamic runner indexes use uncached pages of at most 128 records. Transactional
+scans retain their existing transaction boundaries. Paging bounds storage reads;
+operations returning complete lists still retain their matching results. Catalog
+retirement and dynamic runner expiry keep their existing retention rules.
+
+Alarm reconciliation reads per-lease ownership and workspace state only for
+leases that can contribute a wake; the
+[overload audit](../diagnostics/coordinator-overload.md) covers request
+queueing, Cloudflare error 1101, and the remaining history-proportional walks.

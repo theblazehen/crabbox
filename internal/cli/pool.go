@@ -21,6 +21,8 @@ func (a App) list(ctx context.Context, args []string) error {
 	fs := newFlagSet("list", a.Stderr)
 	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	jsonOut := fs.Bool("json", false, "print JSON")
+	jsonlOut := fs.Bool("jsonl", false, "stream one JSON object per line")
+	retained := fs.Bool("retained", false, "include kept terminal coordinator leases (ignored by direct providers)")
 	all := fs.Bool("all", false, "include provider inventory outside Crabbox-owned leases where supported")
 	refresh := fs.Bool("refresh", false, "refresh provider-backed state where supported")
 	pondFilter := fs.String("pond", "", "only list leases tagged with this pond")
@@ -29,17 +31,17 @@ func (a App) list(ctx context.Context, args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	cfg, err := loadConfig()
+	if *jsonOut && *jsonlOut {
+		return Exit(2, "--json and --jsonl are mutually exclusive")
+	}
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
 	if err := prepareProviderSelection(&cfg, *provider); err != nil {
 		return err
 	}
-	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
-		return err
-	}
-	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
+	if err := applyTargetAndProviderFlags(&cfg, fs, targetFlags, providerFlags); err != nil {
 		return err
 	}
 	if err := finalizeProviderSelection(&cfg); err != nil {
@@ -53,9 +55,18 @@ func (a App) list(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *jsonOut {
+	req := ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh, Retained: *retained}
+	if streaming, ok := backend.(StreamingListBackend); ok {
+		return a.renderStreamingList(ctx, cfg, backend, streaming, req, pondName, *jsonOut, *jsonlOut)
+	}
+	if !*jsonOut && !*jsonlOut {
+		if err := renderListHeader(a.Stdout); err != nil {
+			return err
+		}
+	}
+	if *jsonOut || *jsonlOut {
 		if jsonBackend, ok := backend.(JSONListBackend); ok {
-			view, err := jsonBackend.ListJSON(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh})
+			view, err := jsonBackend.ListJSON(ctx, req)
 			if err != nil {
 				return err
 			}
@@ -63,15 +74,15 @@ func (a App) list(ctx context.Context, args []string) error {
 			if pondName != "" {
 				view = filterJSONListViewByPond(view, pondName)
 			}
-			return json.NewEncoder(a.Stdout).Encode(view)
+			return writeListJSON(a.Stdout, view, *jsonlOut)
 		}
 	}
 	var servers []Server
 	switch b := backend.(type) {
 	case SSHLeaseBackend:
-		servers, err = b.List(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh})
+		servers, err = b.List(ctx, req)
 	case DelegatedRunBackend:
-		servers, err = b.List(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh})
+		servers, err = b.List(ctx, req)
 	default:
 		return Exit(2, "provider=%s does not support list", backend.Spec().Name)
 	}
@@ -82,11 +93,10 @@ func (a App) list(ctx context.Context, args []string) error {
 	if pondName != "" {
 		servers = filterServersByPond(servers, pondName)
 	}
-	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(servers)
+	if *jsonOut || *jsonlOut {
+		return writeListJSON(a.Stdout, servers, *jsonlOut)
 	}
-	renderServerList(a.Stdout, servers)
-	return nil
+	return renderServerList(a.Stdout, servers)
 }
 
 // filterJSONListViewByPond filters a list-view payload (whatever shape the
@@ -309,7 +319,13 @@ func syncExternalRunners(ctx context.Context, cfg Config, backend Backend) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err = client.SyncExternalRunners(ctx, "blacksmith-testbox", runners)
+	// Org scope lets the coordinator stale other owners' rows, so claim it only when the
+	// listing used an explicit Blacksmith org instead of the CLI login's default org.
+	scope := ""
+	if strings.TrimSpace(cfg.Blacksmith.Org) != "" {
+		scope = "org"
+	}
+	_, err = client.SyncExternalRunners(ctx, "blacksmith-testbox", runners, scope)
 	return err
 }
 
@@ -535,17 +551,14 @@ func (a App) cleanup(ctx context.Context, args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	cfg, err := loadConfig()
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
 	if err := prepareProviderSelection(&cfg, *provider); err != nil {
 		return err
 	}
-	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
-		return err
-	}
-	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
+	if err := applyTargetAndProviderFlags(&cfg, fs, targetFlags, providerFlags); err != nil {
 		return err
 	}
 	if err := finalizeProviderSelection(&cfg); err != nil {
@@ -567,17 +580,14 @@ func (a App) cleanup(ctx context.Context, args []string) error {
 
 func shouldCleanupServer(server Server, now time.Time) (bool, string) {
 	labels := server.Labels
-	if labels == nil {
+	if labels == nil || labels["crabbox"] != "true" {
 		return false, "missing labels"
-	}
-	if strings.EqualFold(labels["keep"], "true") {
-		return false, "keep=true"
 	}
 	state := strings.ToLower(labels["state"])
 	switch state {
 	case "running", "provisioning":
 		expiresAt, ok := cleanupExpiry(labels)
-		if ok && now.After(expiresAt.Add(12*time.Hour)) {
+		if ok && now.After(expiresAt.Add(time.Hour)) {
 			return true, "stale state=" + state
 		}
 		return false, "state=" + state
@@ -595,7 +605,7 @@ func shouldCleanupServer(server Server, now time.Time) (bool, string) {
 	if !ok {
 		return false, "missing expires_at"
 	}
-	if now.Before(expiresAt) {
+	if !now.After(expiresAt) {
 		return false, "not expired"
 	}
 	return true, "expired"
@@ -611,7 +621,7 @@ func cleanupExpiry(labels map[string]string) (time.Time, bool) {
 		if value == "" {
 			continue
 		}
-		if parsed, ok := parseLeaseLabelTime(value); ok {
+		if parsed, ok := parseLeaseLabelTime(value); ok && guestExpiryTimeValid(parsed) {
 			return parsed, true
 		}
 	}

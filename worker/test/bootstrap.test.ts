@@ -13,6 +13,8 @@ import {
   windowsBootstrapPowerShell,
 } from "../src/bootstrap";
 import {
+  psQuote,
+  sharedLinuxBootstrapPrelude,
   sharedGnomeDesktopTheme,
   sharedWindowsRuntime,
   sharedWindowsRuntimeGate,
@@ -136,7 +138,7 @@ describe("native Windows runtime readiness", () => {
       expect(script).toContain("Restart-Service sshd -Force");
     }
     expect(shared).toContain(sharedWindowsNativePrelude());
-    expect(shared).toContain(sharedWslTruffleHogInstall());
+    expect(shared).toContain(psQuote(sharedWslTruffleHogInstall()).slice(1, -1));
     expect(shared.indexOf('$wslDistro = "Crabbox"')).toBeGreaterThan(
       shared.indexOf(sharedWindowsCore()) + sharedWindowsCore().length,
     );
@@ -262,17 +264,17 @@ describe("cloud-init bootstrap", () => {
     ({ awsPrivate, failure }) => {
       const fixture = mkdtempSync(join(tmpdir(), "crabbox-ready-"));
       try {
-        for (const tool of ["git", "rsync", "curl", "jq", "tmux", "flock", "systemctl", "ss"]) {
-          writeFileSync(
-            join(fixture, tool),
-            "#!/bin/sh\n" +
-              (tool === "ss" ? 'printf "%s\\n" "${SOCKETS-127.0.0.1:5900}"\n' : "") +
-              '[ "${FAIL_TOOL-}" != "' +
-              tool +
-              '" ]\n',
-            { mode: 0o755 },
-          );
-        }
+        // Stub tools as shell functions and source the checks: executing
+        // freshly written files costs a per-file exec policy check on macOS,
+        // which pushed these cases past the timeout under parallel load.
+        const stubs = ["git", "rsync", "curl", "jq", "tmux", "flock", "systemctl", "ss"]
+          .map(
+            (tool) =>
+              `${tool}() { ${
+                tool === "ss" ? 'printf "%s\\n" "${SOCKETS-127.0.0.1:5900}"; ' : ""
+              }[ "\${FAIL_TOOL-}" != ${tool} ]; }\n`,
+          )
+          .join("");
         symlinkSync("/usr/bin/grep", join(fixture, "grep"));
         const generated = cloudInit({
           ...config,
@@ -280,28 +282,46 @@ describe("cloud-init bootstrap", () => {
           awsPrivate,
           workRoot: fixture,
         });
-        const lines = generated
-          .split("  - path: /usr/local/bin/crabbox-ready\n")[1]
-          .split("    content: |\n")[1]
-          .split("\n");
-        const end = lines.findIndex((line) => line !== "" && !line.startsWith("      "));
-        const script = lines
-          .slice(0, end)
-          .map((line) => line.slice(6))
-          .join("\n")
-          .replaceAll("/var/lib/crabbox/bootstrapped", join(fixture, "bootstrapped"))
-          .replaceAll(fixture + "/workspaces", fixture);
-        expect(script).toMatch(/^#!\/bin\/sh\nset -eu\n/);
-        writeFileSync(join(fixture, "bootstrapped"), "");
-        if (failure === "marker") rmSync(join(fixture, "bootstrapped"));
-        const candidate =
+        const extract = (path: string) => {
+          const lines = generated
+            .split(`  - path: ${path}\n`)[1]!
+            .split("    content: |\n")[1]!
+            .split("\n");
+          const end = lines.findIndex((line) => line !== "" && !line.startsWith("      "));
+          return lines
+            .slice(0, end)
+            .map((line) => line.slice(6))
+            .join("\n")
+            .replaceAll("/var/lib/crabbox/bootstrapped", join(fixture, "bootstrapped"))
+            .replaceAll(fixture + "/workspaces", fixture);
+        };
+        const failWorkroot = (script: string) =>
           failure === "workroot"
             ? script.replace(
                 "test " + (awsPrivate ? "-d " : "-w ") + fixture,
                 "test -d " + fixture + "/missing",
               )
             : script;
-        const result = spawnSync("/bin/sh", ["-c", candidate], {
+        let candidate = failWorkroot(extract("/usr/local/bin/crabbox-ready"));
+        expect(candidate).toMatch(/^#!\/bin\/sh\nset -eu\n/);
+        expect(
+          generated.includes(
+            "  - path: /usr/local/lib/crabbox-ready-checks\n" +
+              "    permissions: '0755'\n    content: |\n      #!/bin/sh\n      set -eu\n",
+          ),
+        ).toBe(!awsPrivate);
+        if (!awsPrivate) {
+          const checks = join(fixture, "ready-checks");
+          writeFileSync(checks, failWorkroot(extract("/usr/local/lib/crabbox-ready-checks")));
+          candidate = candidate.replace(
+            "\nexec /usr/local/lib/crabbox-ready-checks",
+            `\n. ${checks}`,
+          );
+        }
+        expect(candidate).not.toContain("/usr/local/lib/crabbox-ready-checks");
+        writeFileSync(join(fixture, "bootstrapped"), "");
+        if (failure === "marker") rmSync(join(fixture, "bootstrapped"));
+        const result = spawnSync("/bin/sh", ["-c", stubs + candidate], {
           env: {
             PATH: fixture,
             FAIL_TOOL: failure,
@@ -317,10 +337,17 @@ describe("cloud-init bootstrap", () => {
     },
   );
 
-  it("uses retrying package installation in runcmd", () => {
+  it("uses retrying package installation before cloud-final", () => {
     const got = cloudInit(config);
     const minimalUpdate = "retry apt-get -o Acquire::Languages=none";
     expect(got).toContain("package_update: false");
+    expect(got).toContain(
+      sharedLinuxBootstrapPrelude()
+        .trimEnd()
+        .split("\n")
+        .map((line) => `      ${line}`)
+        .join("\n"),
+    );
     expect(got).toContain("bash -euxo pipefail <<'BOOT'");
     expect(got).toContain('Acquire::Retries "8";');
     expect(got).toContain(
@@ -352,15 +379,21 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("test -f /var/lib/crabbox/bootstrapped");
     expect(got).toContain("test -w /work/crabbox");
     expect(got).toContain("      Port 2222\n      Port 22");
-    expect(got).toContain("systemctl enable ssh || true");
+    expect(got).toContain(
+      "systemctl is-enabled --quiet ssh || systemctl enable --no-reload ssh || true",
+    );
     expect(got).toContain("touch /var/lib/crabbox/bootstrapped");
-    expect(got).toContain("After=cloud-final.service");
-    expect(got).toContain("WantedBy=cloud-final.service");
+    expect(got).toContain("After=crabbox-bootstrap.service cloud-config.service");
+    expect(got).toContain("Before=cloud-final.service");
+    expect(got).toContain("After=cloud-config.service network-online.target");
+    expect(got).toContain("cloud-init-per instance crabbox-bootstrap-start");
+    expect(got).not.toContain("multi-user.target");
+    expect(got).toContain("WantedBy=cloud-init.target");
     expect(got.indexOf("ExecStart=/usr/local/bin/crabbox-ready")).toBeLessThan(
       got.indexOf("ExecStart=/usr/bin/touch /run/crabbox/workspace-ready"),
     );
     expect(got).toContain("ExecStart=/usr/bin/touch /run/crabbox/workspace-ready");
-    expect(got).toContain("systemctl enable crabbox-workspace-ready.service");
+    expect(got).toContain("systemctl enable --no-reload crabbox-workspace-ready.service");
     expect(got).toContain("systemctl start --no-block crabbox-workspace-ready.service");
     expect(got).not.toContain("\npackages:\n");
     expect(got).not.toContain("systemctl enable --now ssh");
@@ -376,11 +409,41 @@ describe("cloud-init bootstrap", () => {
     expect(got).not.toContain("corepack");
   });
 
+  it("holds readiness until optional cloud-final setup has completed", () => {
+    for (const options of [
+      { browser: true },
+      { desktop: true },
+      { code: true },
+      { tailscale: true, tailscaleAuthKey: "fixture" },
+    ]) {
+      const got = cloudInit({ ...config, ...options });
+      const [early, final] = got.split("\nruncmd:");
+      expect(early).toContain(
+        "After=crabbox-bootstrap.service cloud-config.service cloud-final.service",
+      );
+      expect(early).not.toContain("touch /var/lib/crabbox/bootstrapped");
+      expect(final).toContain("systemctl start crabbox-bootstrap.service");
+      expect(final).toContain(
+        sharedLinuxBootstrapPrelude()
+          .trimEnd()
+          .split("\n")
+          .map((line) => `    ${line}`)
+          .join("\n"),
+      );
+      expect(final).toContain("retry /usr/local/lib/crabbox-ready-checks");
+      expect(final!.indexOf("retry /usr/local/lib/crabbox-ready-checks")).toBeLessThan(
+        final!.indexOf("touch /var/lib/crabbox/bootstrapped"),
+      );
+      expect(final).not.toContain("crabbox_readiness_packages=");
+    }
+  });
+
   it("embeds the complete generated Linux readiness fragment before bootstrap completes", () => {
     const got = cloudInit(config);
     const embedded = linuxMinimalReadinessBootstrap
+      .trimEnd()
       .split("\n")
-      .map((line) => `    ${line}`)
+      .map((line) => `      ${line}`)
       .join("\n");
     expect(got).toContain(embedded);
     expect(got.indexOf(embedded)).toBeLessThan(got.indexOf("touch /var/lib/crabbox/bootstrapped"));
@@ -665,12 +728,12 @@ describe("cloud-init bootstrap", () => {
     const got = cloudInit({ ...config, code: true });
     expect(got).not.toContain("https://code-server.dev/install.sh");
     expect(got).not.toContain("curl -fsSL https://code-server.dev/install.sh | sh");
-    expect(got).toContain("CS_VERSION='4.126.0'");
+    expect(got).toContain("CS_VERSION='4.143.1'");
     expect(got).toContain(
-      "x86_64) CS_ARCH=amd64; CS_SHA256='54b648d010c02b6583aa06bd8d2aaf109fc624479b9bc2ff71cb94807ac39afa'",
+      "x86_64) CS_ARCH=amd64; CS_SHA256='614877cf71005f14ea252bd2d9b1c12237cf7d73681ef150f0dff7f13849fdb5'",
     );
     expect(got).toContain(
-      "aarch64|arm64) CS_ARCH=arm64; CS_SHA256='441614708ae81b13f14b26db41da8f46f88d7d092c08343a42a0c6c52c51a69d'",
+      "aarch64|arm64) CS_ARCH=arm64; CS_SHA256='51481a891754dc2585b86d007aec24ac675453fc5ef6cfa346c4462449277384'",
     );
     expect(got).toContain(
       "https://github.com/coder/code-server/releases/download/v${CS_VERSION}/code-server-${CS_VERSION}-linux-${CS_ARCH}.tar.gz",
@@ -825,7 +888,7 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("crabbox-sshd-$port");
     expect(got).toContain("tightvnc-2.8.85-gpl-setup-64bit.msi");
     expect(got).toContain("d8fbed7b27ebab86df6f780f6e86f723668f3715cee521ccaa4568812aef5f3e");
-    expect(got).toContain("d8de7a3152266c8bb13577eab850ea1df6dccf8c2aa48be5b4a1c58b7190d62c");
+    expect(got).toContain("dc6d3db061999136e139f31376c5582a9ed6f36a4ea12f15e54ad7fa2bfc0bf2");
     expect(got).toContain("NewNetworkWindowOff");
     expect(got).toContain("DoNotOpenServerManagerAtLogon");
     expect(got).toContain("VALUE_OF_PASSWORD=$vncPassword");
@@ -883,8 +946,8 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("function Assert-CrabboxFileSHA256");
     expect(got).toContain("OpenSSH-Win64.zip");
     expect(got).toContain("0ca131f3a78f404dc819a6336606caec0db1663a692ccc3af1e90232706ada54");
-    expect(got).toContain("Git-2.52.0-64-bit.exe");
-    expect(got).toContain("d8de7a3152266c8bb13577eab850ea1df6dccf8c2aa48be5b4a1c58b7190d62c");
+    expect(got).toContain("Git-2.56.0.3-64-bit.exe");
+    expect(got).toContain("dc6d3db061999136e139f31376c5582a9ed6f36a4ea12f15e54ad7fa2bfc0bf2");
     expect(got).toContain("$passwordPath = $windowsPasswordPath");
     expect(got).toContain("$credentialPaths = @($passwordPath)");
     expect(got).toContain("PubkeyAuthentication yes");
@@ -921,7 +984,8 @@ describe("cloud-init bootstrap", () => {
       windowsMode: "wsl2",
       workRoot: "/work/crabbox",
     } as const;
-    const got = windowsBootstrapPowerShell(input);
+    // Inspect the embedded shell text after unescaping its PowerShell literal.
+    const got = windowsBootstrapPowerShell(input).replaceAll("''", "'");
     expect(got).toContain("$workRoot = 'C:\\crabbox'");
     expect(got).toContain("C:\\ProgramData\\crabbox\\windows.password");
     expect(got).toContain("Microsoft-Windows-Subsystem-Linux");
@@ -944,17 +1008,17 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc");
     expect(got).toContain("test -w /proc/sys/fs/binfmt_misc/register");
     expect(got).toContain(":WSLInterop:M::MZ::/init:PF");
-    expect(got).toContain("trufflehog_version='3.95.9'");
+    expect(got).toContain("trufflehog_version='3.99.4'");
     expect(got).toContain("trufflehog_${trufflehog_version}_linux_amd64.tar.gz");
-    expect(got).toContain("f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e");
+    expect(got).toContain("5ae9b313342d1bfa96404064c0f59e77a2cbd1824d797ca7b11e6655aa8fd9d1");
     expect(got).toContain("sha256sum -c -");
     expect(got).toContain('mv -f "$trufflehog_candidate" /usr/local/bin/trufflehog');
     expect(got).toContain("trufflehog --no-update --version >/dev/null");
     const nodeInstall = got.indexOf(
       "bash /var/lib/crabbox/install-linux-developer-tools.sh --node-only",
     );
-    const readyScript = got.indexOf("cat >/usr/local/bin/crabbox-ready <<'READY'");
-    expect(nodeInstall).toBeGreaterThan(got.indexOf("$linuxSetup = @'"));
+    const readyScript = got.indexOf("cat >/usr/local/bin/crabbox-ready <<");
+    expect(nodeInstall).toBeGreaterThan(got.indexOf("$linuxSetup = "));
     expect(readyScript).toBeGreaterThan(nodeInstall);
     expect(got.slice(readyScript)).toContain("node --version >/dev/null");
     expect(got.slice(readyScript)).toContain("npm --version >/dev/null");
@@ -987,7 +1051,7 @@ describe("cloud-init bootstrap", () => {
     } as const;
     const got = azureWindowsBootstrapPowerShell(input);
     expect(got).toContain("OpenSSH-Win64.zip");
-    expect(got).toContain("Git-2.52.0-64-bit.exe");
+    expect(got).toContain("Git-2.56.0.3-64-bit.exe");
     expect(got).toContain("administrators_authorized_keys");
     expect(got).toContain("Match Group administrators");
     expect(got).toContain("$sshPorts = @('2222', '22')");
@@ -1037,7 +1101,7 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("com.openssh.sshd");
     expect(got).toContain("com.apple.screensharing");
     expect(got).toContain("/usr/local/bin/crabbox-ready");
-    expect(got).toContain("node_version=24.19.0");
+    expect(got).toContain("node_version=24.22.1");
     expect(got).toContain("UsePAM yes");
     expect(got).toContain("KbdInteractiveAuthentication no");
     expect(got).toContain("node_arch=x64");
@@ -1047,3 +1111,50 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("npm --version >/dev/null");
   });
 });
+
+it("keeps WSL here-string terminators inside work roots as data", (context) => {
+  if (
+    spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
+      timeout: 10_000,
+    }).status !== 0
+  ) {
+    context.skip();
+  }
+  const workRoot = "/work/‘’‚‛“”„$(`n)\n'@\nthrow 'injected'\n@'\n’@\nthrow 'injected'\n@‘\nend";
+  const source = windowsBootstrapPowerShell({
+    ...config,
+    target: "windows",
+    windowsMode: "wsl2",
+    workRoot,
+  });
+  const directory = mkdtempSync(join(tmpdir(), "crabbox-wsl-quotes-"));
+  try {
+    const file = join(directory, "bootstrap.ps1");
+    writeFileSync(file, "\ufeff" + source);
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `
+      $tokens=$null; $errors=$null
+      $ast=[System.Management.Automation.Language.Parser]::ParseFile(${psQuote(file)},[ref]$tokens,[ref]$errors)
+      if ($errors.Count) { throw ($errors | Out-String) }
+      $node=$ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$linuxSetup' },$true)
+      $literal=$node.Right.Expression
+      if ($literal -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { throw 'WSL setup must be a constant string' }
+      [Console]::Out.Write($literal.Value)
+    `,
+      ],
+      { encoding: "utf8", timeout: 30000 },
+    );
+    expect(result.status).toBe(0);
+    const quotedRoot = "'" + workRoot.replaceAll("'", "'\\''") + "'";
+    expect(result.stdout).toContain("mkdir -p " + quotedRoot);
+    expect(result.stdout).toContain("test -w " + quotedRoot);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  // Cold pwsh starts on CI runners exceed the 5 s default; cover the probe and the 30 s parse.
+}, 60_000);

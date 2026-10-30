@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	api "github.com/daytonaio/daytona/libs/api-client-go"
+	api "github.com/daytona/clients/api-client-go"
 	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
 )
@@ -184,6 +184,7 @@ func (Provider) CreateNativeCheckpoint(ctx context.Context, req core.NativeCheck
 		snapshotSettled = waitErr == nil || snap != nil && daytonaSnapshotFailed(snap.GetState())
 		return errors.Join(createErr, waitErr)
 	})
+	result.CaptureEstablished = err == nil
 	return result, err
 }
 

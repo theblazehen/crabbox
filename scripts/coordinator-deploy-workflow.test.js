@@ -16,6 +16,7 @@ const artifactPair = {
   CRABBOX_ARTIFACTS_SECRET_ACCESS_KEY: "synthetic-artifact-secret-key",
 };
 const snapshot = 'synthetic-snapshot-"quoted"\nvalue';
+const sha = "a".repeat(40);
 const invalidBundleMessage =
   "::error::CRABBOX_ARTIFACTS_CREDENTIALS_JSON must be a JSON object containing exactly CRABBOX_ARTIFACTS_ACCESS_KEY_ID and CRABBOX_ARTIFACTS_SECRET_ACCESS_KEY as nonempty strings.\n";
 const snapshotConflictMessage =
@@ -42,6 +43,7 @@ function fixture(t, overrides = {}) {
       CRABBOX_ARTIFACTS_CREDENTIALS_JSON: "",
       CRABBOX_DAYTONA_SNAPSHOT: "",
       CLEAR_DAYTONA_SNAPSHOT: "",
+      GITHUB_SHA: sha,
       CRABBOX_ARTIFACTS_ACCESS_KEY_ID: "synthetic-ignored-direct-access-id",
       CRABBOX_ARTIFACTS_SECRET_ACCESS_KEY: "synthetic-ignored-direct-secret-key",
       CRABBOX_ARTIFACTS_SESSION_TOKEN: "synthetic-ignored-session-token",
@@ -134,10 +136,33 @@ function assertDeploy(event, secrets) {
   assert.equal(event.command, "npm");
   assert.deepEqual(
     event.args,
-    secrets ? ["run", "deploy", "--", "--secrets-file", event.file] : ["run", "deploy"],
+    secrets
+      ? ["run", "deploy", "--", "--tag", sha, "--secrets-file", event.file]
+      : ["run", "deploy", "--", "--tag", sha],
   );
   assert.deepEqual(event.secrets, secrets);
 }
+
+test("main deployment excludes coordinator tests while retaining deployment inputs", () => {
+  const paths = workflow.match(/    paths:\n((?:      - .*\n)+)/);
+  assert.ok(paths, "expected the actual push path filters");
+  assert.deepEqual(
+    paths[1]
+      .trim()
+      .split("\n")
+      .map((line) => line.trim()),
+    [
+      '- "worker/**"',
+      '- "!worker/test/**"',
+      '- ".github/workflows/coordinator-deploy.yml"',
+      '- "scripts/prepare-coordinator-deploy-secrets.mjs"',
+      '- "scripts/verify-coordinator-deployment.mjs"',
+      '- "scripts/verify-coordinator-lease-policy.mjs"',
+    ],
+  );
+  assert.doesNotMatch(workflow, /paths-ignore:/);
+  assert.match(workflow, /^  workflow_dispatch:$/m);
+});
 
 test("artifact-only deploy delivers the bundled pair with the Worker version", (t) => {
   const result = runDeploy(t, {
@@ -146,6 +171,66 @@ test("artifact-only deploy delivers the bundled pair with the Worker version", (
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.events.length, 1);
   assertDeploy(result.events[0], artifactPair);
+});
+
+test("missing deployment credentials fail instead of skipping successfully", (t) => {
+  const f = fixture(t);
+  const gate = workflow.match(
+    /      - name: Check for deploy token\n[^]*?        run: \|\n([^]*?)\n      - name: Check out/,
+  );
+  assert.ok(gate, "expected the actual token gate shell block");
+  for (const token of ["", "synthetic-api-token"]) {
+    const result = spawnSync(
+      "/bin/bash",
+      ["--noprofile", "--norc", "-c", gate[1].replace(/^          /gm, "")],
+      { env: { ...f.env, CLOUDFLARE_API_TOKEN: token }, encoding: "utf8" },
+    );
+    assert.ifError(result.error);
+    assert.equal(result.status, token ? 0 : 1);
+    assert.doesNotMatch(result.stdout + result.stderr, /synthetic-api-token/);
+    if (!token) assert.match(result.stdout, /::error::CLOUDFLARE_API_TOKEN is not set/);
+  }
+  assert.doesNotMatch(workflow, /steps\.token\.outputs\.ready|ready=false|skipping deploy/);
+});
+
+test("main deployment verifies final serving identity after optional secret changes", () => {
+  assert.match(workflow, /push:\n    branches:\n      - main\n    paths:/);
+  assert.match(workflow, /      - "scripts\/verify-coordinator-deployment\.mjs"/);
+  assert.match(
+    workflow,
+    /npx wrangler secret bulk[^]*?- name: Verify deployed coordinator\n        run: node scripts\/verify-coordinator-deployment\.mjs/,
+  );
+  assert.match(
+    workflow,
+    /- name: Verify deployed coordinator[^]*?CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/,
+  );
+});
+
+test("deployment checks live lease policy preservation before publishing", () => {
+  assert.match(
+    workflow,
+    /- name: Verify lease policy preservation\n        run: node scripts\/verify-coordinator-lease-policy\.mjs\n[^]*?- name: Deploy\n/,
+  );
+  assert.match(
+    workflow,
+    /- name: Verify lease policy preservation[^]*?CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}/,
+  );
+  assert.match(workflow, /      - "scripts\/verify-coordinator-lease-policy\.mjs"/);
+  assert.doesNotMatch(workflow, /github:/);
+});
+
+test("lease policy replacement acknowledgment is dispatch-only and scoped to the guard", () => {
+  assert.match(
+    workflow,
+    /workflow_dispatch:\n    inputs:\n      replace_live_lease_policy:\n        description: [^\n]+\n        required: false\n        default: false\n        type: boolean\n/,
+  );
+  const acknowledgment =
+    "CRABBOX_ACKNOWLEDGE_LEASE_POLICY_REPLACEMENT: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_live_lease_policy == true && '1' || '0' }}";
+  assert.equal(workflow.split("CRABBOX_ACKNOWLEDGE_LEASE_POLICY_REPLACEMENT").length, 2);
+  const guard = workflow
+    .split("      - name: Verify lease policy preservation\n")[1]
+    .split("      - name: Deploy\n")[0];
+  assert.ok(guard.includes(acknowledgment));
 });
 
 test("coordinator deploy keeps optional credentials with the serialized environment owner", () => {

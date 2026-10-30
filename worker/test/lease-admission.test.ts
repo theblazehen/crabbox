@@ -1,0 +1,114 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { commitLeaseAdmission, fetchReplayableLeaseCreate } from "../src/lease-admission";
+import { ProvisioningTestRuntime, ProvisioningTestStorage } from "./provisioning-fixtures";
+
+const body = {
+  leaseID: "cbx_ca1100000091",
+  createAttemptID: "cat_91000000000000000000000000000091",
+};
+const reset = () => new Error("Durable Object's storage operation failed and was reset.");
+const request = (method: string, path: string, input: unknown = body) =>
+  new Request(`https://example.com${path}`, {
+    method,
+    headers: { "content-type": "application/json", "x-crabbox-owner": "alice@example.com" },
+    body: method === "GET" ? undefined : JSON.stringify(input),
+  });
+
+describe("legacy admission retry boundaries", () => {
+  it.each([reset(), new Error("permanent storage failure"), new Error("provider HTTP 500")])(
+    "does not retry unclassified or reset storage failures: %s",
+    async (error) => {
+      const runtime = new ProvisioningTestRuntime(new ProvisioningTestStorage());
+      const commit = vi.fn<() => Promise<never>>(async () => {
+        throw error;
+      });
+      const reread = vi.fn<() => Promise<undefined>>(async () => undefined);
+      await expect(commitLeaseAdmission(runtime, commit, reread)).rejects.toBe(error);
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect(reread).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    { phase: "slow transaction", times: [0], elapsed: 500 },
+    { phase: "late backoff timer", times: [0, 0], elapsed: 600 },
+  ])("does not start a retry after a $phase exhausts the budget", async ({ times, elapsed }) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(elapsed);
+    for (const time of times) now.mockReturnValueOnce(time);
+    try {
+      const runtime = new ProvisioningTestRuntime(new ProvisioningTestStorage());
+      const commit = vi.fn<() => Promise<never>>(async () => {
+        throw Object.assign(new Error("transient"), { retryable: true });
+      });
+      await expect(commitLeaseAdmission(runtime, commit, async () => undefined)).rejects.toThrow(
+        "transient",
+      );
+      expect(commit).toHaveBeenCalledTimes(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it.each(["/v1/leases", "/v1/leases/resource-constrained"])(
+    "replays only the original bound POST once after a runtime reset: %s",
+    async (path) => {
+      const observed: unknown[] = [];
+      const fetch = vi.fn<(request: Request) => Promise<Response>>(async (next: Request) => {
+        observed.push([next.headers.get("x-crabbox-owner"), await next.json()]);
+        if (observed.length === 1) throw reset();
+        return Response.json({ lease: { id: body.leaseID, state: "provisioning" } });
+      });
+      const response = await fetchReplayableLeaseCreate(request("POST", path), fetch);
+      expect(response.status).toBe(200);
+      expect(observed).toEqual([
+        ["alice@example.com", body],
+        ["alice@example.com", body],
+      ]);
+    },
+  );
+
+  it.each([
+    ["POST", "/v1/leases", { leaseID: body.leaseID }],
+    ["POST", "/v1/leases", { ...body, createAttemptID: "bad" }],
+    ["POST", "/v1/runs/run_example/finish", body],
+    ["POST", "/v1/leases/from-checkpoint", body],
+    ["PUT", `/v1/leases/${body.leaseID}`, body],
+    ["GET", `/v1/leases/${body.leaseID}`, body],
+  ] as const)("does not expand replay contracts for %s %s", async (method, path, input) => {
+    const fetch = vi.fn<() => Promise<never>>(async () => {
+      throw reset();
+    });
+    await expect(fetchReplayableLeaseCreate(request(method, path, input), fetch)).rejects.toThrow(
+      "reset",
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves returned 5xx and non-reset exceptions to the caller", async () => {
+    const fetch = vi.fn<() => Promise<Response>>(
+      async () => new Response("provider unavailable", { status: 500 }),
+    );
+    expect((await fetchReplayableLeaseCreate(request("POST", "/v1/leases"), fetch)).status).toBe(
+      500,
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const throwing = vi.fn<() => Promise<never>>(async () => {
+      throw new Error("connection closed");
+    });
+    await expect(
+      fetchReplayableLeaseCreate(request("POST", "/v1/leases"), throwing),
+    ).rejects.toThrow("connection closed");
+    expect(throwing).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops after one boundary replay even when the new runtime resets", async () => {
+    const fetch = vi.fn<() => Promise<never>>(async () => {
+      throw reset();
+    });
+    await expect(fetchReplayableLeaseCreate(request("POST", "/v1/leases"), fetch)).rejects.toThrow(
+      "reset",
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+});

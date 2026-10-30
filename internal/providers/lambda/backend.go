@@ -152,10 +152,13 @@ func (b *backend) acquireOnce(ctx context.Context, req core.AcquireRequest) (tar
 			core.RemoveStoredTestboxKey(leaseID)
 			return
 		}
-		_ = b.persistRecoveryClaim(leaseID, slug, cfg, req.Repo.Root, key, instanceID, "rollback-cleanup", req.Keep, now)
+		claimErr := b.persistRecoveryClaim(leaseID, slug, cfg, req.Repo.Root, key, instanceID, "rollback-cleanup", req.Keep, now)
 		cleanupErr := rollbackLambdaAcquire(client, instanceID, key)
 		if cleanupErr != nil {
-			err = fmt.Errorf("%v; lambda cleanup failed: %w", err, cleanupErr)
+			if claimErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("persist lambda rollback cleanup claim: %w", claimErr))
+			}
+			err = shared.JoinAcquireCleanupError(err, fmt.Errorf("lambda cleanup failed: %w", cleanupErr))
 			return
 		}
 		core.RemoveLeaseClaim(leaseID)
@@ -227,7 +230,7 @@ func (b *backend) launchRequest(cfg core.Config, leaseID, slug, publicKey string
 		InstanceTypeName: typeForConfig(cfg),
 		Quantity:         1,
 		SSHKeyNames:      []string{key.Name},
-		UserData:         core.CloudInitUserData(cfg, publicKey),
+		UserData:         core.CloudInitUserData(core.WithGuestLeaseExpiry(cfg, core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, now)), publicKey),
 	}
 	if image := imageForConfig(cfg); image != "" {
 		req.ImageID = image

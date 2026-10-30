@@ -66,6 +66,52 @@ func coordinatorAsyncResponse(code int, body any) (*http.Response, error) {
 	return &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(data))}, nil
 }
 
+func TestCoordinatorDefiniteProvisioningFailureStopsRecovery(t *testing.T) {
+	for _, provider := range []string{"aws", "gcp", "hetzner", "azure"} {
+		for _, fixed := range []bool{false, true} {
+			for _, priorUncertainty := range []bool{false, true} {
+				for _, canceled := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/fixed=%v/replay=%v/canceled=%v", provider, fixed, priorUncertainty, canceled), func(t *testing.T) {
+						synctest.Test(t, func(t *testing.T) {
+							f := newCoordinatorAsyncFixture(t, fixed)
+							f.cfg.Provider, f.backend.cfg.Provider = provider, provider
+							ctx, cancel := context.WithCancel(context.Background())
+							defer cancel()
+							const message = "requested exact instance type failed; remove --type to allow class fallback"
+							f.onCreate = func(*http.Request) (*http.Response, error) {
+								if priorUncertainty && f.creates == 1 {
+									return coordinatorAsyncResponse(http.StatusInternalServerError, "response lost")
+								}
+								if canceled {
+									cancel()
+								}
+								return coordinatorAsyncResponse(http.StatusUnprocessableEntity, map[string]string{"error": "provisioning_failed", "message": message})
+							}
+							lease, err := f.acquire(ctx)
+							wantCreates := 1
+							if priorUncertainty {
+								wantCreates++
+							}
+							if lease.ID != "" || err == nil || !strings.Contains(err.Error(), message) {
+								t.Fatalf("lease=%#v err=%v, want actionable failure", lease, err)
+							}
+							if f.creates != wantCreates || f.gets != 0 || f.cancels != 0 || time.Since(f.started) != 0 {
+								t.Fatalf("creates=%d gets=%d cancels=%d elapsed=%s", f.creates, f.gets, f.cancels, time.Since(f.started))
+							}
+							if strings.Contains(f.stderr.String(), "cancellation") || (!priorUncertainty && strings.Contains(f.stderr.String(), "uncertain result")) {
+								t.Fatalf("unexpected recovery: %s", f.stderr.String())
+							}
+							if errors.Is(err, context.Canceled) != canceled {
+								t.Fatalf("cancellation cause: %v", err)
+							}
+						})
+					})
+				}
+			}
+		}
+	}
+}
+
 func (f *coordinatorAsyncFixture) lease(state string) CoordinatorLease {
 	lease := CoordinatorLease{
 		ID: f.canonical, Provider: f.cfg.Provider, TargetOS: f.cfg.TargetOS,
@@ -149,7 +195,7 @@ func (f *coordinatorAsyncFixture) roundTrip(r *http.Request) (*http.Response, er
 			f.t.Fatal("cancellation did not bind the original attempt")
 		}
 		deadline, ok := r.Context().Deadline()
-		if !ok || time.Until(deadline) != 10*time.Second || r.Context().Err() != nil {
+		if !ok || time.Until(deadline) != 30*time.Second || r.Context().Err() != nil {
 			f.t.Fatalf("cancel context budget=%s err=%v", time.Until(deadline), r.Context().Err())
 		}
 		if f.onCancel != nil {
@@ -210,7 +256,7 @@ func TestCoordinatorAsyncReplayReadinessOutlivesRebindBudget(t *testing.T) {
 				if err != nil || lease.ID != f.canonical || lease.State != "active" {
 					t.Fatalf("lease=%#v err=%v", lease, err)
 				}
-				if f.creates != 2 || f.cancels != 0 || f.gets < 2 || time.Since(f.started) != 13*time.Minute || f.deadline.Sub(f.started) != 30*time.Minute {
+				if f.creates != 2 || f.cancels != 0 || f.gets < 2 || time.Since(f.started) != 13*time.Minute || f.deadline.Sub(f.started) != coordinatorHTTPTimeout {
 					t.Fatalf("creates=%d cancels=%d gets=%d elapsed=%s budget=%s", f.creates, f.cancels, f.gets, time.Since(f.started), f.deadline.Sub(f.started))
 				}
 				if !strings.Contains(f.stderr.String(), "elapsed=12m0s") {
@@ -219,6 +265,25 @@ func TestCoordinatorAsyncReplayReadinessOutlivesRebindBudget(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestCoordinatorAzureLinuxProvisioningBeyondTenMinutes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newCoordinatorAsyncFixture(t, false)
+		f.cfg.TargetOS, f.backend.cfg.TargetOS = targetLinux, targetLinux
+		f.onCreate = func(r *http.Request) (*http.Response, error) {
+			select {
+			case <-time.After(11 * time.Minute):
+				return f.reply(f.lease("active"))
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}
+		lease, err := f.acquire(context.Background())
+		if err != nil || lease.State != "active" || f.cancels != 0 {
+			t.Fatalf("lease=%#v err=%v cancels=%d", lease, err, f.cancels)
+		}
+	})
 }
 
 func TestCoordinatorAsyncOriginalDeadlineExhaustion(t *testing.T) {
@@ -234,7 +299,7 @@ func TestCoordinatorAsyncOriginalDeadlineExhaustion(t *testing.T) {
 							return nil, r.Context().Err()
 						}
 						if f.creates == 1 {
-							time.Sleep(9*time.Minute + 30*time.Second)
+							time.Sleep(coordinatorHTTPTimeout - 30*time.Second)
 							return coordinatorAsyncResponse(http.StatusInternalServerError, "error code: 1101")
 						}
 						return f.reply(f.lease("provisioning"))
@@ -251,7 +316,7 @@ func TestCoordinatorAsyncOriginalDeadlineExhaustion(t *testing.T) {
 					if fixed {
 						wantCancels = 0
 					}
-					if !errors.Is(err, context.DeadlineExceeded) || lease.ID != "" || time.Since(f.started) != 10*time.Minute || f.creates != wantCreates || f.cancels != wantCancels {
+					if !errors.Is(err, context.DeadlineExceeded) || lease.ID != "" || time.Since(f.started) != coordinatorHTTPTimeout || f.creates != wantCreates || f.cancels != wantCancels {
 						t.Fatalf("lease=%#v err=%v elapsed=%s creates=%d cancels=%d", lease, err, time.Since(f.started), f.creates, f.cancels)
 					}
 				})
@@ -312,7 +377,7 @@ func TestCoordinatorAsyncCallerDeadlineAndFinalCancellationAttempt(t *testing.T)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		lease, err := f.acquire(ctx)
-		if !errors.Is(err, context.DeadlineExceeded) || lease.ID != "" || f.creates != 1 || f.cancels != 2 || time.Since(f.started) != 30*time.Second || f.deadline.Sub(f.started) != 20*time.Second {
+		if !errors.Is(err, context.DeadlineExceeded) || lease.ID != "" || f.creates != 1 || f.cancels != 2 || time.Since(f.started) != 50*time.Second || f.deadline.Sub(f.started) != 20*time.Second {
 			t.Fatalf("lease=%#v err=%v creates=%d cancels=%d elapsed=%s budget=%s", lease, err, f.creates, f.cancels, time.Since(f.started), f.deadline.Sub(f.started))
 		}
 	})
@@ -465,6 +530,41 @@ func TestCoordinatorAsyncLegacyBrokerIgnoresPreference(t *testing.T) {
 				lease, err := f.acquire(context.Background())
 				if err != nil || lease.ID != f.canonical || f.creates != 1 || f.gets != 0 || f.cancels != 0 {
 					t.Fatalf("lease=%#v err=%v creates=%d gets=%d cancels=%d", lease, err, f.creates, f.gets, f.cancels)
+				}
+			})
+		})
+	}
+}
+
+func TestCoordinatorInterruptedCreateReportsPhaseAndStopsBeforeClientDeadline(t *testing.T) {
+	for _, fixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fixed=%v", fixed), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newCoordinatorAsyncFixture(t, fixed)
+				f.cfg.Provider, f.backend.cfg.Provider = "aws", "aws"
+				pending := f.lease("provisioning")
+				pending.ProvisioningPhase = "provider-request"
+				f.onCreate = func(*http.Request) (*http.Response, error) { return f.reply(pending) }
+				f.onGet = func(*http.Request) (*http.Response, error) {
+					if time.Since(f.started) < time.Minute {
+						return f.reply(pending)
+					}
+					failed := f.lease("failed")
+					failed.ProvisioningPhase = "interrupted-recovering"
+					failed.FailureError = "provider provisioning was interrupted; recovering possible provider resource"
+					uncertain := true
+					failed.ProvisioningResourceMayExist, failed.ProvisioningFailureRetryable = &uncertain, &uncertain
+					return f.reply(failed)
+				}
+				lease, err := f.acquire(context.Background())
+				if err == nil || !strings.Contains(err.Error(), "provider provisioning was interrupted") || lease.ID != "" {
+					t.Fatalf("lease=%#v err=%v", lease, err)
+				}
+				if f.creates != 1 || time.Since(f.started) > 2*time.Minute {
+					t.Fatalf("creates=%d elapsed=%s", f.creates, time.Since(f.started))
+				}
+				if !strings.Contains(f.stderr.String(), `phase="provider-request"`) {
+					t.Fatalf("missing attempt phase: %s", f.stderr.String())
 				}
 			})
 		})

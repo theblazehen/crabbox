@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"os"
@@ -32,6 +33,7 @@ type fakeAWSClient struct {
 	createCfg        core.Config
 	createErr        error
 	waitErr          error
+	acquireStateErr  error
 	get              map[string]core.Server
 	getErrs          map[string]error
 	getErr           error
@@ -65,6 +67,9 @@ func (c *fakeAWSClient) CreateServerWithFallback(_ context.Context, cfg core.Con
 	}
 	if c.created.CloudID == "" {
 		c.created = awsTestServer("i-created", leaseID, slug, "us-east-1")
+		if cfg.TTL > 0 {
+			c.created.Labels["ttl_secs"] = fmt.Sprint(int(cfg.TTL.Seconds()))
+		}
 	}
 	if c.created.Labels["provider_key"] == "" {
 		c.created.Labels["provider_key"] = cfg.ProviderKey
@@ -111,6 +116,10 @@ func (c *fakeAWSClient) WaitForServerIP(context.Context, string) (core.Server, e
 		return core.Server{}, c.waitErr
 	}
 	return c.created, nil
+}
+
+func (c *fakeAWSClient) CheckAcquireState(context.Context, string) error {
+	return c.acquireStateErr
 }
 
 func (c *fakeAWSClient) GetServer(_ context.Context, id string) (core.Server, error) {
@@ -297,7 +306,7 @@ func TestAWSAcquireCleansUpCreatedServerAndKeyOnIPFailure(t *testing.T) {
 }
 
 func TestAWSFixedAcquireAllowsReleaseAfterReadinessFailure(t *testing.T) {
-	for _, phase := range []string{"public IP", "SSH bootstrap"} {
+	for _, phase := range []string{"public IP", "SSH bootstrap", "EC2 terminal"} {
 		t.Run(phase, func(t *testing.T) {
 			testutil.IsolateUserDirs(t)
 			fake := &fakeAWSClient{}
@@ -310,6 +319,10 @@ func TestAWSFixedAcquireAllowsReleaseAfterReadinessFailure(t *testing.T) {
 			}
 			if phase == "public IP" {
 				fake.waitErr = readinessErr
+			}
+			if phase == "EC2 terminal" {
+				readinessErr = &core.AWSAcquireStateError{InstanceID: "i-created", State: "terminated", Reason: "Server.SpotInstanceTermination"}
+				fake.acquireStateErr = readinessErr
 			}
 			cfg := fixedAWSTestConfig()
 			req := core.AcquireRequest{
@@ -412,6 +425,8 @@ func TestAWSFixedAcquireReplaysSameLeaseAndRejectsIntentDrift(t *testing.T) {
 	if _, err := first.Touch(context.Background(), core.TouchRequest{Lease: lease, State: "running"}); err != nil {
 		t.Fatal(err)
 	}
+	// The command default is already resolved into req.Keep before acquisition.
+	cfg.WarmupKeep = !cfg.WarmupKeep
 	second := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
 	replayed, err := second.Acquire(context.Background(), req)
 	if err != nil {
@@ -436,7 +451,7 @@ func TestAWSFixedAcquireReplaysSameLeaseAndRejectsIntentDrift(t *testing.T) {
 		}
 	}
 	for _, acquired := range []core.LeaseTarget{lease, replayed} {
-		for _, want := range []string{"timeout 20m cloud-init status --wait", "/usr/local/bin/crabbox-ready"} {
+		for _, want := range []string{"systemctl cat crabbox-workspace-ready.service", "test -f /run/crabbox/workspace-ready", "timeout 20m cloud-init status --wait", "/usr/local/bin/crabbox-ready"} {
 			if !strings.Contains(acquired.SSH.ReadyCheck, want) {
 				t.Fatalf("fixed AWS acquisition/replay ready check=%q, missing %q", acquired.SSH.ReadyCheck, want)
 			}
@@ -780,6 +795,41 @@ func TestAWSFixedReleasePersistsTerminalTombstoneAndRejectsReplay(t *testing.T) 
 	}
 }
 
+func TestAWSFixedReleaseSkipsSameNameReplacementProviderKey(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	fake := &fakeAWSClient{}
+	t.Cleanup(installFixedAWSTestClient(t, fake))
+	cfg := fixedAWSTestConfig()
+	req := core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, Keep: true, RequestedLeaseID: "cbx_abcdef123482", RequestedSlug: "fixed-replacement"}
+	backend := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+	lease, err := backend.Acquire(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.ClaimLeaseTargetForRepoConfig(lease.LeaseID, req.RequestedSlug, cfg, lease.Server, lease.SSH, req.Repo.Root, cfg.IdleTimeout, false); err != nil {
+		t.Fatal(err)
+	}
+	fake.resolvedKeyID = "key-replacement-id"
+
+	outcome, err := backend.ReleaseLeaseWithOutcome(t.Context(), core.ReleaseLeaseRequest{Lease: lease})
+	if err != nil || !outcome.Terminal {
+		t.Fatalf("release outcome=%+v err=%v", outcome, err)
+	}
+	if !slices.Equal(fake.deletedInstances, []string{lease.Server.CloudID}) {
+		t.Fatalf("deleted instances=%v, want original instance", fake.deletedInstances)
+	}
+	if !slices.Equal(fake.validatedKeys, []string{core.ServerProviderKey(lease.Server)}) {
+		t.Fatalf("validated keys=%v, want immutable identity check", fake.validatedKeys)
+	}
+	if len(fake.deletedKeys) != 0 {
+		t.Fatalf("deleted replacement provider key: %v", fake.deletedKeys)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || !exists || claim.FixedCreateIntent == nil || claim.FixedCreateIntent.State != fixedAWSIntentReleased {
+		t.Fatalf("terminal claim=%+v exists=%t err=%v", claim, exists, err)
+	}
+}
+
 func TestAWSOrdinaryReleaseKeepsLegacyClaimDeletionBehavior(t *testing.T) {
 	testutil.IsolateUserDirs(t)
 	server := awsTestServer("i-ordinary-release", "cbx_abcdef12347f", "ordinary-release", "us-east-1")
@@ -815,6 +865,57 @@ func TestAWSOrdinaryReleaseKeepsLegacyClaimDeletionBehavior(t *testing.T) {
 	}
 	if len(fake.deletedInstances) != 1 || fake.deletedInstances[0] != server.CloudID {
 		t.Fatalf("deleted instances=%v, want ordinary instance", fake.deletedInstances)
+	}
+	if len(fake.validatedKeys) != 0 || len(fake.deletedKeys) != 0 {
+		t.Fatalf("legacy release used an unbound provider key: validated=%v deleted=%v", fake.validatedKeys, fake.deletedKeys)
+	}
+}
+
+func TestAWSOrdinaryReleaseSkipsSameNameReplacementProviderKey(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	server := awsTestServer("i-ordinary-release", "cbx_abcdef123481", "ordinary-release", "us-east-1")
+	server.Labels["provider_key"] = core.ProviderKeyForLease(server.Labels["lease"])
+	fake := &fakeAWSClient{
+		servers:       []core.Server{server},
+		resolvedKeyID: "key-replacement-id",
+	}
+	t.Cleanup(installFixedAWSTestClient(t, fake))
+	cfg := fixedAWSTestConfig()
+	claimAWSCleanupServer(t, cfg, server)
+
+	backend := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+	lease := core.LeaseTarget{LeaseID: server.Labels["lease"], Server: server}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(fake.deletedInstances, []string{server.CloudID}) {
+		t.Fatalf("deleted instances=%v, want original instance", fake.deletedInstances)
+	}
+	if !slices.Equal(fake.validatedKeys, []string{server.Labels["provider_key"]}) {
+		t.Fatalf("validated keys=%v, want immutable identity check", fake.validatedKeys)
+	}
+	if len(fake.deletedKeys) != 0 {
+		t.Fatalf("deleted replacement provider key: %v", fake.deletedKeys)
+	}
+}
+
+func TestAWSOrdinaryReleaseDeletesMatchingProviderKeyByImmutableID(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	server := awsTestServer("i-ordinary-release", "cbx_abcdef123483", "ordinary-release", "us-east-1")
+	server.Labels["provider_key"] = core.ProviderKeyForLease(server.Labels["lease"])
+	fake := &fakeAWSClient{servers: []core.Server{server}}
+	t.Cleanup(installFixedAWSTestClient(t, fake))
+	cfg := fixedAWSTestConfig()
+	claimAWSCleanupServer(t, cfg, server)
+
+	backend := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+	lease := core.LeaseTarget{LeaseID: server.Labels["lease"], Server: server}
+	if err := backend.ReleaseLease(t.Context(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	expectedKeyID := "key-id-for-" + server.Labels["provider_key"]
+	if !slices.Equal(fake.deletedKeys, []string{expectedKeyID}) {
+		t.Fatalf("deleted keys=%v, want immutable id %q", fake.deletedKeys, expectedKeyID)
 	}
 }
 
@@ -1275,6 +1376,7 @@ func fixedAWSTestAttempt(cfg core.Config) core.AWSLaunchAttempt {
 
 func fixedAWSTestServer(control *core.AWSFixedCreateControl, cfg core.Config, leaseID, slug string, attempt core.AWSLaunchAttempt) core.Server {
 	server := awsTestServer("i-fixed", leaseID, slug, cfg.AWSRegion)
+	server.Labels["ttl_secs"] = fmt.Sprint(int(cfg.TTL.Seconds()))
 	server.ServerType.Name = attempt.ServerType
 	server.HostID = attempt.HostID
 	server.ProviderMetadata = map[string]any{
@@ -1445,7 +1547,7 @@ func TestAWSAcquireBindsImmutableProviderKeyID(t *testing.T) {
 	if detections != 1 || len(fake.createCfg.AWSSSHCIDRs) != 1 || fake.createCfg.AWSSSHCIDRs[0] != "198.51.100.7/32" {
 		t.Fatalf("direct AWS outbound CIDR detections=%d provisioned CIDRs=%v, want one detection and [198.51.100.7/32]", detections, fake.createCfg.AWSSSHCIDRs)
 	}
-	for _, want := range []string{"timeout 20m cloud-init status --wait", "/usr/local/bin/crabbox-ready"} {
+	for _, want := range []string{"systemctl cat crabbox-workspace-ready.service", "test -f /run/crabbox/workspace-ready", "timeout 20m cloud-init status --wait", "/usr/local/bin/crabbox-ready"} {
 		if !strings.Contains(lease.SSH.ReadyCheck, want) {
 			t.Fatalf("direct AWS acquisition ready check=%q, missing %q", lease.SSH.ReadyCheck, want)
 		}
@@ -1551,6 +1653,7 @@ func TestAWSResolveAndReleaseUseFallbackRegion(t *testing.T) {
 	east := &fakeAWSClient{}
 	west := &fakeAWSClient{servers: []core.Server{awsTestServer("i-west", "cbx_fedcba654321", "west", "us-west-2")}}
 	west.servers[0].Labels["provider_key"] = "crabbox-cbx-fedcba654321"
+	west.servers[0].Labels["aws_key_pair_id"] = "key-id-for-crabbox-cbx-fedcba654321"
 	oldClient := newAWSClient
 	newAWSClient = func(_ context.Context, cfg core.Config) (awsClient, error) {
 		switch cfg.AWSRegion {
@@ -1590,8 +1693,8 @@ func TestAWSResolveAndReleaseUseFallbackRegion(t *testing.T) {
 	if len(west.deletedInstances) != 1 || west.deletedInstances[0] != "i-west" {
 		t.Fatalf("west deleted instances=%v, want i-west", west.deletedInstances)
 	}
-	if len(west.deletedKeys) != 1 || west.deletedKeys[0] != "crabbox-cbx-fedcba654321" {
-		t.Fatalf("west deleted keys=%v, want provider key", west.deletedKeys)
+	if len(west.deletedKeys) != 1 || west.deletedKeys[0] != west.servers[0].Labels["aws_key_pair_id"] {
+		t.Fatalf("west deleted keys=%v, want immutable provider key id", west.deletedKeys)
 	}
 }
 
@@ -1732,6 +1835,7 @@ func TestAWSReleaseRemovesClaimWhenProviderKeyDeletionFails(t *testing.T) {
 	keyName := "crabbox-cbx-abcdef123456"
 	server := awsTestServer("i-partial", leaseID, "partial-release", "us-west-2")
 	server.Labels["provider_key"] = keyName
+	server.Labels["aws_key_pair_id"] = "key-id-for-" + keyName
 	cfg := core.Config{Provider: "aws", AWSRegion: "us-west-2"}
 	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "partial-release", cfg, server, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
 		t.Fatalf("seed claim: %v", err)
@@ -1758,8 +1862,8 @@ func TestAWSReleaseRemovesClaimWhenProviderKeyDeletionFails(t *testing.T) {
 	if len(fake.deletedInstances) != 1 || fake.deletedInstances[0] != "i-partial" {
 		t.Fatalf("deleted instances=%v, want terminated instance", fake.deletedInstances)
 	}
-	if len(fake.deletedKeys) != 1 || fake.deletedKeys[0] != keyName {
-		t.Fatalf("deleted keys=%v, want failed provider key cleanup attempt", fake.deletedKeys)
+	if len(fake.deletedKeys) != 1 || fake.deletedKeys[0] != server.Labels["aws_key_pair_id"] {
+		t.Fatalf("deleted keys=%v, want failed immutable provider key cleanup attempt", fake.deletedKeys)
 	}
 	if claim, ok, err := core.ResolveLeaseClaim(leaseID); err != nil || ok || claim.LeaseID != "" {
 		t.Fatalf("claim=%+v ok=%v err=%v, want removed claim after instance termination", claim, ok, err)
@@ -2557,10 +2661,10 @@ func TestAWSConfigShowCompletePassiveSection(t *testing.T) {
 		want  map[string]any
 		text  string
 	}{
-		{name: "nil", input: core.Config{}, want: map[string]any{"region": "", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string(nil)}, text: "aws region= root_gb=0 ssh_cidrs=-\n"},
-		{name: "empty", input: core.Config{AWSSSHCIDRs: []string{}}, want: map[string]any{"region": "", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string{}}, text: "aws region= root_gb=0 ssh_cidrs=-\n"},
-		{name: "raw-references-list", input: core.Config{AWSRegion: "raw-region", AWSAMI: "image-reference", AWSSGID: "group-reference", AWSSubnetID: "subnet-reference", AWSProfile: "guest-profile-reference", AWSRootGB: 2147483647, AWSSSHCIDRs: []string{"second", "first", "second", " "}}, want: map[string]any{"region": "raw-region", "ami": "image-reference", "securityGroupId": "group-reference", "subnetId": "subnet-reference", "instanceProfile": "guest-profile-reference", "rootGB": int32(2147483647), "sshCIDRs": []string{"second", "first", "second", " "}}, text: "aws region=raw-region root_gb=2147483647 ssh_cidrs=second,first,second, \n"},
-		{name: "whitespace-empty-elements", input: core.Config{AWSRegion: " ", AWSAMI: " ", AWSSGID: " ", AWSSubnetID: " ", AWSProfile: " ", AWSRootGB: -1, AWSSSHCIDRs: []string{"", ""}}, want: map[string]any{"region": " ", "ami": " ", "securityGroupId": " ", "subnetId": " ", "instanceProfile": " ", "rootGB": int32(-1), "sshCIDRs": []string{"", ""}}, text: "aws region=  root_gb=-1 ssh_cidrs=,\n"},
+		{name: "nil", input: core.Config{}, want: map[string]any{"stockImage": false, "region": "", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string(nil)}, text: "aws region= root_gb=0 ssh_cidrs=-\n"},
+		{name: "empty", input: core.Config{AWSSSHCIDRs: []string{}}, want: map[string]any{"stockImage": false, "region": "", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string{}}, text: "aws region= root_gb=0 ssh_cidrs=-\n"},
+		{name: "raw-references-list", input: core.Config{AWSRegion: "raw-region", AWSAMI: "image-reference", AWSSGID: "group-reference", AWSSubnetID: "subnet-reference", AWSProfile: "guest-profile-reference", AWSRootGB: 2147483647, AWSSSHCIDRs: []string{"second", "first", "second", " "}}, want: map[string]any{"stockImage": false, "region": "raw-region", "ami": "image-reference", "securityGroupId": "group-reference", "subnetId": "subnet-reference", "instanceProfile": "guest-profile-reference", "rootGB": int32(2147483647), "sshCIDRs": []string{"second", "first", "second", " "}}, text: "aws region=raw-region root_gb=2147483647 ssh_cidrs=second,first,second, \n"},
+		{name: "whitespace-empty-elements", input: core.Config{AWSRegion: " ", AWSAMI: " ", AWSSGID: " ", AWSSubnetID: " ", AWSProfile: " ", AWSRootGB: -1, AWSSSHCIDRs: []string{"", ""}}, want: map[string]any{"stockImage": false, "region": " ", "ami": " ", "securityGroupId": " ", "subnetId": " ", "instanceProfile": " ", "rootGB": int32(-1), "sshCIDRs": []string{"", ""}}, text: "aws region=  root_gb=-1 ssh_cidrs=,\n"},
 	} {
 		for _, selected := range []string{"aws", "static"} {
 			t.Run(tc.name+"/"+selected, func(t *testing.T) {
@@ -2572,7 +2676,7 @@ func TestAWSConfigShowCompletePassiveSection(t *testing.T) {
 				if section.JSONKey != "aws" || section.TextLabel != "aws" || !reflect.DeepEqual(section.Providers, []string{"aws"}) {
 					t.Fatalf("section metadata=%#v", section)
 				}
-				wantOrder := []string{"region", "ami", "securityGroupId", "subnetId", "instanceProfile", "rootGB", "sshCIDRs"}
+				wantOrder := []string{"region", "ami", "stockImage", "securityGroupId", "subnetId", "instanceProfile", "rootGB", "sshCIDRs"}
 				if len(section.Fields) != len(wantOrder) {
 					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
 				}
@@ -2599,5 +2703,81 @@ func TestAWSConfigShowCompletePassiveSection(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAWSFixedAcquirePreservesLegacyRootDefault(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	fake := &fakeAWSClient{}
+	restore := installFixedAWSTestClient(t, fake)
+	defer restore()
+	cfg := fixedAWSTestConfig()
+	cfg.Class = "tiny"
+	cfg.AWSRootGB = 400
+	req := core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, Keep: true, RequestedLeaseID: "cbx_abcdef123456", RequestedSlug: "fixed-root"}
+	first := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+	lease, err := first.Acquire(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AWSRootGB = 0
+	replay := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+	replayed, err := replay.Acquire(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Server.CloudID != lease.Server.CloudID || fake.createCalls != 1 {
+		t.Fatalf("legacy root replay allocated: calls=%d", fake.createCalls)
+	}
+	cfg.AWSRootGB = 40
+	drift := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+	if _, err := drift.Acquire(context.Background(), req); err == nil || !strings.Contains(err.Error(), "lease_id_conflict") {
+		t.Fatalf("explicit root drift: %v", err)
+	}
+}
+
+func TestAWSStockImageRequiresBroker(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		coordinator string
+		mode        core.BrokerMode
+		allowed     bool
+	}{
+		{"direct", "", core.BrokerModeManaged, false},
+		{"managed", "https://coordinator.example", core.BrokerModeManaged, true},
+		{"registered direct", "https://coordinator.example", core.BrokerModeRegistered, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (Provider{}).Configure(core.Config{AWSStockImage: true, Coordinator: tc.coordinator, BrokerMode: tc.mode}, core.Runtime{})
+			if tc.allowed {
+				if err != nil {
+					t.Fatalf("brokered stock source rejected: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "requires brokered AWS") {
+				t.Fatalf("stock source must not silently use direct image selection: %v", err)
+			}
+		})
+	}
+}
+
+func TestAWSResourceConstrainedAcquireRetainsRollbackOnUnverifiedType(t *testing.T) {
+	for _, actual := range []string{"", "t3.small"} {
+		t.Run(actual, func(t *testing.T) {
+			testutil.IsolateUserDirs(t)
+			cfg := core.Config{Provider: "aws", TargetOS: core.TargetLinux, AWSRegion: "us-west-2", ServerType: "c7a.2xlarge", Capacity: core.CapacityConfig{MinVCPUs: 8}}
+			fake := &fakeAWSClient{created: awsTestServer("i-created", "cbx_created", "created", "us-west-2"), createCfg: cfg}
+			fake.created.ServerType.Name = actual
+			oldClient := newAWSClient
+			newAWSClient = func(context.Context, core.Config) (awsClient, error) { return fake, nil }
+			t.Cleanup(func() { newAWSClient = oldClient })
+			backend := NewAWSLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*awsLeaseBackend)
+			_, err := backend.acquireOnce(context.Background(), false, "")
+			if err == nil || !strings.Contains(err.Error(), "unverified instance type") {
+				t.Fatalf("err=%v", err)
+			}
+			if !slices.Equal(fake.deletedInstances, []string{"i-created"}) || len(fake.deletedKeys) != 1 {
+				t.Fatalf("cleanup instances=%v keys=%v", fake.deletedInstances, fake.deletedKeys)
+			}
+		})
 	}
 }

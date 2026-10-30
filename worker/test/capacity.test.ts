@@ -11,10 +11,12 @@ import {
   provisioningDuePrefix,
 } from "../src/coordinator-runtime";
 import { FleetCoordinator, FleetDurableObject } from "../src/fleet";
+import { maintainLeaseIndex } from "../src/lease-maintenance-index";
+import { leaseMaintenanceIndex, putLeaseRecord } from "../src/lease-record-store";
 import { orgKeyForLabel } from "../src/org-identity";
 import type { Env, LeaseRecord } from "../src/types";
 import {
-  activeLeaseLimitForOwner,
+  activeLeaseLimitsForOwner,
   costLimits,
   enforceCostLimitUsage,
   type CostLimitUsage,
@@ -40,6 +42,7 @@ import { NodeCoordinatorRuntime } from "../node/node-runtime";
 const now = new Date("2026-09-02T12:00:00.000Z");
 const owner = "github:12345";
 const org = orgKeyForLabel("org-a");
+const generation = "capacity-test-generation";
 
 type CapacityTransaction = Parameters<Parameters<ProvisioningTestStorage["transaction"]>[0]>[0];
 type StorageMutation =
@@ -50,9 +53,21 @@ type StorageMutation =
 
 class CapacityStorage extends ProvisioningTestStorage {
   readonly mutations: StorageMutation[] = [];
-  beforeList?: (options: { prefix?: string; startAfter?: string }) => Promise<void>;
+  readonly reads: Array<{ noCache?: boolean; allowConcurrency?: boolean } | undefined> = [];
+  beforeList?: (options: {
+    prefix?: string;
+    startAfter?: string;
+    allowConcurrency?: boolean;
+  }) => Promise<void>;
   initialize = vi.fn<() => Promise<void>>(async () => {});
   close = vi.fn<() => Promise<void>>(async () => {});
+  override get<T>(
+    key: string,
+    options?: { noCache?: boolean; allowConcurrency?: boolean },
+  ): Promise<T | undefined> {
+    this.reads.push(options);
+    return super.get<T>(key);
+  }
   override list = vi.fn<
     <T>(options?: {
       prefix?: string;
@@ -72,6 +87,11 @@ class CapacityStorage extends ProvisioningTestStorage {
     return super.transaction(async (transaction) => {
       // Observe transaction-local effects too; the shared fixture still owns commit/rollback.
       const { put, delete: remove, setAlarm, deleteAlarm } = transaction;
+      const list = transaction.list.bind(transaction);
+      transaction.list = async <Value>(options?: Parameters<CapacityTransaction["list"]>[0]) => {
+        await this.beforeList?.(options ?? {});
+        return list<Value>(options);
+      };
       transaction.put = async (key, value) => {
         this.mutations.push({ kind: "put", key });
         await put.call(transaction, key, value);
@@ -117,9 +137,9 @@ function lease(id: string, overrides: Partial<LeaseRecord> = {}): LeaseRecord {
     estimatedHourlyUSD: 1,
     maxEstimatedUSD: 1,
     state: "active",
-    createdAt: "2026-09-01T00:00:00Z",
+    createdAt: "2026-09-02T11:30:00Z",
     updatedAt: now.toISOString(),
-    expiresAt: "2026-09-03T00:00:00Z",
+    expiresAt: "2026-09-02T12:30:00Z",
     ...overrides,
   };
 }
@@ -184,6 +204,8 @@ async function fixture(
         },
       } as unknown as DurableObjectState,
       env,
+      {},
+      generation,
     );
     fleet = durable;
     runtime = (durable as unknown as { runtime: CloudflareCoordinatorRuntime }).runtime;
@@ -203,7 +225,7 @@ async function fixture(
     const mutex = new AsyncMutex();
     node.setOperationRunner((callback) => mutex.run(callback));
     runtime = node;
-    fleet = new FleetCoordinator(node, env);
+    fleet = new FleetCoordinator(node, env, {}, {}, generation);
     dispatch = (request) =>
       fleetRequestQueue(request) === "direct"
         ? fleet.fetch(request)
@@ -294,6 +316,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 1,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 1, limit: null },
+        org: { key: "org-a", activeLeases: 1, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       expect(f.storage.values).toEqual(before);
       f.readonly();
@@ -328,6 +354,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 3,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 5, limit: null },
+        org: { key: "org-a", activeLeases: 4, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       f.readonly();
     });
@@ -349,6 +379,141 @@ for (const kind of ["cloudflare", "node"] as const) {
         );
       },
     );
+
+    it.each([
+      { name: "fleet with owner headroom", fleet: 2, owner: 10, org: 10, blockedBy: "fleet" },
+      { name: "org with owner headroom", fleet: 10, owner: 10, org: 2, blockedBy: "org" },
+      { name: "owner", fleet: 10, owner: 1, org: 10, blockedBy: "owner" },
+      { name: "fleet before owner and org", fleet: 3, owner: 1, org: 2, blockedBy: "fleet" },
+      { name: "owner before org", fleet: 10, owner: 1, org: 2, blockedBy: "owner" },
+      { name: "headroom", fleet: 4, owner: 2, org: 3, blockedBy: null },
+      { name: "unlimited", fleet: 0, owner: 0, org: 0, blockedBy: null },
+    ])("reports $name using the allocation limit order", async (test) => {
+      const f = await fixture(kind, {
+        CRABBOX_MAX_ACTIVE_LEASES: String(test.fleet),
+        CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER: String(test.owner),
+        CRABBOX_MAX_ACTIVE_LEASES_PER_ORG: String(test.org),
+      });
+      f.seed(lease("self"));
+      f.seed(lease("same-org", { owner: "github:99999" }), "provider-access:");
+      f.seed(lease("other-org", { owner: "github:88888", org: orgKeyForLabel("org-b") }));
+      const response = await f.fetch();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        owner,
+        activeLeases: 1,
+        effectiveLimit: test.owner,
+        observedAt: now.toISOString(),
+        fleet: { activeLeases: 3, limit: test.fleet || null },
+        org: { key: "org-a", activeLeases: 2, limit: test.org || null },
+        admissible: test.blockedBy === null,
+        blockedBy: test.blockedBy,
+      });
+      f.readonly();
+      const { costUsage } = await f.runtime.runExclusive(() =>
+        admission(f.fleet).leaseAdmissionState({ owner, org }, now),
+      );
+      const messages = {
+        fleet: `fleet active lease limit exceeded: 4/${test.fleet}`,
+        owner: `active lease limit for owner exceeded: 2/${test.owner}`,
+        org: `active lease limit for org exceeded: 3/${test.org}`,
+      };
+      expect(enforceCostLimitUsage(costUsage, lease("candidate"), costLimits(f.env))).toBe(
+        test.blockedBy === null ? "" : messages[test.blockedBy as keyof typeof messages],
+      );
+    });
+
+    it.each([
+      {
+        name: "eligible deployment admin",
+        admin: owner,
+        override: owner,
+        adminLimit: "50",
+        self: 11,
+        shared: true,
+        blockedBy: null,
+      },
+      {
+        name: "eligible normalized legacy admin",
+        admin: "",
+        legacy: ` ${owner.toUpperCase()} `,
+        override: ` ${owner.toUpperCase()} `,
+        adminLimit: "50",
+        self: 11,
+        shared: true,
+        blockedBy: null,
+      },
+      {
+        name: "legacy admin only",
+        admin: "",
+        legacy: owner,
+        override: "",
+        adminLimit: "50",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "override only",
+        admin: "",
+        override: owner,
+        adminLimit: "50",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "ordinary owner",
+        admin: "github:99999",
+        override: "github:99999",
+        adminLimit: "50",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "disabled admin limit",
+        admin: owner,
+        override: owner,
+        adminLimit: "0",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "owner allowance exhausted",
+        admin: owner,
+        override: owner,
+        adminLimit: "50",
+        self: 50,
+        shared: true,
+        blockedBy: "owner",
+      },
+    ])("reports shared override for $name without hiding aggregate usage", async (test) => {
+      const f = await fixture(kind, {
+        CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS: test.admin,
+        CRABBOX_CAPACITY_ADMIN_OWNERS: test.legacy,
+        CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS: test.override,
+        CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN: test.adminLimit,
+        CRABBOX_MAX_ACTIVE_LEASES: "50",
+        CRABBOX_MAX_ACTIVE_LEASES_PER_ORG: "50",
+      });
+      for (let i = 0; i < 50; i++)
+        f.seed(lease(`shared-${i}`, { owner: i < test.self ? owner : "github:99999" }));
+      const response = await f.fetch();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        owner,
+        activeLeases: test.self,
+        effectiveLimit: test.adminLimit !== "0" && (test.admin === owner || test.legacy) ? 50 : 10,
+        observedAt: now.toISOString(),
+        fleet: { activeLeases: 50, limit: test.shared ? null : 50 },
+        org: { key: "org-a", activeLeases: 50, limit: test.shared ? null : 50 },
+        admissible: test.blockedBy === null,
+        blockedBy: test.blockedBy,
+      });
+      f.readonly();
+    });
 
     it("uses live reservations once with precedence and ignores stale entries without deleting", async () => {
       const f = await fixture(kind);
@@ -388,18 +553,22 @@ for (const kind of ["cloudflare", "node"] as const) {
       ]);
     });
 
-    it("scans every bounded page of leases and reservations and propagates scan failures", async () => {
+    it("reads indexed leases and reservation pages and propagates scan failures", async () => {
       const f = await fixture(kind);
       for (let i = 0; i < 260; i++) {
         f.seed(lease(`canonical-${i.toString().padStart(3, "0")}`));
         f.seed(lease(`reservation-${i.toString().padStart(3, "0")}`), "provider-access:");
       }
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      const start = f.storage.listOptions.length;
       expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 520 });
-      for (const prefix of ["lease:", "provider-access:"]) {
-        const calls = f.storage.list.mock.calls.filter(([options]) => options?.prefix === prefix);
+      for (const prefix of [leaseMaintenanceIndex.prefix, "provider-access:"]) {
+        const calls = f.storage.listOptions
+          .slice(start)
+          .filter((options) => options?.prefix === prefix);
         expect(calls).toHaveLength(3);
-        for (const [options] of calls) expect(options).toMatchObject({ limit: 128, noCache: true });
-        expect(calls[1]?.[0]?.startAfter).toBeDefined();
+        for (const options of calls) expect(options).toMatchObject({ limit: 128, noCache: true });
+        expect(calls[1]?.startAfter).toBeDefined();
       }
       f.storage.beforeList = async (options) => {
         if (options.startAfter) throw new Error("synthetic scan failure");
@@ -407,14 +576,13 @@ for (const kind of ["cloudflare", "node"] as const) {
       const response = await f.fetch();
       expect(response.status).toBe(500);
       expect(await response.text()).toContain("synthetic scan failure");
-      f.readonly();
     });
 
-    it("serializes the snapshot behind admission on the runtime's lifecycle boundary", async () => {
+    it("does not queue a capacity snapshot behind the lifecycle mutex", async () => {
       const f = await fixture(kind);
       const request = new Request("https://coordinator.test/v1/capacity");
-      expect(coordinatorRequestQueue(request)).toBe("lifecycle");
-      expect(fleetRequestQueue(request)).toBe("lifecycle");
+      expect(coordinatorRequestQueue(request)).toBe("direct");
+      expect(fleetRequestQueue(request)).toBe("direct");
       let release!: () => void;
       let started!: () => void;
       const entered = new Promise<void>((resolve) => {
@@ -430,18 +598,160 @@ for (const kind of ["cloudflare", "node"] as const) {
         f.seed(lease("admitted"), "provider-access:");
       });
       await entered;
-      const calls = f.storage.list.mock.calls.length;
-      let finished = false;
-      const pendingSnapshot = f.fetch().then((response) => {
-        finished = true;
-        return response;
-      });
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      expect(finished).toBe(false);
-      expect(f.storage.list.mock.calls).toHaveLength(calls);
-      release();
+      try {
+        expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 0 });
+      } finally {
+        release();
+      }
       await pendingAdmission;
-      expect(await (await pendingSnapshot).json()).toMatchObject({ activeLeases: 1 });
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      f.readonly();
+    });
+
+    it("bounds cold historical reads and never returns a partial capacity count", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 5000; i++) f.seed(lease(`history-${i}`, { state: "released" }));
+      f.seed(lease("z-active"));
+      const start = f.storage.listOptions.length;
+      const response = await f.fetch();
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("2");
+      expect(await response.json()).toMatchObject({
+        error: "capacity_unavailable",
+        retryable: true,
+      });
+      expect(f.storage.listOptions.slice(start)).toEqual([
+        { prefix: "lease:", limit: 129, noCache: true, allowConcurrency: true },
+      ]);
+      f.readonly();
+    });
+
+    it("keeps repeated indexed snapshots independent of retained history and tracks live writes", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 5000; i++) f.seed(lease(`history-${i}`, { state: "released" }));
+      f.seed(lease("active"));
+      // More than one maintenance pass is required; partial backfill is not admission proof.
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect((await f.fetch()).status).toBe(503);
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      const start = f.storage.listOptions.length;
+      const reads: string[] = [];
+      f.storage.beforeGet = async (key) => {
+        reads.push(key);
+      };
+      for (let i = 0; i < 3; i++) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- prove successive snapshots, not concurrent requests.
+        expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      }
+      expect(f.storage.listOptions.slice(start).map((options) => options?.prefix)).toEqual(
+        Array.from({ length: 3 }, () => [leaseMaintenanceIndex.prefix, "provider-access:"]).flat(),
+      );
+      expect(reads.filter((key) => key.startsWith("lease:"))).toEqual(
+        Array.from({ length: 3 }, () => "lease:active"),
+      );
+      await f.storage.transaction((storage) => putLeaseRecord(storage, lease("new")));
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 2 });
+      await f.storage.transaction((storage) =>
+        putLeaseRecord(storage, lease("active", { state: "released" })),
+      );
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      // A stale superset entry is harmless because the current lease is reread.
+      f.storage.values.set(`${leaseMaintenanceIndex.prefix}history-0`, 1);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+    });
+
+    it("refuses an old-generation index until rollback history has been audited", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 130; i++) f.seed(lease(`history-${i}`, { state: "released" }));
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), "old-generation");
+      // Simulate an older deployment that could not maintain this index.
+      f.seed(lease("unindexed"));
+      expect((await f.fetch()).status).toBe(503);
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+    });
+
+    it("keeps released running compute in indexed capacity until its stop is confirmed", async () => {
+      const f = await fixture(kind);
+      const retained = lease("retained", {
+        state: "released",
+        releaseDeletesServer: false,
+        lifetimePolicy: {
+          mode: "enforce",
+          workload: "batch",
+          deadlineAt: "2026-09-03T00:00:00Z",
+          retainSeconds: 3600,
+          compute: { state: "running", accumulatedMs: 0, runningSince: now.toISOString() },
+        },
+      });
+      f.seed(retained);
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      await f.storage.transaction((storage) =>
+        putLeaseRecord(storage, {
+          ...retained,
+          lifetimePolicy: {
+            ...retained.lifetimePolicy!,
+            compute: { state: "stopped", accumulatedMs: 0 },
+          },
+        }),
+      );
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 0 });
+    });
+
+    it("leaves the lifecycle mutex available while a capacity read awaits storage", async () => {
+      const f = await fixture(kind);
+      const transactions = vi.spyOn(f.storage, "transaction");
+      const readStart = f.storage.reads.length;
+      let entered!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      f.storage.beforeList = async (options) => {
+        expect(options.allowConcurrency).toBe(true);
+        entered();
+        await gate;
+      };
+      const snapshot = f.fetch();
+      await started;
+      // A native transaction closes the input gate even when its reads opt out.
+      expect(transactions).toHaveBeenCalledTimes(kind === "cloudflare" ? 0 : 1);
+      expect(f.storage.reads.slice(readStart)).toEqual(
+        kind === "cloudflare" ? [{ noCache: true, allowConcurrency: true }] : [],
+      );
+      let timer!: ReturnType<typeof setTimeout>;
+      try {
+        const outcome = await Promise.race([
+          f.runtime.runExclusive(async () => "lifecycle"),
+          new Promise<string>((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), 1000);
+          }),
+        ]);
+        expect(outcome).toBe("lifecycle");
+      } finally {
+        clearTimeout(timer);
+        release();
+      }
+      expect((await snapshot).status).toBe(200);
+      f.readonly();
+    });
+
+    it("bounds retained reservation scans without deleting records or publishing an undercount", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 5000; i++)
+        f.seed(lease(`stale-${i}`, { expiresAt: now.toISOString() }), "provider-access:");
+      f.seed(lease("z-live"), "provider-access:");
+      const start = f.storage.listOptions.length;
+      expect((await f.fetch()).status).toBe(503);
+      expect(
+        f.storage.listOptions
+          .slice(start)
+          .filter((options) => options?.prefix === "provider-access:"),
+      ).toHaveLength(33);
       f.readonly();
     });
 
@@ -486,6 +796,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 1,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 2, limit: null },
+        org: { key: "org-a", activeLeases: 2, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       f.readonly();
     });
@@ -512,6 +826,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 1,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 2, limit: null },
+        org: { key: "org-a", activeLeases: 2, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       f.readonly();
     });
@@ -550,6 +868,30 @@ for (const kind of ["cloudflare", "node"] as const) {
 }
 
 describe("owner capacity limit policy", () => {
+  it("reports deployment capacity membership through the authenticated Fleet route", async () => {
+    const f = await fixture("cloudflare", {
+      CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS: ` ${owner.toUpperCase()} `,
+      CRABBOX_CAPACITY_ADMIN_OWNERS: "github:99999",
+      CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN: "50",
+      CRABBOX_MAX_ACTIVE_LEASES: "50",
+      CRABBOX_MAX_ACTIVE_LEASES_PER_ORG: "50",
+    });
+    for (let index = 0; index < 10; index++) f.seed(lease(`existing-${index}`));
+    const response = await f.fetch();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      owner,
+      activeLeases: 10,
+      effectiveLimit: 50,
+      observedAt: now.toISOString(),
+      fleet: { activeLeases: 10, limit: 50 },
+      org: { key: "org-a", activeLeases: 10, limit: 50 },
+      admissible: true,
+      blockedBy: null,
+    });
+    f.readonly();
+  });
+
   it.each([
     [10, 20, true, 20],
     [10, 5, true, 10],
@@ -569,7 +911,9 @@ describe("owner capacity limit policy", () => {
       });
       f.seed(lease("exact", { owner: "Alice@Example.com" }));
       f.seed(lease("different-case", { owner: "alice@example.com" }));
-      expect(activeLeaseLimitForOwner(costLimits(f.env), "Alice@Example.com")).toBe(expected);
+      expect(activeLeaseLimitsForOwner(costLimits(f.env), "Alice@Example.com").owner).toBe(
+        expected,
+      );
       expect(await (await f.fetch()).json()).toMatchObject({
         owner: "Alice@Example.com",
         activeLeases: 1,

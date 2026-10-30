@@ -605,7 +605,7 @@ func TestLocalContainerOrdinarySourceLayering(t *testing.T) {
 	settings := func(text string, cpus int, enabled bool) LocalContainerConfig {
 		return LocalContainerConfig{
 			Runtime: text, Image: text, User: text, WorkRoot: text,
-			CPUs: cpus, Memory: text, Network: text, DockerSocket: enabled, NoHostname: enabled,
+			CPUs: cpus, Memory: text, Network: text, DockerSocket: enabled, NoHostname: enabled, OCIRuntime: text,
 		}
 	}
 	for _, source := range []string{"file", "env"} {
@@ -645,13 +645,13 @@ func TestLocalContainerOrdinarySourceLayering(t *testing.T) {
 					}
 					if err := applyFileConfig(&cfg, fileConfig{LocalContainer: &fileLocalContainerConfig{
 						Runtime: tc.text, Image: tc.text, User: tc.text, WorkRoot: tc.text,
-						CPUs: cpu, Memory: tc.text, Network: tc.text, DockerSocket: boolean, NoHostname: boolean,
+						CPUs: cpu, Memory: tc.text, Network: tc.text, DockerSocket: boolean, NoHostname: boolean, OCIRuntime: tc.text,
 					}}); err != nil {
 						t.Fatal(err)
 					}
 				} else {
 					wantCPU = tc.envCPU
-					for _, key := range []string{"RUNTIME", "IMAGE", "USER", "WORK_ROOT", "MEMORY", "NETWORK"} {
+					for _, key := range []string{"RUNTIME", "IMAGE", "USER", "WORK_ROOT", "MEMORY", "NETWORK", "OCI_RUNTIME"} {
 						t.Setenv("CRABBOX_LOCAL_CONTAINER_"+key, tc.text)
 					}
 					t.Setenv("CRABBOX_LOCAL_CONTAINER_CPUS", tc.cpu)
@@ -721,6 +721,11 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	isolateTestUserDirs(t)
 	for _, key := range []string{
+		"CRABBOX_MAX_TTL",
+		"CRABBOX_WARMUP_KEEP",
+		"CRABBOX_DIRECT_LEASES",
+		"CRABBOX_DIRECT_LEASE_ALLOW",
+		"CRABBOX_CLAIMS_AUTO_PRUNE",
 		"CRABBOX_SYNC_SOURCE",
 		"CRABBOX_SYNC_GIT_SEED_SOURCE",
 		"CRABBOX_ENV_ALLOW",
@@ -733,6 +738,9 @@ func clearConfigEnv(t *testing.T) {
 		"CRABBOX_COORDINATOR_AUTO_WEBVNC",
 		"CRABBOX_COORDINATOR_TOKEN",
 		"CRABBOX_COORDINATOR_TOKEN_COMMAND",
+		"CRABBOX_STATIC_START_COMMAND",
+		"CRABBOX_STATIC_STOP_COMMAND",
+		"CRABBOX_STATIC_NO_CONTROL_MASTER",
 		"CRABBOX_WEBVNC_AGENT_BASE_URL",
 		"CRABBOX_COORDINATOR_ADMIN_TOKEN",
 		"CRABBOX_ADMIN_TOKEN",
@@ -4579,11 +4587,11 @@ func TestDigitalOceanDefaultsIgnoreStaticProviderOverlays(t *testing.T) {
 		Provider: "ssh",
 		WorkRoot: "/srv/crabbox",
 		SSH:      &fileSSHConfig{User: "alice", Port: "2200"},
-		Static: &fileStaticConfig{
+		Static: &fileStaticSection{fileStaticConfig: fileStaticConfig{
 			User:     "builder",
 			Port:     "2202",
 			WorkRoot: "/srv/static",
-		},
+		}},
 	})
 	normalizeTargetConfig(&cfg)
 	if cfg.SSHUser != "alice" || cfg.SSHPort != "2200" || cfg.WorkRoot != "/srv/static" {
@@ -5279,11 +5287,11 @@ func TestLinodeDefaultsPreserveExplicitGenericWorkRoot(t *testing.T) {
 		Provider: "ssh",
 		WorkRoot: "/srv/crabbox",
 		SSH:      &fileSSHConfig{User: "alice", Port: "2200"},
-		Static: &fileStaticConfig{
+		Static: &fileStaticSection{fileStaticConfig: fileStaticConfig{
 			User:     "builder",
 			Port:     "2202",
 			WorkRoot: "/srv/static",
-		},
+		}},
 	})
 	normalizeTargetConfig(&cfg)
 
@@ -11066,6 +11074,7 @@ results:
     - junit.xml
 shard:
   maxCount: 12
+  maxConcurrency: 4
 run:
   preflightTools:
     - node
@@ -11240,7 +11249,7 @@ ssh:
 	if len(cfg.Results.JUnit) != 1 || cfg.Results.JUnit[0] != "junit.xml" || !cfg.Results.Auto || !cfg.Results.FailOnFailures {
 		t.Fatalf("results config not loaded: %#v", cfg.Results)
 	}
-	if cfg.Shard.MaxCount != 12 {
+	if cfg.Shard.MaxCount != 12 || cfg.Shard.MaxConcurrency != 4 {
 		t.Fatalf("shard config not loaded: %#v", cfg.Shard)
 	}
 	if len(cfg.Run.PreflightTools) != 2 || cfg.Run.PreflightTools[0] != "node" || cfg.Run.PreflightTools[1] != "bun" {
@@ -11286,8 +11295,8 @@ func TestLoadConfigExeDevWorkRootDefaults(t *testing.T) {
 	}{
 		"default": {
 			body:    "provider: exe-dev\n",
-			want:    "/tmp/crabbox",
-			wantExe: "/tmp/crabbox",
+			want:    "/var/tmp/crabbox",
+			wantExe: "/var/tmp/crabbox",
 		},
 		"top-level": {
 			body:    "provider: exe-dev\nworkRoot: /custom/crabbox\n",
@@ -12615,7 +12624,7 @@ os: ubuntu:24.04
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.OSImage != "ubuntu:26.04" || cfg.Image != "ubuntu-24.04" || cfg.Azure.Image != defaultAzureLinuxImage {
+	if cfg.OSImage != "ubuntu:26.04" || cfg.Image != "ubuntu-26.04" || cfg.Azure.Image != defaultAzureLinuxImage {
 		t.Fatalf("higher precedence os did not override provider defaults: os=%q image=%q azure=%q", cfg.OSImage, cfg.Image, cfg.Azure.Image)
 	}
 }
@@ -13046,7 +13055,7 @@ func TestConfigHelperBranches(t *testing.T) {
 }
 
 func TestWriteUserFileConfigAtomic(t *testing.T) {
-	t.Run("successful rewrite keeps mode 0600", func(t *testing.T) {
+	t.Run("successful rewrite keeps file private", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "config.yaml")
 		if err := os.WriteFile(path, []byte("profile: previous\nprovider: aws\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -13061,13 +13070,7 @@ func TestWriteUserFileConfigAtomic(t *testing.T) {
 		if file.Profile != "rewritten" || file.Provider != "aws" {
 			t.Fatalf("file config=%#v", file)
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := info.Mode().Perm(); got != 0o600 {
-			t.Fatalf("config mode=%04o want 0600", got)
-		}
+		assertConfigPrivate(t, path)
 	})
 
 	t.Run("rename failure preserves previous readable config", func(t *testing.T) {
@@ -13136,13 +13139,7 @@ func TestWriteUserFileConfigAtomic(t *testing.T) {
 		if file.Profile != "rewritten" || file.Provider != "aws" {
 			t.Fatalf("file config=%#v", file)
 		}
-		targetInfo, err := os.Stat(target)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := targetInfo.Mode().Perm(); got != 0o600 {
-			t.Fatalf("target config mode=%04o want 0600", got)
-		}
+		assertConfigPrivate(t, target)
 	})
 }
 
@@ -14723,13 +14720,14 @@ func TestExeDevConfigFileContract(t *testing.T) {
 	if got := baseConfig().ExeDev; got != wantDefaults {
 		t.Fatalf("defaults=%#v want=%#v", got, wantDefaults)
 	}
-	if reflect.TypeOf(ExeDevConfig{}).NumField() != 9 || reflect.TypeOf(fileExeDevConfig{}).NumField() != 9 {
+	if reflect.TypeOf(ExeDevConfig{}).NumField() != 10 || reflect.TypeOf(fileExeDevConfig{}).NumField() != 10 {
 		t.Fatal("config field count changed")
 	}
 	for _, trusted := range []bool{false, true} {
 		for _, mode := range []string{"omitted", "null", "empty", "equal", "whitespace", "value"} {
 			cfg := baseConfig()
 			cfg.ExeDev.Image = "prior-image"
+			cfg.ExeDev.Base = "prior-base"
 			cfg.ExeDev.Command = "prior-command"
 			cfg.ExeDev.User = "prior-user"
 			cfg.ExeDev.WorkRoot = "/prior/root"
@@ -14740,7 +14738,7 @@ func TestExeDevConfigFileContract(t *testing.T) {
 			for _, f := range []struct {
 				key string
 				v   *string
-			}{{"controlHost", &want.ControlHost}, {"image", &want.Image}, {"memory", &want.Memory}, {"disk", &want.Disk}, {"command", &want.Command}, {"user", &want.User}, {"workRoot", &want.WorkRoot}} {
+			}{{"controlHost", &want.ControlHost}, {"image", &want.Image}, {"base", &want.Base}, {"memory", &want.Memory}, {"disk", &want.Disk}, {"command", &want.Command}, {"user", &want.User}, {"workRoot", &want.WorkRoot}} {
 				if mode == "omitted" {
 					continue
 				}
@@ -14833,7 +14831,7 @@ func TestExeDevConfigEnvironmentContract(t *testing.T) {
 			for _, f := range []struct {
 				suffix, alias string
 				v             *string
-			}{{"CONTROL_HOST", "EXE_DEV_CONTROL_HOST", &want.ControlHost}, {"IMAGE", "EXE_DEV_IMAGE", &want.Image}, {"MEMORY", "EXE_DEV_MEMORY", &want.Memory}, {"DISK", "EXE_DEV_DISK", &want.Disk}, {"COMMAND", "", &want.Command}, {"USER", "", &want.User}, {"WORK_ROOT", "", &want.WorkRoot}} {
+			}{{"CONTROL_HOST", "EXE_DEV_CONTROL_HOST", &want.ControlHost}, {"IMAGE", "EXE_DEV_IMAGE", &want.Image}, {"FROM", "", &want.Base}, {"MEMORY", "EXE_DEV_MEMORY", &want.Memory}, {"DISK", "EXE_DEV_DISK", &want.Disk}, {"COMMAND", "", &want.Command}, {"USER", "", &want.User}, {"WORK_ROOT", "", &want.WorkRoot}} {
 				raw, alias := *f.v, "alias-value"
 				if mode == "empty" {
 					raw = ""
@@ -14910,7 +14908,7 @@ func TestExeDevConfigEnvironmentContract(t *testing.T) {
 }
 
 func TestExeDevConfigWorkRootFallbackContract(t *testing.T) {
-	for _, tc := range []struct{ providerRoot, generic, want string }{{"", "/work/crabbox", "/tmp/crabbox"}, {"", "/custom/root", "/custom/root"}, {"/specific/root", "/custom/root", "/specific/root"}, {"  ", "/custom/root", "  "}} {
+	for _, tc := range []struct{ providerRoot, generic, want string }{{"", "/work/crabbox", "/var/tmp/crabbox"}, {"", "/custom/root", "/custom/root"}, {"/specific/root", "/custom/root", "/specific/root"}, {"  ", "/custom/root", "  "}} {
 		cfg := baseConfig()
 		cfg.Provider = "exe-dev"
 		cfg.WorkRoot = tc.generic
@@ -14946,7 +14944,7 @@ func TestInheritedWorkRootCallerContract(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USER", "fixture-user")
 	for _, tc := range []struct{ providerRoot, genericRoot, want string }{
-		{"", "", "/tmp/crabbox"}, {"", "/work/crabbox", "/tmp/crabbox"}, {"", "/Users/ec2-user/crabbox", "/tmp/crabbox"}, {"", `C:\crabbox`, "/tmp/crabbox"},
+		{"", "", "/var/tmp/crabbox"}, {"", "/work/crabbox", "/var/tmp/crabbox"}, {"", "/Users/ec2-user/crabbox", "/var/tmp/crabbox"}, {"", `C:\crabbox`, "/var/tmp/crabbox"},
 		{"", " /work/crabbox ", " /work/crabbox "}, {"", "/WORK/crabbox", "/WORK/crabbox"}, {"", `c:\crabbox`, `c:\crabbox`},
 		{"", "/srv/custom", "/srv/custom"}, {"", "/Users/alice/custom", "/Users/alice/custom"}, {"", `D:\custom`, `D:\custom`}, {"", "  ", "  "},
 		{" ", "/srv/custom", " "}, {"/work/crabbox", "/srv/custom", "/work/crabbox"}, {"relative", "/srv/custom", "relative"}, {"/provider/root", "/srv/custom", "/provider/root"},
@@ -16473,7 +16471,6 @@ func TestDigitalOceanBindingCoreDefaults(t *testing.T) {
 		}
 		region, image := raw, raw
 		if raw == "" {
-			region = "nyc3"
 			image = "ubuntu-24-04-x64"
 		}
 		if cfg.DigitalOcean.Region != region || cfg.DigitalOcean.Image != image {
@@ -17480,6 +17477,8 @@ func TestConfigInputGenericFileGroups(t *testing.T) {
 		{"results-clear", "results: {junit: []}", true, false},
 		{"results-false", "results: {auto: false}", true, false},
 		{"shard-zero", "shard: {maxCount: 0}", true, false},
+		{"shard-concurrency-zero", "shard: {maxConcurrency: 0}", true, false},
+		{"shard-concurrency", "shard: {maxConcurrency: 4}", true, false},
 		{"cache-false", "cache: {pnpm: false}", true, false},
 		{"cache-clear", "cache: {volumes: []}", true, false},
 		{"cache-invalid", "cache: {volumes: [{key: fixture}]}", false, true},
@@ -20140,14 +20139,14 @@ func TestBoxdBindingEnvironmentPresence(t *testing.T) {
 
 func TestStaticCompleteFileEnvironmentBindings(t *testing.T) {
 	clearConfigEnv(t)
-	if baseConfig().Static != (StaticConfig{}) {
+	if !reflect.DeepEqual(baseConfig().Static, StaticConfig{}) {
 		t.Fatal("Static must have zero compiled defaults")
 	}
 	prior := StaticConfig{ID: "old-id", Name: "old-name", Host: "old-host", User: "old-user", Port: "old-port", WorkRoot: "old-root"}
 	for _, trusted := range []bool{false, true} {
 		for _, raw := range []string{"", " ", "replacement"} {
 			cfg := Config{Static: prior, SSHUser: "generic-user", SSHPort: "generic-port", SSHKey: "/synthetic/not-read", WorkRoot: "/generic"}
-			input := fileStaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}
+			input := fileStaticSection{fileStaticConfig: fileStaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}}
 			before := input
 			if err := applyFileConfigWithTrust(&cfg, fileConfig{Static: &input}, trusted); err != nil {
 				t.Fatal(err)
@@ -20156,7 +20155,7 @@ func TestStaticCompleteFileEnvironmentBindings(t *testing.T) {
 			if raw != "" {
 				want = StaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}
 			}
-			if cfg.Static != want || input != before {
+			if !reflect.DeepEqual(cfg.Static, want) || !reflect.DeepEqual(input, before) {
 				t.Fatal("file values or immutable DTO changed")
 			}
 			facts := cfg.inputProvenance["ssh"]
@@ -20188,7 +20187,7 @@ func TestStaticCompleteFileEnvironmentBindings(t *testing.T) {
 		if raw != "" {
 			want = StaticConfig{ID: raw, Name: raw, Host: raw, User: raw, Port: raw, WorkRoot: raw}
 		}
-		if cfg.Static != want || (cfg.inputProvenance["ssh"].values != 0) != (raw != "") || cfg.inputProvenance["ssh"].intents != 0 {
+		if !reflect.DeepEqual(cfg.Static, want) || (cfg.inputProvenance["ssh"].values != 0) != (raw != "") || cfg.inputProvenance["ssh"].intents != 0 {
 			t.Fatal("environment values/acceptance changed")
 		}
 		wantSource := credentialSourceUnknown
@@ -20225,7 +20224,7 @@ func TestStaticTargetFlagsEarlyFailureState(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), wantError) {
 				t.Fatalf("error=%v", err)
 			}
-			if cfg.Static != (StaticConfig{ID: "retained-id", Name: "retained-name", Host: raw, User: raw, Port: raw, WorkRoot: raw}) || cfg.credentialProvenance.staticHost != credentialSourceFlag || cfg.inputProvenance["ssh"].values != 1<<(configInputFlag-1) || cfg.inputProvenance["ssh"].intents != 0 {
+			if !reflect.DeepEqual(cfg.Static, StaticConfig{ID: "retained-id", Name: "retained-name", Host: raw, User: raw, Port: raw, WorkRoot: raw}) || cfg.credentialProvenance.staticHost != credentialSourceFlag || cfg.inputProvenance["ssh"].values != 1<<(configInputFlag-1) || cfg.inputProvenance["ssh"].intents != 0 {
 				t.Fatal("static acceptance/source must precede target validation failure")
 			}
 			if !cfg.targetExplicit || !cfg.targetFlagExplicit || cfg.Provider != "other" || cfg.explicitSSHUser != "" || cfg.explicitSSHPort != "" || cfg.explicitWorkRoot != "" {

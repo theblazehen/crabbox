@@ -9,6 +9,8 @@ on:
       - "skills/**"
       - "scripts/build-docs-site.mjs"
       - "scripts/enhance-docs-site.mjs"
+      - "scripts/check-docs-i18n.mjs"
+      - "scripts/lib/**"
       - "scripts/normalize-provider-counts.mjs"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -34,10 +36,11 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Build site
         run: |
+          node scripts/check-docs-i18n.mjs
           node scripts/build-docs-site.mjs
           node scripts/enhance-docs-site.mjs
           node scripts/normalize-provider-counts.mjs

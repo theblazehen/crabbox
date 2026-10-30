@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { defaultOSImage, normalizeOSImage, osImageSpec } from "../src/os-image";
+import {
+  defaultOSImage,
+  normalizeLinuxOSImage,
+  normalizeOSImage,
+  osImageSpec,
+} from "../src/os-image";
 import { osImageAliases, osImageSpecs, supportedOSImages } from "../src/os-image.generated";
 
 const fixtures: { input: string; selector: string }[] = JSON.parse(
@@ -10,6 +15,10 @@ const fixtures: { input: string; selector: string }[] = JSON.parse(
 );
 
 describe("portable OS catalog", () => {
+  it("rejects Windows selectors for Linux image promotion", () => {
+    expect(normalizeLinuxOSImage("ubuntu-26.04")).toBe("ubuntu:26.04");
+    expect(() => normalizeLinuxOSImage("windows-server:2025")).toThrow("requires target=windows");
+  });
   it("normalizes shared aliases and rejects unknown selectors", () => {
     expect(normalizeOSImage(undefined)).toBe(defaultOSImage);
     for (const fixture of fixtures.filter((item) => item.selector)) {
@@ -31,7 +40,7 @@ describe("portable OS catalog", () => {
       expect(spec.awsArm64Name).toContain("arm64-server");
       expect(spec.azureImage).toContain(":server:latest");
       expect(spec.azureArm64Image).toContain(":server-arm64:latest");
-      expect(spec.hetznerImage).toBe("ubuntu-24.04");
+      expect(spec.hetznerImage).toBe(selector.replace(":", "-"));
     }
   });
 });

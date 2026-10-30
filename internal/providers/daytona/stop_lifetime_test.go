@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	api "github.com/daytonaio/daytona/libs/api-client-go"
+	api "github.com/daytona/clients/api-client-go"
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
@@ -21,6 +21,13 @@ func (a *observingDaytonaContextAPI) GetSandbox(ctx context.Context, id string) 
 		return nil, err
 	}
 	return a.fixedDaytonaDeletionAPI.GetSandbox(ctx, id)
+}
+
+func (a *observingDaytonaContextAPI) getSandboxForCleanup(ctx context.Context, id string) (*api.Sandbox, error) {
+	if err := a.beforeGet(ctx); err != nil {
+		return nil, err
+	}
+	return a.fixedDaytonaDeletionAPI.getSandboxForCleanup(ctx, id)
 }
 
 func observeDaytonaDeletionContext(t *testing.T, beforeGet func(context.Context) error) {

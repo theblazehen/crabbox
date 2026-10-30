@@ -23,7 +23,7 @@ jobs:
   go-test:
     name: Go test
     needs: [go-test-core, go-test-cli]
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -51,9 +51,19 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: true
           cache-dependency-path: '**/go.sum'
+
+      # setup-go restores cache entries with their saved mtimes. Once those are
+      # older than Go's 5-day trim limit, the race build trims every entry it
+      # did not use, including the non-race packages builtCLITestBinary reuses.
+      - name: Keep restored Go build cache
+        run: |
+          cache="$(go env GOCACHE)"
+          mkdir -p "$cache"
+          find "$cache" -type f -exec touch -c {} +
 
       - name: Test CLI shard
         run: python3 scripts/test-go-shard.py ${{ matrix.shard }} 4
@@ -70,6 +80,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: true
           cache-dependency-path: '**/go.sum'
@@ -153,6 +164,45 @@ jobs:
 
   go-modules:
     name: Go modules
+    needs: [go-modules-core, go-modules-cli]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require all normal module tests
+        shell: bash
+        env:
+          CORE_RESULT: ${{ needs['go-modules-core'].result }}
+          CLI_RESULT: ${{ needs['go-modules-cli'].result }}
+        run: |
+          printf 'Go non-CLI and nested modules: %s\nGo normal CLI shards: %s\n' "${CORE_RESULT:-missing}" "${CLI_RESULT:-missing}"
+          [[ "${CORE_RESULT:-}" == success && "${CLI_RESULT:-}" == success ]]
+
+  go-modules-cli:
+    name: Go normal CLI shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Test normal CLI shard
+        run: python3 scripts/test-go-shard.py ${{ matrix.shard }} 4 --normal
+
+  go-modules-core:
+    name: Go normal non-CLI and nested modules
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -163,36 +213,120 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: true
           cache-dependency-path: '**/go.sum'
 
-      - name: Test all Go modules
-        run: scripts/test-go-modules.sh
+      - name: Test non-CLI root and all nested modules
+        run: scripts/test-go-modules.sh --exclude-root-cli
+
+  go-coverage-cli:
+    name: Go CLI coverage shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Cover CLI shard
+        run: python3 scripts/test-go-shard.py ${{ matrix.shard }} 3 --coverprofile "${{ runner.temp }}/cli-${{ matrix.shard }}.out"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-coverage-cli-${{ matrix.shard }}
+          path: ${{ runner.temp }}/cli-${{ matrix.shard }}.out
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
+
+  go-coverage-core:
+    name: Go non-CLI coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Cover other packages
+        shell: bash
+        run: |
+          packages=$(go list ./...)
+          mapfile -t packages < <(printf '%s\n' "$packages" | sed '\|^github.com/openclaw/crabbox/internal/cli$|d')
+          go test -count=1 -timeout=20m -covermode=atomic -coverprofile="${{ runner.temp }}/core.out" "${packages[@]}"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-coverage-core
+          path: ${{ runner.temp }}/core.out
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
 
   go-coverage:
     name: Go coverage
+    needs: [go-coverage-core, go-coverage-cli]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
+      - name: Require all coverage producers
+        shell: bash
+        env:
+          CORE_RESULT: ${{ needs['go-coverage-core'].result }}
+          CLI_RESULT: ${{ needs['go-coverage-cli'].result }}
+        run: |
+          printf 'Go non-CLI coverage: %s\nGo CLI coverage shards: %s\n' "${CORE_RESULT:-missing}" "${CLI_RESULT:-missing}"
+          [[ "${CORE_RESULT:-}" == success && "${CLI_RESULT:-}" == success ]]
+
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: true
           cache-dependency-path: '**/go.sum'
 
+      - name: Download coverage profiles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: go-coverage-*
+          path: ${{ runner.temp }}/go-coverage
+          merge-multiple: true
+
       - name: Coverage
-        run: scripts/check-go-coverage.sh 90.0
+        run: scripts/check-go-coverage.sh 90.0 --profiles "${{ runner.temp }}/go-coverage"
 
   go:
     name: Go
     needs: [go-test, go-modules, go-coverage]
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -220,6 +354,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: false
 
@@ -228,6 +363,53 @@ jobs:
 
   windows-pond-mesh-cancellation:
     name: Windows Pond Mesh Cancellation
+    needs: [windows-native-contracts, windows-powershell-architecture]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all native Windows contracts
+        shell: bash
+        env:
+          CONTRACTS_RESULT: ${{ needs['windows-native-contracts'].result }}
+          ARCHITECTURE_RESULT: ${{ needs['windows-powershell-architecture'].result }}
+        run: |
+          printf 'Windows contracts: %s\nPowerShell architecture: %s\n' \
+            "${CONTRACTS_RESULT:-missing}" "${ARCHITECTURE_RESULT:-missing}"
+          [[ "${CONTRACTS_RESULT:-}" == success && "${ARCHITECTURE_RESULT:-}" == success ]]
+
+  windows-powershell-architecture:
+    name: Windows PowerShell 5.1 architecture
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Test static SSH architecture in Windows PowerShell 5.1
+        shell: pwsh
+        env:
+          GOFLAGS: -mod=readonly -trimpath -p=1
+          GOMAXPROCS: 2
+        run: |
+          $name = 'TestStaticSSHArchitectureLocalWindowsPowerShell51Probe'
+          $events = @(go test -race ./internal/providers/ssh -run '^TestStaticSSHArchitectureLocalWindowsPowerShell51Probe$' -count=20 -timeout=8m -json)
+          $code = $LASTEXITCODE
+          $events | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          & ./scripts/verify-go-test-events.ps1 -Events $events -RequiredTests @($name) -Label 'Windows PowerShell 5.1 architecture probe'
+
+  windows-native-contracts:
+    name: Native Windows contracts
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -239,21 +421,41 @@ jobs:
         id: windows_go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: '**/go.sum'
 
-      - name: Test native Windows local Git manifest handoff
-        run: go test ./internal/cli/ -run '^TestGitLocalReceiverWindowsManifestHandoff$' -count=1 -v
+      - name: Test native Windows project detection
+        run: go test ./internal/cli -run '^(TestDetectInitProject|TestInitProjectDetectsRepoCommands)' -count=1 -timeout=5m -v
 
-      - name: Test static SSH architecture in Windows PowerShell 5.1
+      - name: Require PowerShell literal parsing on Windows
         shell: pwsh
         run: |
-          $name = 'TestStaticSSHArchitectureLocalWindowsPowerShell51Probe'
-          $events = @(go test ./internal/providers/ssh -run '^TestStaticSSHArchitectureLocalWindowsPowerShell51Probe$' -count=1 -timeout=1m -json)
+          $required = @(
+            'TestPSQuoteRoundTripsThroughPowerShell',
+            'TestPowerShellGeneratedCommandPreservesValues',
+            'TestPowerShellBootstrapPreservesValues',
+            'TestPowerShellWSLBootstrapPreservesHereStringTerminators'
+          )
+          $events = @(go test ./internal/cli -run ('^(' + ($required -join '|') + ')$') -count=1 -timeout=5m -json)
           $code = $LASTEXITCODE
           $events | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) { exit $code }
-          & ./scripts/verify-go-test-events.ps1 -Events $events -RequiredTests @($name) -Label 'Windows PowerShell 5.1 architecture probe'
+          $required += @($required | ForEach-Object { "$_/powershell.exe" })
+          & ./scripts/verify-go-test-events.ps1 -Events $events -RequiredTests $required -Label 'PowerShell literal parsing'
+
+      - name: Prove paired Windows connection-error classification
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        shell: pwsh
+        run: ./scripts/native-windows-retry-proof.ps1
+
+      - name: Prove native TLS rejection and legitimate private CA
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        run: go test ./internal/cli -run '^TestCoordinator(ReadDoesNotOverrideTLSVerificationWithCurl|HTTPSReadNeverDowngradesAfterDroppedHandshake|NativeHTTPReadRecoversAfterDroppedConnection)$' -count=1 -v
+
+      - name: Test native Windows local Git manifest handoff
+        run: go test ./internal/cli/ -run '^(TestGitLocalReceiverWindowsManifestHandoff|TestCoordinatorReadRetryWindowsConnectionErrors)$' -count=1 -v
 
       - name: Require native Windows external slug reservation recovery and reuse
         if: ${{ !cancelled() && steps.windows_go.outcome == 'success' }}
@@ -276,6 +478,9 @@ jobs:
       - name: Test native Windows archive preparation ownership
         run: go test ./internal/providers/blaxel -run '^TestRunPreparesArchiveBeforeCreate$' -count=1 -v
 
+      - name: Test managed Windows endpoint launch through CMD
+        run: go test ./internal/providers/sshhost -run '^TestMXCEndpointCommandThroughCMD$' -count=1 -v
+
       - name: Test native Windows local history store, readers, and observation
         run: go test ./internal/cli/ -run '^(TestLocalHistory|TestRunObservation(DelegatedAppRoundTrip|DisabledHasNoLedger|CapturesOnlyCommandWriters|AdoptsExistingCaptureOmissions|FinalFailureOnlyWarns|NeverEntersWireRequest|CoordinatorReferenceExcludesCredentials|CoordinatorTerminalAcknowledgment|PolicyIgnoresRepositoryFiles)$)' -count=1 -timeout=5m -v
 
@@ -291,6 +496,11 @@ jobs:
             'TestManagedStateArchiveRejectsSuppliedMarker',
             'TestManagedStateTransferWindowsDirectoryAlias',
             'TestManagedStateTransferWindowsShortName',
+            'TestWindowsFileSnapshotManagedTransferPath',
+            'TestWindowsFileSnapshotHandleMetadata',
+            'TestWindowsFileSnapshotDoesNotFollowJunction',
+            'TestManagedStateEntrySpellingRejectsReplacedPath',
+            'TestFileSnapshotPathInfoOpensContentDeniedFileForMetadata',
             'TestLeaseSSHRootSelection',
             'TestLeaseSSHOptionalDefaultCompatibility',
             'TestLeaseSSHImportedFilePrivacy',
@@ -311,7 +521,7 @@ jobs:
             'TestSSHControlPathIsScopedByKey'
           )
           # POSIX mode tests are excluded; the native Windows ACL equivalents above must pass.
-          $events = @(go test ./internal/cli -run '^(Test(LeaseSSH|SelectedLeaseSSH|ManagedState)|Test(EnsureTestboxLeaseDirectoryCreatesPrivateWindowsComponents|EnsureLeaseSSHDirectoriesToleratesConcurrentCreation|WalkDirectoryPathToleratesConcurrentCreation|TestboxKeyPathAllowsSafeCustomIDs|UseLeaseKnownHostsScopesAndEnforcesHostVerification|SSHControlPathIsScopedByKey)$)' -skip '^TestSelectedLeaseSSH(RootDoesNotRepairCallerDirectory|ExistingKeyRequiresPrivateMode)$' -count=1 -timeout=5m -json)
+          $events = @(go test ./internal/cli -run '^(Test(LeaseSSH|SelectedLeaseSSH|ManagedState)|Test(EnsureTestboxLeaseDirectoryCreatesPrivateWindowsComponents|EnsureLeaseSSHDirectoriesToleratesConcurrentCreation|WalkDirectoryPathToleratesConcurrentCreation|TestboxKeyPathAllowsSafeCustomIDs|UseLeaseKnownHostsScopesAndEnforcesHostVerification|SSHControlPathIsScopedByKey|WindowsFileSnapshotManagedTransferPath|WindowsFileSnapshotHandleMetadata|WindowsFileSnapshotDoesNotFollowJunction|FileSnapshotPathInfoOpensContentDeniedFileForMetadata)$)' -skip '^TestSelectedLeaseSSH(RootDoesNotRepairCallerDirectory|ExistingKeyRequiresPrivateMode)$' -count=1 -timeout=5m -json)
           $code = $LASTEXITCODE
           $events | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) { exit $code }
@@ -326,6 +536,14 @@ jobs:
       - name: Test native Windows runtime prerequisite
         run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-runtime.ps1
 
+      - name: Test Windows developer-image preparation in PowerShell 5.1
+        run: node --test scripts/install-windows-developer-tools.test.js
+
+      - name: Qualify actual managed Node artifacts (finite incident campaign)
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        run: node scripts/native-node-bootstrap-proof.mjs
+
+
       - name: Test native Windows detached process launch contract
         run: powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-windows-detached-process.ps1 -AllowJobBreakawayDenied
 
@@ -333,7 +551,13 @@ jobs:
         shell: pwsh
         run: |
           $required = @(
+            'TestRemoteActionsWorkspaceOriginNativeWindows',
+            'TestReadActionsWorkspaceStateNativeWindows',
             'TestWindowsNativeStdinRuntime',
+            'TestWindowsNativeStdinSynchronousPipe',
+            'TestWindowsNativeRemoteCommandProcessStreamsAndArgv',
+            'TestWindowsRemoteRunScriptProcessArgv',
+            'TestWindowsNativeRemoteCommandInterpreterPaths',
             'TestPackageManagerPreflightWindowsEnvironment',
             'TestWindowsNativeStdinCancellation',
             'TestWindowsSSHStdinReaderBehavior',
@@ -345,6 +569,9 @@ jobs:
             'TestWSLStageLauncherConfirmsOriginalAndCleanupTermination',
             'TestWSLStageRootPreparationSecuresInheritedWindowsACL',
             'TestWSLStageRootPreparationRejectsFilesAndReparsePoints',
+            'TestWSLStageRootPreparationCapabilityGrants',
+            'TestWSLStageRootPreparationRejectsCapabilityGrantsOnStagePaths',
+            'TestWSLStageShellDiscoveryWithoutWMI',
             'TestWSLStageFrameworkInputPreamble',
             'TestWSLStageDelayedInitialHandoff',
             'TestWSLStageInitialHandoffBudgets',
@@ -363,6 +590,12 @@ jobs:
 
       - name: Test native Windows failure captures and private outputs
         run: go test ./internal/cli/ -run '^(TestFailureBundle|TestNativeWindowsFailureBundle|TestPrivateRunOutput|TestManagedAttestKeyWindows|TestArtifactOutputWindows)' -count=1 -v
+
+      - name: Test native Windows atomic private files
+        run: go test ./internal/atomicfile -run '^TestWritePrivate' -count=1 -v
+
+      - name: Test native Windows private staging and config persistence
+        run: go test ./internal/privatefile ./internal/cli -run '^Test(CreateTempWindows|ValidateWindowsDescriptor|WriteUserFileConfig(Atomic|UsesPrivateStaging))' -count=1 -v
 
       - name: Test native Windows shared claim cancellation fences
         run: go test ./internal/cli/ -run '^TestClaim(Shared|FenceContext)' -count=1 -v
@@ -391,16 +624,32 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: false
 
       - name: Test source-derived hermetic lifecycle packages
         run: scripts/test-provider-lifecycles.sh
 
+  macos-intel-tools:
+    name: macOS Intel verification tools
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bootstrap Intel verification tools
+        run: bash scripts/setup-release-macos-architecture.sh x86_64 homebrew
+      - name: Prove Intel execution context and Homebrew
+        run: |
+          /usr/bin/arch -x86_64 /bin/bash -c 'test "$(uname -m)" = x86_64'
+          /usr/bin/arch -x86_64 /usr/local/bin/brew --version
+
   apple-vm:
     name: Apple VM
-    runs-on: macos-15
-    timeout-minutes: 15
+    runs-on: xcode-27
+    timeout-minutes: 30
 
     steps:
       - name: Check out
@@ -412,16 +661,26 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Test macOS script compatibility
         run: PATH="/usr/bin:/bin:$PATH" node --test scripts/mint-aws-devtools-image.test.js
 
+      - name: Qualify actual managed Node artifacts (finite incident campaign)
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        run: node scripts/native-node-bootstrap-proof.mjs
+
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: false
+
+
+      - name: Prove native TLS rejection and legitimate private CA
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        run: go test -race ./internal/cli -run '^TestCoordinator(ReadDoesNotOverrideTLSVerificationWithCurl|HTTPSReadNeverDowngradesAfterDroppedHandshake|NativeHTTPReadRecoversAfterDroppedConnection)$' -count=1 -v
 
       - name: Vet native helper
         run: go vet ./internal/applevmhelper ./cmd/crabbox-apple-vm-helper
@@ -492,7 +751,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: npm
           cache-dependency-path: worker/package-lock.json
 
@@ -539,9 +798,19 @@ jobs:
         run: docker build -f worker/Dockerfile.node worker
 
   worker-postgres-recovery:
-    name: AWS recovery PostgreSQL integration
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AWS recovery PostgreSQL integration
+            config: vitest.postgres.config.ts
+            cli: false
+          - name: Create retirement PostgreSQL integration
+            config: vitest.retire-postgres.config.ts
+            cli: true
     services:
       postgres:
         # Docker Official Image; PostgreSQL 17 satisfies the supported 13+ runtime contract.
@@ -565,35 +834,47 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
           cache: npm
           cache-dependency-path: worker/package-lock.json
       - name: Install existing dependencies
         run: npm ci
         working-directory: worker
-      - name: Prove recovery rollback, reopen, and scoped-lease coexistence
-        run: npm exec -- vitest run --config vitest.postgres.config.ts
+      - name: Set up Go for CLI integration
+        if: matrix.cli
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          go-version-file: go.mod
+          cache: false
+      - name: Build CLI for integration
+        if: matrix.cli
+        run: go build -trimpath -o bin/crabbox ./cmd/crabbox
+      - name: Prove isolated PostgreSQL recovery
+        run: npm exec -- vitest run --config ${{ matrix.config }}
         working-directory: worker
 
   scripts:
     name: Scripts
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: false
 
@@ -605,6 +886,20 @@ jobs:
 
       - name: Check generated bootstrap and OS catalog
         run: node scripts/generate-bootstrap.mjs --check
+
+      - name: Qualify actual managed Node artifacts (finite incident campaign)
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        run: node scripts/native-node-bootstrap-proof.mjs
+
+      - name: Prove native TLS rejection and legitimate private CA
+        if: github.event_name == 'pull_request' && github.head_ref == 'security/emudhra-node-release'
+        run: go test ./internal/cli -run '^TestCoordinator(ReadDoesNotOverrideTLSVerificationWithCurl|HTTPSReadNeverDowngradesAfterDroppedHandshake|NativeHTTPReadRecoversAfterDroppedConnection)$' -count=1 -v
+
+      - name: Prove pinned Rust and uv offline execution
+        timeout-minutes: 5
+        env:
+          CRABBOX_TEST_RUST_UV_DOWNLOAD: "1"
+        run: node --test --test-name-pattern='^reviewed Linux Rust and uv archives' scripts/linux-rust-uv.test.js
 
       - name: Test
         run: node --test scripts/*.test.js scripts/*.test.mjs
@@ -618,14 +913,18 @@ jobs:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Check translations (staleness is advisory)
+        run: node scripts/check-docs-i18n.mjs
+
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: "1.27.3"
           go-version-file: go.mod
           cache: false
 

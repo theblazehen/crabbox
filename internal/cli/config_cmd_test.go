@@ -261,7 +261,7 @@ func TestConfigShowEffectiveLeaseDurations(t *testing.T) {
 		wantTTL, wantIdleTimeout, wantProvider           string
 	}{
 		{
-			name: "compiled defaults", wantTTL: "1h30m0s", wantIdleTimeout: "30m0s",
+			name: "compiled defaults", wantTTL: "30m0s", wantIdleTimeout: "30m0s",
 		},
 		{
 			name: "top-level YAML", userYAML: "ttl: 125m\nidleTimeout: 75s\n",
@@ -297,7 +297,7 @@ jobs:
     ttl: 17m
     idleTimeout: 3m
 `,
-			wantTTL: "1h30m0s", wantIdleTimeout: "30m0s", wantProvider: "aws",
+			wantTTL: "30m0s", wantIdleTimeout: "30m0s", wantProvider: "aws",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -362,6 +362,23 @@ jobs:
 				})
 			}
 		})
+	}
+}
+
+func TestConfigShowWarmupKeep(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		cfg := baseConfig()
+		cfg.WarmupKeep = keep
+		var output bytes.Buffer
+		if err := writeConfigShowText(&output, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if line := fmt.Sprintf("\nwarmup keep=%t\n", keep); !strings.Contains(output.String(), line) || strings.Count(output.String(), "\nwarmup ") != 1 {
+			t.Fatalf("missing unique warmup summary %q", line)
+		}
+		if got := configShowView(cfg)["warmup"].(map[string]any)["keep"]; got != keep {
+			t.Fatalf("JSON warmup.keep=%v, want %t", got, keep)
+		}
 	}
 }
 

@@ -27,7 +27,7 @@ type lifecycleClock struct{ current time.Time }
 
 func (c *lifecycleClock) Now() time.Time { return c.current }
 
-func runpodLifecycleFixture(t *testing.T) (*runpodLeaseBackend, core.LeaseTarget, core.LeaseClaim, core.Repo, *lifecycleClock) {
+func runpodLifecycleFixture(t *testing.T, ttl ...time.Duration) (*runpodLeaseBackend, core.LeaseTarget, core.LeaseClaim, core.Repo, *lifecycleClock) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	clock := &lifecycleClock{current: time.Now().UTC().Truncate(time.Second)}
@@ -35,6 +35,9 @@ func runpodLifecycleFixture(t *testing.T) (*runpodLeaseBackend, core.LeaseTarget
 	pod := runpodPod{ID: "pod-policy", Name: core.LeaseProviderName(leaseID, slug), DesiredStatus: "RUNNING"}
 	fake := &fakeRunpodAPI{listPods: []runpodPod{pod}, getPod: func(string) (runpodPod, error) { return pod, nil }}
 	cfg := core.Config{Provider: providerName, IdleTimeout: 5 * time.Minute, TTL: time.Hour, Runpod: core.RunpodConfig{APIKey: "test-key"}}
+	if len(ttl) > 0 {
+		cfg.TTL = ttl[0]
+	}
 	applyRunpodDefaults(&cfg)
 	server := initializeRunpodLifecycle(runpodServer(pod, leaseID, slug, cfg), cfg, false, clock.current)
 	created := clock.current.Add(-2 * time.Minute)
@@ -133,7 +136,7 @@ func TestRunpodResolveRejectsClaimChangedDuringObservation(t *testing.T) {
 }
 
 func TestRunpodTouchCommitsLifecyclePolicy(t *testing.T) {
-	b, lease, original, repo, clock := runpodLifecycleFixture(t)
+	b, lease, original, repo, clock := runpodLifecycleFixture(t, 90*time.Minute)
 	lease, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo})
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +171,7 @@ func TestRunpodTouchCommitsLifecyclePolicy(t *testing.T) {
 		}
 		if i > 0 {
 			created, _ := strconv.ParseInt(original.Labels["created_at"], 10, 64)
-			if claim.Labels["expires_at"] != strconv.FormatInt(created+3600, 10) {
+			if claim.Labels["expires_at"] != strconv.FormatInt(created+5400, 10) {
 				t.Error("touch lost original TTL cap")
 			}
 		}
@@ -329,6 +332,25 @@ func TestRunpodProviderSpec(t *testing.T) {
 	if len(aliases) != 2 || aliases[0] != "run-pod" || aliases[1] != "runpodio" {
 		t.Fatalf("aliases = %#v, want [run-pod runpodio]", aliases)
 	}
+}
+
+func TestRunpodCatalogFixedLeaseID(t *testing.T) {
+	t.Setenv("RUNPOD_API_KEY", "")
+	t.Setenv("CRABBOX_RUNPOD_API_KEY", "")
+	var out strings.Builder
+	if err := (core.App{Stdout: &out, Stderr: io.Discard}).Run(t.Context(), []string{"providers", "--json", "--feature", "fixed-lease-id"}); err != nil {
+		t.Fatal(err)
+	}
+	var entries []struct{ Provider string }
+	if err := json.Unmarshal([]byte(out.String()), &entries); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Provider == providerName {
+			return
+		}
+	}
+	t.Fatal("fixed-lease-id catalog omitted RunPod")
 }
 
 func TestRunpodClientRedactsReflectedCredential(t *testing.T) {
@@ -620,6 +642,11 @@ func TestRunpodDoctorChecksAuthAndListPods(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			t.Errorf("auth = %q, want Bearer test-key", r.Header.Get("Authorization"))
 		}
+		if r.URL.Path == "/graphql" {
+			_, _ = io.WriteString(w, "{\"data\":{\"myself\":{\"id\":\"account-one\"}}}")
+			paths = append(paths, r.URL.Path)
+			return
+		}
 		if r.Header.Get("Content-Type") != "" {
 			t.Errorf("content-type = %q", r.Header.Get("Content-Type"))
 		}
@@ -642,8 +669,11 @@ func TestRunpodDoctorChecksAuthAndListPods(t *testing.T) {
 	if result.Provider != providerName {
 		t.Fatalf("provider=%q", result.Provider)
 	}
-	if len(paths) != 2 || paths[0] != "/pods" || paths[1] != "/pods" {
-		t.Fatalf("paths=%v, want two /pods reads", paths)
+	if len(paths) != 2 || paths[0] != "/graphql" || paths[1] != "/pods" {
+		t.Fatalf("paths=%v, want GraphQL identity and /pods reads", paths)
+	}
+	if !strings.Contains(result.Message, "account=account-one") {
+		t.Fatalf("doctor did not return the account identity: %s", result.Message)
 	}
 }
 
@@ -1459,7 +1489,7 @@ func TestRunpodClientSendsBearerAndRESTRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Whoami(context.Background()); err != nil {
+	if _, err := client.ListPods(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if gotMethod != http.MethodGet {

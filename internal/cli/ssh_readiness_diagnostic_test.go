@@ -2,11 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -69,9 +71,21 @@ exit 127
 		wantPorts = "proxy:ready"
 	}
 	var progress bytes.Buffer
-	// Long enough for one full probe iteration to complete and record
-	// its evidence before the deadline fires.
-	err = waitForSSHReady(t.Context(), &target, &progress, "bootstrap", 2*time.Second)
+	guardCtx, guardCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer guardCancel()
+	probeCtx, stop := context.WithCancelCause(guardCtx)
+	defer stop(nil)
+	// Expire at the proven readiness observation, before the next iteration
+	// legitimately changes the active probe back to transport.
+	writer := writerFunc(func(p []byte) (int, error) {
+		n, err := progress.Write(p)
+		if strings.Contains(progress.String(), "ports="+wantPorts) {
+			stop(context.DeadlineExceeded)
+		}
+		return n, err
+	})
+	start := time.Now()
+	err = waitForSSHReadyWithProbeContext(t.Context(), probeCtx, &target, writer, "bootstrap", start, start.Add(10*time.Second))
 	if err == nil {
 		t.Fatal("readiness wait unexpectedly succeeded")
 	}
@@ -164,5 +178,20 @@ func TestWaitForSSHReadyProxyTransportProbeFollowsDirectContract(t *testing.T) {
 				t.Fatalf("error should not contain %q: %s", tc.notErr, got)
 			}
 		})
+	}
+}
+
+func TestSSHDialFailureStatusPreservesNoRoute(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&net.OpError{Op: "dial", Net: "tcp", Err: syscall.EHOSTUNREACH}, "no-route-to-host"},
+		{syscall.ECONNREFUSED, "closed"},
+		{context.DeadlineExceeded, "closed"},
+	} {
+		if got := sshDialFailureStatus(tc.err); got != tc.want {
+			t.Errorf("%v: got %s want %s", tc.err, got, tc.want)
+		}
 	}
 }

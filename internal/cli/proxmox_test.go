@@ -1663,3 +1663,134 @@ func TestProxmoxFixedCloneTaskFailurePreservesAttempt(t *testing.T) {
 		t.Fatalf("err=%v post-clone mutations=%d; uncertain fixed attempt must be retained", err, mutations)
 	}
 }
+
+func TestProxmoxVMIdentityExistsInCluster(t *testing.T) {
+	for _, scenario := range []string{"absent", "VMID", "name", "unpropagated", "forbidden", "null"} {
+		t.Run(scenario, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var data any
+				switch r.URL.Path {
+				case "/api2/json/access/permissions":
+					propagate := 1
+					if scenario == "unpropagated" {
+						propagate = 0
+					}
+					data = map[string]any{r.URL.Query().Get("path"): map[string]int{"VM.Audit": propagate}}
+				case "/api2/json/cluster/resources":
+					data = []any{}
+					switch scenario {
+					case "VMID":
+						data = []any{map[string]any{"vmid": 417, "name": "unrelated", "type": "lxc", "node": "pve2"}}
+					case "name":
+						data = []any{map[string]any{"vmid": 418, "name": "crabbox-fixture", "type": "qemu", "node": "pve2"}}
+					case "forbidden":
+						http.Error(w, "permission denied", http.StatusForbidden)
+						return
+					case "null":
+						data = nil
+					}
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+			}))
+			t.Cleanup(api.Close)
+			present, err := testProxmoxClient(t, api.URL).VMIdentityExistsInCluster(t.Context(), "417", "crabbox-fixture")
+			wantPresent := scenario == "VMID" || scenario == "name"
+			wantError := scenario == "unpropagated" || scenario == "forbidden" || scenario == "null"
+			if present != wantPresent || (err != nil) != wantError {
+				t.Fatalf("present=%t err=%v", present, err)
+			}
+		})
+	}
+}
+
+func TestProxmoxVerifyNoActiveCloneTasks(t *testing.T) {
+	for _, scenario := range []string{"absent", "active", "filtered", "forbidden", "null"} {
+		t.Run(scenario, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var data any
+				switch r.URL.Path {
+				case "/api2/json/access/permissions":
+					grants := map[string]int{"Sys.Audit": 0}
+					if scenario == "filtered" {
+						grants = map[string]int{}
+					}
+					data = map[string]any{r.URL.Query().Get("path"): grants}
+				case "/api2/json/nodes/pve1/tasks":
+					if r.URL.Query().Get("source") != "active" || r.URL.Query().Get("typefilter") != "qmclone" || r.URL.Query().Get("limit") != "1" {
+						t.Errorf("unexpected task query: %s", r.URL.RawQuery)
+					}
+					data = []any{}
+					switch scenario {
+					case "active":
+						data = []any{map[string]string{"type": "qmclone", "upid": "UPID:fixture"}}
+					case "forbidden":
+						http.Error(w, "permission denied", http.StatusForbidden)
+						return
+					case "null":
+						data = nil
+					}
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+			}))
+			t.Cleanup(api.Close)
+			err := testProxmoxClient(t, api.URL).VerifyNoActiveCloneTasks(t.Context())
+			if (err == nil) != (scenario == "absent") {
+				t.Fatalf("task verification: %v", err)
+			}
+		})
+	}
+}
+
+func TestProxmoxListVMIDsInClusterRequiresCompleteInventory(t *testing.T) {
+	for _, scenario := range []string{"guests", "absent", "unpropagated", "forbidden", "null", "invalid VMID"} {
+		t.Run(scenario, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var data any
+				switch r.URL.Path {
+				case "/api2/json/access/permissions":
+					propagate := 1
+					if scenario == "unpropagated" {
+						propagate = 0
+					}
+					data = map[string]any{r.URL.Query().Get("path"): map[string]int{"VM.Audit": propagate}}
+				case "/api2/json/cluster/resources":
+					if r.URL.Query().Get("type") != "vm" {
+						t.Error("inventory must include all guest types")
+					}
+					data = []any{}
+					switch scenario {
+					case "guests":
+						data = []any{
+							map[string]any{"vmid": 102, "name": "unlabelled", "type": "qemu", "node": "pve1"},
+							map[string]any{"vmid": 103, "name": "template", "type": "qemu", "template": 1, "node": "pve2"},
+							map[string]any{"vmid": 104, "name": "container", "type": "lxc", "node": "pve2"},
+						}
+					case "forbidden":
+						http.Error(w, "permission denied", http.StatusForbidden)
+						return
+					case "null":
+						data = nil
+					case "invalid VMID":
+						data = []any{map[string]any{"type": "qemu", "node": "pve1"}}
+					}
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+			}))
+			t.Cleanup(api.Close)
+			ids, err := testProxmoxClient(t, api.URL).ListVMIDsInCluster(t.Context())
+			wantError := scenario != "guests" && scenario != "absent"
+			if (err != nil) != wantError {
+				t.Fatalf("ids=%v err=%v", ids, err)
+			}
+			if scenario == "guests" && !reflect.DeepEqual(ids, []int{102, 103, 104}) {
+				t.Fatalf("inventory skipped a guest: %v", ids)
+			}
+		})
+	}
+}

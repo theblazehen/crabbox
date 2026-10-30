@@ -113,8 +113,9 @@ completion still uses the separate signed-receipt finish path.
   8 MiB cap, so very long output is truncated.
 - **`events <run-id>`** prints the ordered phase and output events for a run.
   Filter with `--type`, `--phase`, `--after N`, and `--limit` (default 500).
-- **`attach <run-id>`** follows events for a still-active run, polling every
-  `--poll` interval (default 1s), so you can watch a run another CLI started.
+- **`attach <run-id>`** follows events through the coordinator control WebSocket,
+  falling back to HTTP at the `--poll` interval (default 1s), so you can watch a
+  run another CLI started.
 - **`results <run-id>`** prints structured test-result summaries. See
   [Test results](features/test-results.md).
 
@@ -147,6 +148,11 @@ files captured inside automatic failure bundles are size-capped — pass
 file. Remote archive entries are confined to the bundle subtree; unsafe links
 and special files are omitted. `--capture-on-fail` is still accepted as a compatibility alias; failure
 bundles are saved automatically on non-zero exit regardless.
+
+Remote archive staging uses the output filesystem under the workspace's
+`.crabbox` directory, so a small memory-backed `/tmp` does not block capture
+when the workspace disk has room. Disk-reserve and archive-size limits still
+apply; temporary staging files are removed after success or failure.
 
 If the project capture destination is unwritable (permission denied or a
 read-only filesystem), Crabbox saves the bundle under its per-user state
@@ -519,10 +525,28 @@ Keep the lease ID, owner, org, provider, class, and request time on hand when
 comparing CLI output to Worker logs. See [How it works](how-it-works.md) and the
 [coordinator](features/coordinator.md) reference for the request flow.
 
+The Cloudflare coordinator enables Workers Logs in `worker/wrangler.jsonc` with
+full head sampling, so every Worker request, Durable Object request, alarm, and
+`console` line is retained for seven days and searchable in the Cloudflare
+dashboard or the Workers Logs query API. Query strings are redacted from logged
+request URLs because OAuth callbacks carry authorization codes there. Durable
+Object dispatch failures log one JSON line with
+`event: "coordinator.durable_object_failure"`, the failure kind, method, and
+pathname. `wrangler tail` streams only Worker invocations, so use
+Workers Logs for alarm cadence and Durable Object console output. Running log
+queries through the API (`POST /accounts/{account_id}/workers/observability/telemetry/query`)
+needs a dedicated token with the account-level Workers Observability Write
+permission; Cloudflare's query endpoint does not accept the read permission. Keep
+that token separate from the deploy token. See the
+[overload audit](diagnostics/coordinator-overload.md) for the failure modes these
+logs attribute.
+
 ## Gaps
 
 Crabbox observability is sufficient for maintainer operations but is not yet a
 full analytics product. Notably missing:
 
 - alerting on budget or failure-rate thresholds;
-- a dashboard UI.
+- a general analytics dashboard. The existing [portal](features/portal.md)
+  already shows lease inventory, run logs, events, results, and bounded resource
+  trends; it does not provide a full analytics or alerting system.

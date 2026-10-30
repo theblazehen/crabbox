@@ -1,13 +1,22 @@
 import { cloudInit } from "./bootstrap";
 import {
+  gcpBootDiskTypeForMachineType,
   gcpMachineTypeCandidatesForClass,
   implicitProviderMachineCandidates,
   sshPorts,
   validatedCIDRs,
   type LeaseConfig,
 } from "./config";
+import {
+  creationEvent,
+  observedRunning,
+  measureCreationStep,
+  measureCreationStepSync,
+} from "./creation-events";
 import { base64URL } from "./encoding";
 import { ExpiringTokenCache, type ExpiringToken } from "./expiring-token-cache";
+import type { GCPFirewallCache } from "./gcp-firewall-cache";
+import type { GCPImageMinimumCache, GCPImageMinimum } from "./gcp-image-minimum-cache";
 import { redactDiagnosticSecrets } from "./http";
 import {
   leaseProviderLabels,
@@ -22,8 +31,10 @@ import {
   type ProviderProvisioningCleanupClaim,
 } from "./provider-provisioning";
 import { ProvisioningAttemptHistory } from "./provisioning-attempts";
+import { defaultRootGB } from "./root-disk";
 import { leaseProviderName } from "./slug";
 import type {
+  CreationEvent,
   Env,
   LeaseImageIdentity,
   LeaseRecord,
@@ -139,6 +150,49 @@ interface GCPImageObservation {
   labels?: Record<string, string>;
 }
 
+interface GCPFirewall {
+  description?: string;
+  network?: string;
+  direction?: string;
+  priority?: number;
+  disabled?: boolean;
+  sourceRanges?: string[];
+  targetTags?: string[];
+  sourceTags?: string[];
+  sourceServiceAccounts?: string[];
+  targetServiceAccounts?: string[];
+  destinationRanges?: string[];
+  allowed?: { IPProtocol?: string; ports?: string[] }[];
+  denied?: unknown[];
+}
+
+function gcpFirewallMatches(observed: GCPFirewall, desired: GCPFirewall): boolean {
+  const sameSet = (a: string[] | undefined, b: string[] | undefined) =>
+    Array.isArray(a) &&
+    Array.isArray(b) &&
+    JSON.stringify([...new Set(a)].toSorted()) === JSON.stringify([...new Set(b)].toSorted());
+  const network = (value: string | undefined) =>
+    value?.replace(/^https:\/\/www\.googleapis\.com\/compute\/v1\//, "");
+  return (
+    network(observed.network) === network(desired.network) &&
+    observed.direction === desired.direction &&
+    (observed.priority ?? 1000) === 1000 &&
+    (observed.disabled ?? false) === false &&
+    sameSet(observed.sourceRanges, desired.sourceRanges) &&
+    sameSet(observed.targetTags, desired.targetTags) &&
+    [
+      observed.sourceTags,
+      observed.sourceServiceAccounts,
+      observed.targetServiceAccounts,
+      observed.destinationRanges,
+      observed.denied,
+    ].every((value) => value === undefined || (Array.isArray(value) && value.length === 0)) &&
+    observed.allowed?.length === 1 &&
+    observed.allowed[0]?.IPProtocol === "tcp" &&
+    sameSet(observed.allowed[0]?.ports, desired.allowed?.[0]?.ports)
+  );
+}
+
 interface GCPDisk {
   id?: string;
   selfLink?: string;
@@ -160,13 +214,17 @@ export class GCPClient {
   readonly rootGB: number;
   readonly serviceAccount: string;
   fetcher: typeof fetch = (input, init) => fetch(input, init);
-  private tokenCache = new ExpiringTokenCache();
+  private tokenCache: ExpiringTokenCache;
 
   constructor(
     private readonly env: Env,
     zone?: string,
     project?: string,
+    private readonly sharedTokenCache?: ExpiringTokenCache,
+    private readonly firewallCache?: GCPFirewallCache,
+    private readonly imageMinimumCache?: GCPImageMinimumCache,
   ) {
+    this.tokenCache = sharedTokenCache ?? new ExpiringTokenCache();
     this.project =
       project?.trim() || env.CRABBOX_GCP_PROJECT?.trim() || env.GCP_PROJECT_ID?.trim() || "";
     this.zone = zone || env.CRABBOX_GCP_ZONE?.trim() || "europe-west2-a";
@@ -179,7 +237,7 @@ export class GCPClient {
       "CRABBOX_GCP_SSH_CIDRS",
     );
     if (this.sshCIDRs.length === 0) this.sshCIDRs.push("0.0.0.0/0");
-    this.rootGB = numberFromEnv(env.CRABBOX_GCP_ROOT_GB, 400);
+    this.rootGB = numberFromEnv(env.CRABBOX_GCP_ROOT_GB, 0);
     this.serviceAccount = env.CRABBOX_GCP_SERVICE_ACCOUNT?.trim() || "";
     if (!this.project) throw new Error("GCP_PROJECT_ID or CRABBOX_GCP_PROJECT secret is required");
     if (hasPartialServiceAccountCredential(env)) {
@@ -217,9 +275,16 @@ export class GCPClient {
     if (scopedZone === this.zone && scopedProject === this.project) {
       return this;
     }
-    const client = new GCPClient(this.env, scopedZone, scopedProject);
+    const client = new GCPClient(
+      this.env,
+      scopedZone,
+      scopedProject,
+      this.sharedTokenCache,
+      this.firewallCache,
+      this.imageMinimumCache,
+    );
     client.fetcher = this.fetcher;
-    client.tokenCache = this.tokenCache.clone();
+    client.tokenCache = this.sharedTokenCache ?? this.tokenCache.clone();
     return client;
   }
 
@@ -446,9 +511,13 @@ export class GCPClient {
     attempts?: ProvisioningAttempt[];
   }> {
     const candidates = gcpProvisioningCandidatesForConfig(config);
-    const zones = prependUnique(
-      config.gcpZone || this.zone,
-      config.capacityAvailabilityZones.length > 0 ? config.capacityAvailabilityZones : [this.zone],
+    const zones = measureCreationStepSync("gcp.zone_selection", () =>
+      prependUnique(
+        config.gcpZone || this.zone,
+        config.capacityAvailabilityZones.length > 0
+          ? config.capacityAvailabilityZones
+          : [this.zone],
+      ),
     );
     const history = new ProvisioningAttemptHistory();
     const project = config.gcpProject || this.project;
@@ -586,7 +655,10 @@ export class GCPClient {
         items: [
           { key: "enable-oslogin", value: "FALSE" },
           { key: "ssh-keys", value: `${config.sshUser}:${config.sshPublicKey}` },
-          { key: "user-data", value: cloudInit(config) },
+          {
+            key: "user-data",
+            value: measureCreationStepSync("gcp.user_data_render", () => cloudInit(config)),
+          },
         ],
       },
       networkInterfaces: [
@@ -598,14 +670,24 @@ export class GCPClient {
       ],
     };
     if (!config.gcpMachineImage) {
+      const explicitRootGB = config.gcpRootGB || this.rootGB;
       const initializeParams: Record<string, unknown> = config.gcpSnapshot
         ? { sourceSnapshot: gcpSnapshotRef(config.gcpSnapshot, project) }
         : {
-            sourceImage: config.gcpImage || this.image,
-            diskSizeGb: config.gcpRootGB || this.rootGB,
+            sourceImage: measureCreationStepSync(
+              "gcp.image_selection",
+              () => config.gcpImage || this.image,
+            ),
           };
-      if (config.gcpSnapshot && config.gcpRootGB > 0) {
-        initializeParams["diskSizeGb"] = config.gcpRootGB;
+      if (explicitRootGB > 0) {
+        initializeParams["diskSizeGb"] = explicitRootGB;
+      } else {
+        const sourceKey = config.gcpSnapshot ? "sourceSnapshot" : "sourceImage";
+        const source = String(initializeParams[sourceKey]);
+        const image = await this.rootDiskSource(source, project);
+        initializeParams["diskSizeGb"] = Math.max(defaultRootGB(config.class), image.diskSizeGb);
+        // Family aliases must launch the exact image we inspected.
+        initializeParams[sourceKey] = image.source;
       }
       instance["disks"] = [
         {
@@ -614,7 +696,7 @@ export class GCPClient {
           type: "PERSISTENT",
           initializeParams: {
             ...initializeParams,
-            diskType: `zones/${this.zone}/diskTypes/pd-balanced`,
+            diskType: `zones/${this.zone}/diskTypes/${gcpBootDiskTypeForMachineType(config.serverType)}`,
           },
         },
       ];
@@ -644,9 +726,10 @@ export class GCPClient {
       region: this.zone,
       providerProject: project,
     };
+    const creationEvents: CreationEvent[] = [];
     let recoveredCollision: ProviderMachine | undefined;
     try {
-      await this.insertInstanceAndWait(path, instance, claim);
+      await this.insertInstanceAndWait(path, instance, claim, creationEvents);
     } catch (error) {
       if (provisioning?.onResourceCreated) {
         if (error instanceof GCPOperationError) {
@@ -721,7 +804,10 @@ export class GCPClient {
             `GCP instance ${name} numeric resource id changed after creation`,
           );
         }
-        return machine;
+        return {
+          ...machine,
+          creationEvents: [...creationEvents, ...observedRunning(machine.status)],
+        };
       } catch (error) {
         if (error instanceof ProviderResourceUnresolvedError) throw error;
         throw new ProviderProvisioningCleanupError(
@@ -733,7 +819,11 @@ export class GCPClient {
     }
     try {
       const created = await this.gcp<GCPInstance>("GET", `/zones/${this.zone}/instances/${name}`);
-      return toMachine(created, this.zone);
+      const machine = toMachine(created, this.zone);
+      return {
+        ...machine,
+        creationEvents: [...creationEvents, ...observedRunning(machine.status)],
+      };
     } catch (error) {
       await this.rollbackDirectCreate(name, leaseID, slug, owner, claim, error);
       throw error;
@@ -775,10 +865,13 @@ export class GCPClient {
     path: string,
     instance: Record<string, unknown>,
     claim: ProviderProvisioningCleanupClaim,
+    creationEvents: CreationEvent[],
   ): Promise<void> {
     let operation: GCPOperation;
     try {
+      creationEvents.push(creationEvent("provider_create_request"));
       operation = await this.gcp<GCPOperation>("POST", path, instance);
+      creationEvents.push(creationEvent("provider_create_response"));
       if (!operation.name) {
         throw new Error("GCP instance insert returned no operation name");
       }
@@ -799,7 +892,9 @@ export class GCPClient {
       claim.providerResourceID = providerResourceID;
     }
     try {
-      const completed = await this.waitZoneOperation(operation);
+      const completed = await measureCreationStep("gcp.instance_operation_wait", () =>
+        this.waitZoneOperation(operation),
+      );
       if (completed.targetId !== undefined) {
         const providerResourceID = canonicalNumericResourceID(completed.targetId);
         if (
@@ -887,14 +982,19 @@ export class GCPClient {
 
   async waitForServerIP(name: string): Promise<ProviderMachine> {
     const deadline = Date.now() + 120_000;
-    for (;;) {
+    let interval = 250;
+    while (Date.now() < deadline) {
+      // Provider errors, including throttling, propagate without a new polling retry.
       // oxlint-disable-next-line eslint/no-await-in-loop -- polling waits for eventual public IP.
       const server = await this.getServer(name);
+      if (Date.now() >= deadline) break;
       if (server.host) return server;
-      if (Date.now() > deadline) throw new Error(`timeout waiting for gcp public ip on ${name}`);
-      // oxlint-disable-next-line eslint/no-await-in-loop -- polling interval.
-      await sleep(5000);
+      // oxlint-disable-next-line eslint/no-await-in-loop -- polling interval, bounded by the existing deadline.
+      await sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
+      interval = Math.min(interval * 2, 5_000);
     }
+    this.firewallCache?.invalidate();
+    throw new Error(`timeout waiting for gcp public ip on ${name}`);
   }
 
   async deleteServer(name: string): Promise<void> {
@@ -1069,24 +1169,41 @@ export class GCPClient {
       targetTags,
       allowed: [{ IPProtocol: "tcp", ports }],
     };
-    const existing = await this.gcp<{ description?: string }>(
-      "GET",
-      `/global/firewalls/${name}`,
-    ).catch((error) => {
-      if (isNotFound(error)) return undefined;
-      throw error;
-    });
+    if (this.firewallCache) {
+      const fingerprint = JSON.stringify({
+        ...firewall,
+        sourceRanges: sourceRanges.toSorted(),
+        targetTags: targetTags.toSorted(),
+        allowed: [{ IPProtocol: "tcp", ports: ports.toSorted() }],
+      });
+      await this.firewallCache.ensure(JSON.stringify([this.project, name]), fingerprint, () =>
+        this.verifyFirewall(name, firewall),
+      );
+    } else {
+      await this.verifyFirewall(name, firewall);
+    }
+  }
+
+  private async verifyFirewall(name: string, firewall: GCPFirewall): Promise<boolean> {
+    const existing = await this.gcp<GCPFirewall>("GET", `/global/firewalls/${name}`).catch(
+      (error) => {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      },
+    );
     if (existing) {
       if (!existing.description?.includes("Crabbox-managed")) {
         throw new Error(`gcp firewall ${name} exists but is not Crabbox-managed`);
       }
+      // A fresh complete policy match avoids an unnecessary global operation.
+      if (gcpFirewallMatches(existing, firewall)) return true;
       const op = await this.gcp<GCPOperation>("PUT", `/global/firewalls/${name}`, firewall);
-      await this.waitGlobalOperation(op);
-      return;
+      await measureCreationStep("gcp.firewall_operation_wait", () => this.waitGlobalOperation(op));
+      return false;
     }
     try {
       const op = await this.gcp<GCPOperation>("POST", "/global/firewalls", firewall);
-      await this.waitGlobalOperation(op);
+      await measureCreationStep("gcp.firewall_operation_wait", () => this.waitGlobalOperation(op));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!message.toLowerCase().includes("http 409")) {
@@ -1094,11 +1211,12 @@ export class GCPClient {
       }
       await this.reconcileRacedFirewall(name, firewall, error);
     }
+    return false;
   }
 
   private async reconcileRacedFirewall(
     name: string,
-    firewall: Record<string, unknown>,
+    firewall: GCPFirewall,
     conflictError: unknown,
   ): Promise<void> {
     for (const delay of [0, ...firewallVisibilityBackoffMs]) {
@@ -1126,7 +1244,9 @@ export class GCPClient {
         // oxlint-disable-next-line eslint/no-await-in-loop -- a conflicting insert may still be finishing.
         const op = await this.gcp<GCPOperation>("PUT", `/global/firewalls/${name}`, firewall);
         // oxlint-disable-next-line eslint/no-await-in-loop -- the raced policy must finish before this caller proceeds.
-        await this.waitGlobalOperation(op);
+        await measureCreationStep("gcp.firewall_operation_wait", () =>
+          this.waitGlobalOperation(op),
+        );
         return;
       } catch (error) {
         const message = error instanceof Error ? error.message.toLowerCase() : String(error);
@@ -1138,8 +1258,85 @@ export class GCPClient {
     throw conflictError;
   }
 
+  private async rootDiskSource(source: string, selectedProject: string): Promise<GCPImageMinimum> {
+    if (source.startsWith("global/")) source = `projects/${selectedProject}/${source}`;
+    const match =
+      /^(?:https:\/\/(?:compute|www)\.googleapis\.com\/compute\/v1\/)?projects\/([^/]+)\/global\/(images|snapshots)\/(?:family\/)?([^/]+)$/.exec(
+        source,
+      );
+    if (!match) throw new Error(`resolve GCP root disk minimum: invalid source ${source}`);
+    const [, project, kind, name] = match;
+    const family = source.includes("/images/family/");
+    const path = `/global/${kind}/${family ? "family/" : ""}${name}`;
+    const resolve = () =>
+      measureCreationStep("gcp.image_minimum", async () => {
+        const client = new GCPClient(
+          this.env,
+          this.zone,
+          project,
+          this.tokenCache,
+          this.firewallCache,
+          this.imageMinimumCache,
+        );
+        client.fetcher = this.fetcher;
+        const image = await client.gcp<{ name?: string; diskSizeGb?: string | number }>(
+          "GET",
+          path,
+        );
+        const minimum = Number(image.diskSizeGb);
+        if (!Number.isSafeInteger(minimum) || minimum <= 0 || !image.name) {
+          throw new Error(
+            `resolve GCP root disk minimum: source ${source} has no name or disk size`,
+          );
+        }
+        return { source: `projects/${project}/global/${kind}/${image.name}`, diskSizeGb: minimum };
+      });
+    return this.imageMinimumCache
+      ? this.imageMinimumCache.get(JSON.stringify([selectedProject, project, path]), resolve)
+      : resolve();
+  }
+
+  private invalidateImageMinimumOnError(error: unknown): void {
+    const detail = error instanceof GCPHTTPError ? error.body : errorMessage(error);
+    if (
+      (error instanceof GCPHTTPError && error.status === 404) ||
+      /image|snapshot|disk|not[\s_-]*found/i.test(detail)
+    ) {
+      this.imageMinimumCache?.invalidate();
+    }
+  }
+
   private async gcp<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const token = await this.accessToken();
+    const step = path.startsWith("/global/firewalls")
+      ? method === "GET"
+        ? "gcp.firewall_get"
+        : method === "PUT"
+          ? "gcp.firewall_put"
+          : method === "POST"
+            ? "gcp.firewall_insert"
+            : undefined
+      : method === "POST" && /^\/zones\/[^/]+\/instances(?:\?|$)/.test(path)
+        ? "gcp.disk_instance_insert"
+        : undefined;
+    try {
+      // Token minting has its own step; API timings measure only the Compute request.
+      const token = await this.accessToken();
+      return await (step
+        ? measureCreationStep(step, () => this.gcpRequest<T>(method, path, token, body))
+        : this.gcpRequest<T>(method, path, token, body));
+    } catch (error) {
+      this.firewallCache?.invalidate();
+      this.invalidateImageMinimumOnError(error);
+      throw error;
+    }
+  }
+
+  private async gcpRequest<T>(
+    method: string,
+    path: string,
+    token: string,
+    body?: unknown,
+  ): Promise<T> {
     const init: RequestInit = {
       method,
       headers: {
@@ -1168,9 +1365,11 @@ export class GCPClient {
         ? metadataTokenRefreshSkewSeconds
         : serviceAccountTokenRefreshSkewSeconds;
     return this.tokenCache.get(now + refreshSkewSeconds, () =>
-      credentialSource === "metadata"
-        ? this.metadataAccessToken()
-        : this.serviceAccountAccessToken(now),
+      measureCreationStep("gcp.token_mint", () =>
+        credentialSource === "metadata"
+          ? this.metadataAccessToken()
+          : this.serviceAccountAccessToken(now),
+      ),
     );
   }
 
@@ -1308,7 +1507,7 @@ export class GCPClient {
         "POST",
         `/zones/${this.zone}/operations/${op.name}/wait`,
       );
-      operationError(done);
+      this.checkOperation(done);
       if (operationDone(done)) return done;
       // oxlint-disable-next-line eslint/no-await-in-loop -- polling interval.
       await sleep(2000);
@@ -1320,10 +1519,20 @@ export class GCPClient {
     for (;;) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- operation polling is sequential.
       const done = await this.gcp<GCPOperation>("POST", `/global/operations/${op.name}/wait`);
-      operationError(done);
+      this.checkOperation(done);
       if (operationDone(done)) return;
       // oxlint-disable-next-line eslint/no-await-in-loop -- polling interval.
       await sleep(2000);
+    }
+  }
+
+  private checkOperation(op: GCPOperation): void {
+    try {
+      operationError(op);
+    } catch (error) {
+      this.firewallCache?.invalidate();
+      this.invalidateImageMinimumOnError(error);
+      throw error;
     }
   }
 
@@ -1504,12 +1713,19 @@ export function isFallbackProvisioningError(error: unknown): boolean {
     value.includes("resource_pool_exhausted") ||
     value.includes("does not have enough resources") ||
     isUnavailableMachineTypeError(value) ||
+    isDiskMachineIncompatibilityError(value) ||
     value.includes("rate limit") ||
     value.includes("try again") ||
     value.includes("http 409") ||
     value.includes("http 429") ||
     value.includes("http 5")
   );
+}
+
+function isDiskMachineIncompatibilityError(value: string): boolean {
+  const disk = /disk type|disktype|disktypes\//.test(value);
+  const machine = /machine type|machinetype/.test(value);
+  return disk && machine && /cannot be used|not supported|unsupported|does not support/.test(value);
 }
 
 function isUnavailableMachineTypeError(value: string): boolean {

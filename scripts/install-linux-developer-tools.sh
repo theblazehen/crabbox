@@ -3,8 +3,8 @@ set -euo pipefail
 
 pnpm_version="${CRABBOX_LINUX_PNPM_VERSION:-11.1.0}"
 node_major="${CRABBOX_LINUX_NODE_MAJOR:-24}"
-trufflehog_version="3.95.9"
-docker_images="${CRABBOX_LINUX_DOCKER_IMAGES:-hello-world ubuntu:24.04 node:24-bookworm}"
+trufflehog_version="3.99.4"
+docker_images="${CRABBOX_LINUX_DOCKER_IMAGES:-hello-world ubuntu:24.04 node:24.22.1-bookworm}"
 install_desktop="${CRABBOX_LINUX_DESKTOP_TOOLS:-1}"
 install_browser="${CRABBOX_LINUX_BROWSER:-1}"
 apt_keyrings_dir="${CRABBOX_LINUX_APT_KEYRINGS_DIR:-/etc/apt/keyrings}"
@@ -24,13 +24,23 @@ google_linux_signing_key_fingerprint="EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796"
 public_toolchain_archive_dir="/opt/crabbox/toolchain-archives"
 node_toolcache_root="/opt/hostedtoolcache"
 node_link_dir="/usr/local/bin"
-pinned_node_version="24.19.0"
+pinned_node_version="24.22.1"
+# Retire only aliases owned by the released predecessor image, never arbitrary Node trees.
+previous_pinned_node_version="24.19.0"
 go_toolcache_root="/opt/hostedtoolcache"
 go_link_dir="/usr/local/bin"
-pinned_go_version="1.27.0"
+pinned_go_version="1.27.3"
 bun_bin_dir="/usr/local/bin"
 bun_toolchain_root="/opt/crabbox/toolchains/bun"
-pinned_bun_version="1.4.0"
+pinned_bun_version="1.4.4"
+# Retire only aliases owned by the released predecessor image.
+previous_pinned_bun_version="1.4.0"
+rust_toolchain_root="/opt/crabbox/toolchains/rust"
+uv_toolchain_root="/opt/crabbox/toolchains/uv"
+developer_bin_dir="/usr/local/bin"
+pinned_rust_version="1.98.1"
+pinned_uv_version="0.13.5"
+previous_pinned_uv_version="0.12.19"
 
 log() {
   printf 'linux-tools: %s\n' "$*" >&2
@@ -244,22 +254,26 @@ EOF
 toolchain_archive_spec() {
   # Digests bind upstream bytes, not a mutable installation or Corepack metadata.
   case "$1" in
-    go1.27.0.linux-amd64.tar.gz)
-      printf '%s\n' "sha256 675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685 https://go.dev/dl/$1" ;;
-    node-v24.19.0-linux-x64.tar.xz)
-      printf '%s\n' "sha256 14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647 https://nodejs.org/dist/v24.19.0/$1" ;;
+    rust-1.98.1-x86_64-unknown-linux-gnu.tar.xz)
+      printf '%s\n' "sha256 5326b36c53de11d148c8f8dab6553a3d1006c2cfd32123683073fad3c302605b https://static.rust-lang.org/dist/$1" ;;
+    uv-0.13.5-x86_64-unknown-linux-gnu.tar.gz)
+      printf '%s\n' "sha256 f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f https://github.com/astral-sh/uv/releases/download/0.13.5/uv-x86_64-unknown-linux-gnu.tar.gz" ;;
+    go1.27.3.linux-amd64.tar.gz)
+      printf '%s\n' "sha256 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40 https://go.dev/dl/$1" ;;
+    node-v24.22.1-linux-x64.tar.xz)
+      printf '%s\n' "sha256 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6 https://nodejs.org/dist/v24.22.1/$1" ;;
     pnpm-11.22.0.tgz)
       printf '%s\n' "sha512 1ff870c4c6133dfd88fb2afc46dd13d47f09c9794b438c6fdb47ca98caf3bc16381ee0be93a091b8e3824cf01f889f46d7d9e20910fb0be1ab0fb5baa80dd621 https://registry.npmjs.org/pnpm/-/$1" ;;
-    pnpm-12.3.4.tgz)
-      printf '%s\n' "sha512 961aa41fb077da3a04a441d9f8e15ebc0c96da8ef710b2eb67bf9ee7cb0610eabd48f1fd85f51cffe73846785fa0f87c56a3a872a1d893f8446741b5cce45457 https://registry.npmjs.org/pnpm/-/$1" ;;
-    exe.linux-x64-12.3.4.tgz)
-      printf '%s\n' "sha512 d99a8e9523e47f05f5879711f853e259ff3e17eda1653ff74ef8542b9b22807ab06900888aaf11ec21b186774ab3adc9b5c2e2d9ad50a68fb05ff128c9f8f225 https://registry.npmjs.org/@pnpm/exe.linux-x64/-/$1" ;;
-    bun-v1.4.0-linux-x64.zip)
-      printf '%s\n' "sha256 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452 https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip" ;;
-    bun-v1.4.0-linux-x64-baseline.zip)
-      printf '%s\n' "sha256 184fb4595f0d401a217cf7c78c1bc430ba83314dab7a8b94805babbf7fa7097f https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64-baseline.zip" ;;
-    bun-v1.4.0-linux-aarch64.zip)
-      printf '%s\n' "sha256 4b1a332ee861983eb93bcfe6f770fff94e3e31b2c388bdaea3c8ed35e58eed0e https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-aarch64.zip" ;;
+    pnpm-12.15.0.tgz)
+      printf '%s\n' "sha512 b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61 https://registry.npmjs.org/pnpm/-/$1" ;;
+    exe.linux-x64-12.15.0.tgz)
+      printf '%s\n' "sha512 c9cf9095947ef7e9ebdbd2787d1ce13286a98314c10e776affea5eca8ab55d4b9f9d01677db5d4305b9d0c82b31e2e78e658a71aa98e9977e7d0da2e7cd81c3a https://registry.npmjs.org/@pnpm/exe.linux-x64/-/$1" ;;
+    bun-v1.4.4-linux-x64.zip)
+      printf '%s\n' "sha256 bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip" ;;
+    bun-v1.4.4-linux-x64-baseline.zip)
+      printf '%s\n' "sha256 e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76 https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64-baseline.zip" ;;
+    bun-v1.4.4-linux-aarch64.zip)
+      printf '%s\n' "sha256 baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850e https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-aarch64.zip" ;;
     *) log "no reviewed public toolchain archive: $1"; return 1 ;;
   esac
 }
@@ -281,7 +295,7 @@ PY
 
 stage_toolchain_archive() {
   local name="$1" staging="$2" allow_download="${3:-0}"
-  local algorithm expected url
+  local algorithm expected url status
   read -r algorithm expected url <<<"$(toolchain_archive_spec "$name")"
   [[ -n "$expected" ]] || return 1
   # Hash the private copy that will be extracted; never execute a cached tree.
@@ -296,30 +310,48 @@ stage_toolchain_archive() {
     return 1
   fi
   curl -q --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 300 \
-    --output "$staging/$name" "$url" &&
-    verify_toolchain_archive "$algorithm" "$expected" "$staging/$name"
+    --output "$staging/$name" "$url" || {
+      status=$?
+      log "toolchain archive download failed: $name (curl exit $status)"
+      return "$status"
+    }
+  verify_toolchain_archive "$algorithm" "$expected" "$staging/$name"
+}
+
+prepare_public_toolchain_archive_dir() {
+  local parent directory
+  parent="$(dirname "$public_toolchain_archive_dir")"
+  # Validate both owned public boundaries before changing either; never widen
+  # unrelated ancestors or follow an operator-owned replacement.
+  for directory in "$parent" "$public_toolchain_archive_dir"; do
+    if [[ -L "$directory" || ( -e "$directory" && ( ! -d "$directory" || ! -O "$directory" ) ) ]]; then
+      log "invalid public toolchain archive directory: $directory"
+      return 1
+    fi
+  done
+  install -d -m 0755 "$parent" "$public_toolchain_archive_dir"
 }
 
 cache_public_toolchain_archives() (
   set -euo pipefail
   umask 077
   local staging name pending
-  staging="$(mktemp -d)"
+  # Conditional callers disable errexit; never publish after a failed step.
+  prepare_public_toolchain_archive_dir || return $?
+  staging="$(mktemp -d)" || return $?
   # Bind paths now: Bash can unwind function locals before an EXIT trap on failure.
   # shellcheck disable=SC2064
   trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
-  [[ ! -L "$public_toolchain_archive_dir" ]] || return 1
-  install -d -m 0755 "$public_toolchain_archive_dir"
   if [[ "$#" -eq 0 ]]; then
-    set -- node-v24.19.0-linux-x64.tar.xz pnpm-11.22.0.tgz pnpm-12.3.4.tgz exe.linux-x64-12.3.4.tgz
+    set -- node-v24.22.1-linux-x64.tar.xz pnpm-11.22.0.tgz pnpm-12.15.0.tgz exe.linux-x64-12.15.0.tgz
   fi
   for name in "$@"; do
-    stage_toolchain_archive "$name" "$staging" 1
-    pending="$(mktemp "$public_toolchain_archive_dir/.archive.XXXXXX")"
+    stage_toolchain_archive "$name" "$staging" 1 || return $?
+    pending="$(mktemp "$public_toolchain_archive_dir/.archive.XXXXXX")" || return $?
     # shellcheck disable=SC2064
     trap "$(printf 'rm -rf -- %q %q' "$staging" "$pending")" EXIT
-    install -m 0644 "$staging/$name" "$pending"
-    python3 - "$pending" "$public_toolchain_archive_dir/$name" <<'PY'
+    install -m 0644 "$staging/$name" "$pending" || return $?
+    python3 - "$pending" "$public_toolchain_archive_dir/$name" <<'PY' || return $?
 import os
 import sys
 os.replace(sys.argv[1], sys.argv[2])
@@ -329,19 +361,23 @@ PY
 
 check_go_toolchain() (
   set -euo pipefail
-  local distribution="$1" scratch="$2"
-  mkdir -p "$scratch/home" "$scratch/cache" "$scratch/mod" "$scratch/path"
+  local distribution="$1" scratch="$2" version target result
+  mkdir -p "$scratch/home" "$scratch/cache" "$scratch/mod" "$scratch/path" || return $?
   export HOME="$scratch/home" GOROOT="$distribution" GOCACHE="$scratch/cache"
   export GOMODCACHE="$scratch/mod" GOPATH="$scratch/path" GOENV=off GOTOOLCHAIN=local
   export GOPROXY=off GOSUMDB=off GOWORK=off GO111MODULE=off GOFLAGS="" CGO_ENABLED=1 CC=gcc CXX=g++
   unset GOOS GOARCH GOEXPERIMENT
-  [[ "$("$distribution/bin/go" version)" == "go version go$pinned_go_version linux/amd64" ]] || {
+  version="$("$distribution/bin/go" version)" || return $?
+  [[ "$version" == "go version go$pinned_go_version linux/amd64" ]] || {
     log "unexpected Go version or architecture"
     return 1
   }
-  [[ "$("$distribution/bin/go" env GOOS GOARCH)" == $'linux\namd64' ]]
-  cd "$scratch"
-  cat >main.go <<'GO'
+  target="$("$distribution/bin/go" env GOOS GOARCH)" || return $?
+  [[ "$target" == $'linux\namd64' ]] || return 1
+  cd "$scratch" || return $?
+  # Group the heredoc so Bash 3.2 and 5.2 both serialize its failure check safely.
+  {
+    cat >main.go <<'GO'
 package main
 
 // static int answer(void) { return 42; }
@@ -355,10 +391,12 @@ func main() {
 	fmt.Println("go-cgo-ok")
 }
 GO
-  "$distribution/bin/gofmt" main.go >formatted.go
-  mv formatted.go main.go
-  "$distribution/bin/go" test bytes crypto/sha256
-  [[ "$("$distribution/bin/go" run main.go)" == "go-cgo-ok" ]]
+  } || return $?
+  "$distribution/bin/gofmt" main.go >formatted.go || return $?
+  mv formatted.go main.go || return $?
+  "$distribution/bin/go" test bytes crypto/sha256 || return $?
+  result="$("$distribution/bin/go" run main.go)" || return $?
+  [[ "$result" == "go-cgo-ok" ]]
 )
 
 install_pinned_go() (
@@ -366,28 +404,28 @@ install_pinned_go() (
   umask 022
   local staging destination
   destination="$go_toolcache_root/go/$pinned_go_version/x64"
-  public_tool_links check "$go_link_dir" "$destination/bin" go gofmt || return $?
-  staging="$(mktemp -d)"
+  public_tool_links check "$go_link_dir" "$go_toolcache_root/go/$pinned_go_version/x64/bin" go gofmt || return $?
+  staging="$(mktemp -d)" || return $?
   # shellcheck disable=SC2064
   trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
-  install -d -m 0755 "$(dirname "$destination")"
-  rm -f "$destination.complete"
-  stage_toolchain_archive go1.27.0.linux-amd64.tar.gz "$staging"
-  mkdir "$staging/go"
-  tar --no-same-owner -xzf "$staging/go1.27.0.linux-amd64.tar.gz" -C "$staging/go" --strip-components=1
-  check_go_toolchain "$staging/go" "$staging/check"
+  stage_toolchain_archive "go$pinned_go_version.linux-amd64.tar.gz" "$staging" || return $?
+  mkdir "$staging/go" || return $?
+  tar --no-same-owner -xzf "$staging/go$pinned_go_version.linux-amd64.tar.gz" -C "$staging/go" --strip-components=1 || return $?
+  rm -f "$destination.complete" || return $?
+  check_go_toolchain "$staging/go" "$staging/check" || return $?
+  public_tool_links check "$go_link_dir" "$go_toolcache_root/go/$pinned_go_version/x64/bin" go gofmt || return $?
+  install -d -m 0755 "$(dirname "$destination")" "$go_link_dir" || return $?
   # This image-owned slot is always rebuilt from authenticated private bytes.
-  rm -rf "$destination"
-  mv "$staging/go" "$destination"
-  install -d -m 0755 "$go_link_dir"
-  public_tool_links publish "$go_link_dir" "$destination/bin" go gofmt
+  rm -rf "$destination" || return $?
+  mv "$staging/go" "$destination" || return $?
+  public_tool_links publish "$go_link_dir" "$destination/bin" go gofmt || return $?
   touch "$destination.complete"
 )
 
 install_go_toolchain() {
   if linux_x64_supported; then
     public_tool_links check "$go_link_dir" "$go_toolcache_root/go/$pinned_go_version/x64/bin" go gofmt || return $?
-    cache_public_toolchain_archives go1.27.0.linux-amd64.tar.gz
+    cache_public_toolchain_archives "go$pinned_go_version.linux-amd64.tar.gz" || return $?
     install_pinned_go
   fi
 }
@@ -400,9 +438,9 @@ offline_go_probe() (
   staging="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
-  stage_toolchain_archive go1.27.0.linux-amd64.tar.gz "$staging"
+  stage_toolchain_archive go1.27.3.linux-amd64.tar.gz "$staging"
   mkdir "$staging/go"
-  tar --no-same-owner -xzf "$staging/go1.27.0.linux-amd64.tar.gz" -C "$staging/go" --strip-components=1
+  tar --no-same-owner -xzf "$staging/go1.27.3.linux-amd64.tar.gz" -C "$staging/go" --strip-components=1
   check_go_toolchain "$staging/go" "$staging/check"
 )
 
@@ -412,7 +450,7 @@ go_smoke_script() {
   declare -f log linux_x64_supported toolchain_archive_spec verify_toolchain_archive stage_toolchain_archive check_go_toolchain offline_go_probe
   # shellcheck disable=SC2016
   printf '%s\n' 'if linux_x64_supported; then' \
-    '  [[ "$(GOTOOLCHAIN=local GOENV=off go version)" == "go version go1.27.0 linux/amd64" ]]' \
+    '  [[ "$(GOTOOLCHAIN=local GOENV=off go version)" == "go version go1.27.3 linux/amd64" ]]' \
     '  command -v gofmt' '  offline_go_probe' 'fi'
 }
 
@@ -425,10 +463,10 @@ seed_offline_pnpm() {
   stage_toolchain_archive "pnpm-$version.tgz" "$staging" || return 1
   mkdir -p "$destination" || return 1
   tar --no-same-owner -xzf "$staging/pnpm-$version.tgz" -C "$destination" --strip-components=1 || return 1
-  if [[ "$version" == "12.3.4" ]]; then
-    stage_toolchain_archive exe.linux-x64-12.3.4.tgz "$staging" || return 1
+  if [[ "$version" == "12.15.0" ]]; then
+    stage_toolchain_archive exe.linux-x64-12.15.0.tgz "$staging" || return 1
     mkdir "$staging/native" || return 1
-    tar --no-same-owner -xzf "$staging/exe.linux-x64-12.3.4.tgz" -C "$staging/native" || return 1
+    tar --no-same-owner -xzf "$staging/exe.linux-x64-12.15.0.tgz" -C "$staging/native" || return 1
     install -m 0755 "$staging/native/package/pnpm" "$destination/pnpm-native" || return 1
   fi
   # Corepack 0.35.0 does not authenticate cache hits or `install -g <pack.tgz>`.
@@ -453,13 +491,18 @@ import sys
 import tempfile
 
 action, link_dir, bin_dir, *tools = sys.argv[1:]
+previous_bin_dir = None
+if tools[:1] == ["--previous-bin-dir"]:
+    _, previous_bin_dir, *tools = tools
 if action not in ("check", "publish") or not os.path.isabs(bin_dir):
     sys.exit("invalid public tool link operation")
 
 def check(tool):
     link = os.path.join(link_dir, tool)
-    target = os.path.join(bin_dir, tool)
-    if os.path.lexists(link) and (not os.path.islink(link) or os.readlink(link) != target):
+    targets = [os.path.join(bin_dir, tool)]
+    if previous_bin_dir is not None:
+        targets.append(os.path.join(previous_bin_dir, tool))
+    if os.path.lexists(link) and (not os.path.islink(link) or os.readlink(link) not in targets):
         sys.exit("linux-tools: public tool conflict at " + link + "; resolve before rebake")
 
 for tool in tools:
@@ -480,15 +523,16 @@ install_pinned_node() (
   umask 022
   local staging destination node_path
   destination="$node_toolcache_root/node/$pinned_node_version/x64"
-  public_tool_links check "$node_link_dir" "$destination/bin" node npm npx corepack pnpm pnpx || return $?
+  # Version 0.79.1 images own these exact predecessor aliases, including dangling links.
+  public_tool_links check "$node_link_dir" "$destination/bin" --previous-bin-dir "$node_toolcache_root/node/$previous_pinned_node_version/x64/bin" node npm npx corepack pnpm pnpx || return $?
   staging="$(mktemp -d)" || return $?
   # shellcheck disable=SC2064
   trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
-  stage_toolchain_archive node-v24.19.0-linux-x64.tar.xz "$staging" || return $?
+  stage_toolchain_archive node-v24.22.1-linux-x64.tar.xz "$staging" || return $?
   install -d -m 0755 "$(dirname "$destination")" || return $?
   rm -f "$destination.complete" || return $?
   mkdir "$staging/node" || return $?
-  tar --no-same-owner -xJf "$staging/node-v24.19.0-linux-x64.tar.xz" -C "$staging/node" --strip-components=1 || return $?
+  tar --no-same-owner -xJf "$staging/node-v24.22.1-linux-x64.tar.xz" -C "$staging/node" --strip-components=1 || return $?
   node_path="$staging/node/bin:$PATH"
   [[ "$("$staging/node/bin/node" --version)" == "v$pinned_node_version" ]] || return 1
   env PATH="$node_path" "$staging/node/bin/npm" --version || return $?
@@ -498,7 +542,7 @@ install_pinned_node() (
   rm -rf "$destination" || return $?
   mv "$staging/node" "$destination" || return $?
   install -d -m 0755 "$node_link_dir" || return $?
-  public_tool_links publish "$node_link_dir" "$destination/bin" node npm npx corepack pnpm pnpx || return $?
+  public_tool_links publish "$node_link_dir" "$destination/bin" --previous-bin-dir "$node_toolcache_root/node/$previous_pinned_node_version/x64/bin" node npm npx corepack pnpm pnpx || return $?
   touch "$destination.complete"
 )
 
@@ -545,7 +589,9 @@ install_requested_node() {
   for tool in node npm npx corepack pnpm pnpx; do
     if [[ -L "$node_link_dir/$tool" ]]; then
       link_target="$(readlink -n "$node_link_dir/$tool" && printf '.')" || return 1
-      [[ "$link_target" != "$node_toolcache_root/node/24.19.0/x64/bin/$tool." ]] || retired_tools+=("$tool")
+      case "$link_target" in
+        "$node_toolcache_root/node/$previous_pinned_node_version/x64/bin/$tool."|"$node_toolcache_root/node/$pinned_node_version/x64/bin/$tool.") retired_tools+=("$tool") ;;
+      esac
     fi
   done
   if retry apt-get "${install_args[@]}" "nodejs:$arch=$version"; then
@@ -582,9 +628,9 @@ install_requested_node() {
     if [[ -L "$node_link_dir/$tool" ]]; then
       # Preserve operator replacements, including targets with trailing newlines.
       link_target="$(readlink -n "$node_link_dir/$tool" && printf '.')" || return 1
-      if [[ "$link_target" == "$node_toolcache_root/node/24.19.0/x64/bin/$tool." ]]; then
-        rm -- "$node_link_dir/$tool" || return 1
-      fi
+      case "$link_target" in
+        "$node_toolcache_root/node/$previous_pinned_node_version/x64/bin/$tool."|"$node_toolcache_root/node/$pinned_node_version/x64/bin/$tool.") rm -- "$node_link_dir/$tool" || return 1 ;;
+      esac
     fi
   done
   hash -r
@@ -594,7 +640,7 @@ install_node_runtime() {
   local use_pinned_node=0
   if pinned_node_supported; then
     use_pinned_node=1
-    public_tool_links check "$node_link_dir" "$node_toolcache_root/node/$pinned_node_version/x64/bin" node npm npx corepack pnpm pnpx || return $?
+    public_tool_links check "$node_link_dir" "$node_toolcache_root/node/$pinned_node_version/x64/bin" --previous-bin-dir "$node_toolcache_root/node/$previous_pinned_node_version/x64/bin" node npm npx corepack pnpm pnpx || return $?
     cache_public_toolchain_archives "node-v$pinned_node_version-linux-x64.tar.xz" || return $?
     install_pinned_node || return $?
     export PATH="$node_link_dir:$PATH"
@@ -615,8 +661,8 @@ install_node_runtime() {
       apt_install nodejs || return $?
     fi
   fi
-  command -v npm >/dev/null
-  command -v corepack >/dev/null
+  command -v npm >/dev/null || return $?
+  command -v corepack >/dev/null || return $?
   if [[ "$use_pinned_node" == "0" ]]; then
     corepack enable
   fi
@@ -627,7 +673,7 @@ install_node_pnpm() {
   if pinned_node_supported; then
     cache_public_toolchain_archives || return $?
   fi
-  corepack prepare "pnpm@$pnpm_version" --activate
+  corepack prepare "pnpm@$pnpm_version" --activate || return $?
   command -v pnpm >/dev/null
 }
 
@@ -639,11 +685,11 @@ offline_node_pnpm_probe() (
   staging="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
-  stage_toolchain_archive node-v24.19.0-linux-x64.tar.xz "$staging"
+  stage_toolchain_archive node-v24.22.1-linux-x64.tar.xz "$staging"
   mkdir "$staging/node" "$staging/home"
-  tar --no-same-owner -xJf "$staging/node-v24.19.0-linux-x64.tar.xz" -C "$staging/node" --strip-components=1
-  [[ "$("$staging/node/bin/node" --version)" == "v24.19.0" ]]
-  for version in 11.22.0 12.3.4; do
+  tar --no-same-owner -xJf "$staging/node-v24.22.1-linux-x64.tar.xz" -C "$staging/node" --strip-components=1
+  [[ "$("$staging/node/bin/node" --version)" == "v24.22.1" ]]
+  for version in 11.22.0 12.15.0; do
     corepack_home="$staging/corepack-$version"
     seed_offline_pnpm "$version" "$staging" "$corepack_home"
     read -r algorithm digest url <<<"$(toolchain_archive_spec "pnpm-$version.tgz")"
@@ -709,7 +755,7 @@ bun_optimized_supported() {
 stage_bun_archive() {
   local name="$1" staging="$2" allow_download="${3:-0}"
   case "$name" in
-    bun-v1.4.0-linux-x64.zip|bun-v1.4.0-linux-x64-baseline.zip|bun-v1.4.0-linux-aarch64.zip) ;;
+    bun-v1.4.4-linux-x64.zip|bun-v1.4.4-linux-x64-baseline.zip|bun-v1.4.4-linux-aarch64.zip) ;;
     *) log "unsupported pinned Bun archive: $name"; return 1 ;;
   esac
   if [[ -L "$public_toolchain_archive_dir" ||
@@ -755,13 +801,14 @@ PY
 install_bun() {
   pinned_bun_supported || return 0
   local destination="$bun_toolchain_root/$pinned_bun_version/linux-x64-baseline" directory
-  public_tool_links check "$bun_bin_dir" "$destination" bun bunx || return $?
+  public_tool_links check "$bun_bin_dir" "$destination" --previous-bin-dir "$bun_toolchain_root/$previous_pinned_bun_version/linux-x64-baseline" bun bunx || return $?
   # Check only this managed path's ancestors before any write can follow a symlink.
   directory="$destination"
   while [[ "$directory" != "/" ]]; do
     [[ ! -L "$directory" ]] || { log "symlinked Bun managed directory: $directory"; return 1; }
     directory="$(dirname "$directory")" || return $?
   done
+  prepare_public_toolchain_archive_dir || return $?
   (
     set -euo pipefail
     umask 077
@@ -772,7 +819,6 @@ install_bun() {
     for variant in linux-x64-baseline linux-x64; do
       name="bun-v$pinned_bun_version-$variant.zip"
       stage_bun_archive "$name" "$staging" 1 || return $?
-      install -d -m 0755 "$public_toolchain_archive_dir" || return $?
       pending="$(mktemp "$public_toolchain_archive_dir/.bun-archive.XXXXXX")" || return $?
       # shellcheck disable=SC2064
       trap "$(printf 'rm -rf -- %q %q' "$staging" "$pending")" EXIT
@@ -789,12 +835,12 @@ PY
     # The installed image can move to a less capable guest. Keep its default baseline.
     chmod 0755 "$staging/linux-x64-baseline" || return $?
     ln -s bun "$staging/linux-x64-baseline/bunx" || return $?
-    public_tool_links check "$bun_bin_dir" "$destination" bun bunx || return $?
+    public_tool_links check "$bun_bin_dir" "$destination" --previous-bin-dir "$bun_toolchain_root/$previous_pinned_bun_version/linux-x64-baseline" bun bunx || return $?
     (umask 022; install -d -m 0755 "$(dirname "$destination")" "$bun_bin_dir") || return $?
     # The exact image-owned slot may be incomplete; never reuse its executable bytes.
     rm -rf -- "$destination" || return $?
     mv "$staging/linux-x64-baseline" "$destination" || return $?
-    public_tool_links publish "$bun_bin_dir" "$destination" bun bunx || return $?
+    public_tool_links publish "$bun_bin_dir" "$destination" --previous-bin-dir "$bun_toolchain_root/$previous_pinned_bun_version/linux-x64-baseline" bun bunx || return $?
   ) || return $?
   export PATH="$bun_bin_dir:$PATH"
   hash -r
@@ -847,10 +893,214 @@ bun_smoke_script() {
   printf '%s\n' 'if pinned_bun_supported; then' '  offline_bun_probe' 'fi'
 }
 
+pinned_rust_uv_supported() {
+  linux_x64_supported && [[ "$(getconf GNU_LIBC_VERSION 2>/dev/null)" == glibc\ * ]]
+}
+
+check_developer_toolchain_destination() {
+  local directory="$1"
+  # The image owns this slot, never an operator's symlinked toolchain or home.
+  while [[ "$directory" != "/" ]]; do
+    [[ ! -L "$directory" ]] || { log "symlinked developer toolchain directory: $directory"; return 1; }
+    directory="$(dirname "$directory")" || return $?
+  done
+}
+
+stage_rust_uv_archive() {
+  local name="$1" staging="$2" allow_download="${3:-0}"
+  case "$name" in
+    "rust-$pinned_rust_version-x86_64-unknown-linux-gnu.tar.xz"|"uv-$pinned_uv_version-x86_64-unknown-linux-gnu.tar.gz") ;;
+    *) log "unsupported Rust or uv archive: $name"; return 1 ;;
+  esac
+  if [[ -L "$public_toolchain_archive_dir" ]]; then
+    log "symlinked public toolchain archive directory"
+    return 1
+  fi
+  if [[ -e "$public_toolchain_archive_dir/$name" || -L "$public_toolchain_archive_dir/$name" ]]; then
+    [[ -f "$public_toolchain_archive_dir/$name" && ! -L "$public_toolchain_archive_dir/$name" ]] || {
+      log "malformed Rust or uv archive: $name"
+      return 1
+    }
+    allow_download=0
+  fi
+  stage_toolchain_archive "$name" "$staging" "$allow_download"
+}
+
+extract_rust_toolchain() {
+  local staging="$1" package="rust-$pinned_rust_version-x86_64-unknown-linux-gnu"
+  stage_rust_uv_archive "$package.tar.xz" "$staging" || return $?
+  # Select only the offline host toolchain, not bundled docs or optional components.
+  tar --no-same-owner -xJf "$staging/$package.tar.xz" -C "$staging" \
+    "$package/install.sh" "$package/components" "$package/rust-installer-version" \
+    "$package/rustc" "$package/cargo" "$package/rust-std-x86_64-unknown-linux-gnu" || return $?
+  /bin/sh "$staging/$package/install.sh" --prefix="$staging/toolchain" \
+    --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu --disable-ldconfig || return $?
+}
+
+check_rust_toolchain() (
+  set -euo pipefail
+  local bin="$1" scratch="$2" rustc cargo rustdoc version
+  rustc="$(command -v "${bin:+$bin/}rustc")" || return $?
+  cargo="$(command -v "${bin:+$bin/}cargo")" || return $?
+  rustdoc="$(command -v "${bin:+$bin/}rustdoc")" || return $?
+  mkdir -p "$scratch/home" "$scratch/cargo" "$scratch/src" || return $?
+  local -a clean=(env -i "HOME=$scratch/home" "PATH=$PATH" "TMPDIR=$scratch"
+    "CARGO_HOME=$scratch/cargo" CARGO_NET_OFFLINE=true "RUSTC=$rustc" "RUSTDOC=$rustdoc")
+  version="$("${clean[@]}" "$rustc" --version --verbose)" || return $?
+  [[ "$version" == "rustc $pinned_rust_version ("* ]] || return 1
+  grep -qx 'host: x86_64-unknown-linux-gnu' <<<"$version" || return $?
+  [[ "$("${clean[@]}" "$cargo" --version)" == "cargo $pinned_rust_version ("* ]] || return 1
+  [[ "$("${clean[@]}" "$rustdoc" --version)" == "rustdoc $pinned_rust_version ("* ]] || return 1
+  printf '[package]\nname = "crabbox-rust-smoke"\nversion = "0.1.0"\nedition = "2024"\n' >"$scratch/Cargo.toml" || return $?
+  {
+    cat >"$scratch/src/main.rs" <<'RUST'
+/// ```
+/// assert_eq!(6 * 7, 42);
+/// ```
+fn answer() -> i32 { 42 }
+fn main() { println!("{}", answer()); }
+#[test]
+fn computes_answer() { assert_eq!(answer(), 42); }
+RUST
+  } || return $?
+  cd "$scratch" || return $?
+  "${clean[@]}" "$cargo" test --offline || return $?
+  [[ "$("${clean[@]}" "$cargo" run --offline --quiet)" == 42 ]] || return 1
+  "${clean[@]}" "$rustdoc" --test src/main.rs || return $?
+)
+
+check_uv_toolchain() (
+  set -euo pipefail
+  local bin="$1" scratch="$2" uv uvx python version
+  uv="$(command -v "${bin:+$bin/}uv")" || return $?
+  uvx="$(command -v "${bin:+$bin/}uvx")" || return $?
+  python="$(command -v python3)" || return $?
+  mkdir -p "$scratch/home" || return $?
+  local -a clean=(env -i "HOME=$scratch/home" "PATH=$PATH" "TMPDIR=$scratch"
+    "UV_CACHE_DIR=$scratch/cache" "UV_TOOL_DIR=$scratch/tools"
+    UV_OFFLINE=1 UV_NO_CONFIG=1 UV_PYTHON_DOWNLOADS=never UV_NO_PROGRESS=1)
+  version="$("${clean[@]}" "$uv" --version)" || return $?
+  [[ "$version" == "uv $pinned_uv_version" || "$version" == "uv $pinned_uv_version ("* ]] || return 1
+  version="$("${clean[@]}" "$uvx" --version)" || return $?
+  [[ "$version" == "uvx $pinned_uv_version" || "$version" == "uvx $pinned_uv_version ("* ]] || return 1
+  # A stdlib-built wheel exercises both consumers without fetching a build backend.
+  {
+    "$python" - "$scratch" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+root = pathlib.Path(sys.argv[1])
+metadata = "crabbox_uv_smoke-0.1.0.dist-info/"
+files = {
+    "crabbox_uv_smoke.py": "ANSWER = 42\ndef main():\n    print(ANSWER)\n",
+    metadata + "METADATA": "Metadata-Version: 2.1\nName: crabbox-uv-smoke\nVersion: 0.1.0\n",
+    metadata + "WHEEL": "Wheel-Version: 1.0\nGenerator: crabbox\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    metadata + "entry_points.txt": "[console_scripts]\ncrabbox-uv-smoke = crabbox_uv_smoke:main\n",
+}
+files[metadata + "RECORD"] = "".join(name + ",,\n" for name in [*files, metadata + "RECORD"])
+with zipfile.ZipFile(root / "crabbox_uv_smoke-0.1.0-py3-none-any.whl", "w") as wheel:
+    for name, contents in files.items():
+        wheel.writestr(name, contents)
+PY
+  } || return $?
+  cd "$scratch" || return $?
+  "${clean[@]}" "$uv" venv --python "$python" "$scratch/venv" || return $?
+  "${clean[@]}" "$uv" pip install --python "$scratch/venv/bin/python" "$scratch/crabbox_uv_smoke-0.1.0-py3-none-any.whl" || return $?
+  "${clean[@]}" "$scratch/venv/bin/python" -c 'import crabbox_uv_smoke; assert crabbox_uv_smoke.ANSWER == 42' || return $?
+  [[ "$("${clean[@]}" "$uvx" --python "$python" --from "$scratch/crabbox_uv_smoke-0.1.0-py3-none-any.whl" crabbox-uv-smoke)" == 42 ]]
+)
+
+install_rust_uv_toolchain() (
+  set -euo pipefail
+  umask 022
+  pinned_rust_uv_supported || return 0
+  local tool="$1" destination name staging pending
+  local -a commands link_arguments
+  case "$tool" in
+    rust) destination="$rust_toolchain_root/$pinned_rust_version"; name="rust-$pinned_rust_version-x86_64-unknown-linux-gnu.tar.xz"; commands=(rustc cargo rustdoc) ;;
+    uv) destination="$uv_toolchain_root/$pinned_uv_version"; name="uv-$pinned_uv_version-x86_64-unknown-linux-gnu.tar.gz"; commands=(uv uvx) ;;
+    *) return 2 ;;
+  esac
+  link_arguments=("$developer_bin_dir" "$destination/bin")
+  if [[ "$tool" == uv ]]; then
+    link_arguments+=(--previous-bin-dir "$uv_toolchain_root/$previous_pinned_uv_version/bin")
+  fi
+  public_tool_links check "${link_arguments[@]}" "${commands[@]}" || return $?
+  check_developer_toolchain_destination "$destination" || return $?
+  prepare_public_toolchain_archive_dir || return $?
+  staging="$(mktemp -d)" || return $?
+  # shellcheck disable=SC2064
+  trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
+  stage_rust_uv_archive "$name" "$staging" 1 || return $?
+  pending="$(mktemp "$public_toolchain_archive_dir/.archive.XXXXXX")" || return $?
+  # shellcheck disable=SC2064
+  trap "$(printf 'rm -rf -- %q %q' "$staging" "$pending")" EXIT
+  install -m 0644 "$staging/$name" "$pending" || return $?
+  python3 - "$pending" "$public_toolchain_archive_dir/$name" <<'PY' || return $?
+import os
+import sys
+os.replace(sys.argv[1], sys.argv[2])
+PY
+  if [[ "$tool" == rust ]]; then
+    extract_rust_toolchain "$staging" || return $?
+  else
+    mkdir -p "$staging/toolchain/bin" || return $?
+    tar --no-same-owner -xzf "$staging/$name" -C "$staging/toolchain/bin" --strip-components=1 \
+      uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx || return $?
+  fi
+  "check_${tool}_toolchain" "$staging/toolchain/bin" "$staging/check" || return $?
+  public_tool_links check "${link_arguments[@]}" "${commands[@]}" || return $?
+  check_developer_toolchain_destination "$destination" || return $?
+  install -d -m 0755 "$(dirname "$destination")" "$developer_bin_dir" || return $?
+  rm -rf -- "$destination" || return $?
+  mv "$staging/toolchain" "$destination" || return $?
+  public_tool_links publish "${link_arguments[@]}" "${commands[@]}" || return $?
+)
+
+offline_rust_probe() (
+  set -euo pipefail
+  umask 077
+  [[ "$(id -u)" -ne 0 ]] || { log "offline Rust smoke must run as a nonroot user"; return 1; }
+  local staging
+  staging="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
+  extract_rust_toolchain "$staging"
+  check_rust_toolchain "" "$staging/installed"
+  check_rust_toolchain "$staging/toolchain/bin" "$staging/extracted"
+)
+
+offline_uv_probe() (
+  set -euo pipefail
+  umask 077
+  [[ "$(id -u)" -ne 0 ]] || { log "offline uv smoke must run as a nonroot user"; return 1; }
+  local staging
+  staging="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "$(printf 'rm -rf -- %q' "$staging")" EXIT
+  stage_rust_uv_archive "uv-$pinned_uv_version-x86_64-unknown-linux-gnu.tar.gz" "$staging"
+  tar --no-same-owner -xzf "$staging/uv-$pinned_uv_version-x86_64-unknown-linux-gnu.tar.gz" -C "$staging"
+  check_uv_toolchain "" "$staging/installed"
+  check_uv_toolchain "$staging/uv-x86_64-unknown-linux-gnu" "$staging/extracted"
+)
+
+rust_smoke_script() {
+  printf 'public_toolchain_archive_dir=%q\npinned_rust_version=%q\npinned_uv_version=%q\n' "$public_toolchain_archive_dir" "$pinned_rust_version" "$pinned_uv_version"
+  declare -f log linux_x64_supported pinned_rust_uv_supported toolchain_archive_spec verify_toolchain_archive stage_toolchain_archive stage_rust_uv_archive extract_rust_toolchain check_rust_toolchain offline_rust_probe
+  printf '%s\n' 'if pinned_rust_uv_supported; then' '  offline_rust_probe' 'fi'
+}
+
+uv_smoke_script() {
+  printf 'public_toolchain_archive_dir=%q\npinned_rust_version=%q\npinned_uv_version=%q\n' "$public_toolchain_archive_dir" "$pinned_rust_version" "$pinned_uv_version"
+  declare -f log linux_x64_supported pinned_rust_uv_supported toolchain_archive_spec verify_toolchain_archive stage_toolchain_archive stage_rust_uv_archive check_uv_toolchain offline_uv_probe
+  printf '%s\n' 'if pinned_rust_uv_supported; then' '  offline_uv_probe' 'fi'
+}
+
 trufflehog_sha256_for_arch() {
   case "$1" in
-    amd64) printf '%s\n' "f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e" ;;
-    arm64) printf '%s\n' "9d9c2ec4ea36a089a9c5aaafe1969d176013ddf9f44d68e8cd75291aed8c83ed" ;;
+    amd64) printf '%s\n' "5ae9b313342d1bfa96404064c0f59e77a2cbd1824d797ca7b11e6655aa8fd9d1" ;;
+    arm64) printf '%s\n' "e6285aff62e692131255dca91ad300a62a479330e0b72e4eb1d60ae58908f8d5" ;;
     *)
       log "unsupported TruffleHog architecture: $1"
       return 1
@@ -995,7 +1245,8 @@ prepare_fast_boot() {
   local readiness_producer
   readiness_producer="$(readiness_producer_path)" || return 1
   install -d -m 1777 /var/cache/crabbox /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/cache/crabbox/corepack /var/cache/crabbox/docker
-  "$readiness_producer"
+  "$readiness_producer" || return $?
+  "$readiness_producer" --verify linux-builder || return $?
   systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
   systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
   clean_cloud_init_state || return $?
@@ -1022,6 +1273,13 @@ print_versions() {
   if pinned_bun_supported; then
     bun --version
     command -v bunx
+  fi
+  if pinned_rust_uv_supported; then
+    rustc --version
+    cargo --version
+    rustdoc --version
+    uv --version
+    uvx --version
   fi
   "$trufflehog_bin_dir/trufflehog" --no-update --version
   docker --version
@@ -1108,8 +1366,10 @@ APT
   if [[ "$install_browser" == "1" ]]; then
     install_chrome_or_chromium
   fi
-  install_node_pnpm
-  install_go_toolchain
+  install_node_pnpm || return $?
+  install_go_toolchain || return $?
+  install_rust_uv_toolchain rust || return $?
+  install_rust_uv_toolchain uv || return $?
   install_bun
   install_trufflehog
   install_docker

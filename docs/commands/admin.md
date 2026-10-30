@@ -10,11 +10,14 @@ Coordinator-backed `admin` commands require server-authorized admin access. An e
 
 ```sh
 crabbox admin leases
+crabbox admin retained-reconcile --json
 crabbox admin leases --state active --json
 crabbox admin lease-audit --state expired --provider aws
 crabbox admin lease-audit --fail-on-live
+crabbox admin extend-lifetime --id cbx_abcdef123456 --owner alice@example.com --reason 'finish test' --expires-at 2026-10-12T12:00:00Z
+crabbox admin lifetime-readback --id cbx_abcdef123456 --json
 crabbox admin providers identity --provider aws --region eu-west-1
-crabbox admin providers policy --provider aws --target macos
+crabbox admin providers policy --provider aws --region eu-west-1 --target macos
 crabbox admin hosts policy --provider aws --target macos
 crabbox admin hosts offerings --provider aws --target macos --region eu-west-1 --type mac2.metal
 crabbox admin hosts quota --provider aws --target macos --region eu-west-1 --type mac2.metal
@@ -28,6 +31,41 @@ crabbox admin delete cbx_... --force
 ```
 
 `release` and `delete` accept either a canonical `cbx_...` lease ID or an active slug, given positionally or via `--id`. Prefer the canonical ID when a slug lookup could be ambiguous. Add `--json` to any subcommand to print the structured record instead of the human-readable line.
+
+## retire-create
+
+Recover an interrupted ordinary create after its private cancellation token was
+lost. Start with a read-only preview of the canonical requested ID:
+
+```sh
+crabbox admin retire-create --id cbx_abcdef123456 --json
+```
+
+The preview returns an opaque `revision`, binding state, original owner and
+canonical org key when present, cancellation fence, and cleanup state. An absent
+record means `cleanup: "unproven"`; absence alone never proves cleanup.
+
+After checking the original request identity and creation time, explicitly retire
+that ID with the preview revision:
+
+```sh
+crabbox admin retire-create --id cbx_abcdef123456 --force \
+  --revision <preview-revision> --owner alice@example.com --org <canonical-org-key> \
+  --created-before 2026-10-01T12:00:00Z --reason 'interrupted creation; token lost' --json
+```
+
+The coordinator rejects a changed preview, another owner or org, a newer attempt,
+workspace reservations, and inconsistent bindings. An absent or unbound request
+receives a permanent cancellation fence; never reuse the retired ID. A bound
+request uses the existing generation-checked cleanup path. Its cleanup may remain
+`pending`; the CLI exits nonzero until cleanup is `confirmed`. An unbound retired
+request reports `not-allocated`. Reinspect after a conflict or pending outcome;
+do not replay creation. Tokens are never returned by this command.
+
+This requires coordinator support for retirement. Older coordinators reject the
+route; a 404 is not a successful retirement. The fence is compatible with
+coordinators that recognize version-2 create attempts. Checkpoint-backed
+attempts require their existing checkpoint recovery path.
 
 ## leases
 
@@ -43,7 +81,54 @@ Flags:
 --json              print JSON
 ```
 
-The text output prints one line per lease with ID, slug, provider, state, server type, host, owner, org, idle timeout, and expiry.
+The text output prints one line per lease with ID, slug, provider, state, server type, host, owner, org, idle timeout, and expiry. Enrolled leases append their lifetime mode, canary marker, effective stop and confirmed-stop deletion deadlines, retention, status, readiness and warnings. JSON retains the complete `lifetimePolicy`.
+
+## extend-lifetime
+
+Extend an enrolled lease's compute deadline before stopping or deletion starts.
+This requires admin authorization and records the responsible owner, reason,
+granting administrator, grant time, and expiry. It applies to explicit canaries
+as well as default-cohort leases when their global mode allows mutation.
+
+```text
+--id <canonical-lease-id>   enrolled lease (required)
+--owner <owner>             responsible owner (required)
+--reason <reason>           audit reason (required)
+--expires-at <RFC3339>      new compute deadline (required)
+--json                      print the updated lease record
+```
+
+The expiry must advance the effective deadline and be no more than seven days
+away. The coordinator rejects extensions once stopping starts, including a
+stop request whose outcome is still uncertain. An extension cannot restore a
+stopped instance or recover a deleted root disk. Ordinary lease owners cannot
+authorize an extension themselves; ask an administrator before the warning's
+deadline.
+
+## lifetime-readback
+
+Read the coordinator's current observation of the exact owned AWS instance and
+its root volume, without local AWS credentials or any resource mutation:
+
+```sh
+crabbox admin lifetime-readback --id cbx_abcdef123456 --json
+```
+
+`--id` must be a canonical lease ID; `--json` is optional. JSON contains
+`leaseId`, `provider`, `region`, `instanceId`, `instanceState`, `rootVolumeId`,
+`rootVolumePresent`, and `observedAt`. A confirmed absent instance reports
+`instanceState: "terminated"`; a confirmed absent retained root volume reports
+`rootVolumePresent: false`. Missing or failed observations are not proof of
+deletion. The coordinator verifies recorded ownership and resource identity
+before reporting provider state. This operation is admin-only and read-only.
+
+When the coordinator resolves the original root identity from a matching
+provider allocation event, JSON also contains `rootIdentityEvidence` with only
+the original `eventID` and `eventTime`. The field is omitted when no such evidence
+is returned; the CLI does not infer or create it. Raw provider event payloads
+are not included. This provenance is not proof of remote child termination,
+private artifact custody, or a trial score. Those require their own original
+records and verification.
 
 ## lease-audit
 
@@ -69,7 +154,7 @@ Inspect provider identity and IAM policy requirements through provider-scoped su
 
 ```sh
 crabbox admin providers identity --provider aws --region eu-west-1
-crabbox admin providers policy --provider aws --target macos
+crabbox admin providers policy --provider aws --region eu-west-1 --target macos
 ```
 
 ### providers identity
@@ -90,12 +175,14 @@ Print the baseline brokered AWS IAM policy. With `--target macos` (or `--host-li
 
 ```text
 --provider <provider>   provider (currently aws)
+--region <region>       region for owned-instance stop and termination permissions
+--account <account-id>  AWS account ID (default: the IAM principal's account)
 --target <target>       optional; macos combines provider plus host lifecycle policy
 --host-lifecycle        include provider host lifecycle permissions
 --mac-hosts             legacy alias for --host-lifecycle
 ```
 
-The baseline AWS provider policy covers key pairs, instance launch and termination, managed security groups, image creation/promotion, snapshot cleanup, and Service Quotas reads. If you set `CRABBOX_AWS_INSTANCE_PROFILE`, add a separate scoped `iam:PassRole` grant for that role with `iam:PassedToService=ec2.amazonaws.com`.
+The baseline AWS provider policy covers key pairs, instance launch, managed security groups, image creation/promotion, snapshot cleanup, instance/volume inspection, and Service Quotas reads. Stop and termination share an account-, region-, and ownership-tag-scoped statement (`crabbox=true`, `created_by=crabbox`). Supply `--region` for an installable policy; without it, replace the literal `<aws-region>` placeholder before installation. The account defaults to the IAM `${aws:PrincipalAccount}` policy variable; `--account` binds it to a specific 12-digit account. These are policy-generation options, not changes to coordinator configuration. If you set `CRABBOX_AWS_INSTANCE_PROFILE`, add a separate scoped `iam:PassRole` grant for that role with `iam:PassedToService=ec2.amazonaws.com`.
 
 ## hosts
 
@@ -287,3 +374,17 @@ The EC2 Mac Dedicated Host lifecycle policy is intentionally limited to host ope
 
 - [Operations](../operations.md)
 - [Auth and admin](../features/auth-admin.md)
+
+## retained-reconcile
+
+`crabbox admin retained-reconcile [--json]` reads the admin-only
+`GET /v1/admin/retained-reconcile` status endpoint. It reports effective settings,
+cumulative counters by provider/outcome, last pass time, the current-index cursor,
+completed cycles, records scanned, and provider backoff deadlines. Counters count
+observations across passes, not distinct leases. `present` identifies real retained
+machines; only a bounded sample of their lease IDs appears in each structured
+`coordinator.retained_reconcile` log line. The command does not start a pass or
+change deletion settings.
+
+See [Retained record reconciliation](../features/lifecycle-cleanup.md#retained-record-reconciliation)
+for provider coverage and unresolved classes.

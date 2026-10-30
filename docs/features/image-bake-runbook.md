@@ -19,6 +19,12 @@ registers an AMI as the default for a given **target**, **architecture**, and
 scoped: a macOS promotion is only selected by `target=macos` leases and never
 replaces the Linux or Windows default.
 
+When capacity fallback changes regions, the coordinator selects that region's
+promotion or its stock image. A missing automatic promotion also falls back
+once to stock. Stock runners use the normal bootstrap and may take longer to
+prepare; image capability requirements still require a matching promoted image.
+Explicit AMIs and checkpoint snapshots retain their requested image source.
+
 Two ways to point a lease at a specific image during testing:
 
 - Set the provider override env var, for example `CRABBOX_AWS_AMI=ami-...`, to
@@ -339,6 +345,87 @@ than overwriting it. Publisher rollback explicitly authorizes retiring the
 exact failed catalog revision so capability-aware leases cannot select it;
 generic stale compare-and-swap requests leave the catalog unchanged.
 
+### Bake a smaller Linux root disk from stock Ubuntu
+
+A rebuild from the promoted AMI inherits its root snapshot minimum. Even if
+only 8 GB is used, a 400 GB snapshot cannot boot on a 40 GB disk. To lower that
+minimum, start the source lease from owner-verified stock Ubuntu and install
+the developer tools again:
+
+```bash
+scripts/mint-aws-devtools-image.sh --target linux --stock-source --root-gb 40
+# Review the plan, then add --run to perform the paid bake and promotion.
+```
+
+For the protected publisher workflow, set the optional `linux_root_gb` input to
+`40` (or another integer from 16 through 400). This passes `--stock-source
+--root-gb 40` to the Linux wrapper. An empty input keeps the promoted-source
+rebuild; Windows and macOS reject a nonempty value. Deploy the coordinator
+version supporting stock requests before running the publisher.
+
+`--stock-source` supports Linux and Windows. For Linux, `--root-gb` requires
+`--stock-source`; Windows may set a source root size without that flag. Invalid
+sizes fail before any paid work. Without `--root-gb`, a stock source uses normal
+class sizing. Pick enough space for the installer and its temporary files;
+16 GB is an accepted input, not a guarantee that the full developer recipe fits.
+The source uses the selected `CRABBOX_OS` / `linux_os` Ubuntu version. Stock
+selection requires the same coordinator admin authorization as an explicit AMI
+and cannot be combined with an explicit AMI, snapshot, or image capability
+requirements.
+
+Only the source lease gets these overrides. Candidate and promoted proof
+leases, plus all `--measured` baseline/candidate/promoted cohorts, use normal
+root sizing. Baseline measurements retain normal image selection. The wrapper
+clears ambient `CRABBOX_AWS_STOCK_IMAGE` / `CRABBOX_AWS_ROOT_GB` settings for
+proofs, including file-config values via explicit false/zero inputs. A configured
+coordinator root override still applies to normal sizing. Source settings and
+lease ID are written to the source JSON receipt beside the diagnostic logs;
+measured public proof includes the allowlisted requested source settings.
+Promotion and rollback receipts still bind the original baseline default.
+
+### Bake Windows Server 2025 from stock
+
+The protected workflow defaults to `windows_os=windows-server:2022`, preserving
+the existing promoted-source rebuild. Select 2025 to start the source lease
+from Amazon's stock Windows Server 2025 English Full Base AMI:
+
+```bash
+gh workflow run devtools-image-publish.yml \
+  --ref main \
+  -f target=windows \
+  -f windows_os=windows-server:2025 \
+  -f region=eu-west-1
+```
+
+The equivalent wrapper plan is:
+
+```bash
+CRABBOX_OS=windows-server:2025 scripts/mint-aws-devtools-image.sh \
+  --target windows --stock-source --region eu-west-1 --windows-mode normal
+# Review the plan, then add --run to perform the paid bake and promotion.
+```
+
+Windows `--stock-source` requires `CRABBOX_OS=windows-server:2022` or
+`windows-server:2025`. Only the source receives that selector and
+`CRABBOX_AWS_STOCK_IMAGE=1`. The candidate uses the captured AMI explicitly;
+the promoted proof uses normal image selection without the source selector.
+Do not configure a separate Windows OS selector or AMI override in the
+publisher's file config: the final proof must select the promoted image.
+All three smokes verify the requested guest build (20348 for 2022, 26100 for
+2025), and prep/smoke select the matching `ltsc2022` or `ltsc2025` Server Core
+container image. The region guard, exact failed-candidate checkpoint cleanup,
+and transactional promotion rollback apply to Windows too.
+
+Windows promotions are scoped by target, architecture, and region, without an
+OS-version key. Explicit Windows OS selectors deliberately bypass those
+unversioned promotions: `--os windows-server:2022` still selects stock 2022
+after a 2025 image is promoted. The default workflow input is a legacy rebuild
+mode, not a promise to downgrade a promoted 2025 image to 2022; use the stock
+wrapper command with the 2022 selector for that. The stock fallback is Server
+2025; unversioned promoted images still take precedence without an explicit
+Windows selector. Roll out this fallback change only after live 2025 image
+promotion, guest proof, and cleanup have succeeded.
+
 ## Developer-image wrappers
 
 For generic AWS Linux and Windows developer AMIs, use the guarded wrapper
@@ -386,6 +473,31 @@ same source/candidate proof works with direct AWS credentials and with an
 admin-authenticated broker. Promotion updates broker-managed image defaults;
 use `--no-promote` when validating a direct-only AWS configuration.
 
+An explicit region (including `CRABBOX_IMAGE_REGION` or `CRABBOX_AWS_REGION`)
+sets `CRABBOX_CAPACITY_REGIONS` to that single region for all lifecycle and
+measurement leases. The wrapper clears configured capacity AZ defaults unless
+`CRABBOX_CAPACITY_AVAILABILITY_ZONES` is explicitly nonempty. These client hints
+cannot disable the broker's additional fallback regions: the coordinator merges
+its own region list. Region-checked minting therefore requires coordinator admin
+auth to verify the exact lease's recorded region as well as the selected-image
+line. Missing or mismatched evidence stops the lease immediately, even with
+`--keep-lease`, before preparation, capture, or smoke. Retry when quota/capacity
+is available in the requested region, or choose another region explicitly.
+Measured runs apply the same check to each retained sample before acceptance.
+
+The captured checkpoint's region must also match before a candidate boots.
+On failure before promotion, EXIT cleanup deletes only the checkpoint created
+by this invocation using `crabbox checkpoint delete <checkpoint-id> --admin`.
+This deregisters its AMI and deletes its backing snapshots through the existing
+ownership and use-claim checks; generic `image delete` refuses managed
+checkpoint resources. The private `*-candidate-cleanup.json` receipt records
+the exact checkpoint, AMI, region, status, and deletion exit code. Deletion
+failures are printed prominently and mark measured `cleanupStatus` as failed
+without replacing the original mint error. Retry the recorded checkpoint
+deletion after resolving the failure. A successful `--no-promote` run retains
+its candidate; a promoted image retains the existing receipt-based rollback
+and investigation semantics and is never deleted by this cleanup.
+
 Enable FSR for hot lanes that need lower first-boot variance, in the AZs you
 actually launch from:
 
@@ -403,8 +515,9 @@ scripts/mint-aws-devtools-image.sh \
 ### What the prep scripts install
 
 - **Linux** (`scripts/install-linux-developer-tools.sh`): common CLI/build
-  tooling, GitHub CLI, Node 24.19.0, Go 1.27.0, and Bun 1.4.0 on x86_64,
-  corepack/pnpm, TruffleHog 3.95.9, Chrome or
+  tooling, GitHub CLI, Node 24.22.1, Go 1.27.3, Bun 1.4.4, Rust/Cargo 1.98.1,
+  and uv/uvx 0.12.19 on x86_64,
+  corepack/pnpm, TruffleHog 3.99.4, Chrome or
   Chromium for browser lanes, desktop/VNC helpers, Docker Engine, Compose,
   buildx, and a small default Docker image set. TruffleHog archives are pinned
   to reviewed SHA-256 digests for amd64 and arm64. NodeSource, Docker, and
@@ -420,19 +533,23 @@ scripts/mint-aws-devtools-image.sh \
   functional probe, including creating and checking a disposable pip-enabled
   virtual environment, before atomically emitting the strongest supported profile.
 - **Managed WSL2 distro bootstrap**: the Linux installer's `--node-only` entrypoint
-  provides the same Node/npm baseline (checksum-pinned Node 24.19.0 on amd64).
-  It skips image-only Docker, Go, browser/desktop setup, pnpm activation, and the
+  provides the same Node/npm baseline (checksum-pinned Node 24.22.1 on amd64).
+  It skips image-only Docker, Go, Rust, uv, browser/desktop setup, pnpm activation, and the
   offline pnpm archives; see [AWS targets](../providers/aws.md#targets).
 - **Windows** (`scripts/install-windows-developer-tools.ps1`): common CLI/build
-  tooling, GitHub CLI, Node 24, corepack/pnpm, TruffleHog 3.95.9, and Windows
+  tooling, GitHub CLI, Node 24, corepack/pnpm, TruffleHog 3.99.4, and Windows
   Server container support with Docker Engine. It deliberately avoids Docker
   Desktop because headless image bakes should not depend on a user-session
   desktop app or Docker Desktop licensing. The Chocolatey package, Node MSI,
   TruffleHog archive, and Docker Engine archive are pinned to reviewed SHA-256
-  digests and verified before privileged installation or extraction.
+  digests and verified before privileged installation or extraction. TruffleHog
+  is staged with an `.exe` suffix in the installation directory and moved into
+  place only after its pinned version runs successfully. Failed validation logs
+  the exit code, both output streams, and any launch error; the existing binary
+  remains untouched and the rejected candidate is removed.
 - **Windows WSL2**: the shared Windows bootstrap installs the checksum-pinned
-  Linux TruffleHog 3.95.9 binary inside the managed WSL distro. This happens
-  during environment setup and does not require autoreview-time installation.
+  Linux TruffleHog 3.99.4 binary inside the managed WSL distro during environment
+  setup.
 
 Linux preparation retains `cloud-init clean --logs --seed` while preserving
 the running source's completed initialization. Using the distro's isolated
@@ -449,16 +566,42 @@ unchanged.
 Windows developer bakes are headless by default for faster boot and fewer
 desktop-bootstrap moving parts. Pass `--desktop` only when the image must back
 interactive desktop leases. Windows container support can require one reboot
-before Docker starts; the wrapper detects the prep script's reboot marker,
-reboots the source lease, waits for Crabbox readiness, reruns the prep script to
-pull the configured Docker images, and only then runs the source smoke and AMI
-capture.
+before Docker starts; the wrapper detects the prep script's reboot marker and
+reboots the source through the validated command from `crabbox ssh`. This
+maintenance connection does not acquire a workspace owner, so reboot cannot
+interrupt `crabbox run`'s ownership release. A failed `shutdown` command stops
+the bake. Fresh SSH probes must observe the source go down (within
+`CRABBOX_IMAGE_REBOOT_DOWN_TIMEOUT`, default 2m) and return (within
+`CRABBOX_IMAGE_REBOOT_WAIT_TIMEOUT`, default 25m). The wrapper then settles for
+`CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS` (default 180), probes again, and
+reruns prep to pull the configured Docker images before source smoke and AMI
+capture. Missing either reboot transition fails the bake and triggers cleanup.
+
+Windows prep retries downloads, Chocolatey package installation, pnpm preparation,
+and each Docker image pull up to four times, with 30-, 60-, and 120-second waits.
+Each successful pull must also pass `docker image inspect`; exhausted retries
+stop the bake before source smoke or capture. Native command exit codes are
+checked explicitly because Windows PowerShell does not throw on nonzero exits.
+The prep script records its current step in
+`C:\ProgramData\crabbox\image-prep.step` and uncaught exception details in
+`image-prep.error`. On failure the mint reports these files, the child PowerShell
+exit code, and the last 200 log lines. A process exit of `-1` (`0xFFFFFFFF`)
+does not identify a Docker error or failing statement on its own.
+
+The normal five-minute coordinator-backed stop budget also applies to mint
+cleanup. If Windows failure cleanup reports that release was accepted but
+observation timed out, the mint preserves the original failure and reports
+cleanup as unconfirmed, retaining lease handles and local recovery state.
+Use the printed `status --json` command to check progress, then repeat `stop`
+to confirm cleanup and remove retained local artifacts. An accepted release
+alone never proves termination, and pending cleanup cannot make a successful
+mint pass.
 
 ### Linux public toolchain archives
 
-The x86_64 recipe installs the checksum-pinned upstream Node 24.19.0 archive,
+The x86_64 recipe installs the checksum-pinned upstream Node 24.22.1 archive,
 including its bundled Corepack 0.35.0, at
-`/opt/hostedtoolcache/node/24.19.0/x64`. The sibling `x64.complete` marker is
+`/opt/hostedtoolcache/node/24.22.1/x64`. The sibling `x64.complete` marker is
 written only after executable checks. This matches the GitHub tool-cache
 `$RUNNER_TOOL_CACHE/node/<version>/<architecture>` layout; it does not bind a
 runner to that root. Crabbox's GitHub runner defaults to
@@ -470,8 +613,10 @@ as described below. Completion markers are availability hints, not authenticatio
 Before cache or network preparation, the pinned Node route checks all six
 public aliases: `node`, `npm`, `npx`, `corepack`, `pnpm`, and `pnpx`. It repeats
 the check before replacing the image toolcache slot. Each alias must be absent
-or an absolute symlink to its same-named binary in the exact Node 24.19.0 x64
-slot; dangling matching links are allowed. Files, directories, and other link
+or an absolute symlink to its same-named binary in
+`/opt/hostedtoolcache/node/24.19.0/x64/bin` (the released predecessor) or
+`/opt/hostedtoolcache/node/24.22.1/x64/bin` (the current slot); dangling matching
+links are allowed. Files, directories, and other link
 targets stop the bake with a resolve-before-rebake diagnostic. Relative aliases,
 including those from earlier unshipped builder revisions, require operator
 resolution rather than automatic ownership inference.
@@ -481,20 +626,24 @@ installer publishes each public alias using a private temporary symlink and
 rename, then prepares the selected pnpm version without running public
 `corepack enable`. Existing public `yarn` and `yarnpkg` entries remain untouched.
 Each alias replacement is atomic; the six replacements are not one transaction.
+Publication replaces accepted 24.19.0 aliases with 24.22.1 links; old managed
+trees and cached archives remain intact.
 
 Public archives are retained under `/opt/crabbox/toolchain-archives`:
 
 | Filename | Purpose |
 | --- | --- |
-| `node-v24.19.0-linux-x64.tar.xz` | Node, npm, and bundled Corepack |
+| `node-v24.22.1-linux-x64.tar.xz` | Node, npm, and bundled Corepack |
 | `pnpm-11.22.0.tgz` | pnpm 11.22.0 |
-| `pnpm-12.3.4.tgz` | pnpm 12.3.4 JavaScript wrapper |
-| `exe.linux-x64-12.3.4.tgz` | pnpm 12.3.4 native executable for glibc Linux x64 |
-| `go1.27.0.linux-amd64.tar.gz` | Complete Go 1.27.0 distribution |
-| `bun-v1.4.0-linux-x64-baseline.zip` | Original Bun 1.4.0 baseline Linux glibc ZIP |
-| `bun-v1.4.0-linux-x64.zip` | Original Bun 1.4.0 optimized Linux glibc ZIP |
+| `pnpm-12.15.0.tgz` | pnpm 12.15.0 JavaScript wrapper |
+| `exe.linux-x64-12.15.0.tgz` | pnpm 12.15.0 native executable for glibc Linux x64 |
+| `go1.27.3.linux-amd64.tar.gz` | Complete Go 1.27.3 distribution |
+| `bun-v1.4.0-linux-x64-baseline.zip` | Original Bun 1.4.4 baseline Linux glibc ZIP |
+| `bun-v1.4.0-linux-x64.zip` | Original Bun 1.4.4 optimized Linux glibc ZIP |
+| `rust-1.98.1-x86_64-unknown-linux-gnu.tar.xz` | Official standalone Rust/Cargo host distribution |
+| `uv-0.12.19-x86_64-unknown-linux-gnu.tar.gz` | Original uv/uvx Linux glibc release archive |
 
-The SHA-256 Node/Go/Bun pins and SHA-512 pnpm pins live in the installer's
+The SHA-256 Node/Go/Bun/Rust/uv pins and SHA-512 pnpm pins live in the installer's
 `toolchain_archive_spec`. Consumers must carry independently reviewed pins,
 copy archives into private staging, validate those exact bytes, and extract
 fresh trees. Do not authenticate a cached installation by running `--version`,
@@ -519,10 +668,11 @@ Node 22; it does not authorize other downgrades or change the default Node 24
 route. APT failure or a failed installed-package version, architecture, or
 package-owned binary check leaves the owned links and caches intact.
 
-Only after those checks does the installer recheck and remove its six exact
-Node 24.19.0 toolcache symlinks, including dangling ones. Operator files,
-nonmatching symlinks, and cached archives and trees remain intact. It clears the
-shell command cache and checks normal PATH selection before preparing Corepack.
+Only after those checks does the installer recheck the aliases identified before
+APT and remove only same-name absolute links into the Node 24.19.0 or 24.22.1
+toolcache slot, including dangling ones. Operator files, nonmatching symlinks,
+and cached archives and trees remain intact. It clears the shell command cache
+and checks normal PATH selection before preparing Corepack.
 A conflicting operator-provided Node stops the rebake with a PATH diagnostic
 rather than being deleted. The alternate toolchain must provide npm and Corepack;
 this does not add packaging for newer Node majors.
@@ -537,9 +687,41 @@ have independent Linux `amd64` contracts, including when the Node major is
 overridden. Bun additionally requires glibc. ARM guests and custom prep scripts
 retain the existing normal-tool smoke; their success does not qualify the
 x86_64 archive recipe. Missing or corrupt archives cannot disable any required
-probe for the supported builder.
+probe for the supported builder. Rust and uv also require glibc Linux `amd64`
+and are independent of Node selection.
 
-Go 1.27.0 installs at `/opt/hostedtoolcache/go/1.27.0/x64`, with image-owned
+Rust and uv install under `/opt/crabbox/toolchains/{rust,uv}/<version>/bin`,
+with public `rustc`, `cargo`, `rustdoc`, `uv`, and `uvx` links under
+`/usr/local/bin`. Existing files or links to other destinations stop preparation
+before the tool's cache or installation changes. Rebakes rebuild only their
+exact image-owned slots from authenticated bytes. User `.cargo`, `.rustup`,
+shell profiles, and existing package-manager installations are not adopted or
+rewritten. Rustup, additional Rust targets, and Python downloads are not included.
+
+Rust uses the [official standalone distribution](https://forge.rust-lang.org/infra/other-installation-methods.html),
+with only the compiler, Cargo, and host standard-library components installed;
+its SHA-256 is pinned from the matching Rust distribution checksum. uv uses the
+[official release archive](https://github.com/astral-sh/uv/releases/tag/0.12.19)
+and its SHA-256 release-asset digest. The versioned uv cache filename preserves
+the original upstream bytes. No mutable installer script runs from the network.
+
+Source, candidate, and promoted smokes check both ordinary runtime PATH and a
+fresh extraction of each authenticated archive as a nonroot user. Rust compiles,
+tests, and runs a dependency-free Cargo crate offline, then runs a rustdoc test.
+uv creates a virtual environment using the existing Python, installs and imports
+a local wheel, and executes its console script through `uvx`. These probes use
+fresh private homes/caches with package-network access and Python downloads
+disabled, and remove their scratch on success or failure. Generic
+`linux-minimal`/`linux-builder` readiness and node-only bootstrap are unchanged.
+
+The Scripts CI job repeats this Rust/uv installation and offline smoke in
+temporary nonroot-owned tool slots, without changing runner installations or
+passing credentials to the tools. Its opt-in test downloads approximately
+225 MB of pinned public archives and has a four-minute execution limit inside
+a five-minute step. Ordinary local script tests use fixtures and skip this
+download; the isolated tool proof does not replace a baked-image smoke.
+
+Go 1.27.3 installs at `/opt/hostedtoolcache/go/1.27.3/x64`, with image-owned
 `/usr/local/bin/go` and `gofmt` links. The installer authenticates a private
 archive copy and freshly extracts the entire distribution; it never executes
 an existing same-version tree to establish trust. The sibling `x64.complete`
@@ -547,17 +729,17 @@ marker is written last, after version/architecture, standard-library tests and
 a CGO compile/link/run assertion pass. Source, candidate and promoted smokes
 repeat those functional checks as nonroot from a new private extraction with
 fresh writable build/module caches, `GOPROXY=off` and `GOTOOLCHAIN=local`.
-Go 1.27.1 or another version does not satisfy the exact 1.27.0 cache slot.
+Go 1.27.1 or another version does not satisfy the exact 1.27.3 cache slot.
 
 Before cache or network preparation, and again before changing the Go slot or
 marker, both public `go` and `gofmt` paths must be absent or exact same-name
-absolute symlinks into the Go 1.27.0 x64 slot. Matching dangling links are
+absolute symlinks into the Go 1.27.3 x64 slot. Matching dangling links are
 allowed. Files, directories and other targets require operator resolution
 before rebaking; a conflict preserves the existing tree, marker and aliases.
 Publication uses the same private temporary-symlink replacement as Node,
 without treating the pair as one atomic transaction.
 
-The bundled builder retains both Bun 1.4.0 x64 ZIPs on glibc Linux `amd64`,
+The bundled builder retains both Bun 1.4.4 x64 ZIPs on glibc Linux `amd64`,
 independently of the Node-major override. Their versioned cache filenames do
 not change the upstream ZIP bytes. After Node and Go setup, the baseline
 executable is installed at
@@ -597,8 +779,8 @@ private home and dependency-free fixtures with auto-install disabled; `bunx`
 executes a local binary with `--no-install`. A missing cache fails this offline
 proof even though installation supports a pinned download fallback.
 
-Native GitHub runner registration seeds only `node/24.19.0/x64` and
-`go/1.27.0/x64` after configuration and before service start. It reads the
+Native GitHub runner registration seeds only `node/24.22.1/x64` and
+`go/1.27.3/x64` after configuration and before service start. It reads the
 actual `.runner` work folder and `.env` values, including the precedence of
 `RUNNER_TOOL_CACHE`, `RUNNER_TOOLSDIRECTORY`, `AGENT_TOOLSDIRECTORY` and
 `agent.ToolsDirectory`. Literal `.env` values are not evaluated as shell code.
@@ -620,7 +802,7 @@ tools root and existing Go-on-PATH validation; its shim is not an upstream
 `setup-go` execution.
 
 Qualification must exercise the real pinned `setup-go` action with exact
-`go-version: 1.27.0`, `check-latest: false`, dependency `cache: false` and no
+`go-version: 1.27.3`, `check-latest: false`, dependency `cache: false` and no
 custom download URL, verifying an offline toolchain hit and the native Runner's
 effective cache root. Fixture tests do not replace that Linux proof or imply
 ARM support, another Ubuntu release's ABI, or successful image publication.
@@ -632,7 +814,7 @@ and hydration behavior are unchanged.
 ### Tuning the prebake set
 
 ```bash
-CRABBOX_LINUX_DOCKER_IMAGES='hello-world ubuntu:24.04 node:24-bookworm'
+CRABBOX_LINUX_DOCKER_IMAGES='hello-world ubuntu:24.04 node:24.22.1-bookworm'
 CRABBOX_WINDOWS_DOCKER_IMAGES='mcr.microsoft.com/windows/servercore:ltsc2022'
 CRABBOX_WINDOWS_NODE_VERSION='<version>'
 CRABBOX_WINDOWS_NODE_SHA256='<reviewed-64-hex-sha256>'
@@ -670,6 +852,33 @@ a safe same-filesystem rename and verified before capture. Later managed Linux
 boots independently rerun the declared probes under a sanitized system PATH
 before skipping baseline APT. Use the timing logs to compare provider request,
 network readiness, bootstrap, and end-to-end time before and after each bake.
+
+If coordinator admission rejects an acquisition with HTTP 429,
+`cost_limit_exceeded`, and a fleet, owner, or org **active lease count** message,
+the wrapper retries the same request every two minutes. Each source, candidate,
+promoted proof, and measured sample has its own `CRABBOX_IMAGE_CAPACITY_WAIT`
+budget (default `45m`, measured from the first rejection). Use whole seconds,
+minutes, or hours, such as `600`, `10m`, or `1h`; `0` disables waiting. The final
+sleep is shortened to the remaining budget. An accepted attempt may take its
+normal provisioning time. Each wait prints the phase, delay, remaining budget,
+and diagnostic log path; exhausted capacity preserves the failing exit code and
+normal cleanup/rollback. The surrounding workflow timeout still bounds the job.
+
+Spending limits also use `cost_limit_exceeded` but are never retried. Other
+errors, failed log writes, and any attempt with evidence of an allocated lease
+fail immediately. Active-count admission rejects before publishing a lease or
+starting provisioning, so these retries do not add live leases. Rejected logs
+are retained as `.capacity-<attempt>` beside the final attempt log.
+
+Linux developer-image acceptance runs the publisher checkout's generated script
+with `--verify linux-builder` on source, candidate, and promoted leases. It
+requires the canonical trusted manifest and working builder probes without
+rewriting evidence. The runtime smoke compiles and executes C, runs npm/pnpm
+offline, writes the baked caches, and exercises Docker run, buildx, and Compose
+with local images and networking disabled. Docker must work as the runtime user
+(or after refreshing its Docker group); root execution cannot satisfy acceptance.
+All probe scratch is disposable and cleanup failures remain failures. This adds
+no toolchain versions or new desktop/browser package requirements.
 
 Linux source, candidate, and promoted smokes require a nonroot user. After
 successful bundled Linux preparation, the wrapper activates the selected pnpm
@@ -755,6 +964,10 @@ cleanup also fails. Interruptions recover an already-published retained handle
 without waiting for a final timing record. The original runner timing excludes the subsequent evidence
 read and cleanup wait, consistently across all cohorts. Warmup timings are not
 benchmark samples, and a `--cold` label alone is not evidence of fresh acquisition.
+Admission-capacity waits also stay outside runner totals: each retry starts a
+fresh CLI invocation. Rejected attempts without a lease are moved out of the
+cohort's timing store into `.capacity-<attempt>.timing.jsonl` diagnostics before
+retrying, so they neither count as samples nor inflate the timing distribution.
 Existing `bench report` owns all three timing distributions. `bench check`
 enforces the predeclared p95 policy only for candidate and promoted cohorts.
 Missing, mixed, reused, or insufficient observations block promotion; measured
@@ -936,7 +1149,7 @@ image generic: it verifies Command Line Tools by default, or selects an
 installed `/Applications/Xcode*.app` developer directory when
 `CRABBOX_MACOS_REQUIRE_XCODE=1`. It installs Homebrew when missing, installs
 common developer packages (Git, GitHub CLI, jq/yq, ripgrep, fd, ShellCheck,
-shfmt, Python, Node 24, pnpm via corepack), installs TruffleHog 3.95.9 from a
+shfmt, Python, Node 24, pnpm via corepack), installs TruffleHog 3.99.4 from a
 reviewed SHA-256-pinned archive, and creates `/usr/local/bin` shims so non-login
 SSH commands find those tools after the AMI boots. It does not download Xcode —
 install Xcode in a private prep hook first if the base image lacks it. Do not

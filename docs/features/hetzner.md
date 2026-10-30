@@ -47,16 +47,16 @@ large     ccx53, ccx43, cpx62, cx53
 beast     ccx63, ccx53, ccx43, cpx62, cx53
 ```
 
-`--type` pins an explicit server type. It is tried first, but Crabbox still
-falls back to the rest of the class candidates if that type is rejected for
-quota or capacity, so a busy region does not strand a lease. Dedicated-core
-types (the `ccx*` family) are the most likely to hit account quota.
+`--type` pins one exact server type and disables class fallback. Omit it to
+allow the class candidates above. Dedicated-core types (the `ccx*` family) are
+the most likely to hit account quota.
 
 ## Image and location
 
-The OS image follows `--os` (default `ubuntu:26.04`), mapped to the Hetzner
-image name. Both `ubuntu:26.04` and `ubuntu:24.04` resolve to the
-`ubuntu-24.04` Hetzner image today. The default location is `fsn1`.
+The OS image follows `--os`: the default `ubuntu:26.04` maps to
+`ubuntu-26.04`, and `ubuntu:24.04` maps to `ubuntu-24.04`. See the
+[provider image catalog](../providers/hetzner.md#os-selector) for Hetzner's
+availability announcement. The default location is `fsn1`.
 
 Override the image, location, or a preexisting Hetzner SSH key via config or
 environment variables (see below). Crabbox otherwise generates and uploads a

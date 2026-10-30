@@ -165,6 +165,12 @@ process argument. Managed targets without an explicit SSH-config route also
 exclude ambient identity files and agents. Ordinary keyed commands retain their
 multiplexing policy.
 
+Providers with expiring SSH credentials may set `SSHTarget.PrepareConnection`
+to refresh their credential files before each new SSH or file-transfer transport.
+The callback must honor cancellation, bound its own work, synchronize concurrent
+callers, and preserve the target's paths and established connections. Credential
+policy and caching remain provider-owned; callback errors prevent dispatch.
+
 `--no-sync` is validated by each adapter, not inferred from `FeatureArchiveSync`:
 some SDK/CLI transports support it without archive sync. An adapter that cannot
 skip transfer must reject it before acquisition or provider execution. Blacksmith
@@ -259,15 +265,17 @@ type IdempotentLeaseIDBackend interface {
 }
 ```
 
-The ASCII Box, AWS, Azure, DigitalOcean, Daytona, Incus, Machine0, local-container, Parallels,
-Proxmox, and Tenki direct backends implement this capability; coordinator-backed
+The ASCII Box, AWS, Azure, DigitalOcean, Daytona, GitHub Codespaces, Incus, Linode, Machine0, local-container, Parallels,
+Proxmox, RunPod, and Tenki direct backends implement this capability; coordinator-backed
 leases support it through the coordinator wrapper. External
 backends support it only when their configured protocol explicitly advertises
 idempotent lease IDs. `crabbox warmup --lease-id` rejects other backends before
 provisioning. Built-in direct adapters use `core.AcquireFixedResource` and
 `core.FixedLeaseOperations[T]`: `DescribeIntent`, `Plan`, `ObserveExact`,
 `Submit`, `PrepareAccess`, and `DeleteExact`. Plans return native input data;
-core assembles labels and nonces, persists attempts, applies binding evidence,
+`DescribeIntent` may supply `FixedLeaseBinding.InitialLabels` so the first durable
+claim retains ownership and cleanup metadata even if planning fails. Core
+assembles labels and nonces, persists attempts, applies binding evidence,
 and publishes acquired and terminal records. Adapters supply native scope,
 identity, readiness, and exact-deletion proofs. Ordered `FixedIntentFields`
 preserve existing fingerprint field order, names, omission rules, and hash domains.
@@ -282,8 +290,18 @@ use `DeferredAdmission` and call `tx.Admit` at the mutation boundary. APIs resol
 launch inputs during submission also declare `PlanDuringSubmit` and persist each
 payload with `WriteFixedAttempt` before allocation. Only a provider-certified
 definite failure may call `tx.RejectAttempt`; unknown outcomes retain custody.
-Adapters treat the transaction claim as read-only and publish returned evidence
-through `tx.Bind` or `tx.Observe`. Binding cannot retarget a known native identity.
+Adapters treat the transaction claim as read-only and return attested binding
+evidence from `ObserveExact`, or publish partial native results through `tx.Bind`
+or `tx.Observe`. Core persists observation bindings before preparing access and
+selects journal phases; adapters do not write them. Binding cannot retarget a
+known native identity.
+
+For a native ID namespace shared by multiple local fixed acquisitions, set
+`FixedLeaseOperations.PlanReservationKey` to the same stable key for every
+caller sharing that namespace. Core serializes planning, uniqueness checks,
+and durable attempt publication across processes, then releases the reservation
+fence before submission. This requires a pre-submission plan; it cannot be used
+with `PlanDuringSubmit`.
 
 Providers with expiring idempotency keys can combine `FreshOnly` with
 `FixedAdmission.KeyedRetry`, specifying the native attempt key and retention
@@ -300,19 +318,20 @@ an empty list or matching display name grants no authority.
 `core.DeleteFixedResource` keeps claim comparison, native proof, and terminal
 publication under one durable claim lock. Existing shared claim resolvers and
 native cleanup graphs remain reusable; a deletion callback must prove completion,
-not merely request admission. Formats with a `FixedLeaseKind.DeletionState`
-persist their cleanup marker and the `deleting` journal phase before native
-deletion. By default, formats without that state leave the exact durable claim
-and bound evidence unchanged at deletion admission. An adapter whose deletion
-depends on captured recovery identities opts into `FixedReleasePolicy.PersistBinding`:
-core journals supplied observation or release bindings before calling `DeleteExact`,
-retaining them if native cleanup fails. Adapters may still persist native
-cleanup acknowledgements through their existing witness contract. Existing
+not merely request admission. Core journals supplied observation or release
+bindings before calling `DeleteExact`, retaining them if native cleanup fails.
+This is the default for every adapter, including formats without a legacy
+deletion state. `OnlyUnbound` bindings leave an already-bound claim unchanged;
+without new binding evidence or a legacy deletion marker, admission preserves
+the existing durable claim. Formats with a `FixedLeaseKind.DeletionState` also
+persist that cleanup marker with the `deleting` journal phase. Adapters may still
+persist native cleanup acknowledgements through their existing witness contract. Existing
 deletion markers block acquisition replay and retain their admitted status on
 stale retries.
 `FixedLeaseKind.AfterTerminal`, when needed, cleans
 local lease artifacts after durable terminal publication while retaining that
-same claim fence. Native absence-only recovery is a separate proof path.
+same claim fence. Native absence-only recovery returns `AbsenceProven` through
+the same engine: it publishes a terminal receipt without calling `DeleteExact`.
 Cleanup callers can request `FixedReleasePolicy.Started` to distinguish a stale
 claim rejected by the ownership fence from an admitted deletion that failed.
 A reclaimed or renewed candidate is skipped; an already-admitted deletion retains
@@ -348,6 +367,59 @@ type PausableBackend interface {
 
 Declare `FeaturePauseResume` when implementing this interface so
 `crabbox providers` exposes the capability.
+
+#### Retained session disks
+
+`FeatureSessionDiskRetentionV1` (`session-disk-retention-v1`) is a separate,
+opt-in contract layered on fixed acquisition and `PausableBackend`. Ordinary
+pause/resume implementations need not implement it. Azure Sandbox is the first
+adapter; see its [configuration and receipt fields](providers/azure-sandbox.md#session-disk-retention-opt-in).
+
+Core owns immutable `SessionDiskRetentionPolicy`, the versioned fixed claim,
+`RetentionLifecycleRequest`, and `SessionDiskRetentionView`. A policy binds
+`session-disk`, an opaque SHA-256 owner digest, and a positive finite
+`computeWindowSeconds` derived from acquisition TTL. It cannot convert an
+existing ephemeral claim or extend its allocation deadline. Core's
+`MutateFixedRetention` holds the durable claim lock, compares exact identity and
+revision, journals the operation before submission, and preserves its original
+window on replay. Pause closes the window; resume requires confirmed suspension
+and a closed window before admitting one new activation.
+
+Adapters own exact native ownership observation, lifecycle-policy readback,
+state normalization, Disk suspension/resumption, execution admission, and exact
+deletion proof. Before work or lifecycle effects, independently verify disabled
+auto-delete and the configured disk-preserving idle suspension policy. Missing,
+mismatched or unknown evidence grants neither replacement nor new admission.
+Do not route retained disks into clean reserve inventory. `stop` and release
+remain destructive and require independent absence proof; cleanup must work
+when acquisition opt-in is disabled or the work window has expired.
+
+The finite window bounds authorized work on each activation, not physical
+billing. Admission and activity cannot renew it. Expiry blocks work; the lifecycle
+owner must reconcile suspension, and provider idle suspension remains enabled.
+There is no independent watchdog or hard billing cutoff if that owner is down,
+and no RAM/process continuation guarantee. Disk retention lasts until explicit
+retirement, subject to the provider's platform guarantees and quotas.
+
+#### Journal compatibility and rollback
+
+Ephemeral claims continue using journal v1 (or their supported legacy envelope).
+Retained claims require journal v2, including after terminal deletion. New readers
+support both; pre-v2 readers reject v2 during claim decoding before provider
+effects. This refusal can also make inventory or other commands encountering
+that claim fail: it is an intentional downgrade incompatibility, not transparent
+backward compatibility. Never rewrite the version or remove retention fields to
+make an old reader accept a retained disk.
+
+Upgrade the lifecycle owner and Crabbox reader together before enabling retained
+acquisition. Disabling opt-in stops new retained acquisitions but does not migrate
+or delete existing claims. For rollback, keep a compatible reader and lifecycle
+owner available to inspect, suspend and explicitly retire each exact disk. Once
+deletion and absence are confirmed, terminal v2 receipts still require the
+compatible reader; retain them in its claim store rather than downgrading them.
+An older binary may use a separate claim store for new ephemeral work, but it
+must not take custody of retained resources. The legacy workspace controller is
+not a retained lifecycle owner and refuses retained acquisition/cleanup.
 
 Provider-owned lease heartbeats are optional, for providers with no
 Crabbox-managed SSH lease to touch:
@@ -411,7 +483,12 @@ type DoctorProvider interface {
 ```
 
 Native checkpoint and fork support follow the same pattern through
-`NativeCheckpointProvider` and `NativeCheckpointForkProvider`. Future
+`NativeCheckpointProvider` and `NativeCheckpointForkProvider`. A delegated-run
+backend has no SSH target for core to resolve or relocate, so it also
+implements `DelegatedCheckpointBackend`: `ResolveCheckpointSource` returns a
+lease the current repository already claims, and `ForkNativeCheckpoint` creates
+and claims one lease from the checkpoint record. Core then skips SSH lease
+claims, archive checkpoints, and workdir relocation for that provider. Future
 provider-specific capability areas should add similarly narrow interfaces
 rather than widening the base backend. Live provider-owned machine catalogs use
 `ProviderSizeCatalogBackend`; core exposes them through `crabbox providers sizes
@@ -1073,9 +1150,10 @@ SSH-over-Linux/Windows workflow that requires an SSH lease backend, a
 
 Set `CoordinatorSupported` only when the Crabbox broker can provision that
 provider. Today that is the managed cloud set (`aws`, `azure`, `daytona`, `gcp`,
-`hetzner`). A direct-only SSH provider should use `CoordinatorNever`. Even a
-`CoordinatorSupported` provider runs direct from the CLI until a broker URL/token
-is configured.
+`hetzner`) plus owner-donated `serve` capacity. A direct-only SSH provider should
+use `CoordinatorNever`. `BrokeredOnly` declares that direct mode is unsupported;
+the provider must reject direct configuration. Other `CoordinatorSupported`
+providers run direct until a broker URL/token is configured.
 
 Checkpoint-related features are reserved for versioned workspaces:
 
@@ -1424,6 +1502,11 @@ and two-second delay. Adapters return complete `StatusView` values and identify
 final observations, retaining their ownership checks, terminal-state behavior,
 and error diagnostics. The helper preserves observed results before checking
 the deadline or cancellation; it does not add a timeout to provider requests.
+Shared polling and delegated exit errors retain pointer identity so `errors.Is`
+can safely match a wrapper to itself even when a retained cause is non-comparable.
+Their public diagnostics, exit codes, cause graphs, and run classification remain
+separate contracts.
+
 Both waiting contracts use the same observation driver. Transport and probe
 errors retain the adapter's existing context-error classification boundary;
 ownership failures are never reclassified by the shared driver.

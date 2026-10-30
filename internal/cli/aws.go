@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/md5"
 	"crypto/rsa"
@@ -27,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
+	"github.com/openclaw/crabbox/internal/rootdisk"
 )
 
 const (
@@ -114,6 +114,7 @@ func (c *AWSClient) CapacityDoctorChecks(ctx context.Context, cfg Config) []Doct
 		cfg.ServerType = serverTypeForConfig(cfg)
 	}
 	vcpus := c.capacityInstanceTypeVCPUs(ctx, cfg)
+	cfg.AWSRegion = c.region
 	checks := make([]DoctorCheck, 0, 2)
 	for _, market := range awsCapacityDoctorMarkets(cfg) {
 		limit, known, err := c.appliedEC2ServiceQuota(ctx, awsQuotaCodeForMarket(market))
@@ -439,14 +440,6 @@ func colonHex(data []byte) string {
 	return strings.Join(parts, ":")
 }
 
-func (c *AWSClient) DeleteSSHKey(ctx context.Context, name string) error {
-	_, err := c.ec2.DeleteKeyPair(ctx, &ec2.DeleteKeyPairInput{KeyName: aws.String(name)})
-	if err != nil && strings.Contains(err.Error(), "InvalidKeyPair.NotFound") {
-		return nil
-	}
-	return err
-}
-
 type awsCleanupKeyOwnershipError struct{ err error }
 
 func (e *awsCleanupKeyOwnershipError) Error() string { return e.err.Error() }
@@ -548,6 +541,10 @@ func shouldRetryAWSRegionAfterCreateError(err error, control *AWSFixedCreateCont
 }
 
 func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any), control *AWSFixedCreateControl) (result Server, resolved Config, resultErr error) {
+	candidates, err := c.resourceQualifiedLaunchCandidates(ctx, cfg)
+	if err != nil {
+		return Server{}, cfg, err
+	}
 	if cfg.ProviderKey == "" {
 		cfg.ProviderKey = "crabbox-steipete"
 	}
@@ -602,7 +599,6 @@ func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Co
 	if err != nil {
 		return Server{}, cfg, err
 	}
-	candidates := AWSLaunchCandidates(cfg)
 	useSpot := cfg.Capacity.Market != "on-demand"
 	var marketFallbackCandidates []string
 	var errs []error
@@ -651,7 +647,7 @@ func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Co
 		}
 	}
 	if cfg.ServerTypeExplicit {
-		return Server{}, cfg, fmt.Errorf("requested exact AWS instance type %s failed; remove --type to allow class fallback: %w", cfg.ServerType, joinErrors(errs))
+		return Server{}, cfg, fmt.Errorf("requested exact AWS instance type %s failed; remove --type to allow class fallback (regional quota limits still apply): %w", cfg.ServerType, joinErrors(errs))
 	}
 	return Server{}, cfg, joinErrors(errs)
 }
@@ -666,15 +662,11 @@ func (c *AWSClient) resolveLaunchAMI(ctx context.Context, cfg Config, staticImag
 func awsRunInstancesUserData(cfg Config, publicKey string) (string, error) {
 	userData := []byte(awsUserData(cfg, publicKey))
 	if cfg.TargetOS != targetWindows && cfg.TargetOS != targetMacOS {
-		var compressed bytes.Buffer
-		writer := gzip.NewWriter(&compressed)
-		if _, err := writer.Write(userData); err != nil {
+		compressed, err := GzipCloudInit(string(userData))
+		if err != nil {
 			return "", fmt.Errorf("gzip AWS Linux cloud-init user data: %w", err)
 		}
-		if err := writer.Close(); err != nil {
-			return "", fmt.Errorf("finish gzip AWS Linux cloud-init user data: %w", err)
-		}
-		userData = compressed.Bytes()
+		userData = compressed
 		if len(userData) > awsEC2UserDataLimit {
 			return "", fmt.Errorf("EC2 user-data limit is 16 KiB (%d raw bytes); compressed Linux cloud-init is %d bytes", awsEC2UserDataLimit, len(userData))
 		}
@@ -706,11 +698,28 @@ func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 		return Server{}, err
 	}
 	rootGB := cfg.AWSRootGB
+	rootDevice := "/dev/sda1"
 	if rootGB <= 0 {
-		rootGB = 400
+		image, err := c.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{imageID}})
+		if err != nil {
+			return Server{}, fmt.Errorf("resolve AWS root disk minimum: %w", err)
+		}
+		if len(image.Images) != 1 {
+			return Server{}, fmt.Errorf("resolve AWS root disk minimum: expected one AMI %s", imageID)
+		}
+		rootDevice = aws.ToString(image.Images[0].RootDeviceName)
+		var minimum int32
+		for _, mapping := range image.Images[0].BlockDeviceMappings {
+			if aws.ToString(mapping.DeviceName) == rootDevice && mapping.Ebs != nil {
+				minimum = aws.ToInt32(mapping.Ebs.VolumeSize)
+			}
+		}
+		if rootDevice == "" || minimum <= 0 {
+			return Server{}, fmt.Errorf("resolve AWS root disk minimum: AMI %s has no root EBS volume size", imageID)
+		}
+		rootGB = max(int32(rootdisk.DefaultGB(cfg.Class)), minimum)
 	}
 	one := int32(1)
-	rootDevice := "/dev/sda1"
 	clientToken := leaseID
 	if control != nil {
 		clientToken = awsFixedAttemptClientToken(leaseID, cfg, imageID, securityGroupID, spot)
@@ -761,6 +770,7 @@ func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 		}
 	}
 	applyAWSRunInstanceTargetOptions(input, cfg)
+	applyAWSGuestExpiryOptions(input, cfg)
 	if cfg.TargetOS == targetMacOS {
 		hostID := cfg.HostID
 		if hostID == "" {
@@ -892,8 +902,9 @@ func mapMarket(spot bool) string {
 func (c *AWSClient) waitForServerIP(ctx context.Context, id string) (Server, error) {
 	ctx, cancel := context.WithTimeoutCause(ctx, 10*time.Minute, Exit(5, "timed out waiting for AWS instance public IP"))
 	defer cancel()
+	interval := 250 * time.Millisecond
 	for {
-		server, err := c.GetServer(ctx, id)
+		server, err := c.getServerForAcquire(ctx, id)
 		if ctx.Err() != nil {
 			return Server{}, context.Cause(ctx)
 		}
@@ -904,9 +915,10 @@ func (c *AWSClient) waitForServerIP(ctx context.Context, id string) (Server, err
 		if err == nil && server.PublicNet.IPv4.IP != "" {
 			return server, nil
 		}
-		if err := sleepContext(ctx, 5*time.Second); err != nil {
+		if err := sleepContext(ctx, interval); err != nil {
 			return Server{}, context.Cause(ctx)
 		}
+		interval = min(interval*2, 5*time.Second)
 	}
 }
 
@@ -1147,7 +1159,14 @@ func (c *AWSClient) resolveAMI(ctx context.Context, cfg Config) (string, error) 
 		return cfg.AWSAMI, nil
 	}
 	if cfg.TargetOS == targetWindows {
-		return c.resolveLatestAmazonAMI(ctx, "Windows_Server-2022-English-Full-Base-*", "x86_64")
+		spec, err := osImageSpecFor(cfg.OSImage)
+		if err != nil {
+			return "", err
+		}
+		if spec.Target != targetWindows {
+			spec = osImageSpecs["windows-server:2025"]
+		}
+		return c.resolveLatestAmazonAMI(ctx, spec.AWSName, "x86_64")
 	}
 	if cfg.TargetOS == targetMacOS {
 		name, architecture := awsMacOSAMIQueryForInstanceType(cfg.ServerType)
@@ -1171,7 +1190,7 @@ func (c *AWSClient) resolveAMI(ctx context.Context, cfg Config) (string, error) 
 		return "", err
 	}
 	if len(out.Images) == 0 {
-		return "", Exit(3, "no %s %s AMI found in %s; set CRABBOX_AWS_AMI", label, architecture, cfg.AWSRegion)
+		return "", Exit(3, "no AWS AMI found in %s for %s architecture=%s; set CRABBOX_AWS_AMI", c.region, label, architecture)
 	}
 	sort.Slice(out.Images, func(i, j int) bool {
 		return aws.ToString(out.Images[i].CreationDate) > aws.ToString(out.Images[j].CreationDate)
@@ -1486,6 +1505,15 @@ func awsInstanceToServer(instance types.Instance) Server {
 	}
 	server.PublicNet.IPv4.IP = aws.ToString(instance.PublicIpAddress)
 	server.ServerType.Name = string(instance.InstanceType)
+	server.ProviderMetadata["spotInstanceRequestID"] = aws.ToString(instance.SpotInstanceRequestId)
+	if instance.StateReason != nil {
+		server.ProviderMetadata["stateReasonCode"] = aws.ToString(instance.StateReason.Code)
+		server.ProviderMetadata["stateReasonMessage"] = aws.ToString(instance.StateReason.Message)
+	}
+	// A persisted readiness tag cannot override EC2's terminal state.
+	if server.Status == "shutting-down" || server.Status == "terminated" {
+		server.Labels["state"] = server.Status
+	}
 	return server
 }
 
@@ -1632,6 +1660,7 @@ func awsCapacityDoctorCheckForQuota(cfg Config, market string, quotaValue float6
 	needed := vcpus[serverType]
 	base := map[string]string{
 		"provider":             "aws",
+		"region":               cfg.AWSRegion,
 		"market":               market,
 		"quota_code":           quotaCode,
 		"default_class":        cfg.Class,
@@ -1695,11 +1724,14 @@ func awsCapacityDoctorCheckForQuota(cfg Config, market string, quotaValue float6
 			Details: base,
 		}
 	}
-	base["hint"] = "quota_satisfies_default_class"
+	base["capacity"] = "unknown"
+	base["quota_limit"] = "sufficient"
+	base["usage"] = "unchecked"
+	base["hint"] = "check_regional_quota_usage"
 	return DoctorCheck{
 		Status:  "ok",
 		Check:   "capacity",
-		Message: awsDoctorMessage("provider=aws capacity=ready", base),
+		Message: awsDoctorMessage("provider=aws", base),
 		Details: base,
 	}
 }
@@ -1808,4 +1840,14 @@ func parsePort32(port string) (int32, bool) {
 		return 0, false
 	}
 	return int32(n), true
+}
+
+// Only direct Linux guests own their expiry. IMDSv2 exposes the same launch
+// tags used by cleanup; guest poweroff must terminate rather than stop billing.
+func applyAWSGuestExpiryOptions(input *ec2.RunInstancesInput, cfg Config) {
+	if guestExpiryAdapter(cfg) != "aws" {
+		return
+	}
+	input.InstanceInitiatedShutdownBehavior = types.ShutdownBehaviorTerminate
+	input.MetadataOptions = &types.InstanceMetadataOptionsRequest{HttpEndpoint: types.InstanceMetadataEndpointStateEnabled, HttpTokens: types.HttpTokensStateRequired, InstanceMetadataTags: types.InstanceMetadataTagsStateEnabled}
 }

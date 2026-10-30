@@ -13,6 +13,13 @@ SSH rules.
 
 ## File copy
 
+Workspace rsync uses the [sync compression policy](sync.md#rsync-compression).
+Explicit file-copy transfers keep their existing compression defaults.
+Empty POSIX workspaces can use a streamed tar channel under the same workspace
+owner. The SSH child and archive producer finish before temporary transport
+configuration is removed; cancellation joins both. See [sync](sync.md#sync-flow)
+for eligibility and the receiver's emptiness recheck.
+
 `crabbox cp` preserves provider-native copy when available. If the backend has
 no native copy capability but does expose a managed SSH lease, Crabbox maps the
 single `SANDBOX:PATH` operand to the remote side and transfers over the resolved
@@ -140,6 +147,20 @@ PowerShell's `Start-Process -RedirectStandardInput` retain their separate
 redirected-file stream behavior. No SSH service setting or client timeout change is required.
 
 ## Workspace-owner setup failures
+
+On direct POSIX routes, workspace-owner acquire, inspect, renew, and release
+requests share a private foreground SSH connection for that owner. This
+connection is independent of workload and file-transfer connections. It uses
+`ControlPersist=no`; acquisition failure and owner release terminate and join
+the owned process tree before removing its temporary configuration and socket.
+Cancellation still allows ownership cleanup before the connection closes.
+If an SSH wrapper exits before keeping the master alive, startup joins and cleans
+it before falling back to direct owner-control connections with multiplexing
+disabled. Cancellation and cleanup failures still stop acquisition.
+Owner scripts travel as complete, length-checked stdin frames so long scripts
+do not exceed the macOS OpenSSH multiplexing message limit. Windows/WSL2,
+proxy/config-backed routes, provider-owned authoritative known-host files, and
+explicitly disabled multiplexing retain separate connections.
 
 Linux, macOS, and native Windows readiness checks execute the ready command
 without a separate successful-login probe. A failed direct readiness check

@@ -675,7 +675,7 @@ func TestAcquireRemovesStoredKeyAfterPostKeyFailure(t *testing.T) {
 		DirectSSHBackend: sharedBackend(cfg, runner),
 	}
 
-	_, err := backend.acquireOnce(context.Background(), false, "")
+	_, err := backend.acquireOnce(context.Background(), false, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "snapshot lookup failed") {
 		t.Fatalf("acquireOnce err=%v, want snapshot lookup failure", err)
 	}
@@ -728,7 +728,7 @@ func TestAcquireHoldsCapacityThroughCloneOnly(t *testing.T) {
 		}
 	}
 	backend := &leaseBackend{DirectSSHBackend: sharedBackend(cfg, runner)}
-	if _, err := backend.acquireOnce(context.Background(), false, ""); err == nil || !strings.Contains(err.Error(), "stop after clone") {
+	if _, err := backend.acquireOnce(context.Background(), false, "", nil); err == nil || !strings.Contains(err.Error(), "stop after clone") {
 		t.Fatalf("acquireOnce err=%v, want controlled post-clone stop", err)
 	}
 	if strings.Join(observed, ",") != "clone,start" {
@@ -758,7 +758,7 @@ func TestParallelsAcquireKeepsStoredKeyWhenRollbackDeleteFails(t *testing.T) {
 		DirectSSHBackend: sharedBackend(cfg, runner),
 	}
 
-	_, err := backend.acquireOnce(context.Background(), false, "")
+	_, err := backend.acquireOnce(context.Background(), false, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "start failed") {
 		t.Fatalf("acquireOnce err=%v, want start failure", err)
 	}
@@ -834,6 +834,7 @@ func seedParallelsCleanupState(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 	labels := map[string]string{
+		"crabbox":    "true",
 		"provider":   "parallels",
 		"lease":      leaseID,
 		"slug":       "blue",
@@ -1274,6 +1275,7 @@ func TestParallelsTouchPersistsIdlePolicyOverride(t *testing.T) {
 			cfg.Provider = "parallels"
 			cfg.TargetOS = core.TargetLinux
 			cfg.IdleTimeout = 5 * time.Minute
+			cfg.TTL = time.Hour
 			backend := &leaseBackend{DirectSSHBackend: shared.DirectSSHBackend{Cfg: cfg, RT: core.Runtime{Exec: runner, Stderr: io.Discard}}}
 
 			got, err := backend.Touch(context.Background(), core.TouchRequest{

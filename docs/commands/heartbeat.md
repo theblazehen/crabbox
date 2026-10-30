@@ -32,6 +32,15 @@ ingress maintenance. It does not wait for AWS security-group reconciliation. Cha
 incomplete source policy retains the normal access-refresh attempt before the
 response; pinned source ranges remain authoritative.
 
+AWS coordinator connections prefer IPv4 so manual and automatic heartbeats
+refresh the source family used by public AWS SSH. If IPv4 cannot connect,
+Crabbox falls back to ordinary dual-stack dialing before sending the request;
+IPv6-only coordinators and configured proxies remain supported. A proxy still
+determines the source address observed by the coordinator. This does not bypass
+pinned source ranges or grant access to an address supplied by the caller.
+An IPv6 fallback can renew the lease while leaving its IPv4 SSH source unchanged;
+the bounded IPv4 preference is not a guarantee that every renewal restores SSH.
+
 HTTP heartbeats use the existing 30-minute mutation budget so a slow access
 refresh can finish. An earlier caller deadline or cancellation still wins;
 a timeout leaves the outcome uncertain and does not replay the request.
@@ -59,6 +68,13 @@ Heartbeat validates that account and the exact live instance before writing
 tags, while holding the unchanged local claim. Renewals preserve native
 ownership tags, including the full fixed-create fingerprint.
 Waiting for the mutation lock honors request cancellation.
+
+DigitalOcean fixed leases use the account returned by its API, and Azure
+leases use the subscription and resource group resolved by the Azure client
+(including the subscription from `az login`). Heartbeat and `status --wait`
+validate that scope and the exact resource recorded during acquisition;
+incomplete claims and claims for a different account or resource cannot renew
+the lease.
 
 Direct GCP heartbeats persist the idle policy in instance labels.
 `--idle-timeout` replaces the stored window, while omission preserves it.
@@ -131,3 +147,9 @@ object.
 - [`status`](status.md) — read the current lease state without touching it.
 - [`inspect`](inspect.md) — inspect full lease and provider details.
 - [`run`](run.md) — run a command with automatic background heartbeats.
+
+This command never requests auto-extension or changes total TTL. Its idle window
+is capped by total TTL and the current coordinator maximum. An explicit idle
+override above that cap is reduced and reported in a policy notice. The default TTL and
+idle timeout are both 30m, with a 4h default lifetime maximum. Use
+[extend](extend.md) to increase total lifetime when permitted.

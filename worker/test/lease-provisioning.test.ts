@@ -50,6 +50,7 @@ class AzureFixture {
   asyncDelete = false;
   readonly operations = new Map<string, string>();
   rejectFirstVM = false;
+  vmRejection?: { status: number; code: string; message?: string };
   galleryVersions: unknown[] = [];
   private sequence = 0;
   remove(path: string): void {
@@ -123,6 +124,10 @@ class AzureFixture {
       this.resources.set(path, { ...existing, ...body });
     } else {
       const vm = /\/virtualMachines\/[^/]+$/.test(path);
+      if (vm && this.vmRejection) {
+        const { status, ...error } = this.vmRejection;
+        return Response.json({ error }, { status });
+      }
       if (vm && this.rejectFirstVM) {
         this.rejectFirstVM = false;
         return Response.json({ error: { code: "SkuNotAvailable" } }, { status: 400 });
@@ -230,6 +235,7 @@ function fleet(
   storage: ProvisioningTestStorage,
   fixture: AzureFixture,
   overrides: Partial<Env> = {},
+  admissionDeadlineMs?: number,
 ) {
   const currentEnv = { ...env, ...overrides };
   const provider = new AzureProvider(currentEnv);
@@ -240,7 +246,14 @@ function fleet(
   };
   const runtime = new ProvisioningTestRuntime(storage);
   return {
-    coordinator: new FleetCoordinator(runtime, currentEnv, { azure: provider }),
+    coordinator: new FleetCoordinator(
+      runtime,
+      currentEnv,
+      { azure: provider },
+      {},
+      undefined,
+      admissionDeadlineMs,
+    ),
     runtime,
     provider,
   };
@@ -261,6 +274,195 @@ async function step(
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+it("bounds durable admission history reads while preserving monthly cost accounting", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-05-20T02:00:00Z"));
+  const storage = new ProvisioningTestStorage();
+  const azure = new AzureFixture();
+  vi.stubGlobal("fetch", azure.fetch);
+  const now = new Date().toISOString();
+  const staleAccessKey = "provider-access:cbx_ffffffffffff";
+  storage.values.set(staleAccessKey, {
+    id: "cbx_ffffffffffff",
+    state: "active",
+    expiresAt: now,
+  });
+  for (let index = 0; index < 300; index++) {
+    const leaseID = `cbx_${index.toString(16).padStart(12, "0")}`;
+    storage.values.set(`lease:${leaseID}`, {
+      id: leaseID,
+      owner: "alice@example.com",
+      org,
+      provider: "azure",
+      state: "released",
+      cloudID: `retired-vm-${index}`,
+      createdAt: new Date(Date.parse(now) - 3600000).toISOString(),
+      updatedAt: now,
+      endedAt: now,
+      expiresAt: now,
+      estimatedHourlyUSD: 1,
+      maxEstimatedUSD: 1,
+      ttlSeconds: 3600,
+    });
+  }
+  const rejected = await fleet(storage, azure, {
+    CRABBOX_MAX_MONTHLY_USD: "200",
+  }).coordinator.fetch(request("POST", "/v1/leases", input()));
+  expect(rejected.status).toBe(429);
+  const accepted = await fleet(storage, azure, {
+    CRABBOX_MAX_MONTHLY_USD: "1000",
+  }).coordinator.fetch(request("POST", "/v1/leases", input()));
+  expect(accepted.status).toBe(202);
+  const reads = storage.listOptions.filter((options) => options?.prefix === "lease:");
+  expect(reads.length).toBeGreaterThan(6);
+  expect(reads.every((options) => options?.limit === 128 && options.noCache === true)).toBe(true);
+  expect(azure.mutations).toEqual([]);
+  // A concurrent admission can replace this row; unlocked preparation must never prune it.
+  expect(storage.values.has(staleAccessKey)).toBe(true);
+  expect(storage.writes).not.toContain(staleAccessKey);
+});
+
+describe("Azure definite VM rejections", () => {
+  const rejections = [
+    { status: 409, code: "SkuNotAvailable" },
+    { status: 400, code: "InvalidParameter" },
+    { status: 403, code: "QuotaExceeded" },
+    { status: 409, code: "OperationNotAllowed", message: "exceeding regional vCPU quota" },
+    { status: 400, code: "InvalidTemplate" },
+  ];
+
+  it.each([
+    ...rejections.map((rejection) => ({ ...rejection, unresolved: false, cleanupFailure: false })),
+    { status: 500, code: "SkuNotAvailable", unresolved: true, cleanupFailure: false },
+    { status: 409, code: "SkuNotAvailable", unresolved: true, cleanupFailure: false, mixed: true },
+    {
+      status: 409,
+      code: "OperationNotAllowed",
+      message: "operation currently unavailable",
+      unresolved: true,
+      cleanupFailure: false,
+    },
+    { status: 409, code: "SkuNotAvailable", unresolved: true, cleanupFailure: true },
+  ])(
+    "records legacy $code/$status cleanup facts (unresolved=$unresolved, cleanupFailure=$cleanupFailure)",
+    async ({ unresolved, cleanupFailure, mixed, ...rejection }) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const storage = new ProvisioningTestStorage();
+      const azure = new AzureFixture();
+      azure.vmRejection = rejection;
+      if (cleanupFailure) azure.deleteFailures = ["AuthorizationFailed"];
+      vi.stubGlobal("fetch", azure.fetch);
+      const currentEnv = { ...env, CRABBOX_DURABLE_PROVISIONING_ADMISSION: "false" };
+      const provider = new AzureProvider(currentEnv, undefined, storage);
+      const coordinator = new FleetCoordinator(new ProvisioningTestRuntime(storage), currentEnv, {
+        azure: provider,
+      });
+      let expired = false;
+      azure.beforeMutation = async (path) => {
+        if (/\/virtualMachines\/[^/]+$/.test(path) && mixed) {
+          azure.vmRejection = { ...rejection, status: expired ? rejection.status : 500 };
+        }
+        if (!expired && /\/virtualMachines\/[^/]+$/.test(path)) {
+          expired = true;
+          vi.setSystemTime(Date.now() + 6 * 60_000);
+          await coordinator.alarm();
+          const lease = (await storage.get<LeaseRecord>(`lease:${id}`))!;
+          // Model expiry's persisted uncertainty while the legacy provider call is still running.
+          await storage.put(`lease:${id}`, {
+            ...lease,
+            state: "failed",
+            provisioningResourceMayExist: true,
+          });
+        }
+      };
+      const create = request("POST", "/v1/leases", {
+        ...input(),
+        target: "linux",
+        keep: true,
+        ttlSeconds: 900,
+        idleTimeoutSeconds: 300,
+        capacity: { market: "on-demand", fallback: "none", regions: ["eastus", "westus"] },
+      });
+      create.headers.delete("prefer");
+      await coordinator.fetch(create);
+      const failed = await storage.get<LeaseRecord>(`lease:${id}`);
+      expect(failed?.failureError ?? failed?.cleanupError).toContain(rejection.code);
+      expect(azure.mutations.filter((entry) => entry.method === "DELETE").length).toBeGreaterThan(
+        0,
+      );
+      expect(
+        [...azure.resources.keys()].filter((path) =>
+          /\/(networkInterfaces|publicIPAddresses|virtualMachines|disks)\//.test(path),
+        ),
+      ).toHaveLength(cleanupFailure ? 2 : 0);
+      expect(failed).toMatchObject({ state: "failed", provisioningResourceMayExist: unresolved });
+      expect(failed?.cleanupCompletedAt).toBeUndefined();
+      expect(Boolean(failed?.cloudID)).toBe(cleanupFailure);
+      expect(Boolean(failed?.cleanupRetryAt)).toBe(cleanupFailure);
+      expect(Boolean(await storage.get(azureOwnedDeleteClaimKey(scope, failed!.cloudID, id)))).toBe(
+        cleanupFailure,
+      );
+      if (unresolved) return;
+      const release = await coordinator.fetch(
+        request("POST", `/v1/leases/${id}/release`, { delete: true }),
+      );
+      expect(await release.json()).toMatchObject({
+        lease: {
+          state: "released",
+          cleanupStatus: "complete",
+          cleanupCompletedAt: expect.any(String),
+        },
+      });
+    },
+  );
+
+  it.each([
+    { status: 500, code: "SkuNotAvailable" },
+    { status: 409, code: "OperationNotAllowed", message: "operation unavailable" },
+  ])("retains durable ambiguous $code/$status and its fragments", async (rejection) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const storage = new ProvisioningTestStorage();
+    const azure = new AzureFixture();
+    azure.vmRejection = rejection;
+    await fleet(storage, azure).coordinator.fetch(request("POST", "/v1/leases", input()));
+    for (let n = 0; n < 35; n++) await step(storage, azure);
+    expect(
+      (await storage.get<LeaseProvisioningOperation>(provisioningOperationKey(id)))?.step.phase,
+    ).toBe("blocked");
+    expect(azure.mutations.filter((entry) => entry.method === "DELETE")).toEqual([]);
+    expect(
+      [...azure.resources.keys()].filter((path) =>
+        /\/(networkInterfaces|publicIPAddresses)\//.test(path),
+      ),
+    ).toHaveLength(2);
+  });
+
+  it.each(rejections)("settles durable $code after exact fragment cleanup", async (rejection) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const storage = new ProvisioningTestStorage();
+    const azure = new AzureFixture();
+    azure.vmRejection = rejection;
+    await fleet(storage, azure).coordinator.fetch(
+      request("POST", "/v1/leases", {
+        ...input(),
+        keep: true,
+        capacity: { market: "on-demand", fallback: "none" },
+      }),
+    );
+    for (let n = 0; n < 60; n++) await step(storage, azure);
+    expect(await storage.get<LeaseRecord>(`lease:${id}`)).toMatchObject({
+      provisioningResourceMayExist: false,
+      cleanupCompletedAt: expect.any(String),
+    });
+    expect(
+      azure.mutations
+        .filter((entry) => entry.method === "DELETE")
+        .map((entry) => entry.path.split("/").at(-2)),
+    ).toEqual(["networkInterfaces", "publicIPAddresses"]);
+  });
 });
 
 async function ready(storage: ProvisioningTestStorage, azure: AzureFixture) {
@@ -282,6 +484,35 @@ async function publicLease(storage: ProvisioningTestStorage, azure: AzureFixture
 }
 
 describe("durable Azure admission and reconstruction", () => {
+  it("starts durable idle expiry only when slow provisioning is published", async () => {
+    vi.useFakeTimers();
+    const admitted = Date.parse("2026-09-28T08:00:00Z");
+    vi.setSystemTime(admitted);
+    const storage = new ProvisioningTestStorage();
+    const azure = new AzureFixture();
+    const response = await fleet(storage, azure).coordinator.fetch(
+      request("POST", "/v1/leases", {
+        ...input(),
+        ttlSeconds: 1800,
+        idleTimeoutSeconds: 600,
+      }),
+    );
+    expect(response.status).toBe(202);
+    vi.setSystemTime(admitted + 11 * 60_000);
+    for (let n = 0; n < 40; n++) {
+      await step(storage, azure);
+      if ((await storage.get<LeaseRecord>(`lease:${id}`))?.state === "active") break;
+    }
+    const lease = await storage.get<LeaseRecord>(`lease:${id}`);
+    expect(lease?.state).toBe("active");
+    expect(Date.parse(lease!.lastTouchedAt!)).toBeGreaterThanOrEqual(admitted + 11 * 60_000);
+    expect(Date.parse(lease!.expiresAt)).toBe(Date.parse(lease!.lastTouchedAt!) + 600_000);
+    const heartbeat = await fleet(storage, azure).coordinator.fetch(
+      request("POST", `/v1/leases/${id}/heartbeat`, {}),
+    );
+    expect(heartbeat.status).toBe(200);
+  });
+
   it("persists the requested market with the initial provisioning lease", async () => {
     const storage = new ProvisioningTestStorage();
     const azure = new AzureFixture();
@@ -1553,5 +1784,103 @@ describe("protected material", () => {
         ciphertext: `AAAA${sealed.ciphertext.slice(4)}`,
       }),
     ).rejects.toThrow("unavailable");
+  });
+});
+
+describe("durable lease admission deadline", () => {
+  it.each(["prepare", "prepare rejection", "commit callback"])(
+    "fences pending admission but preserves committing admission at %s",
+    async (stage) => {
+      vi.useFakeTimers();
+      const storage = new ProvisioningTestStorage();
+      const azure = new AzureFixture();
+      vi.stubGlobal("fetch", azure.fetch);
+      const deadlineMs = 25;
+      const { coordinator, runtime, provider } = fleet(storage, azure, {}, deadlineMs);
+      const reached = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const settled = Promise.withResolvers<void>();
+      if (stage.startsWith("prepare")) {
+        const continuation = new AzureResumableProvisioning(env, azure.fetch, storage);
+        provider.resumableProvisioning = () => continuation;
+        const prepare = continuation.prepare.bind(continuation);
+        vi.spyOn(continuation, "prepare").mockImplementationOnce(async (...args) => {
+          try {
+            reached.resolve();
+            await release.promise;
+            if (stage === "prepare rejection") throw new Error("synthetic late discovery failure");
+            return await prepare(...args);
+          } finally {
+            settled.resolve();
+          }
+        });
+      } else {
+        const commit = runtime.commitAndWake.bind(runtime);
+        vi.spyOn(runtime, "commitAndWake").mockImplementationOnce(async (callback) => {
+          try {
+            reached.resolve();
+            await release.promise;
+            return await commit(callback);
+          } finally {
+            settled.resolve();
+          }
+        });
+      }
+      let response: Response | undefined;
+      const create = () => coordinator.fetch(request("POST", "/v1/leases", input()));
+      const pending = create().then((result) => (response = result));
+      try {
+        await reached.promise;
+        await vi.advanceTimersByTimeAsync(deadlineMs);
+        expect(response?.status).toBe(503);
+        expect(response!.headers.get("retry-after")).toBe("2");
+        expect(await response!.json()).toMatchObject({
+          error: "lease_admission_timeout",
+          retryable: true,
+        });
+        release.resolve();
+        await settled.promise;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await storage.get(`lease:${id}`)).toBeUndefined();
+        expect(await storage.get(provisioningOperationKey(id))).toBeUndefined();
+        expect(azure.mutations).toHaveLength(0);
+        expect((await create()).status).toBe(202);
+      } finally {
+        release.resolve();
+        await pending;
+      }
+    },
+  );
+  it("waits for durable admission commit acknowledgement past the deadline", async () => {
+    vi.useFakeTimers();
+    const storage = new ProvisioningTestStorage();
+    const azure = new AzureFixture();
+    vi.stubGlobal("fetch", azure.fetch);
+    const deadlineMs = 25;
+    const { coordinator, runtime } = fleet(storage, azure, {}, deadlineMs);
+    const reached = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const commit = runtime.commitAndWake.bind(runtime);
+    vi.spyOn(runtime, "commitAndWake").mockImplementationOnce(async (callback) => {
+      const result = await commit(callback);
+      reached.resolve();
+      await release.promise;
+      return result;
+    });
+    let response: Response | undefined;
+    const pending = coordinator
+      .fetch(request("POST", "/v1/leases", input()))
+      .then((result) => (response = result));
+    try {
+      await reached.promise;
+      await vi.advanceTimersByTimeAsync(deadlineMs);
+      expect(response).toBeUndefined();
+      expect(await storage.get(`lease:${id}`)).toBeDefined();
+      release.resolve();
+      expect((await pending).status).toBe(202);
+    } finally {
+      release.resolve();
+      await pending;
+    }
   });
 });

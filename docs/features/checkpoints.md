@@ -93,9 +93,10 @@ or restored.
 
 `--mode auto` produces a native checkpoint when the resolved lease supports one
 for the chosen strategy, otherwise it falls back to an archive. With the default
-`--strategy auto`, direct (non-brokered) providers other than Parallels only get
-a native checkpoint when you explicitly ask for `--mode native`; `auto` keeps the
-archive fallback for them.
+`--strategy auto`, direct (non-brokered) providers other than Parallels and
+Cloudflare only get a native checkpoint when you explicitly ask for
+`--mode native`; `auto` keeps the archive fallback for them. Cloudflare has no
+archive path, so `auto` selects its container snapshot.
 
 ## Native strategies
 
@@ -113,6 +114,7 @@ Native checkpoints use one of two provider primitives, selected with
 | Hetzner Linux (direct only) | `hetzner-snapshot` |
 | Parallels | `parallels-snapshot` |
 | Incus Linux containers (direct, root disk only) | `incus-image` (private image published from a stateless disk snapshot) |
+| Cloudflare containers | `cloudflare-container-snapshot` (full container filesystem, captured while running) |
 
 Disk snapshots are faster to create and (on AWS and GCP) boot with fresh
 per-lease SSH keys via injected user-data.
@@ -185,7 +187,7 @@ for new Azure leases. Crabbox refuses native checkpoint creation from Azure
 ephemeral-OS-disk leases (Azure reports success but does not capture live disk
 state). Azure disk-snapshot forks boot from a specialized OS disk and may inherit
 the source machine identity — treat them as exact clones. Use
-`--azure-os-disk ephemeral` or `--azure-os-disk ephemeral-preview` only for
+`--azure-os-disk ephemeral` only for
 stateless leases that do not need native checkpoints.
 
 **Parallels notes.** A forkable Parallels snapshot must be taken from a
@@ -207,8 +209,10 @@ longer needed, and do not create them from ad-hoc debugging sessions that hold
 temporary credentials.
 
 **Archives may contain secrets too.** They capture workdir contents including
-build outputs, caches, and generated files. Crabbox excludes `.crabbox/env` and
-`.crabbox/scripts` but does not scan arbitrary files for credentials.
+build outputs, caches, and generated files. Crabbox excludes `.crabbox/env`,
+temporary command environments under `.crabbox/env-*`, and `.crabbox/scripts`,
+including files left after interrupted cleanup. It does not scan arbitrary files
+for credentials.
 
 **Ownership depends on how the checkpoint was created.** Newly created brokered
 native AWS, Azure, and GCP checkpoints have authoritative, owner/org-scoped
@@ -308,6 +312,29 @@ credential handling are provider-specific; see the provider notes above.
 Archive checkpoints tar the workdir over SSH (excluding `.crabbox/env` and
 `.crabbox/scripts`), download it, and save the record.
 
+With `--json`, a native operation that proves image submission was never attempted
+can emit a `crabbox.checkpoint.create.failure.v1` receipt with
+`outcome: not_submitted`. The existing six-key variant includes `schema`, `outcome`,
+`provider`, `leaseId`, `checkpointId`, and `localReservation: removed`; it is emitted
+only after the exact local reservation is removed and its absence verified. It
+does not attest successful source rollback or readiness.
+
+The seven-key `native_unsupported` variant includes `schema`, `outcome`, `reason`,
+`provider`, `leaseId`, `localReservation: none`, and `message`. It is emitted only
+when capability resolution refuses before any checkpoint reservation, source
+preparation, or provider/coordinator checkpoint create request. The refusal precedes checkpoint create's own lease
+claim registration and unused-expiry coordinator probe. Lease resolution keeps
+its existing behavior, including claim/adoption with `--reclaim`. This receipt
+proves no checkpoint exists or will be created for that invocation and the source
+was not prepared or modified for capture.
+
+Unsupported native requests exit 2 with a diagnostic naming the mode, any explicit
+strategy, provider, target OS, and sanitized coordinator origin when configured.
+The same message appears in the receipt, bounded to 1024 bytes on a UTF-8 rune
+boundary. Invalid modes fail before lease resolution and emit no receipt. See the
+[checkpoint command reference](../commands/checkpoint.md#create) for both exact
+receipt shapes; neither an absent receipt nor error text proves non-submission.
+
 ### list and inspect
 
 `list` prints local checkpoint records; `inspect <id>` prints one record's
@@ -398,6 +425,13 @@ requires at least one age filter. `--older-than` selects by creation time and
 supplied, a checkpoint must satisfy both; the optional `--kind native|archive`
 filter is also composed with them. Pair the final filter set with `--dry-run`
 first. Deleting a non-Crabbox Parallels snapshot requires `--yes`.
+
+Direct Azure OS-disk checkpoints bind deletion to the captured ARM resource ID
+and Azure `uniqueId`. Replaced snapshots and missing identities (including
+legacy records) are retained for manual cleanup and the checkpoint is marked
+detached; repeated deletion attempts make no provider requests. Use
+`checkpoint inspect` for the reason and `checkpoint delete <id> --local-only`
+after manual reconciliation. See [deletion safety and its concurrency limit](../commands/checkpoint.md#delete).
 
 For example, this user crontab previews the policy interactively first, then
 removes native checkpoints that have not been forked or restored for 30 days:

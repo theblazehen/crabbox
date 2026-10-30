@@ -11,6 +11,8 @@ import (
 type crabboxKongCLI struct {
 	Version kong.VersionFlag `name:"version" short:"v" help:"Print version."`
 
+	Host           hostKongCmd           `cmd:"" passthrough:"" help:"Enroll and operate coordinator-managed SSH hosts."`
+	Serve          serveKongCmd          `cmd:"" passthrough:"" help:"Donate trusted container capacity to the coordinator."`
 	VersionCmd     versionKongCmd        `cmd:"" name:"version" help:"Print version."`
 	Init           initKongCmd           `cmd:"" passthrough:"" help:"Onboard the current repo for Crabbox."`
 	Login          loginKongCmd          `cmd:"" passthrough:"" help:"Open GitHub login, store broker credentials, verify access."`
@@ -40,6 +42,7 @@ type crabboxKongCLI struct {
 	Cache          cacheKongCmd          `cmd:"" help:"Inspect, purge, or warm remote caches."`
 	Status         statusKongCmd         `cmd:"" passthrough:"" help:"Show lease state; add --wait to block until ready."`
 	Heartbeat      heartbeatKongCmd      `cmd:"" passthrough:"" help:"Refresh a lease idle deadline and print its state."`
+	Extend         extendKongCmd         `cmd:"" passthrough:"" help:"Extend a lease within its lifetime policy."`
 	Claims         claimsKongCmd         `cmd:"" help:"Inspect unverified local lease claims without loading providers."`
 	List           listKongCmd           `cmd:"" passthrough:"" help:"List Crabbox machines."`
 	Ports          portsKongCmd          `cmd:"" passthrough:"" help:"Publish, list, or unpublish provider-native ports."`
@@ -49,7 +52,7 @@ type crabboxKongCLI struct {
 	Unshare        unshareKongCmd        `cmd:"" passthrough:"" help:"Remove lease sharing."`
 	Image          imageKongCmd          `cmd:"" help:"Create provider images and promote brokered AWS runner images."`
 	Usage          usageKongCmd          `cmd:"" passthrough:"" help:"Show cost and usage estimates by user, org, or fleet."`
-	Capacity       capacityKongCmd       `cmd:"" passthrough:"" help:"Show self-owner admission count and effective owner limit."`
+	Capacity       capacityKongCmd       `cmd:"" passthrough:"" help:"Show fleet, org, and owner lease headroom."`
 	Marketplace    marketplaceKongCmd    `cmd:"" help:"Preview the Crabbox credits gateway and smart routing quotes."`
 	Admin          adminKongCmd          `cmd:"" help:"Lease admin controls for trusted operators."`
 	Actions        actionsKongCmd        `cmd:"" help:"Register GitHub Actions runners or dispatch workflows."`
@@ -68,6 +71,7 @@ type crabboxKongCLI struct {
 	Stop           stopKongCmd           `cmd:"" passthrough:"" help:"Release a lease or delete a direct-provider machine."`
 	Release        releaseKongCmd        `cmd:"" passthrough:"" help:"Alias for stop."`
 	Pause          pauseKongCmd          `cmd:"" passthrough:"" help:"Pause a lease, freeing remote compute while preserving state (provider-dependent)."`
+	Hold           holdKongCmd           `cmd:"" passthrough:"" help:"Retain an exact failed lease and its resources for salvage."`
 	Resume         resumeKongCmd         `cmd:"" passthrough:"" help:"Resume a previously paused lease."`
 	Cleanup        cleanupKongCmd        `cmd:"" passthrough:"" help:"Sweep expired direct-provider machines or local provider state."`
 	Azure          azureKongCmd          `cmd:"" help:"Azure provider setup and login."`
@@ -245,11 +249,19 @@ type tunnelKongCmd struct {
 type statusKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type extendKongCmd struct {
+	Args []string `arg:"" optional:"" passthrough:""`
+}
+
 type heartbeatKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type claimsKongCmd struct {
-	List claimsListKongCmd `cmd:"" passthrough:"" help:"List unverified local lease claims without loading providers."`
+	Prune claimsPruneKongCmd `cmd:"" passthrough:"" help:"Prune old local claims for remotely bounded leases."`
+	List  claimsListKongCmd  `cmd:"" passthrough:"" help:"List unverified local lease claims without loading providers."`
+}
+type claimsPruneKongCmd struct {
+	Args []string `arg:"" optional:""`
 }
 type claimsListKongCmd struct {
 	Args []string `arg:"" optional:""`
@@ -316,6 +328,9 @@ type releaseKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type pauseKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type holdKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type resumeKongCmd struct {
@@ -445,17 +460,38 @@ type imageDeleteKongCmd struct {
 }
 
 type adminKongCmd struct {
-	Leases      adminLeasesKongCmd      `cmd:"" passthrough:"" help:"List coordinator lease records."`
-	LeaseAudit  adminLeaseAuditKongCmd  `cmd:"" name:"lease-audit" passthrough:"" help:"Check expired coordinator leases against cloud provider state."`
-	Providers   adminProvidersKongCmd   `cmd:"" passthrough:"" help:"Inspect provider identities and policies."`
-	Hosts       adminHostsKongCmd       `cmd:"" passthrough:"" help:"List, allocate, or release provider hosts."`
-	AWSIdentity adminAWSIdentityKongCmd `cmd:"" name:"aws-identity" passthrough:"" help:"Show the coordinator AWS caller identity."`
-	AWSPolicy   adminAWSPolicyKongCmd   `cmd:"" name:"aws-policy" passthrough:"" help:"Print the baseline brokered AWS IAM policy."`
-	MacHosts    adminMacHostsKongCmd    `cmd:"" name:"mac-hosts" passthrough:"" help:"List, allocate, or release AWS EC2 Mac Dedicated Hosts."`
-	Release     adminReleaseKongCmd     `cmd:"" passthrough:"" help:"Mark a lease released."`
-	Delete      adminDeleteKongCmd      `cmd:"" passthrough:"" help:"Delete the backing server and mark the lease released."`
+	RetireCreate      adminRetireCreateKongCmd      `cmd:"" name:"retire-create" passthrough:"" help:"Preview or retire an exact create request after its cancellation token was lost."`
+	ExtendLifetime    adminExtendLifetimeKongCmd    `cmd:"" name:"extend-lifetime" passthrough:"" help:"Extend an enrolled lease deadline before stopping starts."`
+	RetainedReconcile adminRetainedReconcileKongCmd `cmd:"" name:"retained-reconcile" passthrough:"" help:"Inspect retained lease reconciliation progress."`
+	LifetimeReadback  adminLifetimeReadbackKongCmd  `cmd:"" name:"lifetime-readback" passthrough:"" help:"Read coordinator-observed instance and root volume state."`
+	Leases            adminLeasesKongCmd            `cmd:"" passthrough:"" help:"List coordinator lease records."`
+	LeaseAudit        adminLeaseAuditKongCmd        `cmd:"" name:"lease-audit" passthrough:"" help:"Check expired coordinator leases against cloud provider state."`
+	Providers         adminProvidersKongCmd         `cmd:"" passthrough:"" help:"Inspect provider identities and policies."`
+	Hosts             adminHostsKongCmd             `cmd:"" passthrough:"" help:"List, allocate, or release provider hosts."`
+	AWSIdentity       adminAWSIdentityKongCmd       `cmd:"" name:"aws-identity" passthrough:"" help:"Show the coordinator AWS caller identity."`
+	AWSPolicy         adminAWSPolicyKongCmd         `cmd:"" name:"aws-policy" passthrough:"" help:"Print the baseline brokered AWS IAM policy."`
+	MacHosts          adminMacHostsKongCmd          `cmd:"" name:"mac-hosts" passthrough:"" help:"List, allocate, or release AWS EC2 Mac Dedicated Hosts."`
+	Release           adminReleaseKongCmd           `cmd:"" passthrough:"" help:"Mark a lease released."`
+	Delete            adminDeleteKongCmd            `cmd:"" passthrough:"" help:"Delete the backing server and mark the lease released."`
 }
 type adminLeasesKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type adminRetireCreateKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+
+func (c *adminRetireCreateKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminRetireCreate(ctx, c.Args)
+}
+
+type adminExtendLifetimeKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type adminRetainedReconcileKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type adminLifetimeReadbackKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type adminLeaseAuditKongCmd struct {
@@ -702,8 +738,11 @@ func (c *cpKongCmd) Run(ctx context.Context, app App) error        { return app.
 func (c *tunnelKongCmd) Run(ctx context.Context, app App) error    { return app.tunnel(ctx, c.Args) }
 func (c *statusKongCmd) Run(ctx context.Context, app App) error    { return app.status(ctx, c.Args) }
 func (c *heartbeatKongCmd) Run(ctx context.Context, app App) error { return app.heartbeat(ctx, c.Args) }
-func (c *claimsListKongCmd) Run(_ context.Context, app App) error {
-	return app.claimsList(stripKongCommandPath(c.Args, "claims", "list"))
+func (c *claimsPruneKongCmd) Run(ctx context.Context, app App) error {
+	return app.claimsPrune(ctx, stripKongCommandPath(c.Args, "claims", "prune"))
+}
+func (c *claimsListKongCmd) Run(ctx context.Context, app App) error {
+	return app.claimsList(ctx, stripKongCommandPath(c.Args, "claims", "list"))
 }
 func (c *listKongCmd) Run(ctx context.Context, app App) error     { return app.list(ctx, c.Args) }
 func (c *shareKongCmd) Run(ctx context.Context, app App) error    { return app.share(ctx, c.Args) }
@@ -731,6 +770,7 @@ func (c *inspectKongCmd) Run(ctx context.Context, app App) error { return app.in
 func (c *stopKongCmd) Run(ctx context.Context, app App) error    { return app.stop(ctx, c.Args) }
 func (c *releaseKongCmd) Run(ctx context.Context, app App) error { return app.stop(ctx, c.Args) }
 func (c *pauseKongCmd) Run(ctx context.Context, app App) error   { return app.pause(ctx, c.Args) }
+func (c *holdKongCmd) Run(ctx context.Context, app App) error    { return app.hold(ctx, c.Args) }
 func (c *resumeKongCmd) Run(ctx context.Context, app App) error  { return app.resume(ctx, c.Args) }
 func (c *cleanupKongCmd) Run(ctx context.Context, app App) error { return app.cleanup(ctx, c.Args) }
 func (c *pondConnectKongCmd) Run(ctx context.Context, app App) error {
@@ -826,6 +866,12 @@ func (c *imageDeleteKongCmd) Run(ctx context.Context, app App) error {
 
 func (c *adminLeasesKongCmd) Run(ctx context.Context, app App) error {
 	return app.adminLeases(ctx, c.Args)
+}
+func (c *adminExtendLifetimeKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminExtendLifetime(ctx, c.Args)
+}
+func (c *adminLifetimeReadbackKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminLifetimeReadback(ctx, c.Args)
 }
 func (c *adminLeaseAuditKongCmd) Run(ctx context.Context, app App) error {
 	return app.adminLeaseAudit(ctx, c.Args)
@@ -983,4 +1029,9 @@ func stripKongCommandPath(args []string, path ...string) []string {
 		out = out[1:]
 	}
 	return out
+}
+
+func (c *extendKongCmd) Run(ctx context.Context, app App) error { return app.extend(ctx, c.Args) }
+func (c *adminRetainedReconcileKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminRetainedReconcile(ctx, c.Args)
 }

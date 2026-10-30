@@ -17,6 +17,8 @@ import (
 
 const (
 	gitOriginRuntimeFallbackExitCode = 78
+	gitSeedUnsafeWorkspaceExitCode   = 79
+	gitSeedRawWorkspaceExitCode      = 80
 	gitOverlayFallbackExitCode       = 78
 	gitOverlayFallbackMarker         = "CRABBOX_GIT_OVERLAY_FALLBACK:"
 	gitOverlayMutationMarker         = "CRABBOX_GIT_OVERLAY_WORKSPACE_MUTATED"
@@ -116,13 +118,14 @@ func prepareGitOverlaySnapshotWithCleanup(
 	hook sourceSnapshotHook,
 	cleanup func(*gitOverlaySnapshot) error,
 ) (gitOverlaySnapshot, error) {
+	ctx = withSyncDigests(ctx)
 	policy := gitSnapshotPolicy{
 		target:   plan.Target,
 		checkout: captureGitOverlayCheckoutState,
 		manifest: syncManifestFilteredRules,
 		validate: validateGitOverlayManifestAtState,
 		files:    func(manifest SyncManifest) []string { return manifest.OverlayFiles },
-		fingerprint: func(repo Repo, manifest SyncManifest, excludes SyncExcludeRules, _ gitOverlayCheckoutState) (string, error) {
+		fingerprint: func(ctx context.Context, repo Repo, manifest SyncManifest, excludes SyncExcludeRules, _ gitOverlayCheckoutState) (string, error) {
 			return syncFingerprintForManifest(ctx, repo, cfg, manifest, excludes, plan)
 		},
 	}
@@ -135,7 +138,7 @@ type gitSnapshotPolicy struct {
 	manifest    func(string, SyncExcludeRules, []string) (SyncManifest, error)
 	validate    func(Repo, SyncManifest, gitOverlayCheckoutState) error
 	files       func(SyncManifest) []string
-	fingerprint func(Repo, SyncManifest, SyncExcludeRules, gitOverlayCheckoutState) (string, error)
+	fingerprint func(context.Context, Repo, SyncManifest, SyncExcludeRules, gitOverlayCheckoutState) (string, error)
 }
 
 func prepareGitSnapshotWithCleanup(
@@ -219,7 +222,7 @@ func prepareGitSnapshotWithCleanup(
 		}
 		snapshotRepo := repo
 		snapshotRepo.Root = snapshot.Root
-		snapshot.Fingerprint, err = policy.fingerprint(snapshotRepo, manifest, excludes, checkout)
+		snapshot.Fingerprint, err = policy.fingerprint(ctx, snapshotRepo, manifest, excludes, checkout)
 		if err != nil {
 			return cleanupGitOverlaySnapshotAfterFailure(snapshot, err, cleanup)
 		}
@@ -251,7 +254,7 @@ func prepareGitSnapshotWithCleanup(
 		if hook != nil {
 			hook("before_live_fingerprint", attempt, snapshot.Root)
 		}
-		liveFingerprint, err := policy.fingerprint(repo, refreshed, refreshedExcludes, checkout)
+		liveFingerprint, err := policy.fingerprint(ctx, repo, refreshed, refreshedExcludes, checkout)
 		if err != nil {
 			return cleanupGitOverlaySnapshotAfterFailure(snapshot, err, cleanup)
 		}
@@ -286,7 +289,10 @@ func prepareGitSnapshotWithCleanup(
 		if err != nil {
 			return cleanupGitOverlaySnapshotAfterFailure(snapshot, err, cleanup)
 		}
-		acceptedFingerprint, err := policy.fingerprint(repo, acceptedManifest, acceptedExcludes, finalCheckout)
+		// Dirty mmap pages can change bytes without advancing mtime or ctime.
+		// Stat-validated digests are an intermediate hint, never acceptance proof.
+		acceptanceContext := context.WithValue(ctx, syncDigestContextKey{}, (*syncDigestCache)(nil))
+		acceptedFingerprint, err := policy.fingerprint(acceptanceContext, repo, acceptedManifest, acceptedExcludes, finalCheckout)
 		if err != nil {
 			return cleanupGitOverlaySnapshotAfterFailure(snapshot, err, cleanup)
 		}
@@ -539,6 +545,9 @@ func classifyGitOrigin(remoteURL string) gitOriginDisposition {
 	if gitRemoteURLHasCredentials(raw) || strings.ContainsAny(raw, "?#") {
 		return gitOriginNonForwardable
 	}
+	// Classify the same anonymous URL that Git seeding uses. A GitHub SCP
+	// spelling must not disable its supported HTTPS seed before hydration.
+	raw = normalizeGitRemoteURL(raw)
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" {
 		return gitOriginNonForwardable
@@ -574,6 +583,10 @@ func validateGitOverlayManifest(repo Repo, manifest SyncManifest) error {
 }
 
 func validateGitOverlayManifestAtState(repo Repo, manifest SyncManifest, checkout gitOverlayCheckoutState) error {
+	return validateGitSyncManifestAtState(repo, manifest, checkout, gitOverlayTransformAttributes)
+}
+
+func validateGitSyncManifestAtState(repo Repo, manifest SyncManifest, checkout gitOverlayCheckoutState, attributes []string) error {
 	if repo.Root == "" || repo.Head == "" {
 		return fmt.Errorf("missing_repo_identity")
 	}
@@ -618,7 +631,7 @@ func validateGitOverlayManifestAtState(repo Repo, manifest SyncManifest, checkou
 		{source: repo.Head, paths: splitNul(targetPaths)},
 		{paths: manifest.Files},
 	} {
-		attribute, err := gitOverlayTransformAttribute(repo.Root, inspection.source, inspection.paths)
+		attribute, err := gitSyncTransformAttribute(repo.Root, inspection.source, inspection.paths, attributes)
 		if err != nil {
 			return fmt.Errorf("git_attribute_inspection")
 		}
@@ -685,7 +698,7 @@ func validateGitOverlayCheckoutConfig(root string) error {
 	return nil
 }
 
-func gitOverlayTransformAttribute(root, source string, paths []string) (string, error) {
+func gitSyncTransformAttribute(root, source string, paths, attributes []string) (string, error) {
 	if len(paths) == 0 {
 		return "", nil
 	}
@@ -702,7 +715,7 @@ func gitOverlayTransformAttribute(root, source string, paths []string) (string, 
 		args = append(args, "--source="+source)
 	}
 	args = append(args, "-z", "--stdin")
-	args = append(args, gitOverlayTransformAttributes...)
+	args = append(args, attributes...)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = root
 	cmd.Env = repositoryGitEnvironment()
@@ -778,6 +791,9 @@ func gitOverlayFallbackResult(output string, err error) (string, bool) {
 }
 
 func gitSeedRuntimeFallbackResult(plan gitCoherencePlan, output string, err error) (string, bool) {
+	if err != nil && exitCode(err) == gitSeedRawWorkspaceExitCode {
+		return "raw_workspace", true
+	}
 	// The runner has not published the private seed when its exact-SHA fetch
 	// fails. Local-only commits and servers that refuse SHA wants use file sync.
 	if plan.Branch == "" && plan.seedEnabled() && err != nil && exitCode(err) == gitOriginRuntimeFallbackExitCode {

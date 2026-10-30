@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { locales, pilotPages, localizeHTML, readTranslation } from "./lib/docs-i18n.mjs";
 
 import { markdownToHtml, readAgentSkills } from "./build-docs-site.mjs";
 
@@ -14,6 +16,69 @@ const useCasesFile = path.join(repoRoot, "docs", "use-cases.md");
 const siteDir = path.join(repoRoot, "dist", "docs-site");
 // Importing the builder generates the site before these tests register.
 const generatedTest = test;
+
+generatedTest("landing catalogs cover visible English copy without translating provider names or code", () => {
+  const english = readGenerated("index.html").match(/<main\b[^>]*>([\s\S]*?)<\/main>/)[1];
+  const products = [...english.matchAll(/<a data-home-provider="[^"]+"[^>]*>([^<]+)<\/a>/g)].map((match) => match[1]);
+  const keep = new Set([...products, "GitHub", "Linux", "macOS", "Windows", "WSL2", "Linux, Windows, WSL2, macOS"]);
+  const chunks = (html) => html.split(/(<pre\b[\s\S]*?<\/pre>|<code\b[\s\S]*?<\/code>|<[^>]+>)/g)
+    .map((part) => part.trim()).filter((part) => !part.startsWith("<") && /[A-Za-z]/.test(part));
+  const source = new Set(chunks(english));
+  for (const locale of Object.keys(locales).filter((lang) => lang !== "en")) {
+    const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, "docs/.i18n", locale, "site.json"), "utf8"));
+    const untranslated = chunks(localizeHTML(english, catalog.messages)).filter((text) => source.has(text) && !keep.has(text));
+    assert.deepEqual(untranslated, [], `${locale} landing text is untranslated`);
+  }
+});
+
+generatedTest("translation pilot has language metadata, reciprocal alternates, routing and English fallback", () => {
+  for (const locale of Object.keys(locales).filter((lang) => lang !== "en")) {
+    for (const source of pilotPages) {
+      const output = source === "README.md" ? "index.html" : source.replace(/\.md$/, ".html");
+      const translated = readGenerated(`${locale}/${output}`);
+      const english = readGenerated(output);
+      assert.match(translated, new RegExp(`<html lang="${locale}">`));
+      const canonical = `https://crabbox.sh/${locale}/${output === "index.html" ? "" : output}`;
+      assert.ok(translated.includes(`<link rel="canonical" href="${canonical}">`));
+      assert.ok(english.includes(`hreflang="${locale}" href="${canonical}"`));
+      assert.ok(translated.includes('hreflang="x-default"'));
+      assert.ok(translated.includes('href="../security.html"'), "untranslated navigation points to English");
+      assert.ok(translated.includes('href="getting-started.html"'), "translated navigation stays in the locale");
+      const translation = readTranslation(
+        path.join(repoRoot, "docs/.i18n", locale, source),
+        fs.readFileSync(path.join(repoRoot, "docs", source), "utf8"),
+      );
+      assert.equal(/class="translation-notice"/.test(translated), translation.stale,
+        `${locale}/${source} should show a notice only when its source changed`);
+    }
+    const home = readGenerated(`${locale}/index.html`);
+    assert.doesNotMatch(home, /<h1>On-demand computers/);
+    assert.ok(home.includes('href="use-cases.html#fan-out-parallel-experiments"'));
+    const start = readGenerated(`${locale}/getting-started.html`);
+    assert.ok(start.includes('id="choosing-an-access-path"'), "translated headings retain English link identities");
+    const fallback = readGenerated("security.html");
+    assert.ok(fallback.includes(`lang="${locale}">${locales[locale]} (English)</a>`));
+    assert.ok(!fs.existsSync(path.join(siteDir, locale, "security.html")), "fallback does not pretend English is translated");
+  }
+});
+
+generatedTest("English changes do not block a build and stale translations link to the original", () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cbx-i18n-build-"));
+  try {
+    for (const dir of ["docs", "scripts", "skills"]) {
+      fs.cpSync(path.join(repoRoot, dir), path.join(fixtureRoot, dir), { recursive: true });
+    }
+    fs.appendFileSync(path.join(fixtureRoot, "docs/getting-started.md"), '\n## New guidance\n\n```sh\ncrabbox --help\n```\n');
+    const build = spawnSync(process.execPath, [path.join(fixtureRoot, "scripts/build-docs-site.mjs")], { cwd: fixtureRoot, encoding: "utf8" });
+    assert.equal(build.status, 0, build.stderr);
+    const translated = fs.readFileSync(path.join(fixtureRoot, "dist/docs-site/fr/getting-started.html"), "utf8");
+    assert.match(translated, /class="translation-notice"/);
+    assert.match(translated, /href="https:\/\/crabbox.sh\/getting-started.html" lang="en">English/);
+    const check = spawnSync(process.execPath, [path.join(fixtureRoot, "scripts/check-docs-i18n.mjs")], { cwd: fixtureRoot, encoding: "utf8" });
+    assert.equal(check.status, 0, check.stderr);
+    assert.match(check.stdout, /stale: docs\/\.i18n\/fr\/getting-started.md/);
+  } finally { fs.rmSync(fixtureRoot, { recursive: true, force: true }); }
+});
 
 const providerMarkdown = fs
   .readdirSync(providersDir)
@@ -207,7 +272,7 @@ generatedTest("generated AWS page is active in Providers navigation and pager", 
   const html = readGenerated("providers/aws.html");
 
   assert.match(html, /<p class="eyebrow">Providers<\/p>/);
-  assert.equal(occurrences(html, 'aria-current="page"'), 1);
+  assert.equal(occurrences(navSection(html, "Providers"), 'aria-current="page"'), 1);
   assert.match(
     html,
     /<a class="nav-link active" href="\.\.\/providers\/aws\.html"[^>]*aria-current="page">AWS Provider<\/a>/,
@@ -223,6 +288,47 @@ generatedTest("generated AWS page is active in Providers navigation and pager", 
   assert.match(pager, new RegExp(escapeRegExp(`href="../providers/${next}"`)));
 });
 
+generatedTest("homepage provider wall groups every catalog entry with accurate counts and working links", () => {
+  const metadata = JSON.parse(fs.readFileSync(path.join(providersDir, "provider-metadata.json"), "utf8"));
+  const home = readGenerated("index.html");
+  const links = [...home.matchAll(/data-home-provider="([^"]+)" href="([^"]+)"/g)];
+  assert.equal(links.length, Object.keys(metadata).length);
+  assert.deepEqual(links.map(([, name]) => name).sort(), Object.keys(metadata).sort());
+  for (const [, name, href] of links) {
+    assert.equal(href, `providers/${metadata[name].docs.replace(/\.md$/, ".html")}`);
+    assert.ok(fs.existsSync(path.join(siteDir, href)), `${name} must link to a generated page`);
+  }
+  const groups = [...home.matchAll(/<section class="home-provider-group" data-provider-category="([^"]+)"[\s\S]*?<\/section>/g)];
+  assert.deepEqual(groups.map(([, category]) => category).sort(), [...new Set(Object.values(metadata).map((entry) => entry.category))].sort());
+  for (const [html, category] of groups) {
+    const expected = Object.entries(metadata).filter(([, entry]) => entry.category === category).map(([name]) => name).sort();
+    assert.match(html, new RegExp(`class="home-provider-count">${expected.length}<`));
+    assert.deepEqual([...html.matchAll(/data-home-provider="([^"]+)"/g)].map(([, name]) => name).sort(), expected);
+  }
+});
+
+generatedTest("homepage explains the remote loop and links every section to existing documentation", () => {
+  const main = readGenerated("index.html").match(/<main\b[^>]*>([\s\S]*?)<\/main>/)[1];
+  assert.match(main, /On-demand computers <em>for agents\.<\/em>/);
+  assert.match(main, /Uncommitted changes included/);
+  assert.match(main, /Stream \+ exit code/);
+  assert.match(main, /Linux<\/li><li>macOS<\/li><li>Windows <small>native<\/small><\/li><li>WSL2/);
+  assert.match(main, /VNC or WebVNC/);
+  assert.match(main, /<code>--code<\/code> on managed Linux/);
+  assert.match(main, /configured spend caps/);
+  assert.match(main, /ambiguous ownership fails closed/);
+  assert.equal(occurrences(main.match(/<section class="home-loop"[\s\S]*?<\/section>/)[0], "<li>"), 6);
+  for (const [, href] of main.matchAll(/href="([^"]+)"/g)) {
+    if (/^https?:/.test(href)) continue;
+    const [file, anchor] = href.split("#");
+    const target = file ? readGenerated(file.split("?")[0]) : main;
+    if (anchor) assert.match(target, new RegExp(`id="${escapeRegExp(anchor)}"`), `${href} must resolve`);
+  }
+  for (const id of ["home-use-cases-heading", "home-paths-heading", "home-pricing-heading", "home-nested-heading", "home-install-heading", "home-trust-heading"]) {
+    assert.match(main, new RegExp(`id="${id}"`), "preserve existing home section links");
+  }
+});
+
 generatedTest("homepage presents use-case, pricing, and onboarding paths", () => {
   const home = readGenerated("index.html");
   const startNav = navSection(home, "Start");
@@ -232,27 +338,27 @@ generatedTest("homepage presents use-case, pricing, and onboarding paths", () =>
 
   assert.match(
     home,
-    /<title>Crabbox — Run Any Repository Command in the Right Box<\/title>/,
+    /<title>Crabbox — On-demand Computers for Agents<\/title>/,
   );
   assert.match(home, /<meta name="description" content="[^"]+">/);
   assert.match(home, /<link rel="canonical" href="https:\/\/crabbox\.sh\/">/);
-  assert.match(home, /<meta property="og:title" content="Crabbox — Run Any Repository Command in the Right Box">/);
+  assert.match(home, /<meta property="og:title" content="Crabbox — On-demand Computers for Agents">/);
   assert.match(home, /navParams\.get\('docs'\)/);
   assert.match(home, /next\.searchParams\.set\('docs',value\)/);
   assert.match(
     home,
-    /<a class="cta-primary" href="getting-started\.html">Run Your First Command<\/a>/,
+    /<a class="cta-primary" href="getting-started\.html">Get started <span aria-hidden="true">→<\/span><\/a>/,
   );
   assert.match(
     home,
-    /<a class="cta-secondary" href="#home-use-cases-heading">Route Your Workload<\/a>/,
+    /<a class="cta-secondary" href="providers\/index\.html">Providers<\/a>/,
   );
   assert.match(home, /<form class="home-job-finder" data-home-job-finder>/);
   assert.equal(occurrences(home, 'class="home-job-radio sr-only"'), 6, "homepage should expose six job choices");
   assert.equal(occurrences(home, 'class="home-job-result"'), 6, "every job choice should have a result");
   assert.equal(occurrences(home, 'data-home-job-radio checked'), 1, "job finder should have one default route");
   assert.equal(occurrences(home, 'aria-controls="home-job-result-'), 6, "every job choice should identify its result");
-  assert.equal(occurrences(home, "data-copy-text="), 6, "every job result should expose a runnable copy target");
+  assert.equal(occurrences(home, "data-copy-text="), 7, "the run example and every job result should expose a runnable copy target");
   assert.doesNotMatch(home, /data-copy-text="[^"]*\$/);
   assert.doesNotMatch(home, /data-copy-text="[^"]*&lt;name&gt;/);
   assert.match(home, /homeJobParams\.get\('job'\)/);
@@ -277,10 +383,11 @@ generatedTest("homepage presents use-case, pricing, and onboarding paths", () =>
     [],
     "job finder recommendations should stay on the canonical CLI surface",
   );
-  const providerCount = Object.keys(
-    JSON.parse(fs.readFileSync(path.join(providersDir, "provider-metadata.json"), "utf8")),
-  ).length;
-  assert.match(home, new RegExp(`<li>${providerCount} registered providers</li>`));
+  const metadata = JSON.parse(fs.readFileSync(path.join(providersDir, "provider-metadata.json"), "utf8"));
+  const providerCount = Object.keys(metadata).length;
+  const builtInCount = Object.values(metadata).filter((entry) => entry.category !== "external-provider").length;
+  assert.match(home, new RegExp(`<li>${builtInCount} built-in providers</li>`));
+  assert.match(home, new RegExp(`>${builtInCount} <span class="home-nowrap">built-in</span> providers\\.<br>One way to run\\.`));
   assert.match(home, new RegExp(`Turn ${providerCount} registered providers into a focused comparison path\\.`));
   assert.match(home, /href="pricing\.html">See Pricing and Cost Boundaries/);
   assert.match(home, /There is no generic nested mode\./);

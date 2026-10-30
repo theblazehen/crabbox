@@ -112,6 +112,8 @@ function runMockedHomebrewPhase({
   helperMissing = false,
   helperOnIntel = false,
   helperByteMismatch = false,
+  trustFailure = false,
+  xdgConfig = "private",
   fetchFailure = false,
   installedByteMismatch = false,
   macosVerifierFailure = false,
@@ -131,6 +133,10 @@ function runMockedHomebrewPhase({
   const work = path.join(root, "work");
   const home = path.join(work, "home");
   const cache = path.join(work, "cache");
+  const config = path.join(home, ".config");
+  const externalConfig = path.join(root, "external-config");
+  const externalTrust = path.join(externalConfig, "homebrew", "trust.json");
+  const externalSentinel = '{"trustedformulae":["example/tap/existing"]}\n';
   const log = path.join(root, "calls.log");
   for (const directory of [
     assets,
@@ -141,9 +147,15 @@ function runMockedHomebrewPhase({
     work,
     home,
     cache,
+    externalConfig,
+    path.dirname(externalTrust),
   ]) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
+
+  fs.writeFileSync(externalTrust, externalSentinel, { mode: 0o600 });
+  if (xdgConfig === "symlink") fs.symlinkSync(externalConfig, config);
+  else fs.mkdirSync(config, { mode: 0o700 });
 
   const credentialCanary = forbiddenCredentials.concat("UNRELATED_SECRET").map(
     (name) => `[ -z "\${${name}+x}" ] || exit 95`,
@@ -166,7 +178,7 @@ function runMockedHomebrewPhase({
     )}\n`,
   );
 
-  const packMembers = runtimePack === "filesystem"
+  const packMembers = runtimePack === "filesystem" || runtimePack === "egress"
     ? ["manifest.json", "darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64", "windows-amd64.exe", "windows-arm64.exe"]
     : ["manifest.json", "linux-amd64", "linux-arm64"];
   if (runtimePack) {
@@ -205,7 +217,7 @@ function runMockedHomebrewPhase({
   fs.writeFileSync(
     path.join(assets, "provenance.json"),
     JSON.stringify({
-      schemaVersion: runtimePack === "filesystem" ? 3 : runtimePack ? 2 : 1,
+      schemaVersion: runtimePack === "egress" ? 4 : runtimePack === "filesystem" ? 3 : runtimePack ? 2 : 1,
       payloads: [
         {
           binaries: [
@@ -260,7 +272,7 @@ esac
 case "$1" in
   --verify)
     if [[ "$*" == *--check-notarization* ]]; then
-      [[ "$*" == "--verify --strict --check-notarization -R=notarized --verbose=2 $binary" ]] || exit 98
+      [[ "$*" == "--verify --strict --check-notarization -R=notarized --verbose=4 $binary" ]] || exit 98
       ${notarizationFailure ? "exit 74" : "exit 0"}
     fi
     requirement=$(crabbox_release_designated_requirement "$identifier")
@@ -288,6 +300,13 @@ esac
     path.join(mockBin, "brew"),
     `#!/bin/sh
 ${credentialCanary}printf 'brew:%s\\n' "$*" >>${shellQuote(log)}
+# Model machine brew.env loading after the launcher has scrubbed caller state.
+HOMEBREW_XDG_CONFIG_HOME=${shellQuote(externalConfig)}
+if [ -n "\${XDG_CONFIG_HOME:-}" ]; then
+  user_config="$XDG_CONFIG_HOME/homebrew"
+else
+  user_config="$HOMEBREW_XDG_CONFIG_HOME/homebrew"
+fi
 case "\${1:-}" in
   tap)
     [ "$*" = "tap openclaw/tap" ] || exit 80
@@ -295,8 +314,17 @@ case "\${1:-}" in
   update)
     [ "\${2:-}" = --force ] || exit 81
     ;;
+  trust)
+    [ "$*" = "trust --formula openclaw/tap/crabbox" ] || exit 91
+    [ "$HOME" = "\${HOMEBREW_CACHE%/cache}/home" ] || exit 86
+    [ -d "$HOME" ] && [ -d "$HOMEBREW_CACHE" ] || exit 87
+    ${trustFailure ? "exit 75" : ""}
+    /bin/mkdir -m 700 "$user_config"
+    printf '%s\\n' openclaw/tap/crabbox >"$user_config/trusted-formula"
+    ;;
   info)
     [ "$*" = "info --json=v2 --formula openclaw/tap/crabbox" ] || exit 82
+    [ -f "$user_config/trusted-formula" ] || exit 92
     /bin/cat ${shellQuote(formulaPath)}
     ;;
   fetch)
@@ -373,6 +401,7 @@ if [[ "\${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
       [
         "-i",
         `HOME=${home}`,
+        ...(xdgConfig === "missing" ? [] : [`XDG_CONFIG_HOME=${xdgConfig === "outside" ? externalConfig : config}`]),
         `HOMEBREW_CACHE=${cache}`,
         "USER=crabbox-test",
         "LOGNAME=crabbox-test",
@@ -407,17 +436,34 @@ if [[ "\${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
         cwd: repoRoot, encoding: "utf8", env: {
           PATH: `${mockBin}:${process.env.PATH}`, TMPDIR: root,
           HOME: root, UNRELATED_SECRET: "synthetic-secret-canary",
+          CRABBOX_HOMEBREW_RELEASE_METADATA: path.join(root, "public-release.json"),
         },
       });
     }
     return {
       ...result,
       calls: fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "",
+      externalTrustUnchanged: fs.readFileSync(externalTrust, "utf8") === externalSentinel &&
+        (fs.statSync(externalTrust).mode & 0o777) === 0o600 &&
+        fs.readdirSync(path.dirname(externalTrust)).join() === "trust.json",
     };
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+test("Homebrew workflow runs full release verification for both architectures", () => {
+  const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/verify-homebrew.yml"), "utf8");
+  const job = workflow.split("\n  verify:\n")[1];
+  assert.ok(job);
+  assert.match(job, /runs-on: \$\{\{ matrix\.runner \}\}/);
+  assert.match(job, /runner: xcode-27\n\s+arch: arm64/);
+  assert.match(job, /runner: xcode-27\n\s+arch: x86_64/);
+  assert.doesNotMatch(job.split("    steps:")[0], /\bif:|exclude:/);
+  assert.match(job, /scripts\/verify-homebrew-release\.sh/);
+  assert.match(job, /\/usr\/bin\/arch "-\$VERIFY_ARCH" \/bin\/bash scripts\/verify-homebrew-release\.sh/);
+  assert.match(source, /CRABBOX_VERIFY_EXEC_ARCH="\$native_arch"\s*\\\n\s*CRABBOX_VERIFY_MODE=static[\s\S]*"\$ROOT\/scripts\/verify-release\.sh"/);
+});
 
 test("Homebrew verifier checks immutable bytes before credential-free native installation", () => {
   const main = source.slice(source.indexOf("main() {"));
@@ -614,14 +660,14 @@ set -eu
 /bin/cat ${shellQuote(path.join(root, "release.json"))}
 `);
     const frozen = path.join(root, "frozen");
-    const runFreeze = () => {
+    const runFreeze = (overrides = {}) => {
       fs.rmSync(frozen, { recursive: true, force: true });
       fs.mkdirSync(frozen);
       return spawnSync("/bin/bash", [
         "-c", 'source "$1"; shift; freeze_public_release "$@"', "freeze-test", verifier,
         "v1.2.3", assetDirectory, "a".repeat(40), "b".repeat(40), verifierCommit,
         "123", frozen, process.execPath,
-      ], { encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH}`, HOME: root, TMPDIR: root } });
+      ], { encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH}`, HOME: root, TMPDIR: root, ...overrides } });
     };
     const frozenResult = runFreeze();
     assert.equal(frozenResult.status, 0, frozenResult.stderr);
@@ -631,11 +677,24 @@ set -eu
     assert.notEqual(extra.status, 0);
     assert.match(extra.stderr, /public asset inventory is not exact/);
     fs.unlinkSync(path.join(assetDirectory, "extra"));
+    // Hosted runners prefetch metadata with read-only auth; the verifier gets only JSON.
+    writeExecutable(path.join(bin, "curl"), "#!/bin/sh\necho unexpected-anonymous-api >&2\nexit 98\n");
+    const prefetched = { CRABBOX_HOMEBREW_RELEASE_METADATA: path.join(root, "release.json") };
+    const authenticated = runFreeze(prefetched);
+    assert.equal(authenticated.status, 0, authenticated.stderr);
+    assert.deepEqual(fs.readdirSync(path.join(frozen, "public-assets")).sort(), names);
+    assert.notEqual(runFreeze({ CRABBOX_HOMEBREW_RELEASE_METADATA: path.join(root, "missing.json") }).status, 0);
+    const metadataLink = path.join(root, "metadata-link.json");
+    fs.symlinkSync(prefetched.CRABBOX_HOMEBREW_RELEASE_METADATA, metadataLink);
+    assert.notEqual(runFreeze({ CRABBOX_HOMEBREW_RELEASE_METADATA: metadataLink }).status, 0);
     const check = (record, pattern) => {
       writeJson("release.json", record);
       const result = spawnSync(process.execPath, args, { encoding: "utf8", env });
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, pattern);
+      const prefetchedResult = runFreeze(prefetched);
+      assert.notEqual(prefetchedResult.status, 0);
+      assert.match(prefetchedResult.stderr, pattern);
     };
     for (const patch of [
       { draft: true }, { immutable: false }, { id: 124 }, { tag_name: "v1.2.4" },
@@ -799,9 +858,11 @@ test("mocked Homebrew phase proves fresh fetch, frozen bytes, trust, and final e
   const result = runMockedHomebrewPhase();
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Verified Homebrew v1\.2\.3 on arm64/);
+  assert.equal(result.externalTrustUnchanged, true);
   assert.match(result.calls, /^verify-source:v1\.2\.3 /m);
   assert.match(result.calls, /^verify-release:v1\.2\.3 /m);
   assert.match(result.calls, /^brew:update --force$/m);
+  assert.match(result.calls, /^brew:trust --formula openclaw\/tap\/crabbox$/m);
   assert.match(result.calls, /^brew:fetch --force --formula openclaw\/tap\/crabbox$/m);
   assert.match(result.calls, /^brew:install openclaw\/tap\/crabbox$/m);
   assert.match(result.calls, /^verify-macos:org\.openclaw\.crabbox arm64 /m);
@@ -811,7 +872,29 @@ test("mocked Homebrew phase proves fresh fetch, frozen bytes, trust, and final e
   );
   assert.match(result.calls, /^brew:test openclaw\/tap\/crabbox$/m);
   assert.ok(result.calls.indexOf("brew:fetch") < result.calls.indexOf("brew:install"));
+  assert.ok(result.calls.indexOf("brew:tap") < result.calls.indexOf("brew:update"));
+  assert.ok(result.calls.indexOf("brew:update") < result.calls.indexOf("brew:trust"));
+  assert.ok(result.calls.indexOf("brew:trust") < result.calls.indexOf("brew:info"));
   assert.ok(result.calls.indexOf("verify-macos:") < result.calls.indexOf("brew:test"));
+});
+
+test("mocked Homebrew phase rejects missing, outside, or linked XDG configuration before brew", () => {
+  for (const xdgConfig of ["missing", "outside", "symlink"]) {
+    const result = runMockedHomebrewPhase({ xdgConfig });
+    assert.notEqual(result.status, 0, xdgConfig);
+    assert.match(result.stderr, /real work-local XDG config directory/);
+    assert.doesNotMatch(result.calls, /^brew:/m);
+    assert.equal(result.externalTrustUnchanged, true);
+  }
+});
+
+test("mocked Homebrew phase stops before formula loading when private trust fails", () => {
+  const result = runMockedHomebrewPhase({ trustFailure: true });
+  assert.equal(result.status, 75, result.stderr);
+  assert.match(result.calls, /^brew:trust --formula openclaw\/tap\/crabbox$/m);
+  assert.doesNotMatch(result.calls, /^brew:(?:info|fetch|install|reinstall|test) /m);
+  assert.doesNotMatch(result.calls, /^verify-macos:/m);
+  assert.doesNotMatch(result.stdout, /Verified Homebrew/);
 });
 
 test("mocked Homebrew phase rejects installed bytes that differ from the release", () => {
@@ -1129,6 +1212,15 @@ test("schema 2 Homebrew phase rejects formulae that omit the offline pack", () =
   assert.notEqual(result.status, 0);
   assert.doesNotMatch(result.calls, /brew:test/);
 });
+
+for (const nativeArch of ["arm64", "x86_64"]) {
+  test(`schema 4 (egress) Homebrew install verifies the filesystem-layout runtime pack on ${nativeArch}`, () => {
+    const result = runMockedHomebrewPhase({ runtimePack: "egress", nativeArch });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.calls, /brew:--prefix\n/);
+    assert.match(result.stdout, /Verified Homebrew/);
+  });
+}
 
 for (const nativeArch of ["arm64", "x86_64"]) {
   test(`schema 3 Homebrew install preserves all six filesystem companions on ${nativeArch}`, () => {

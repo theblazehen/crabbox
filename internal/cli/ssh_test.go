@@ -4894,8 +4894,8 @@ func TestWindowsGitSeedChecksGitBeforeInstallingClone(t *testing.T) {
 	cloneCheck := strings.Index(decoded, `if ($LASTEXITCODE -ne 0) { throw "Git seed clone failed" }`)
 	checkout := strings.Index(decoded, "& git -C $tmp checkout")
 	checkoutCheck := strings.Index(decoded, `if ($LASTEXITCODE -ne 0) { throw "Git seed checkout failed" }`)
-	removeWorkdir := strings.Index(decoded, "Remove-Item -LiteralPath $workdir -Recurse -Force")
-	moveClone := strings.Index(decoded, "Move-Item -LiteralPath $tmp -Destination $workdir")
+	removeWorkdir := strings.Index(decoded, "[IO.Directory]::Delete($workdir)")
+	moveClone := strings.Index(decoded, "[IO.Directory]::Move($tmp, $workdir)")
 	if clone < 0 || cloneCheck <= clone || checkout <= cloneCheck || checkoutCheck <= checkout ||
 		removeWorkdir <= checkoutCheck || moveClone <= removeWorkdir {
 		t.Fatalf("Windows seed can install before clone and checkout verification:\n%s", decoded)
@@ -5045,7 +5045,7 @@ func requireWindowsGitWorkspaceState(t *testing.T, workdir string, plan gitCoher
 	}
 }
 
-func TestWindowsGitSeedReplacesUnusableExactRootsAfterVerifiedClone(t *testing.T) {
+func TestWindowsGitSeedRejectsUnusableExactRoots(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("native Windows PowerShell execution is covered by Windows CI")
 	}
@@ -5080,7 +5080,7 @@ func TestWindowsGitSeedReplacesUnusableExactRootsAfterVerifiedClone(t *testing.T
 			unverified := plan
 			unverified.Tree = strings.Repeat("f", 40)
 			out, err := runDecodedWindowsPowerShell(t, windowsGitSeed(workdir, unverified))
-			if err == nil || !strings.Contains(string(out), "Git seed tree verification failed") {
+			if err == nil || exitCode(err) != gitSeedUnsafeWorkspaceExitCode {
 				t.Fatalf("unverified seed err=%v\n%s", err, out)
 			}
 			requireWindowsExactGitRoot(t, workdir)
@@ -5093,12 +5093,11 @@ func TestWindowsGitSeedReplacesUnusableExactRootsAfterVerifiedClone(t *testing.T
 				}
 			}
 
-			if out, err := runDecodedWindowsPowerShell(t, windowsGitSeed(workdir, plan)); err != nil {
-				t.Fatalf("verified seed failed: %v\n%s", err, out)
+			if out, err := runDecodedWindowsPowerShell(t, windowsGitSeed(workdir, plan)); err == nil || exitCode(err) != gitSeedUnsafeWorkspaceExitCode {
+				t.Fatalf("unusable root was not rejected: %v\n%s", err, out)
 			}
-			requireWindowsGitWorkspaceState(t, workdir, plan)
-			if _, err := os.Stat(marker); !os.IsNotExist(err) {
-				t.Fatalf("verified seed did not replace unusable root: %v", err)
+			if got, err := os.ReadFile(marker); err != nil || string(got) != "preserve\n" {
+				t.Fatalf("seed changed unusable root: data=%q err=%v", got, err)
 			}
 		})
 	}
@@ -5955,6 +5954,13 @@ func TestRemoteGitSeedLocalCanary(t *testing.T) {
 			t.Fatalf("%s left seed staging files: %v", label, staging)
 		}
 	}
+	rejectSeed := func(workdir string) {
+		t.Helper()
+		out, err := exec.Command("bash", "-lc", remoteGitSeed(workdir, plan)).CombinedOutput()
+		if err == nil || exitCode(err) != gitSeedUnsafeWorkspaceExitCode {
+			t.Fatalf("unusable root was not rejected: %v\n%s", err, out)
+		}
+	}
 	requireSeeded := func(workdir string) {
 		t.Helper()
 		if got := gitOutput(workdir, "remote", "get-url", "origin"); got != origin {
@@ -6000,11 +6006,8 @@ func TestRemoteGitSeedLocalCanary(t *testing.T) {
 	}
 	runGit(t, unbornWorkdir, "init")
 	mustWriteTestFile(t, filepath.Join(unbornWorkdir, "stale-unborn.txt"), "stale\n")
-	runSeed("replace unborn workspace", unbornWorkdir)
-	requireSeeded(unbornWorkdir)
-	if _, err := os.Stat(filepath.Join(unbornWorkdir, "stale-unborn.txt")); !os.IsNotExist(err) {
-		t.Fatalf("unborn workspace was reused instead of reseeded: %v", err)
-	}
+	rejectSeed(unbornWorkdir)
+	requireWorkspaceFile(t, filepath.Join(unbornWorkdir, "stale-unborn.txt"), "stale\n")
 
 	missingIndexWorkdir := filepath.Join(root, "missing-index-workdir")
 	if out, err := exec.Command("git", "clone", "--quiet", origin, missingIndexWorkdir).CombinedOutput(); err != nil {
@@ -6018,11 +6021,8 @@ func TestRemoteGitSeedLocalCanary(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustWriteTestFile(t, filepath.Join(missingIndexWorkdir, "stale-missing-index.txt"), "stale\n")
-	runSeed("replace missing-index workspace", missingIndexWorkdir)
-	requireSeeded(missingIndexWorkdir)
-	if _, err := os.Stat(filepath.Join(missingIndexWorkdir, "stale-missing-index.txt")); !os.IsNotExist(err) {
-		t.Fatalf("missing-index workspace was reused instead of reseeded: %v", err)
-	}
+	rejectSeed(missingIndexWorkdir)
+	requireWorkspaceFile(t, filepath.Join(missingIndexWorkdir, "stale-missing-index.txt"), "stale\n")
 
 	nestedWorkdir := filepath.Join(source, "nested-workdir")
 	if err := os.Mkdir(nestedWorkdir, 0o755); err != nil {
@@ -6152,15 +6152,15 @@ func TestRemoteWriteSyncManifestsNewForTargetUsesInterpretedWriterForWSL2(t *tes
 	}
 
 	plain := remoteWriteSyncManifestsNewForTarget(SSHTarget{TargetOS: targetLinux}, "/work/repo", "0123456789abcdef0123456789abcdef")
-	if !strings.Contains(plain, "dd bs=1") {
-		t.Fatalf("non-WSL2 manifest writer should keep portable dd fallback: %q", plain)
+	if strings.Contains(plain, "dd bs=1") {
+		t.Fatalf("non-WSL2 manifest writer must not copy byte at a time: %q", plain)
 	}
 	if strings.Contains(plain, "status=none") {
 		t.Fatalf("non-WSL2 manifest writer should not require GNU dd extensions: %q", plain)
 	}
 	// The portable wrapper includes one writer in each shell branch.
 	for _, length := range []string{"manifest_len", "deleted_len"} {
-		if strings.Count(plain, `dd bs=1 count="$`+length+`"`) != 2 {
+		if strings.Count(plain, `write_frame "$`+length+`"`) != 2 {
 			t.Fatalf("non-WSL2 manifest writer should exact-read %s in both shell branches: %q", length, plain)
 		}
 	}
@@ -6406,8 +6406,12 @@ func TestRemoteWriteSyncManifestsNewPython(t *testing.T) {
 func TestRemoteWriteSyncManifestsNewReadsChunkedInput(t *testing.T) {
 	const finalizeToken = "0123456789abcdef0123456789abcdef"
 	workdir := t.TempDir()
-	manifest := strings.Repeat("manifest-entry\x00", 4096)
-	deleted := "old.txt\x00"
+	var paths strings.Builder
+	for i := range 50000 {
+		fmt.Fprintf(&paths, "packages/package-%04d/src/file-%05d.test.ts\x00", i/100, i)
+	}
+	manifest := paths.String() + "binary\xff\x00newline\nname\x00"
+	deleted := "old.txt\x00gone\xfe\x00"
 
 	bashPath, err := exec.LookPath("bash")
 	if err != nil {

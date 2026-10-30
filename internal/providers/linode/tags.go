@@ -2,7 +2,6 @@ package linode
 
 import (
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -21,9 +20,9 @@ const (
 	tagChunkHeaderLength      = 5
 )
 
-var tagSafeRe = regexp.MustCompile(`[^A-Za-z0-9_:\-]`)
-
-var tagSchema = shared.LeaseTagSchema(shared.TailscaleTagFields()...)
+var tagSchema = shared.LeaseTagSchema(append(shared.TailscaleTagFields(),
+	shared.TagLabelField{Key: "fixed_intent_sha256", Exact: true}, shared.TagLabelField{Key: "fixed_attempt", Exact: true},
+)...)
 
 func leaseTags(cfg core.Config, leaseID, slug, state string, keep bool, now time.Time) []string {
 	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, now)
@@ -49,22 +48,12 @@ func tagsFromLabels(labels map[string]string) []string {
 }
 
 func encodeTagKV(key, value string) []string {
-	key = sanitizeTagPart(key)
-	plain := tagPrefix + key + ":" + sanitizeTagPart(value)
+	key = shared.SanitizeTagPart(key, 0)
+	plain := tagPrefix + key + ":" + shared.SanitizeTagPart(value, 0)
 	if !tagSchema.Exact(key) && len(plain) <= maxLinodeTagLength {
 		return []string{plain}
 	}
 	return encodeChunkedTagKV(key, value)
-}
-
-func sanitizeTagPart(value string) string {
-	value = strings.TrimSpace(value)
-	value = tagSafeRe.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-")
-	if value == "" {
-		return "unknown"
-	}
-	return value
 }
 
 func encodeChunkedTagKV(key, value string) []string {
@@ -217,31 +206,12 @@ func recordTagChunk(chunks map[string]*tagChunkSet, key, value string) {
 	set.parts[index] = part
 }
 
-func replaceCrabboxTags(existing, desired []string) []string {
-	tags := append([]string(nil), desired...)
-	for _, tag := range existing {
-		lower := strings.ToLower(strings.TrimSpace(tag))
-		if lower == tagCrabbox || strings.HasPrefix(lower, tagPrefix) {
-			continue
-		}
-		tags = append(tags, tag)
-	}
-	return shared.NormalizeTags(tags)
-}
-
 func isOwnedLinode(item linodeInstance) bool {
 	return validateLinodeLabels(labelsFromTags(item.Tags)) == nil
 }
 
 func validateLinodeLabels(labels map[string]string) error {
-	if labels == nil ||
-		labels[ownershipTagConflictLabel] != "" ||
-		labels["crabbox"] != "true" ||
-		labels["created_by"] != "crabbox" ||
-		labels["provider"] != providerName ||
-		!core.IsCanonicalLeaseID(labels["lease"]) ||
-		labels["slug"] == "" ||
-		labels["target"] != core.TargetLinux {
+	if !shared.ValidLeaseTagLabels(labels, providerName, ownershipTagConflictLabel) {
 		return core.Exit(2, "refusing to operate on non-Crabbox Linode instance")
 	}
 	return nil

@@ -1,11 +1,10 @@
 package cli
 
 import (
-	"errors"
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"hash/fnv"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -47,6 +46,11 @@ func NewLeaseSlug(leaseID string) string {
 	adjective := leaseSlugAdjectives[int(hash%uint32(len(leaseSlugAdjectives)))]
 	noun := leaseSlugNouns[int((hash/uint32(len(leaseSlugAdjectives)))%uint32(len(leaseSlugNouns)))]
 	return adjective + "-" + noun
+}
+
+func generatedLeaseSlug(leaseID string) string {
+	fingerprint := sha256.Sum256([]byte(leaseID))
+	return fmt.Sprintf("%s-%x", NewLeaseSlug(leaseID), fingerprint[:4])
 }
 
 func SlugWithCollisionSuffix(base, seed string) string {
@@ -101,21 +105,30 @@ func LeaseProviderName(leaseID, slug string) string {
 }
 
 func AllocateDirectLeaseSlug(leaseID, requested string, servers []Server) (string, error) {
+	return AllocateDirectLeaseSlugContext(context.Background(), leaseID, requested, servers)
+}
+
+func AllocateDirectLeaseSlugContext(ctx context.Context, leaseID, requested string, servers []Server) (string, error) {
+	return allocateDirectLeaseSlug(ctx, leaseID, requested, servers, claimSlugInUse)
+}
+
+func allocateDirectLeaseSlug(ctx context.Context, leaseID, requested string, servers []Server, claimInUse func(context.Context, string, string) (bool, error)) (string, error) {
 	base := NormalizeLeaseSlug(requested)
 	generated := base == ""
 	if base == "" {
-		base = NewLeaseSlug(leaseID)
+		// The ID-derived suffix spreads generated names without scanning stale
+		// local claims; the coordinator/provider remains authoritative.
+		base = generatedLeaseSlug(leaseID)
 	}
 	slug := base
 	for attempt := 0; attempt < 20; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		inUse := serverSlugInUse(slug, servers)
-		if !inUse {
+		if !inUse && !generated {
 			var err error
-			if generated {
-				inUse, err = claimSlugInUseBestEffort(slug, leaseID)
-			} else {
-				inUse, err = claimSlugInUse(slug, leaseID)
-			}
+			inUse, err = claimInUse(ctx, slug, leaseID)
 			if err != nil {
 				return "", err
 			}
@@ -127,13 +140,9 @@ func AllocateDirectLeaseSlug(leaseID, requested string, servers []Server) (strin
 	}
 	fallback := SlugWithCollisionSuffix(base, leaseID)
 	inUse := serverSlugInUse(fallback, servers)
-	if !inUse {
+	if !inUse && !generated {
 		var err error
-		if generated {
-			inUse, err = claimSlugInUseBestEffort(fallback, leaseID)
-		} else {
-			inUse, err = claimSlugInUse(fallback, leaseID)
-		}
+		inUse, err = claimInUse(ctx, fallback, leaseID)
 		if err != nil {
 			return "", err
 		}
@@ -145,90 +154,24 @@ func AllocateDirectLeaseSlug(leaseID, requested string, servers []Server) (strin
 }
 
 func AllocateClaimLeaseSlug(leaseID, requested string) (string, error) {
-	base := NormalizeLeaseSlug(requested)
-	generated := base == ""
-	if base == "" {
-		base = NewLeaseSlug(leaseID)
-	}
-	slug := base
-	for attempt := 0; attempt < 20; attempt++ {
-		var inUse bool
-		var err error
-		if generated {
-			inUse, err = claimSlugInUseBestEffort(slug, leaseID)
-		} else {
-			inUse, err = claimSlugInUse(slug, leaseID)
-		}
-		if err != nil {
-			return "", err
-		}
-		if !inUse {
-			return slug, nil
-		}
-		slug = SlugWithCollisionSuffix(base, fmt.Sprintf("%s-%d", leaseID, attempt))
-	}
-	fallback := SlugWithCollisionSuffix(base, leaseID)
-	var inUse bool
-	var err error
-	if generated {
-		inUse, err = claimSlugInUseBestEffort(fallback, leaseID)
-	} else {
-		inUse, err = claimSlugInUse(fallback, leaseID)
-	}
-	if err != nil {
-		return "", err
-	}
-	if inUse {
-		return "", Exit(2, "could not allocate a unique lease slug for %s", leaseID)
-	}
-	return fallback, nil
+	return AllocateDirectLeaseSlug(leaseID, requested, nil)
 }
 
-func claimSlugInUse(slug, leaseID string) (bool, error) {
+func AllocateClaimLeaseSlugContext(ctx context.Context, leaseID, requested string) (string, error) {
+	return AllocateDirectLeaseSlugContext(ctx, leaseID, requested, nil)
+}
+
+func claimSlugInUse(ctx context.Context, slug, leaseID string) (bool, error) {
 	slug = NormalizeLeaseSlug(slug)
 	if slug == "" {
 		return false, nil
 	}
-	_, ok, err := findLeaseClaim(slug, func(candidate leaseClaim) bool {
+	_, ok, err := findLeaseClaim(ctx, slug, func(candidate leaseClaim) bool {
 		return candidate.LeaseID != "" &&
 			candidate.LeaseID != leaseID &&
 			NormalizeLeaseSlug(candidate.Slug) == slug
 	})
 	return ok, err
-}
-
-func claimSlugInUseBestEffort(slug, leaseID string) (bool, error) {
-	slug = NormalizeLeaseSlug(slug)
-	if slug == "" {
-		return false, nil
-	}
-	dir, err := CrabboxStateDir()
-	if err != nil {
-		return false, err
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, "claims"))
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, Exit(2, "read claims directory: %v", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		candidateID := strings.TrimSuffix(entry.Name(), ".json")
-		candidate, err := ReadLeaseClaim(candidateID)
-		if err != nil {
-			continue
-		}
-		if candidate.LeaseID != "" &&
-			candidate.LeaseID != leaseID &&
-			NormalizeLeaseSlug(candidate.Slug) == slug {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func serverSlugInUse(slug string, servers []Server) bool {
@@ -242,9 +185,6 @@ func serverSlugInUse(slug string, servers []Server) bool {
 }
 
 func ServerSlug(server Server) string {
-	if server.Labels == nil {
-		return ""
-	}
 	return NormalizeLeaseSlug(server.Labels["slug"])
 }
 

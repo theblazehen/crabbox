@@ -8,9 +8,11 @@ Read when:
 
 Static SSH is the provider for machines Crabbox does **not** create. The backend
 resolves a configured SSH target and hands it to core, which owns sync, command
-execution, results, tunnels, and status rendering. Crabbox does not provision,
-stop, or delete the machine, or account for its cost. The host's lifecycle is
-yours; commands can still perform connection cleanup when releasing a lease.
+execution, results, tunnels, and status rendering. Crabbox does not provision
+or delete the machine, or account for its cost. The host's lifecycle is yours;
+commands can still perform connection cleanup when releasing a lease, and
+optional [power hooks](#power-hooks) can bring a host up
+and down around its leases.
 
 The provider id is `ssh`, with aliases `static` and `static-ssh`. It is
 direct-only and is never brokered through the coordinator.
@@ -35,26 +37,42 @@ crabbox run --provider static-ssh --target windows --static-host win-dev.local \
   -- pwsh -NoProfile -Command '$PSVersionTable'
 ```
 
+An explicit `static.port` / `--static-port` / `CRABBOX_STATIC_PORT`, or
+`ssh.port` / `--ssh-port` / `CRABBOX_SSH_PORT`, selects exactly one SSH port.
+Crabbox does not try fallback ports, even an explicit `ssh.fallbackPorts` list.
+This prevents an unavailable port-forward such as `127.0.0.1:2224` from
+redirecting work to a different sshd on port `22`.
+
+When neither port is configured, Static SSH retains the default `2222`, then
+`22` selection (or the configured fallback list), including on localhost.
+Set the port explicitly for forwarded endpoints. A static host uses SSH's
+trust-on-first-use checking; a key learned for one host/port does not pin a
+different port to the same machine.
+
 `warmup` for Static SSH does not provision a machine. It validates the
 configured target and returns it as a lease-like object so the rest of the
 warm-box workflow (`run`, `ssh`, `status`, tunnels) behaves the same as for
 provisioned providers.
 
-`stop` (also spelled `release`) removes the local claim after attempting the
-shared connection cleanup described below. `run` does the same when its release
-policy fires: normally after a fresh one-shot run, but not a kept run or a run
-reusing an ID by default. Remote cleanup is best-effort: failures warn but do
-not block local unclaiming. The static backend itself only removes the local
-claim and cached target; it never stops or deletes the machine. There is no
-static machine `cleanup` action.
+`stop` (also spelled `release`) attempts shared connection cleanup and removes
+the local claim. `run` does the same when its release policy fires: normally
+after a fresh one-shot run, but not a kept run or ordinary unpowered ID reuse.
+Without power hooks, remote connection cleanup is best-effort and the host stays
+available. With power hooks, the last reference runs shutdown before custody is
+cleared; failure blocks release and remains retryable. There is no static
+machine `cleanup` action, and the provider never deletes the host.
 
-When a run releases its static lease, it also releases the run's remote
-workspace ownership after connection cleanup and local unclaiming. The host
-and workspace remain available for immediate reuse. This final release still
-checks the owner token and child state; an unreachable host, changed owner,
-or live/ambiguous child fails closed rather than deleting another run's
-authority. Explicit `stop` does not invent an owner token or remove unrelated
-workspace-owner records.
+Runs also close their remote workspace ownership with owner-token and child-state
+checks. Powered runs do this **before** release so SSH is still available;
+ordinary static runs close it afterward. An unreachable host, changed owner,
+or live/ambiguous child fails closed rather than deleting another run's authority.
+Explicit `stop` does not invent an owner token or remove unrelated workspace-owner
+records.
+
+POSIX workspace locks support both util-linux and BusyBox `flock`. BusyBox uses
+bounded nonblocking retries on the same lock file because it lacks `flock -w`;
+util-linux keeps its native timed wait. Minimal Alpine hosts also need `procps`
+for the process identity checks used by workspace ownership.
 
 ### Connection cleanup
 
@@ -78,6 +96,145 @@ using an existing tailnet address or MagicDNS name does not set that metadata
 or trigger logout by itself. The metadata gate is not a live node-ownership
 check.
 
+### Sharing a static host
+
+A static host has one lease per `static.id`. Without an explicit id, the lease
+id is derived from `static.host` (`static_<host slug>`), so every checkout that
+targets the same host string shares one lease, and a second repository checkout
+is refused while the first holds the claim. The remote workdir is
+`<workRoot>/<lease id>/<repo>`, so the lease id also selects the remote
+checkout.
+
+To run several checkouts against one host at the same time, give each a distinct
+`static.id` or `CRABBOX_STATIC_ID`. A distinct id isolates both the local claim
+and the remote workdir:
+
+```sh
+CRABBOX_STATIC_ID=buildbox-slot-1 crabbox run --provider ssh \
+  --static-host buildbox.local -- pnpm test
+```
+
+Do not use `--reclaim` to share a host. It adopts the other checkout's lease and
+its `<workRoot>/<lease id>` directory; checkouts of the same repository then
+share one remote workdir.
+
+Each new id starts with an empty workdir. With Git seeding enabled (the default),
+its first run pays a full Git seed, which can take minutes for a large
+repository. Later runs with the same id reuse the
+seeded workdir. Prefer a stable id per checkout or per concurrency slot over a
+fresh id per run.
+
+Releasing a static lease does not remove its workdir. Like other static-host
+housekeeping, delete the `<workRoot>/<id>` directories of ids you no longer use.
+
+### Power hooks
+
+A dedicated lab host can be powered on for work and stopped after its last
+lease. Put the complete contract in **trusted user configuration** (or an
+explicit `CRABBOX_CONFIG` file outside the repository):
+
+```yaml
+provider: ssh
+static:
+  host: 127.0.0.1
+  user: root
+  port: "2222"
+  power:
+    dedicated: true
+    hostID: lab-container # optional stable operator label
+  startCommand: ["/usr/local/bin/docker", "start", "lab-ssh"]
+  stopCommand: ["/usr/local/bin/docker", "stop", "lab-ssh"]
+```
+
+Use the actual absolute Docker executable path on your controller. The container
+must already exist, expose SSH on the configured port, and authorize your SSH
+key. Crabbox does not create or delete it. The `power.dedicated: true` declaration
+is required whenever either hook is configured: **this controller and its local
+state directory exclusively own the entire host's power lifecycle**. Other
+users, other state directories, other controllers, and unrelated workloads must
+not share it. References cannot protect work outside that contract.
+
+Identity is the canonical IP literal plus the resolved SSH user and port, with
+optional `power.hostID`. Use one canonical IP for the whole host, even when it
+has multiple interfaces. Hostname and SSH aliases are refused; configure their
+canonical IP instead. Different users, ports, host IDs, or hook argv cannot
+inherit an existing host record. Do not change that contract while references
+remain. SSH fallback ports and ambient SSH configuration are disabled for powered targets;
+provide credentials explicitly through `ssh.key`.
+
+Both hooks are local argv arrays, without an implicit shell. Their first element
+must be an absolute executable path; repository-relative and bare PATH names are
+refused. They run from the current working directory, inherit the controller's
+environment, and receive `CRABBOX_LEASE_ID` and `CRABBOX_STATIC_HOST`. Scripts,
+script arguments, and executables must be operator-controlled. Output goes to
+stderr; failures retain the last 4 KiB of stderr and the hook's exit code.
+Environment overrides `CRABBOX_STATIC_START_COMMAND` and
+`CRABBOX_STATIC_STOP_COMMAND`, and flags `--static-start-command` and
+`--static-stop-command`, accept JSON argv arrays (`[]` clears a command).
+Repository commands need identical trusted approval; repositories cannot grant
+the dedicated contract or change its SSH destination. Clearing hooks cannot
+abandon existing host custody.
+
+A durable per-host reference set under the host lock controls power. The first
+lease runs start before SSH readiness; overlapping leases with distinct
+`static.id` values share that start. Releasing either lease first leaves the
+host on. Only the final release runs stop. Same-ID acquisitions and prepared
+reuse (`run --id`) are refused while custody exists, so use a distinct
+`CRABBOX_STATIC_ID` per concurrent run (see
+[Sharing a static host](#sharing-a-static-host)). Keep the same hook contract for every
+lease. A kept run remains referenced until explicitly stopped. `status`, `list`,
+and `doctor` do not start the host.
+
+Shutdown records `pending-stop` **before** running the hook and keeps the claim
+and reference on failure or cancellation. Restore the hook's dependency and
+retry with the original config:
+
+```sh
+crabbox stop --provider ssh --id static_example
+# Forced recovery requires an explicit acknowledgement and an exact retained ID:
+crabbox stop --provider ssh --id static_example --force --static-power-acknowledge-stop
+```
+
+Force never discards custody or adopts an unknown host. It can recover an
+interruption between host reservation and claim publication. Stale claim
+snapshots, changed host contracts, and missing authority fail closed. Successful
+shutdown is recorded before custody is cleared. Preserve the local claims and
+`ssh-power` state directory until recovery completes.
+
+If start succeeds but readiness or acquisition fails, Crabbox rolls back its
+reference and runs stop only if no other lease remains. A failed rollback keeps
+retryable pending-stop custody. An ordinary nonzero start exit grants no
+power-on custody; hooks must report success only after their operation succeeds.
+An interrupted start is uncertain and retains pending-stop for explicit retry.
+Use idempotent start/stop hooks, including after a controller crash.
+
+Hooks have a five-minute timeout and run in an owned process group on macOS or
+Linux. Cancellation/timeout signals the whole group and joins descendants before
+releasing the host lock, preserving the typed cancellation cause. The normal
+cleanup grace is five seconds; if termination cannot be confirmed, cleanup is
+reported pending and the lock remains held until the group is gone. Hooks must
+not daemonize or escape their group. Windows controllers cannot run power hooks.
+Run-owned workspace authority is closed while SSH is reachable before shutdown.
+
+For wake-on-LAN, use the host's fixed LAN IP and an operator-controlled shutdown
+helper (for example one that calls the hypervisor or an authenticated power API):
+
+```yaml
+static:
+  host: 192.0.2.40
+  user: builder
+  port: "22"
+  power:
+    dedicated: true
+    hostID: lab-builder
+  startCommand: ["/opt/homebrew/bin/wakeonlan", "02:00:00:00:00:40"]
+  stopCommand: ["/usr/local/libexec/lab-power", "stop", "lab-builder"]
+```
+
+Wake-on-LAN returns before SSH is ready; Crabbox's normal readiness wait follows
+successful start. A VM can use absolute-path `virsh start/shutdown` commands
+instead. A start-only contract is supported but leaves shutdown to the operator.
+
 ## Targets
 
 Static SSH supports all four targets:
@@ -92,6 +249,8 @@ cannot infer whether a Windows host runs native PowerShell or WSL2 commands.
 On Linux, macOS, and WSL2 targets, Crabbox's workspace-owner protocol invokes
 `/bin/sh` explicitly and does not require the SSH account to use a POSIX login
 shell on POSIX hosts; zsh, Bash, and Fish login shells are supported there.
+Linux and macOS workspace sync stages its rsync receiver through the same
+explicit POSIX interpreter and reports the receiver path if staging fails.
 WSL staging supports Windows OpenSSH with `cmd.exe`, Windows PowerShell, or
 PowerShell (`pwsh`) as DefaultShell. Preparation binds the observed shell kind
 to the fresh route nonce; PowerShell executes the verified script directly to
@@ -291,12 +450,28 @@ workspace descendant containment or require `setsid` on macOS.
 | `user` | SSH user. Falls back to `ssh.user`, then `$USER`. |
 | `port` | SSH port. Falls back to `ssh.port`; the base default is `2222` with a `22` fallback. |
 | `workRoot` | Remote checkout/work directory. |
-| `id` | Optional stable lease id (default derived from `host`). |
+| `id` | Optional stable lease id (default `static_<host slug>`). Selects the local claim and the remote workdir `<workRoot>/<id>/<repo>`; use a distinct id per concurrent checkout. See [Sharing a static host](#sharing-a-static-host). |
 | `name` | Optional friendly slug (default derived from `host`). |
+| `noControlMaster` | Disable SSH multiplexing, including workspace owner calls (default `false`). Use it for SSH servers that close multiplexed sessions without sending `exit-status`. Also `CRABBOX_STATIC_NO_CONTROL_MASTER` or `--static-no-control-master`. |
+| `startCommand` | Optional local argv run before the SSH readiness wait. See [Power hooks](#power-hooks). |
+| `stopCommand` | Optional local argv run before final custody retirement; failures remain retryable. |
+| `power.dedicated` | Required `true` for hooks; one controller exclusively owns the whole host. |
+| `power.hostID` | Optional stable host label, bound together with canonical IP/user/port. |
 
 The SSH private key comes from the shared `ssh.key` field (or `CRABBOX_SSH_KEY`).
 There is no per-host key field; the static provider connects with your existing
 key, not a key Crabbox generates.
+
+Set `static.noControlMaster: true` for a direct connection per command. This
+also skips the workspace owner's foreground master; sync, copy, interactive
+connections, and VNC/port-forward transports cannot reuse a master. Direct
+connections explicitly set `ControlMaster=no`, `ControlPath=none`, and
+`ControlPersist=no` so local SSH configuration cannot re-enable multiplexing.
+The default keeps existing multiplexing behavior. Flags override environment
+variables, which override config; `--static-no-control-master=false` restores
+the default even when config or environment enables the opt-out. Generated
+recovery commands preserve either value. Existing configs and stored leases
+need no migration; reused leases use the current transport setting.
 
 A repository-defined `static.host` cannot silently inherit a key or ambient SSH
 authentication from user config, the environment, an SSH agent, or local SSH
@@ -305,6 +480,12 @@ contained by the repository in the same repository config, or approve the
 destination explicitly with `--static-host` or `CRABBOX_STATIC_HOST`. Absolute,
 missing, and repository-escaping key paths require explicit host approval.
 
+Repository config cannot run local commands on its own. A repository-defined
+`static.startCommand` or `static.stopCommand` is refused unless the same argv
+appears in trusted user config, or the command is set with
+`CRABBOX_STATIC_START_COMMAND`/`CRABBOX_STATIC_STOP_COMMAND` or
+`--static-start-command`/`--static-stop-command`.
+
 ### Flags
 
 ```text
@@ -312,7 +493,13 @@ missing, and repository-escaping key paths require explicit host approval.
 --static-user
 --static-port
 --static-work-root
+--static-no-control-master
+--static-start-command '["/usr/local/bin/host-power","up"]'
+--static-stop-command '["/usr/local/bin/host-power","down"]'
 ```
+
+The command flags and environment variables take a JSON argv array; `[]`
+clears a command set by lower-precedence config.
 
 ### Environment
 
@@ -323,6 +510,9 @@ CRABBOX_STATIC_PORT
 CRABBOX_STATIC_WORK_ROOT
 CRABBOX_STATIC_ID
 CRABBOX_STATIC_NAME
+CRABBOX_STATIC_NO_CONTROL_MASTER
+CRABBOX_STATIC_START_COMMAND
+CRABBOX_STATIC_STOP_COMMAND
 CRABBOX_SSH_USER
 CRABBOX_SSH_KEY
 CRABBOX_SSH_PORT
@@ -364,6 +554,24 @@ This is a compatibility change from v0.47.0, which shipped the stdin fallback:
 WSL2 execution now requires SFTP. Enable and verify it before upgrading.
 Connection loss and malformed protocol responses remain transport errors rather
 than being mislabeled as a missing subsystem.
+
+#### Non-administrator WSL2 accounts
+
+A standard Windows account that owns its WSL distribution can serve as a WSL2
+static target, which keeps build code away from other profiles and elevation.
+No WMI namespace or profile ACL changes are needed: Crabbox identifies the SSH
+default shell without WMI, and accepts the read-only app-capability grant that
+Windows 11 adds to new profiles. Import the distribution as that account, since
+`wsl --install` requires elevation:
+
+```sh
+crabbox run --provider ssh --target windows --windows-mode wsl2 \
+  --static-host win-dev.local --static-user builder \
+  --static-work-root /home/builder/crabbox --no-sync --shell -- 'id -un'
+```
+
+Doctor's `wsl2-sftp` probe does not prepare the private stage, so confirm a new
+account with a one-shot run like the one above.
 
 The staged launcher supports both `cmd.exe` and PowerShell as the Windows
 OpenSSH default shell. Its complete encoded command stays below 8191 bytes.
@@ -438,7 +646,9 @@ workspace-owner protocol's separate direct-child ownership contract.
 WSL2 staging requires a private Windows HOME owned by the SSH user, SYSTEM, or
 Builtin Administrators. The `.crabbox` parent and `wsl-stage` directory must be
 owned by the SSH user. Access may be granted only to that user, SYSTEM, and
-Builtin Administrators; Crabbox does not change HOME ownership or ACLs. Crabbox
+Builtin Administrators. HOME may also grant app-capability SIDs (`S-1-15-3-*`)
+limited to read, execute, and synchronize rights; the staging directories may not.
+Crabbox does not change HOME ownership or ACLs. Crabbox
 rejects files, reparse points, and existing unsafe ACLs before changing
 permissions or writing a route proof or payload.
 Both safe inherited staging directories are normalized to an explicit SSH-user

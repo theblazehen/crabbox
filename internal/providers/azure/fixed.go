@@ -2,6 +2,7 @@ package azure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"strconv"
@@ -13,17 +14,17 @@ import (
 
 var fixedAzureLeaseKind = core.FixedLeaseKind{ClaimProvider: "azure", IntentVersion: 1, Label: "Azure"}
 
+const fixedAzureUserAssignedIdentityAttempt = "user_assigned_identity_resource_id"
+
 func (*azureLeaseBackend) SupportsRequestedLeaseID() bool { return true }
 
 type fixedAzureCreator interface {
-	CreateFixedServer(context.Context, core.Config, string, string, string, map[string]string) (core.Server, error)
+	CreateFixedServer(context.Context, core.Config, string, string, string, map[string]string, func(core.AzureFixedCompanions) error) (core.Server, error)
+	SettleRejectedFixedCompanions(context.Context, core.Server, core.AzureFixedCompanions) error
 }
 
 func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	cfg := b.Cfg
-	if cfg.Azure.OSDisk == core.AzureOSDiskEphemeralPreview {
-		return core.LeaseTarget{}, core.Exit(2, "direct Azure fixed leases do not support ephemeral-preview OS disks")
-	}
 	if cfg.Azure.Snapshot != "" || req.RequestedCheckpointID != "" {
 		return core.LeaseTarget{}, core.Exit(2, "direct Azure fixed leases require a VM image; checkpoint forks are not supported")
 	}
@@ -69,7 +70,8 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 			CIDRs                                                                                                                                                    []string
 			Keep                                                                                                                                                     bool
 			TTL, Idle                                                                                                                                                time.Duration
-		}{core.DirectLeaseLabels(cfg, req.RequestedLeaseID, req.RequestedSlug, "azure", cfg.Capacity.Market, req.Keep, time.Unix(0, 0)), cfg.Azure.Location, cfg.Azure.Image, cfg.Azure.OSDisk, cfg.Azure.OSDiskSKU, cfg.Azure.VNet, cfg.Azure.Subnet, cfg.Azure.NSG, cfg.Azure.Network, cfg.ServerType, cfg.Architecture, cfg.TargetOS, cfg.WindowsMode, bootstrap, core.NormalizeLeaseSlug(req.RequestedSlug), cfg.SSHUser, cfg.SSHPort, cfg.WorkRoot, cfg.Pond, cfg.Capacity.Market, cfg.Azure.SSHCIDRs, req.Keep, cfg.TTL, cfg.IdleTimeout})
+			Identity                                                                                                                                                 string `json:",omitempty"`
+		}{core.DirectLeaseLabels(cfg, req.RequestedLeaseID, req.RequestedSlug, "azure", cfg.Capacity.Market, req.Keep, time.Unix(0, 0)), cfg.Azure.Location, cfg.Azure.Image, cfg.Azure.OSDisk, cfg.Azure.OSDiskSKU, cfg.Azure.VNet, cfg.Azure.Subnet, cfg.Azure.NSG, cfg.Azure.Network, cfg.ServerType, cfg.Architecture, cfg.TargetOS, cfg.WindowsMode, bootstrap, core.NormalizeLeaseSlug(req.RequestedSlug), cfg.SSHUser, cfg.SSHPort, cfg.WorkRoot, cfg.Pond, cfg.Capacity.Market, cfg.Azure.SSHCIDRs, req.Keep, cfg.TTL, cfg.IdleTimeout, cfg.Azure.UserAssignedIdentityResourceID})
 		if err != nil {
 			return core.FixedLeaseBinding{}, err
 		}
@@ -86,7 +88,9 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 	}, ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[core.Server], error) {
 		claim := tx.Claim
 		var result core.FixedObservation[core.Server]
-		if core.HasAzureCleanupBinding(claim.Labels) {
+		// Legacy cleanup snapshots predate the journal. New preparation snapshots
+		// remain replayable; the engine denies deleting/released journal phases.
+		if core.HasAzureCleanupBinding(claim.Labels) && claim.FixedCreateIntent.Journal == nil {
 			return result, core.Exit(4, "Azure fixed lease has entered cleanup; retry stop")
 		}
 		name := core.LeaseProviderName(claim.LeaseID, claim.Slug)
@@ -96,14 +100,43 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 		server, err := client.GetServer(ctx, name)
 		return core.FixedLookupObservation(fixedAzureLeaseKind, *claim, server, err, isAzureCleanupNotFound, validateFixedAzureServer)
 	}, Plan: func(ctx context.Context, claim core.LeaseClaim) (core.FixedAttemptPlan, error) {
-		return core.FixedAttemptPlan{Values: map[string]string{"name": core.LeaseProviderName(claim.LeaseID, claim.Slug)},
+		values := map[string]string{"name": core.LeaseProviderName(claim.LeaseID, claim.Slug)}
+		if cfg.Azure.UserAssignedIdentityResourceID != "" {
+			values[fixedAzureUserAssignedIdentityAttempt] = cfg.Azure.UserAssignedIdentityResourceID
+		}
+		return core.FixedAttemptPlan{Values: values,
 			NonceKey: "nonce", FingerprintLabel: "fixed_intent_sha256", NonceLabel: "fixed_attempt",
 			DirectLabels: &core.FixedDirectLabels{Config: cfg, Provider: "azure", Market: cfg.Capacity.Market, Keep: req.Keep},
 		}, nil
 	}, Submit: func(ctx context.Context, tx *core.FixedTransaction) (core.Server, error) {
 		claim := tx.Claim
-		server, err := creator.CreateFixedServer(ctx, cfg, publicKey, claim.LeaseID, claim.Slug, maps.Clone(claim.Labels))
+		server, err := creator.CreateFixedServer(ctx, cfg, publicKey, claim.LeaseID, claim.Slug, tx.CreateLabels(), func(binding core.AzureFixedCompanions) error {
+			if binding.NICGUID == "" || binding.PublicIPGUID == "" {
+				return core.Exit(4, "Azure fixed companions lack immutable identities")
+			}
+			if err := tx.Bind(core.FixedResourceBinding{AttemptValues: map[string]string{
+				"pre_vm_nic_guid": binding.NICGUID, "pre_vm_public_ip_guid": binding.PublicIPGUID,
+			}}); err != nil {
+				return err
+			}
+			return tx.Record("submitting")
+		})
 		if err != nil {
+			var shortage *azureFixedVMShortage
+			attempt := claim.FixedCreateIntent.Attempt
+			if errors.As(err, &shortage) && tx.CanSettleCreateRejection(fixedAzureLeaseKind) && claim.CloudID == "" &&
+				attempt["pre_vm_nic_guid"] != "" && attempt["pre_vm_public_ip_guid"] != "" {
+				binding := core.AzureFixedCompanions{NICGUID: attempt["pre_vm_nic_guid"], PublicIPGUID: attempt["pre_vm_public_ip_guid"]}
+				expected := core.Server{CloudID: attempt["name"], Labels: tx.CreateLabels()}
+				if settleErr := creator.SettleRejectedFixedCompanions(ctx, expected, binding); settleErr == nil {
+					return core.Server{}, &core.FixedCreateRejected{Err: &azureFixedShortagePending{
+						LeaseID: claim.LeaseID, AttemptName: attempt["name"], AttemptNonce: attempt["nonce"],
+						ProviderCode: shortage.Code, Cause: err,
+					}}
+				} else {
+					return core.Server{}, fmt.Errorf("Azure fixed shortage companions unresolved for lease %s: %w", claim.LeaseID, errors.Join(err, settleErr))
+				}
+			}
 			return core.Server{}, fmt.Errorf("Azure fixed create unresolved; replay or stop lease %s: %w", claim.LeaseID, err)
 		}
 		return server, nil
@@ -116,11 +149,29 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 		if err := tx.Bind(core.FixedResourceBinding{CloudID: server.CloudID, ImmutableID: server.ImmutableID}); err != nil {
 			return core.LeaseTarget{}, err
 		}
-		server, err := client.WaitForServerIP(ctx, name)
+		// Capture genuine companion identities while the VM still proves their
+		// links, before any readiness publication or interruptible access wait.
+		prepared, err := client.PrepareOwnedServer(ctx, fixedAzureCleanupServer(server, *claim))
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if !core.HasAzureCleanupBinding(prepared.Labels) {
+			return core.LeaseTarget{}, core.Exit(4, "Azure fixed preparation did not capture cleanup identities")
+		}
+		if err := validateFixedAzureCompanions(*claim, prepared); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if err := tx.Bind(core.FixedResourceBinding{Labels: prepared.Labels}); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		server, err = client.WaitForServerIP(ctx, name)
 		if err != nil {
 			return core.LeaseTarget{}, err
 		}
 		if err := validateFixedAzureServer(*claim, server); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if err := core.ValidateAzureVMUserAssignedIdentity(server, cfg.Azure.UserAssignedIdentityResourceID); err != nil {
 			return core.LeaseTarget{}, err
 		}
 		target := core.SSHTargetFromConfig(cfg, core.AzureServerHost(server, cfg.Azure.Network))
@@ -131,12 +182,49 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 		if err := client.SetTags(ctx, name, server.Labels); err != nil {
 			return core.LeaseTarget{}, err
 		}
-		return core.LeaseTarget{Server: server, SSH: target, LeaseID: claim.LeaseID}, nil
+		return core.LeaseTarget{Server: fixedAzureCleanupServer(server, *claim), SSH: target, LeaseID: claim.LeaseID}, nil
 	}})
 	if err == nil && req.OnAcquired != nil {
 		err = req.OnAcquired(lease)
 	}
 	return lease, err
+}
+
+// Cleanup identities are local claim facts, not Azure tags. Always reuse the
+// original capture rather than adopting replacement companions on replay.
+func fixedAzureCleanupServer(server core.Server, claim core.LeaseClaim) core.Server {
+	server.Labels = maps.Clone(server.Labels)
+	if server.Labels == nil {
+		server.Labels = make(map[string]string)
+	}
+	for key := range server.Labels {
+		if strings.HasPrefix(key, "_crabbox_azure_cleanup_") {
+			delete(server.Labels, key)
+		}
+	}
+	for key, value := range claim.Labels {
+		if strings.HasPrefix(key, "_crabbox_azure_cleanup_") {
+			server.Labels[key] = value
+		}
+	}
+	return server
+}
+
+func validateFixedAzureCompanions(claim core.LeaseClaim, server core.Server) error {
+	// Owned cleanup may return no snapshot after proving every slot absent;
+	// that path adopts no resources. Acquisition requires a snapshot first.
+	if claim.FixedCreateIntent == nil || !core.HasAzureCleanupBinding(server.Labels) {
+		return nil
+	}
+	for key, expected := range map[string]string{
+		azureCleanupNICIdentityLabel:      claim.FixedCreateIntent.Attempt["pre_vm_nic_guid"],
+		azureCleanupPublicIPIdentityLabel: claim.FixedCreateIntent.Attempt["pre_vm_public_ip_guid"],
+	} {
+		if expected != "" && server.Labels[key] != expected {
+			return errors.New("Azure fixed companion differs from its original pre-VM identity")
+		}
+	}
+	return nil
 }
 
 func validateFixedAzureServer(claim core.LeaseClaim, server core.Server) error {
@@ -159,6 +247,9 @@ func (b *azureLeaseBackend) resolveFixed(ctx context.Context, client azureClient
 	if !exists || claim.FixedCreateIntent == nil {
 		return core.LeaseTarget{}, false, nil
 	}
+	if claim.RecoveryHold != nil {
+		return core.LeaseTarget{}, true, core.Exit(4, "recovery_required: Azure lease %s is held for salvage", claim.LeaseID)
+	}
 	if claim.ProviderScope != client.LeaseClaimScope() {
 		return core.LeaseTarget{}, true, core.Exit(4, "Azure fixed lease account scope changed")
 	}
@@ -170,6 +261,12 @@ func (b *azureLeaseBackend) resolveFixed(ctx context.Context, client azureClient
 		server, err := client.GetServer(ctx, claim.FixedCreateIntent.Attempt["name"])
 		if err == nil {
 			err = validateFixedAzureServer(claim, server)
+			if err == nil && !req.ReleaseOnly {
+				err = core.ValidateAzureVMUserAssignedIdentity(server, b.Cfg.Azure.UserAssignedIdentityResourceID)
+				if err == nil {
+					err = core.ValidateAzureVMUserAssignedIdentity(server, claim.FixedCreateIntent.Attempt[fixedAzureUserAssignedIdentityAttempt])
+				}
+			}
 		}
 		return server, err
 	})
@@ -181,9 +278,10 @@ func (b *azureLeaseBackend) resolveFixed(ctx context.Context, client azureClient
 		return core.LeaseTarget{}, true, err
 	}
 	if claim.CloudImmutableID == "" && req.ReleaseOnly {
-		next := claim
-		next.CloudID, next.CloudImmutableID = server.CloudID, server.ImmutableID
-		if _, err := core.ReplaceLeaseClaimIfUnchangedDurableReturning(claim.LeaseID, claim, next); err != nil {
+		_, err := core.CompareAndBindFixedClaim(claim, func(next *core.LeaseClaim, persist func() error) error {
+			return core.BindFixedClaim(next, core.FixedResourceBinding{CloudID: server.CloudID, ImmutableID: server.ImmutableID, ImageEvidence: claim.ImageEvidence}, persist)
+		})
+		if err != nil {
 			return core.LeaseTarget{}, true, err
 		}
 	}
@@ -200,6 +298,11 @@ func (b *azureLeaseBackend) RetainLeaseClaimAfterReleaseWithClaim(lease core.Lea
 }
 
 func (b *azureLeaseBackend) resolvedAzureLease(server core.Server, target core.SSHTarget, leaseID string, releaseOnly bool) (core.LeaseTarget, error) {
+	if !releaseOnly {
+		if err := core.ValidateAzureVMUserAssignedIdentity(server, b.Cfg.Azure.UserAssignedIdentityResourceID); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
 	if server.Labels["fixed_attempt"] != "" {
 		claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
 		if err != nil {
@@ -210,6 +313,11 @@ func (b *azureLeaseBackend) resolvedAzureLease(server core.Server, target core.S
 		}
 		if err := validateFixedAzureServer(claim, server); err != nil {
 			return core.LeaseTarget{}, err
+		}
+		if !releaseOnly {
+			if err := core.ValidateAzureVMUserAssignedIdentity(server, claim.FixedCreateIntent.Attempt[fixedAzureUserAssignedIdentityAttempt]); err != nil {
+				return core.LeaseTarget{}, err
+			}
 		}
 	}
 	return b.ResolvedLeaseTarget(server, target, leaseID, releaseOnly)

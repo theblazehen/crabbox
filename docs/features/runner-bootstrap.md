@@ -43,10 +43,28 @@ Bootstrap creates:
 - shared package cache directories `/var/cache/crabbox/pnpm` and
   `/var/cache/crabbox/npm`.
 
-After writing the SSH port configuration, bootstrap reloads systemd and restarts
-the active `ssh.socket`, or the SSH service on images without socket activation.
-This also runs on prepared images that skip package installation: restarting only
-the service would keep the socket's previous listening ports.
+The minimal bootstrap runs in `crabbox-bootstrap.service`, after cloud-config
+has written files, created users, and configured APT, and after networking is
+online. Cloud-init's early `bootcmd` queues this unit once per instance without
+waiting for `multi-user.target` or cloud-final. An ordinary reboot does not rerun
+the instance bootstrap. Output remains available in the systemd journal and
+`/var/log/cloud-init-output.log`; cloud-final also observes the unit's result.
+
+The direct GCP expiry timer is armed in the early unit. Desktop, browser,
+Tailscale, and other optional setup retains cloud-final
+ordering. The `bootstrapped` marker is published only after every required phase
+and capability check succeeds. `crabbox-ready` still requires this marker and
+reruns the same checks. The per-boot workspace observation follows the early
+unit, plus cloud-final when optional setup is required.
+
+Bootstrap compares the configured SSH ports with the live SSH listeners before
+changing services. When a required listener is missing or cannot be inspected,
+it reloads systemd and restarts the active `ssh.socket`, or the SSH service on
+images without socket activation. Matching listeners avoid a restart, including
+on prepared images that skip package installation. Socket activation must be
+reconciled at the socket because service restarts inherit its listening ports.
+Already-enabled SSH services skip repeated enablement, and workspace-unit
+enablement shares one explicit systemd reload.
 
 Bootstrap installs only a small base set with `--no-install-recommends`:
 
@@ -61,6 +79,13 @@ Bootstrap installs only a small base set with `--no-install-recommends`:
 
 `apt-get` runs are wrapped in a retry loop (8 attempts, increasing backoff) so a
 transient mirror failure does not fail the whole boot.
+
+Both bootstrap phases run package hooks with `NEEDRESTART_MODE=l`: pending
+service restarts are reported, while Crabbox explicitly starts its required
+services. Automatically restarting Ubuntu 26.04's `cloud-init-main.service`
+between stages strands cloud-final and prevents optional desktop/browser setup
+from running. This setting is scoped to the bootstrap processes; later operator
+package operations keep the image's normal restart policy.
 
 The minimal bootstrap's APT refresh skips translation, AppStream DEP-11, and
 command-not-found indexes through command-local APT options. These auxiliary
@@ -89,7 +114,20 @@ temporary directory on success or failure. Cold bootstrap installs and claims
 only `linux-minimal`; an image producer claims `linux-builder` only after every
 minimal and builder probe passes.
 
-Bootstrap skips baseline APT only when the exact canonical manifest bytes,
+The standalone script also supports `--verify linux-minimal` and
+`--verify linux-builder`. Verification requires the exact requested profile and
+validates manifest trust and canonical bytes before running probes. It does not
+escalate privileges, install packages, rewrite evidence, or downgrade the profile.
+Developer-image preparation and publication require `linux-builder`.
+
+Scratch containment preserves the original v1 probe bytes and builder manifest
+digest. Existing valid builder images and newly produced manifests therefore
+retain the same canonical-byte contract across older and newer CLI/coordinator
+consumers; each consumer still runs its own probes. This does not add `--verify`
+to older installed scripts. Preparation and publication must use the updated
+standalone script from the same trusted source as the installer and publisher.
+
+Bootstrap skips baseline APT on prepared images when the exact canonical manifest bytes,
 root-owned non-symlink path, root group, `0644` file mode, bounded file size,
 non-writable parent directories, and every declared profile probe are verified.
 Named probe commands use only the sanitized system PATH
@@ -108,6 +146,17 @@ and renamed into the legacy directory without following the destination. If the
 legacy directory does not exist yet, the marker writer first verifies its
 ancestors and creates it root-owned with mode `0755`; existing safe directories
 owned by the runtime user remain valid.
+A stock image with neither a readiness manifest nor a legacy marker also skips
+baseline APT when every minimal capability probe passes. This check runs at the
+start of the baseline package stage, before any refresh or install, uses the same
+sanitized system PATH and real command probes, and writes the canonical readiness
+manifest and compatibility marker only after success. It does not invoke dpkg or
+trust package names alone. An existing invalid manifest or legacy marker still
+takes the repair/install path; it cannot select this stock-image shortcut.
+`package_update` and `package_upgrade` remain false in cloud-init. Missing tools
+still run the existing explicit APT refresh/install with retries; stock images
+missing even one baseline tool should not be expected to boot faster.
+
 Missing tools are installed normally or fail visibly if installation is
 unavailable. Optional browser, desktop, and Tailscale installation remains
 independent.
@@ -354,7 +403,7 @@ Edit `recipes/bootstrap/v1/` rather than the generated Go or TypeScript files:
   aliases after case/separator normalization, and image metadata. Provider
   adapters still choose images and architecture-specific behavior; the catalog
   does not choose providers or change fallback policy. For example, Ubuntu
-  26.04 retains its existing Hetzner 24.04 mapping.
+  26.04 maps to Hetzner's published `ubuntu-26.04` image.
 - `artifacts.json` defines pinned URLs, versions, SHA-256 digests, and the browser
   signing-key fingerprint. The generator produces constants for both runtimes,
   including the existing Tailscale default exports. Runtime override lookup and

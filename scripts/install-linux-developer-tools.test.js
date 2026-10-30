@@ -50,7 +50,7 @@ install_go_toolchain
     );
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout.includes("go-installed"), expected);
-    assert.equal(result.stdout.includes("archive=go1.27.0.linux-amd64.tar.gz"), expected);
+    assert.equal(result.stdout.includes("archive=go1.27.3.linux-amd64.tar.gz"), expected);
   });
 }
 
@@ -83,7 +83,11 @@ test("linux developer image executes the standalone producer and stops when capa
   );
   writeExecutable(
     path.join(scriptRoot, "linux-readiness.generated.sh"),
-    `#!/usr/bin/env bash\nprintf 'verified\\n' >${JSON.stringify(marker)}\nexit \"\${CRABBOX_FAKE_PRODUCER_EXIT:-0}\"\n`,
+    `#!/usr/bin/env bash
+printf '%s\\n' "$*" >>${JSON.stringify(marker)}
+if [[ "\${1:-}" == --verify ]]; then exit "\${CRABBOX_FAKE_VERIFY_EXIT:-0}"; fi
+exit "\${CRABBOX_FAKE_PRODUCER_EXIT:-0}"
+`,
   );
   const shell = `set -euo pipefail
 source ${JSON.stringify(path.join(scriptRoot, "install.sh"))}
@@ -94,7 +98,7 @@ sync() { return 0; }
 prepare_fast_boot`;
   const successful = spawnSync("bash", ["-c", shell], { cwd: repoRoot, encoding: "utf8" });
   assert.equal(successful.status, 0, successful.stderr || successful.stdout);
-  assert.equal(fs.readFileSync(marker, "utf8"), "verified\n");
+  assert.equal(fs.readFileSync(marker, "utf8"), "\n--verify linux-builder\n");
   assert.equal(fs.readFileSync(cleaned, "utf8"), "cleaned\n");
   fs.unlinkSync(cleaned);
   const failed = spawnSync("bash", ["-c", shell], {
@@ -104,6 +108,13 @@ prepare_fast_boot`;
   });
   assert.equal(failed.status, 73, failed.stderr || failed.stdout);
   assert.equal(fs.existsSync(cleaned), false);
+  const downgraded = spawnSync("bash", ["-c", shell], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { ...process.env, CRABBOX_FAKE_VERIFY_EXIT: "74" },
+  });
+  assert.equal(downgraded.status, 74, downgraded.stderr || downgraded.stdout);
+  assert.equal(fs.existsSync(cleaned), false, "minimal producer success must not reach cleanup");
 });
 
 test("linux developer image cloud-init cleanup preserves current-boot facts", async (t) => {
@@ -933,7 +944,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 cat > "$output_dir/trufflehog" <<'SCRIPT'
 #!/usr/bin/env bash
-printf 'trufflehog %s\n' "\${CRABBOX_FAKE_TRUFFLEHOG_VERSION:-3.95.9}"
+printf 'trufflehog %s\n' "\${CRABBOX_FAKE_TRUFFLEHOG_VERSION:-3.99.4}"
 SCRIPT
 chmod 0755 "$output_dir/trufflehog"
 `,
@@ -963,17 +974,17 @@ test("linux developer image installs pinned TruffleHog after checksum verificati
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	assert.match(
 		fs.readFileSync(fixture.downloadLog, "utf8"),
-		/trufflehog\/releases\/download\/v3\.95\.9\/trufflehog_3\.95\.9_linux_amd64\.tar\.gz/,
+		/trufflehog\/releases\/download\/v3\.99\.4\/trufflehog_3\.99\.4_linux_amd64\.tar\.gz/,
 	);
 	assert.match(
 		fs.readFileSync(fixture.checksumLog, "utf8"),
-		/^f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e  trufflehog_3\.95\.9_linux_amd64\.tar\.gz\n$/,
+		/^5ae9b313342d1bfa96404064c0f59e77a2cbd1824d797ca7b11e6655aa8fd9d1  trufflehog_3\.99\.4_linux_amd64\.tar\.gz\n$/,
 	);
 	assert.equal(
 		spawnSync(path.join(fixture.targetBin, "trufflehog"), ["--version"], {
 			encoding: "utf8",
 		}).stdout,
-		"trufflehog 3.95.9\n",
+		"trufflehog 3.99.4\n",
 	);
 });
 
@@ -981,7 +992,7 @@ test("linux developer image re-verifies an existing same-version TruffleHog bina
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-linux-trufflehog-existing-"));
 	const fixture = installTruffleHogFixture(dir);
 	const target = path.join(fixture.targetBin, "trufflehog");
-	writeExecutable(target, "#!/usr/bin/env bash\nprintf 'trufflehog 3.95.9\\n'\nprintf 'untrusted\\n'\n");
+	writeExecutable(target, "#!/usr/bin/env bash\nprintf 'trufflehog 3.99.4\\n'\nprintf 'untrusted\\n'\n");
 	const result = spawnSync(
 		"bash",
 		["-c", "set -euo pipefail\nsource scripts/install-linux-developer-tools.sh\ninstall_trufflehog"],
@@ -999,10 +1010,10 @@ test("linux developer image re-verifies an existing same-version TruffleHog bina
 	);
 
 	assert.equal(result.status, 0, result.stderr || result.stdout);
-	assert.match(fs.readFileSync(fixture.downloadLog, "utf8"), /trufflehog_3\.95\.9_linux_amd64/);
+	assert.match(fs.readFileSync(fixture.downloadLog, "utf8"), /trufflehog_3\.99\.4_linux_amd64/);
 	assert.equal(
 		spawnSync(target, ["--version"], { encoding: "utf8" }).stdout,
-		"trufflehog 3.95.9\n",
+		"trufflehog 3.99.4\n",
 	);
 });
 
@@ -1068,11 +1079,11 @@ test("linux developer image reports TruffleHog from the configured install direc
 	fs.writeFileSync(osRelease, "PRETTY_NAME='Test Linux'\n", "utf8");
 	writeExecutable(
 		path.join(fixture.targetBin, "trufflehog"),
-		"#!/usr/bin/env bash\nprintf 'trufflehog 3.95.9\\n'\n",
+		"#!/usr/bin/env bash\nprintf 'trufflehog 3.99.4\\n'\n",
 	);
 	writeExecutable(
 		path.join(goLinkDir, "go"),
-		"#!/usr/bin/env bash\nprintf 'go version go1.27.0 linux/amd64\\n'\n",
+		"#!/usr/bin/env bash\nprintf 'go version go1.27.3 linux/amd64\\n'\n",
 	);
 	for (const command of [
 		"git",
@@ -1086,6 +1097,11 @@ test("linux developer image reports TruffleHog from the configured install direc
 		"corepack",
 		"pnpm",
 		"bun",
+		"rustc",
+		"cargo",
+		"rustdoc",
+		"uv",
+		"uvx",
 		"docker",
 	]) {
 		writeExecutable(
@@ -1123,10 +1139,13 @@ test("linux developer image reports TruffleHog from the configured install direc
 	);
 
 	assert.equal(result.status, 0, result.stderr || result.stdout);
-	assert.match(result.stdout, /go version go1\.27\.0 linux\/amd64/);
+	assert.match(result.stdout, /go version go1\.27\.3 linux\/amd64/);
 	assert.match(result.stdout, /bun test-version/);
+	for (const command of ["rustc", "cargo", "rustdoc", "uv", "uvx"]) {
+		assert.match(result.stdout, new RegExp(`${command} test-version`));
+	}
 	assert.match(result.stdout, new RegExp(`${fixture.bin}/bunx`));
-	assert.match(result.stdout, /trufflehog 3\.95\.9/);
+	assert.match(result.stdout, /trufflehog 3\.99\.4/);
 });
 
 test("linux developer image keeps pinned TruffleHog probes update-free", () => {
@@ -1151,6 +1170,7 @@ install_requested_node() { echo requested-node; }
 node() { printf 'v%s.0.0\\n' "$node_major"; }
 npm() { echo npm-version; }
 corepack() { printf 'corepack=%s\\n' "$*"; }
+install_rust_uv_toolchain() { echo unexpected-rust-uv; return 93; }
 main --node-only
 main --node-only
 `], { cwd: repoRoot, env: { PATH: process.env.PATH, CRABBOX_LINUX_NODE_MAJOR: major }, encoding: "utf8" });
@@ -1159,11 +1179,11 @@ main --node-only
     assert.match(result.stdout, /packages=ca-certificates curl gnupg python3-minimal xz-utils/);
     if (major === "24") {
       assert.equal(result.stdout.split("pinned-node").length - 1, 2);
-      assert.match(result.stdout, /archives=node-v24\.19\.0-linux-x64\.tar\.xz/);
+      assert.match(result.stdout, /archives=node-v24\.22\.1-linux-x64\.tar\.xz/);
     } else {
       assert.equal(result.stdout.split("requested-node").length - 1, 2);
     }
-    assert.doesNotMatch(result.stdout, /pnpm-.*tgz|corepack=prepare|docker|chrome|go1\./);
+    assert.doesNotMatch(result.stdout, /pnpm-.*tgz|corepack=prepare|docker|chrome|go1\.|unexpected-rust-uv/);
     assert.match(result.stderr, /Node baseline installed in \d+s/);
   });
 }
@@ -1180,3 +1200,36 @@ install_node_runtime || exit $?
   assert.equal(result.status, 41, result.stderr);
   assert.doesNotMatch(result.stdout, /unexpected-install/);
 });
+
+for (const [failure, expected] of [["runtime", 42], ["activate", 43], ["", 0]]) {
+  test(`pnpm conditional installation preserves ${failure || "success"} result`, () => {
+    const result = spawnSync("bash", ["-c", `
+source scripts/install-linux-developer-tools.sh
+install_node_runtime() { echo runtime >&2; [[ "$FAIL" != runtime ]] || return 42; }
+pinned_node_supported() { return 1; }
+corepack() { echo activate >&2; [[ "$FAIL" != activate ]] || return 43; }
+command() { echo verify >&2; builtin command "$@"; }
+pnpm() { :; }
+if install_node_pnpm; then echo complete; else exit $?; fi
+`], { cwd: repoRoot, env: { PATH: process.env.PATH, FAIL: failure }, encoding: "utf8", timeout: 10_000 });
+    assert.equal(result.status, expected, result.stderr);
+    if (failure) assert.doesNotMatch(result.stdout, /complete/);
+    if (failure === "runtime") assert.doesNotMatch(result.stderr, /activate|verify/);
+    if (failure === "activate") assert.doesNotMatch(result.stderr, /verify/);
+  });
+}
+
+for (const missing of ["npm", "corepack"]) {
+  test(`conditional Node runtime rejects missing ${missing} before activation`, () => {
+    const result = spawnSync("bash", ["-c", `
+source scripts/install-linux-developer-tools.sh
+pinned_node_supported() { return 1; }
+apt_install() { :; }
+command() { [[ "$*" != "-v $MISSING" ]] || return 71; builtin command "$@"; }
+corepack() { echo unexpected-enable; }
+if install_node_pnpm; then echo unexpected-success; else exit $?; fi
+`], { cwd: repoRoot, env: { PATH: process.env.PATH, MISSING: missing }, encoding: "utf8", timeout: 10_000 });
+    assert.equal(result.status, 71, result.stderr);
+    assert.doesNotMatch(result.stdout, /unexpected-/);
+  });
+}

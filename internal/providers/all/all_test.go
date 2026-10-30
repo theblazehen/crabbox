@@ -121,7 +121,7 @@ func TestManualBatchBCodespacesGenericTypeInput(t *testing.T) {
 }
 
 func TestProviderActionsRunnerRestrictions(t *testing.T) {
-	restricted := map[string]bool{"local-container": true, "apple-container": true, "multipass": true}
+	restricted := map[string]bool{"local-container": true, "apple-container": true, "multipass": true, "serve": true, "ssh-host": true}
 	for _, name := range core.RegisteredProviderNames() {
 		provider, err := core.ProviderFor(name)
 		if err != nil {
@@ -796,6 +796,7 @@ func TestProviderKindFeatureContracts(t *testing.T) {
 		}
 		for _, feature := range []core.Feature{
 			core.FeatureModuleRun,
+			core.FeatureShellScriptRun,
 			core.FeatureRunProof,
 			core.FeatureRunArtifacts,
 			core.FeatureRunDownloads,
@@ -854,7 +855,7 @@ func TestArchiveSyncFeatureGatesDelegatedSyncOptions(t *testing.T) {
 	}
 }
 
-func TestModuleRunFeatureGatesScriptMode(t *testing.T) {
+func TestDelegatedScriptFeaturesGateScriptMode(t *testing.T) {
 	checked := 0
 	script := &core.RunScriptSpec{Source: "worker.mjs", Data: []byte("export default {}")}
 	for _, name := range allBuiltInProviderNames() {
@@ -883,8 +884,21 @@ func TestModuleRunFeatureGatesScriptMode(t *testing.T) {
 			checked++
 			continue
 		}
+		if spec.Features.Has(core.FeatureShellScriptRun) {
+			if err != nil {
+				t.Fatalf("%s advertises %s but rejects script mode: %v", name, core.FeatureShellScriptRun, err)
+			}
+			if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+				ScriptRequested: true,
+				Script:          &core.RunScriptSpec{Source: "script.sh", Data: []byte("printf '%s' \"$1\"")},
+				Command:         []string{"argument"},
+			}); err != nil {
+				t.Fatalf("%s rejects shell-script arguments: %v", name, err)
+			}
+			continue
+		}
 		if err == nil {
-			t.Fatalf("%s accepts script mode without %s", name, core.FeatureModuleRun)
+			t.Fatalf("%s accepts script mode without %s or %s", name, core.FeatureModuleRun, core.FeatureShellScriptRun)
 		}
 	}
 	if checked == 0 {
@@ -1433,6 +1447,8 @@ func offlineConformanceConfig(provider string) (core.Config, bool) {
 	cfg := core.BaseConfig()
 	cfg.Provider = provider
 	switch provider {
+	case "azure-sandbox":
+		return cfg, true
 	case "agent-sandbox", "agent-sandbox-ssh":
 		cfg.AgentSandbox.Context = "agent-context"
 		cfg.AgentSandbox.WarmPool = "linux-pool"
@@ -1503,6 +1519,7 @@ func allBuiltInProviderNames() []string {
 		"aws-lambda-microvm",
 		"azure",
 		"azure-dynamic-sessions",
+		"azure-sandbox",
 		"blaxel",
 		"blacksmith-testbox",
 		"boxd",
@@ -1559,9 +1576,11 @@ func allBuiltInProviderNames() []string {
 		"anthropic-sandbox-runtime",
 		"semaphore",
 		"sealos-devbox",
+		"serve",
 		"smolvm",
 		"sprites",
 		"ssh",
+		"ssh-host",
 		"superserve",
 		"tart",
 		"tencentcloud",

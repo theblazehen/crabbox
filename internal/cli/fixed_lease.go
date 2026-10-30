@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,9 @@ func lockFixedLeaseAcquisition(ctx context.Context, leaseID string) (func(), err
 }
 
 type FixedLeaseBinding struct {
+	// InitialLabels preserve provider ownership and cleanup metadata even if
+	// planning fails before the native attempt is published. Replays ignore them.
+	InitialLabels       map[string]string
 	AllocateSlug        bool
 	RejectExistingLease bool
 	RequestedSlug       string
@@ -41,6 +45,7 @@ type FixedLeaseBinding struct {
 }
 
 type FixedAcquireOptions struct {
+	Retention    *SessionDiskRetentionPolicy
 	Kind         FixedLeaseKind
 	LeaseID      string
 	CheckpointID string
@@ -92,6 +97,9 @@ func AcquireFixedIntent(
 	acquire func(context.Context, *LeaseClaim, *FixedCreateIntent, func() error) error,
 	ctx context.Context,
 ) (LeaseClaim, error) {
+	if opts.Retention != nil && !opts.journal {
+		return LeaseClaim{}, Exit(4, "retained acquisition requires the fixed resource journal owner")
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -125,7 +133,7 @@ func AcquireFixedIntent(
 			}
 		}
 		if exists {
-			if claim.FixedCreateIntent == nil ||
+			if claim.FixedCreateIntent == nil || !reflect.DeepEqual(claim.FixedCreateIntent.Retention, opts.Retention) ||
 				claim.FixedCreateIntent.Version != opts.Kind.IntentVersion ||
 				claim.FixedCreateIntent.Fingerprint != binding.Fingerprint ||
 				claim.FixedCreateIntent.ProviderScope != binding.ProviderScope {
@@ -149,8 +157,10 @@ func AcquireFixedIntent(
 			claim.ClaimedAt = current.Format(time.RFC3339)
 			claim.LastUsedAt = claim.ClaimedAt
 			claim.IdleTimeoutSeconds = int(opts.IdleTimeout.Seconds())
+			claim.Labels = maps.Clone(binding.InitialLabels)
 			claim.FixedCreateIntent = &FixedCreateIntent{
 				Version:       opts.Kind.IntentVersion,
+				Retention:     opts.Retention,
 				Fingerprint:   binding.Fingerprint,
 				ProviderScope: binding.ProviderScope,
 				CheckpointID:  opts.CheckpointID,
@@ -160,6 +170,11 @@ func AcquireFixedIntent(
 			}
 			if opts.journal {
 				claim.FixedCreateIntent.Journal = &FixedLeaseJournal{Version: 1, Phase: "prepared", Revision: 1}
+				if opts.Retention != nil {
+					if err := initializeSessionDiskRetention(claim.FixedCreateIntent, opts.LeaseID, current); err != nil {
+						return err
+					}
+				}
 			}
 			if err := persist(); err != nil {
 				return err
@@ -174,7 +189,7 @@ func AcquireFixedIntent(
 		if err != nil {
 			return Exit(4, "lease_id_conflict: lease %s has invalid fixed create timestamp", opts.LeaseID)
 		}
-		if opts.TTL > 0 && now().UTC().After(createdAt.Add(opts.TTL)) {
+		if opts.Retention == nil && opts.TTL > 0 && now().UTC().After(createdAt.Add(opts.TTL)) {
 			return Exit(4, "lease_id_conflict: fixed create intent for lease %s has expired", opts.LeaseID)
 		}
 
@@ -184,7 +199,8 @@ func AcquireFixedIntent(
 		claim.LastUsedAt = now().UTC().Format(time.RFC3339)
 		intent.State = "acquired"
 		if intent.Journal != nil && intent.Journal.Phase != "acquired" {
-			intent.Journal = &FixedLeaseJournal{Version: 1, Phase: "acquired", Revision: intent.Journal.Revision + 1, Submission: intent.Journal.Submission}
+			intent.Journal.Phase = "acquired"
+			intent.Journal.Revision++
 		}
 		if err := persist(); err != nil {
 			return err

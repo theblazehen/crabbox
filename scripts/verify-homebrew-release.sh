@@ -26,6 +26,7 @@ PROTECTED_HOMEBREW_TOOLING=(
   scripts/verify-go-release-binary.mjs
   scripts/verify-homebrew-release.sh
   scripts/verify-macos-binary.sh
+  scripts/verify-macos-notarization.mjs
   scripts/verify-release.sh
   scripts/verify-release-source.sh
 )
@@ -108,7 +109,7 @@ assert_clean_homebrew_environment() {
     case "$name" in
       CRABBOX_HOMEBREW_CLEAN_CHILD | \
         CRABBOX_VERIFY_TOOLING_COMMIT | \
-        HOME | HOMEBREW_CACHE | HOMEBREW_NO_ANALYTICS | HOMEBREW_NO_AUTO_UPDATE | \
+        HOME | XDG_CONFIG_HOME | HOMEBREW_CACHE | HOMEBREW_NO_ANALYTICS | HOMEBREW_NO_AUTO_UPDATE | \
         HOMEBREW_NO_ENV_HINTS | HOMEBREW_NO_INSTALL_CLEANUP | \
         LC_ALL | LOGNAME | NONINTERACTIVE | PATH | PWD | SHLVL | TMPDIR | USER) ;;
       *)
@@ -228,13 +229,20 @@ freeze_public_release() {
     cp "$asset_dir/$name" "$frozen/$name"
   done <"$expected_names"
 
-  public_api_get() {
+  # Hosted workflows fetch metadata in a separate read-only authenticated step.
+  # Only the response enters this verifier; validation below is identical.
+  if [[ -n "${CRABBOX_HOMEBREW_RELEASE_METADATA+x}" ]]; then
+    [[ -f "$CRABBOX_HOMEBREW_RELEASE_METADATA" && ! -L "$CRABBOX_HOMEBREW_RELEASE_METADATA" ]] || {
+      echo "public release metadata must be a regular file, not a symlink" >&2
+      return 1
+    }
+    cp "$CRABBOX_HOMEBREW_RELEASE_METADATA" "$work/public-release.json"
+  else
     curl --disable --fail --silent --show-error --location --retry 3 \
       --header 'Accept: application/vnd.github+json' \
       --header 'X-GitHub-Api-Version: 2026-03-10' \
-      "https://api.github.com/$1"
-  }
-  public_api_get "repos/$repository/releases/$release_id" >"$work/public-release.json"
+      "https://api.github.com/repos/$repository/releases/$release_id" >"$work/public-release.json"
+  fi
   env -i \
     CRABBOX_PUBLISH_REPOSITORY="$repository" \
     CRABBOX_PUBLISH_RELEASE_ID="$release_id" \
@@ -338,6 +346,12 @@ homebrew_phase() {
     return 1
   }
 
+  [[ "${XDG_CONFIG_HOME:-}" == "$work/home/.config" &&
+    -d "$XDG_CONFIG_HOME" && ! -L "$XDG_CONFIG_HOME" ]] || {
+    echo "Homebrew verification must use a real work-local XDG config directory" >&2
+    return 1
+  }
+
   # Repeat the protected-record decision inside the credential-free child so
   # direct/private-phase invocation cannot bypass a newly blocked release.
   require_publishable_source "$tag" "$tag_object" "$source_commit" "$verifier_commit"
@@ -360,6 +374,9 @@ homebrew_phase() {
   local metadata_file="$work/formula.json"
   "$brew_bin" tap openclaw/tap
   "$brew_bin" update --force
+  # Authorize only this maintained formula in the credential-free workspace.
+  # Homebrew requires explicit trust before it can load non-official formulae.
+  "$brew_bin" trust --formula "$FORMULA"
   # Tap maintainers own executable formulae; metadata is not a Ruby sandbox.
   "$brew_bin" info --json=v2 --formula "$FORMULA" >"$metadata_file"
   verify_homebrew_formula "$node_bin" "$metadata_file" "$tag" "$archive_name" "$archive_sha"
@@ -390,8 +407,9 @@ homebrew_phase() {
   local runtime_pack
   runtime_pack=$("$node_bin" -e '
     const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
-    if (![1, 2, 3].includes(p.schemaVersion)) throw new Error("unsupported release provenance schema");
-    process.stdout.write(p.schemaVersion === 3 ? "filesystem" : p.schemaVersion === 2 ? "true" : "false");
+    if (![1, 2, 3, 4].includes(p.schemaVersion)) throw new Error("unsupported release provenance schema");
+    // Schema 4 (egress) ships the same archive inventory as schema 3 (filesystem).
+    process.stdout.write(p.schemaVersion >= 3 ? "filesystem" : p.schemaVersion === 2 ? "true" : "false");
   ' "$asset_dir/provenance.json")
   local expected_members=crabbox
   [[ "$native_arch" == arm64 ]] && expected_members=$'crabbox\ncrabbox-apple-vm-helper'
@@ -537,6 +555,9 @@ main() {
   homebrew_home="$work/home"
   homebrew_cache="$work/cache"
   mkdir -m 700 "$homebrew_home" "$homebrew_cache"
+  # Machine brew.env can redirect HOME-derived storage. Explicit XDG takes
+  # precedence and keeps formula authorization inside this cleanup tree.
+  mkdir -m 700 "$homebrew_home/.config"
   mkdir -m 700 "$work/public-preflight"
   freeze_public_release \
     "$tag" "$asset_dir" "$tag_object" "$source_commit" "$verifier_commit" \
@@ -564,6 +585,7 @@ main() {
   # shellcheck disable=SC2016 # Expanded by the credential-free child shell.
   /usr/bin/env -i \
     HOME="$homebrew_home" \
+    XDG_CONFIG_HOME="$homebrew_home/.config" \
     HOMEBREW_CACHE="$homebrew_cache" \
     USER="$user_name" \
     LOGNAME="$user_name" \

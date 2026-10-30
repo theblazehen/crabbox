@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   CheckpointError,
+  abortCheckpointProvisioningForLease,
   expireCheckpointClaims,
   backfillFailedCheckpointCreateRecovery,
   checkpointAuditRetentionMS,
@@ -58,7 +59,12 @@ afterEach(() => {
 class CheckpointMemoryStorage implements CoordinatorStorage {
   private values = new Map<string, unknown>();
   private transactionTail = Promise.resolve();
-  readonly lists: Array<{ prefix?: string; limit?: number; startAfter?: string }> = [];
+  readonly lists: Array<{
+    prefix?: string;
+    limit?: number;
+    startAfter?: string;
+    noCache?: boolean;
+  }> = [];
   failKey?: string;
 
   async get<T>(key: string): Promise<T | undefined> {
@@ -76,12 +82,13 @@ class CheckpointMemoryStorage implements CoordinatorStorage {
   }
 
   async list<T>(
-    options: { prefix?: string; limit?: number; startAfter?: string } = {},
+    options: { prefix?: string; limit?: number; startAfter?: string; noCache?: boolean } = {},
   ): Promise<Map<string, T>> {
     this.lists.push({
       ...(options.prefix ? { prefix: options.prefix } : {}),
       ...(options.limit ? { limit: options.limit } : {}),
       ...(options.startAfter ? { startAfter: options.startAfter } : {}),
+      ...(options.noCache ? { noCache: options.noCache } : {}),
     });
     const matches = [...this.values]
       .toSorted(([left], [right]) => left.localeCompare(right))
@@ -288,6 +295,7 @@ function providerImage(
 async function checkpointFixture(
   providerName: CoordinatorCheckpointProvider = "aws",
   overrides: Partial<Env> = {},
+  admissionDeadlineMs?: number,
 ) {
   const storage = new CheckpointMemoryStorage();
   const runtime = new CheckpointRuntime(storage);
@@ -306,7 +314,14 @@ async function checkpointFixture(
       providerImage(providerName, name, strategy, ownership),
   );
   const deleteImage = vi.spyOn(provider, "deleteCheckpointImage").mockResolvedValue(undefined);
-  const coordinator = new FleetCoordinator(runtime, env, { [providerName]: provider });
+  const coordinator = new FleetCoordinator(
+    runtime,
+    env,
+    { [providerName]: provider },
+    {},
+    undefined,
+    admissionDeadlineMs,
+  );
   await storage.put(`lease:${leaseID}`, checkpointLease(providerName));
   return { storage, runtime, coordinator, provider, deleteImage, env };
 }
@@ -448,8 +463,11 @@ describe("coordinator-managed checkpoints", () => {
     },
   );
 
-  async function fixedForkFixture(providerName: CoordinatorCheckpointProvider = "aws") {
-    const fixture = await checkpointFixture(providerName);
+  async function fixedForkFixture(
+    providerName: CoordinatorCheckpointProvider = "aws",
+    admissionDeadlineMs?: number,
+  ) {
+    const fixture = await checkpointFixture(providerName, {}, admissionDeadlineMs);
     const { coordinator, provider } = fixture;
     const checkpointID = "chk_fixed_fork";
     expect((await createCheckpoint(coordinator, checkpointID)).status).toBe(201);
@@ -513,6 +531,121 @@ describe("coordinator-managed checkpoints", () => {
     };
     return { ...fixture, checkpointID, body, begin, fork, create };
   }
+
+  it.each([
+    ["POST", 1],
+    ["POST", 3],
+    ["PUT", 1],
+    ["PUT", 3],
+  ] as const)(
+    "lease admission deadline covers checkpoint %s mutex wait %s",
+    async (method, turn) => {
+      vi.useFakeTimers();
+      const deadlineMs = 25;
+      const { coordinator, runtime, storage, body, begin, create } = await fixedForkFixture(
+        "aws",
+        deadlineMs,
+      );
+      const claim = await begin();
+      const path =
+        method === "POST"
+          ? "/v1/leases/from-checkpoint"
+          : `/v1/leases/${body.leaseID}/from-checkpoint`;
+      const createRequest = () =>
+        coordinator.fetch(
+          checkpointRequest(method, path, {
+            ...body,
+            checkpointUseClaim: claim,
+            ...(method === "POST" ? { createAttemptID: `cat_${"a".repeat(32)}` } : {}),
+          }),
+        );
+      const queued = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const exclusive = runtime.runExclusive.bind(runtime);
+      let acquisitions = 0;
+      let holder: Promise<void> | undefined;
+      vi.spyOn(runtime, "runExclusive").mockImplementation((callback) => {
+        if (++acquisitions === turn) {
+          holder = exclusive(() => release.promise);
+          queued.resolve();
+        }
+        return exclusive(callback);
+      });
+      let response: Response | undefined;
+      const pending = createRequest().then((result) => (response = result));
+      try {
+        await queued.promise;
+        const attemptBeforeExpiry = await storage.get(`create-attempt:${body.leaseID}`);
+        await vi.advanceTimersByTimeAsync(deadlineMs);
+        expect(response?.status).toBe(503);
+        expect(await response!.json()).toMatchObject({
+          error: "lease_admission_timeout",
+          retryable: true,
+        });
+        release.resolve();
+        await holder;
+        await exclusive(async () => undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await storage.get(`lease:${body.leaseID}`)).toBeUndefined();
+        expect(await storage.get(`create-attempt:${body.leaseID}`)).toEqual(attemptBeforeExpiry);
+        expect(create).not.toHaveBeenCalled();
+        expect((await createRequest()).status).toBe(201);
+        expect(create).toHaveBeenCalledOnce();
+      } finally {
+        release.resolve();
+        await holder;
+        await pending;
+      }
+    },
+  );
+
+  it("treats a bound checkpoint POST claim as committed admission", async () => {
+    vi.useFakeTimers();
+    const deadlineMs = 25;
+    const { coordinator, runtime, storage, body, begin, create } = await fixedForkFixture(
+      "aws",
+      deadlineMs,
+    );
+    const claim = await begin();
+    const queued = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const exclusive = runtime.runExclusive.bind(runtime);
+    let acquisitions = 0;
+    let holder: Promise<void> | undefined;
+    // The sixth acquisition is lease admission, after the checkpoint claim is bound.
+    vi.spyOn(runtime, "runExclusive").mockImplementation((callback) => {
+      if (++acquisitions === 6) {
+        holder = exclusive(() => release.promise);
+        queued.resolve();
+      }
+      return exclusive(callback);
+    });
+    let response: Response | undefined;
+    const pending = coordinator
+      .fetch(
+        checkpointRequest("POST", "/v1/leases/from-checkpoint", {
+          ...body,
+          checkpointUseClaim: claim,
+          createAttemptID: `cat_${"a".repeat(32)}`,
+        }),
+      )
+      .then((result) => (response = result));
+    try {
+      await queued.promise;
+      await vi.advanceTimersByTimeAsync(deadlineMs * 4);
+      expect(response).toBeUndefined();
+      release.resolve();
+      await holder;
+      await pending;
+      expect(response?.status).toBe(201);
+      expect(await storage.get(`lease:${body.leaseID}`)).toBeDefined();
+      expect(create).toHaveBeenCalledOnce();
+    } finally {
+      release.resolve();
+      await holder;
+      await pending;
+    }
+  });
 
   it.each(
     [
@@ -6189,6 +6322,42 @@ describe("coordinator-managed checkpoints", () => {
     expect(await storage.list({ prefix: `checkpoint-event:${checkpointID}:` })).toHaveLength(0);
   }, 20_000);
 
+  it("does not back off checkpoint tombstone batches that advance their audit cursor", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { coordinator, storage, runtime } = await checkpointFixture();
+    const checkpointID = "chk_alarm_prune_progress";
+    await createCheckpoint(coordinator, checkpointID);
+    expect(
+      (await coordinator.fetch(checkpointRequest("DELETE", `/v1/checkpoints/${checkpointID}`)))
+        .status,
+    ).toBe(200);
+    await storage.delete(`lease:${leaseID}`);
+    const record = (await storage.get<CoordinatorCheckpointRecord>(checkpointKey(checkpointID)))!;
+    await Promise.all(
+      Array.from({ length: 192 }, (_, index) =>
+        storage.put(checkpointEventKey(checkpointID, index + 1), {
+          checkpointID,
+          sequence: index + 1,
+          type: "checkpoint.audit.pruned",
+        }),
+      ),
+    );
+    await storage.put(checkpointKey(checkpointID), { ...record, eventSequence: 192 });
+    vi.setSystemTime(Date.now() + checkpointAuditRetentionMS + 1);
+    for (const remaining of [128, 64, 0]) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- each pass prunes one bounded audit batch.
+      await coordinator.alarm();
+      // oxlint-disable-next-line eslint/no-await-in-loop -- observe actual progress before the next delivery.
+      expect(await storage.list({ prefix: `checkpoint-event:${checkpointID}:` })).toHaveLength(
+        remaining,
+      );
+      expect(runtime.alarmTime).toBe(Date.now() + 1);
+    }
+    await coordinator.alarm();
+    expect(await storage.get(checkpointKey(checkpointID))).toBeUndefined();
+    expect(runtime.alarmTime).toBeUndefined();
+  });
+
   it("converges historical excess checkpoint audit events in bounded prune batches", async () => {
     const { coordinator, storage } = await checkpointFixture();
     const checkpointID = "chk_audit_converges";
@@ -6761,3 +6930,180 @@ describe("coordinator-managed checkpoints", () => {
     expect(await storage.get(checkpointKey(checkpointID))).toMatchObject({ activeUseCount: 0 });
   });
 });
+
+/* oxlint-disable eslint/no-await-in-loop -- seed and inspect ordered storage fixtures. */
+describe("bounded checkpoint storage scans", () => {
+  function pages(storage: CheckpointMemoryStorage, prefix: string) {
+    const reads = storage.lists.filter((read) => read.prefix === prefix);
+    expect(reads.length).toBeGreaterThan(1);
+    expect(reads.every((read) => read.limit === 128 && read.noCache === true)).toBe(true);
+    expect(reads.some((read) => read.startAfter !== undefined)).toBe(true);
+  }
+
+  async function ready() {
+    const fixture = await checkpointFixture();
+    expect((await createCheckpoint(fixture.coordinator, "chk_paged")).status).toBe(201);
+    const record = (await fixture.storage.get<CoordinatorCheckpointRecord>(
+      checkpointKey("chk_paged"),
+    ))!;
+    fixture.storage.lists.length = 0;
+    return { ...fixture, record };
+  }
+
+  async function claims(storage: CheckpointMemoryStorage, record: CoordinatorCheckpointRecord) {
+    for (let i = 0; i < 130; i += 1) {
+      await storage.put(`checkpoint-use:${record.id}:${String(i).padStart(4, "0")}`, {
+        checkpointID: record.id,
+        tokenHash: String(i),
+        owner: record.owner,
+        org: record.org,
+        generation: record.generation,
+        createdAt: record.createdAt,
+        expiresAt: new Date(Date.now() - 1).toISOString(),
+        state: "available",
+      } satisfies CoordinatorCheckpointUseClaim);
+    }
+    await storage.put(checkpointKey(record.id), { ...record, activeUseCount: 130 });
+  }
+
+  it("pages claim expiry and deadline calculation, retaining future and provisioning claims", async () => {
+    const { storage, record } = await ready();
+    await claims(storage, record);
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await storage.put(`checkpoint-use:${record.id}:zz_future`, {
+      checkpointID: record.id,
+      tokenHash: "future",
+      owner: record.owner,
+      org: record.org,
+      generation: record.generation,
+      createdAt: record.createdAt,
+      expiresAt: future,
+      state: "available",
+    } satisfies CoordinatorCheckpointUseClaim);
+    await storage.put(checkpointKey(record.id), { ...record, activeUseCount: 131 });
+    const result = await expireCheckpointClaims(storage, record.id);
+    expect(result).toMatchObject({ activeUseCount: 1, nextSweepAt: future });
+    expect(await storage.get(`checkpoint-use:${record.id}:0000`)).toBeUndefined();
+    expect(await storage.get(`checkpoint-use:${record.id}:zz_future`)).toBeDefined();
+    pages(storage, `checkpoint-use:${record.id}:`);
+  });
+
+  it("pages deletion claims and rolls back expired removals when a later claim is active", async () => {
+    const { storage, record } = await ready();
+    await claims(storage, record);
+    await storage.put(`checkpoint-use:${record.id}:zz_active`, {
+      state: "provisioning",
+      expiresAt: new Date(Date.now() - 1).toISOString(),
+    });
+    await expect(
+      claimCheckpointDeletion(
+        storage,
+        record.id,
+        { admin: true, owner: record.owner, org: record.org },
+        "manual",
+      ),
+    ).rejects.toThrow("active use claim");
+    expect(await storage.get(`checkpoint-use:${record.id}:0000`)).toBeDefined();
+    pages(storage, `checkpoint-use:${record.id}:`);
+    await storage.delete(`checkpoint-use:${record.id}:zz_active`);
+    const result = await claimCheckpointDeletion(
+      storage,
+      record.id,
+      { admin: true, owner: record.owner, org: record.org },
+      "manual",
+    );
+    expect(result.checkpoint.state).toBe("deleting");
+    expect(await storage.get(`checkpoint-use:${record.id}:0129`)).toBeUndefined();
+  });
+
+  it("pages the global abort lookup and stops after the first matching claim", async () => {
+    const { storage, record } = await ready();
+    await claims(storage, record);
+    const key = `checkpoint-use:${record.id}:0130`;
+    await storage.put(key, {
+      checkpointID: record.id,
+      tokenHash: "match",
+      owner: record.owner,
+      org: record.org,
+      generation: record.generation,
+      state: "provisioning",
+      leaseID: "target",
+      attemptID: "attempt",
+    });
+    for (let i = 131; i < 400; i += 1)
+      await storage.put(`checkpoint-use:${record.id}:${i}`, { state: "available" });
+    const result = await abortCheckpointProvisioningForLease(storage, "target", "attempt", {
+      owner: record.owner,
+      org: record.org,
+    });
+    expect(result?.activeUseCount).toBe(129);
+    expect(await storage.get(key)).toBeUndefined();
+    pages(storage, "checkpoint-use:");
+    expect(storage.lists.filter((read) => read.prefix === "checkpoint-use:")).toHaveLength(2);
+  });
+
+  it("pages resource ownership and pending intents while preserving exact matches and ambiguity", async () => {
+    const { storage, record } = await ready();
+    const image = record.image!;
+    for (const prefix of ["checkpoint-resource:aws:", "checkpoint-intent:aws:"]) {
+      for (let i = 0; i < 130; i += 1)
+        await storage.put(`${prefix}000-${String(i).padStart(4, "0")}`, {
+          scope: record.scope,
+          kind: image.kind,
+          resourceID: `unrelated-${i}`,
+          resourceName: `unrelated-${i}`,
+          checkpointID: "absent",
+          immutableID: "unrelated",
+        });
+    }
+    // The original exact resource claim sorts after the filler records.
+    expect((await findManagedCheckpointImage(storage, "aws", image))?.id).toBe(record.id);
+    pages(storage, "checkpoint-resource:aws:");
+    for (const [key] of await storage.list({ prefix: "checkpoint-resource:aws:" }))
+      await storage.delete(key);
+    await storage.put(checkpointKey(record.id), { ...record, state: "creating" });
+    await storage.put("checkpoint-intent:aws:zz-match", {
+      checkpointID: record.id,
+      generation: record.generation,
+      provider: "aws",
+      scope: record.scope,
+      kind: image.kind,
+      resourceID: image.id,
+      resourceName: image.id,
+    });
+    storage.lists.length = 0;
+    expect((await findManagedCheckpointImage(storage, "aws", image))?.id).toBe(record.id);
+    pages(storage, "checkpoint-intent:aws:");
+    await storage.put(checkpointKey("chk_duplicate"), {
+      ...record,
+      id: "chk_duplicate",
+      state: "creating",
+    });
+    await storage.put("checkpoint-intent:aws:zz-duplicate", {
+      checkpointID: "chk_duplicate",
+      generation: record.generation,
+      provider: "aws",
+      scope: record.scope,
+      kind: image.kind,
+      resourceID: image.id,
+      resourceName: image.id,
+    });
+    await expect(findManagedCheckpointImage(storage, "aws", image)).rejects.toThrow("multiple");
+  });
+
+  it("pages each promotion catalog before attaching checkpoint pins", async () => {
+    const { coordinator, storage } = await checkpointFixture();
+    const prefixes = ["image:aws:catalog:", "image:aws:variant:", "image:aws:promoted"];
+    for (const prefix of prefixes) {
+      for (let i = 0; i < 130; i += 1)
+        await storage.put(`${prefix}${String(i).padStart(4, "0")}`, { id: `other-${i}` });
+      await storage.put(`${prefix}zz-match`, { id: "snap-000000000001", name: "snapshot" });
+    }
+    expect((await createCheckpoint(coordinator, "chk_paged")).status).toBe(201);
+    const record = (await storage.get<CoordinatorCheckpointRecord>(checkpointKey("chk_paged")))!;
+    expect(record.pinCount).toBe(3);
+    for (const prefix of prefixes) pages(storage, prefix);
+  });
+});
+
+/* oxlint-enable eslint/no-await-in-loop */

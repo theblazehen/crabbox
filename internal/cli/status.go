@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"time"
@@ -73,7 +74,7 @@ func (a App) status(ctx context.Context, args []string) error {
 						fmt.Fprintf(a.Stderr, "warning: touch skipped for %s: %v\n", lease.LeaseID, claimErr)
 					} else if claimed {
 						SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
-						_, touchErr := sshBackend.Touch(statusCtx, TouchRequest{Lease: lease, State: state.State, IdleTimeout: cfg.IdleTimeout})
+						_, touchErr := touchLeaseWithGuestExpiry(statusCtx, sshBackend, cfg, TouchRequest{Lease: lease, State: state.State, IdleTimeout: cfg.IdleTimeout})
 						if touchErr != nil {
 							fmt.Fprintf(a.Stderr, "warning: touch failed for %s: %v\n", lease.LeaseID, touchErr)
 						}
@@ -93,6 +94,7 @@ func (a App) status(ctx context.Context, args []string) error {
 			}
 			return err
 		}
+		addStatusLifetime(&state, cfg)
 		if *jsonOut {
 			if !*wait || statusWaitDone(state) {
 				if err := json.NewEncoder(a.Stdout).Encode(state); err != nil {
@@ -112,6 +114,11 @@ func (a App) status(ctx context.Context, args []string) error {
 			if telemetry != "" {
 				telemetry = " " + telemetry
 			}
+			if state.ProvisioningPhase != "" {
+				telemetry += fmt.Sprintf(" provisioning_phase=%q", state.ProvisioningPhase)
+			}
+			telemetry += lifetimePolicySummary(state.LifetimePolicy)
+			printStatusLifetime(a.Stdout, state)
 			fmt.Fprintf(a.Stdout, "%s slug=%s provider=%s target=%s windows_mode=%s state=%s type=%s host=%s pond=%s network=%s%s ready=%t has_host=%t idle_for=%s idle_timeout=%s expires=%s%s\n", state.ID, blank(state.Slug, "-"), state.Provider, state.TargetOS, blank(state.WindowsMode, "-"), state.State, state.ServerType, state.Host, blank(state.Pond, "-"), state.Network, tailscale, state.Ready, state.HasHost, blank(state.IdleFor, "-"), blank(state.IdleTimeout, "-"), blank(state.ExpiresAt, "-"), telemetry)
 		}
 		if *wait {
@@ -134,7 +141,17 @@ func (a App) status(ctx context.Context, args []string) error {
 }
 
 func statusWaitDone(state statusView) bool {
-	return state.Ready || statusTerminalState(state.State)
+	return state.Ready || statusWaitTerminalState(state)
+}
+
+func statusWaitTerminalState(state statusView) bool {
+	if state.Retention != nil {
+		switch strings.ToLower(strings.TrimSpace(state.State)) {
+		case "suspended", "compute-expired", "deleted":
+			return true
+		}
+	}
+	return statusTerminalState(state.State)
 }
 
 func statusLeaseExactClaim(ctx context.Context, backend Backend, lease LeaseTarget, fallbackProvider, providerScope string) (leaseClaim, bool, error) {
@@ -142,6 +159,8 @@ func statusLeaseExactClaim(ctx context.Context, backend Backend, lease LeaseTarg
 	if lease.LeaseID == "" || provider == "" {
 		return leaseClaim{}, false, nil
 	}
+	// The status wait budget may already be spent; this exact-ID read is O(1)
+	// and must still observe the claim that authorizes the touch.
 	claim, claimed, exact, err := ResolveLeaseClaimForProviderWithExact(lease.LeaseID, provider)
 	if err != nil {
 		return leaseClaim{}, false, fmt.Errorf("read exact %s lease claim: %w", provider, err)
@@ -173,15 +192,18 @@ func statusLeaseExactClaim(ctx context.Context, backend Backend, lease LeaseTarg
 }
 
 func statusWaitTerminalError(id string, state statusView) error {
-	if state.Ready || !statusTerminalState(state.State) {
+	if state.Ready || !statusWaitTerminalState(state) {
 		return nil
+	}
+	if state.Retention != nil {
+		return Exit(5, "retained lease %s is %s and cannot become ready by waiting; inspect its lifecycle receipt", id, state.State)
 	}
 	return Exit(5, "lease %s reached terminal state %s before ready", id, state.State)
 }
 
 func statusTerminalState(state string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "dead", "deleting", "exited", "expired", "failed", "missing", "released", "stopped", "stopped_with_code", "terminated":
+	case "dead", "deleting", "exited", "expired", "failed", "missing", "released", "shutting-down", "stopped", "stopped_with_code", "terminated":
 		return true
 	default:
 		return false
@@ -200,6 +222,13 @@ func statusSSHReadinessTimeout(target SSHTarget) time.Duration {
 func statusViewFromLeaseTarget(ctx context.Context, cfg Config, lease LeaseTarget) (statusView, error) {
 	server := lease.Server
 	target := lease.SSH
+	if err := validateResolvedLeasePlatform(cfg, server); err != nil {
+		return statusView{}, err
+	}
+	// Recorded lease labels decide the platform. Resolve them before the
+	// readiness probe so a lease found under configuration defaults is probed
+	// with its own platform's readiness command rather than the default one.
+	applyResolvedLeaseConfig(&cfg, server, &target)
 	hasHost := server.PublicNet.IPv4.IP != ""
 	if target.NetworkKind == NetworkPublic && target.Host != "" {
 		hasHost = true
@@ -225,6 +254,7 @@ func statusViewFromLeaseTarget(ctx context.Context, cfg Config, lease LeaseTarge
 		serverID = server.DisplayID()
 	}
 	return statusView{
+		LifetimePolicy:   server.LifetimePolicy,
 		ID:               lease.LeaseID,
 		Slug:             ServerSlug(server),
 		Provider:         provider,
@@ -280,16 +310,21 @@ func leaseStatusStateCanBeReady(lease LeaseTarget, state string) bool {
 }
 
 type StatusView struct {
-	ID            string         `json:"id"`
-	Slug          string         `json:"slug,omitempty"`
-	Provider      string         `json:"provider"`
-	TargetOS      string         `json:"target"`
-	WorkRoot      string         `json:"workroot,omitempty"`
-	WindowsMode   string         `json:"windowsMode,omitempty"`
-	State         string         `json:"state"`
-	ServerID      string         `json:"serverId"`
-	ServerType    string         `json:"serverType"`
-	ImageEvidence *ImageEvidence `json:"imageEvidence,omitempty"`
+	Retention         *SessionDiskRetentionView `json:"retention,omitempty"`
+	LeasePolicy       *CoordinatorLeasePolicy   `json:"leasePolicy,omitempty"`
+	RemainingLifetime string                    `json:"remainingLifetime,omitempty"`
+	MaxLifetime       string                    `json:"maxLifetime,omitempty"`
+	LifetimePolicy    *LeaseLifetimePolicy      `json:"lifetimePolicy,omitempty"`
+	ID                string                    `json:"id"`
+	Slug              string                    `json:"slug,omitempty"`
+	Provider          string                    `json:"provider"`
+	TargetOS          string                    `json:"target"`
+	WorkRoot          string                    `json:"workroot,omitempty"`
+	WindowsMode       string                    `json:"windowsMode,omitempty"`
+	State             string                    `json:"state"`
+	ServerID          string                    `json:"serverId"`
+	ServerType        string                    `json:"serverType"`
+	ImageEvidence     *ImageEvidence            `json:"imageEvidence,omitempty"`
 	// ProviderResourceID optionally exposes an immutable provider resource ID.
 	// ServerID keeps each provider's existing identity semantics; for Islo it
 	// is the sandbox name rather than the immutable sandbox ID.
@@ -318,6 +353,7 @@ type StatusView struct {
 	CleanupRetryAt               string                   `json:"cleanupRetryAt,omitempty"`
 	ReleaseDeletesServer         *bool                    `json:"releaseDeletesServer,omitempty"`
 	FailureError                 string                   `json:"failureError,omitempty"`
+	ProvisioningPhase            string                   `json:"provisioningPhase,omitempty"`
 	ProvisioningResourceMayExist *bool                    `json:"provisioningResourceMayExist,omitempty"`
 	ProvisioningFailureRetryable *bool                    `json:"provisioningFailureRetryable,omitempty"`
 	Labels                       map[string]string        `json:"labels,omitempty"`
@@ -421,12 +457,15 @@ func (a App) resolveSSHLeaseWithRequestConfig(ctx context.Context, cfg *Config, 
 	if err != nil {
 		return LeaseTarget{}, err
 	}
+	if err := validateResolvedLeasePlatform(*cfg, lease.Server); err != nil {
+		return LeaseTarget{}, err
+	}
 	applyResolvedLeaseConfig(cfg, lease.Server, &lease.SSH)
 	return lease, nil
 }
 
 func resolveSSHLeaseTarget(ctx context.Context, backend SSHLoginBackend, req ResolveRequest) (LeaseTarget, error) {
-	claimsBefore, err := snapshotLeaseClaims()
+	claimsBefore, err := snapshotLeaseClaimsContext(ctx)
 	if err != nil {
 		return LeaseTarget{}, err
 	}
@@ -641,4 +680,31 @@ func formatSecondsDuration(seconds int) string {
 		return ""
 	}
 	return (time.Duration(seconds) * time.Second).String()
+}
+
+func addStatusLifetime(state *StatusView, cfg Config) {
+	if state.Retention != nil {
+		state.MaxLifetime = (time.Duration(state.Retention.ComputeWindowSeconds) * time.Second).String()
+		return
+	}
+	if deadline, err := time.Parse(time.RFC3339, state.ExpiresAt); err == nil {
+		state.RemainingLifetime = max(time.Duration(0), time.Until(deadline)).Round(time.Second).String()
+	}
+	if state.LeasePolicy != nil {
+		state.MaxLifetime = formatSecondsDuration(state.LeasePolicy.MaxTTLSeconds)
+	} else if state.ExpiresAt != "" {
+		if provider, err := ProviderFor(state.Provider); err == nil && !ShouldUseCoordinator(cfg, provider.Spec()) {
+			state.MaxLifetime = EffectiveMaxTTL(cfg).String()
+		}
+	}
+}
+
+func printStatusLifetime(out io.Writer, state StatusView) {
+	if state.RemainingLifetime != "" {
+		fmt.Fprintf(out, "remaining_lifetime=%s max_lifetime=%s", state.RemainingLifetime, blank(state.MaxLifetime, "-"))
+		if state.LeasePolicy != nil {
+			fmt.Fprintf(out, " runtime_extension=%t", state.LeasePolicy.RuntimeExtension)
+		}
+		fmt.Fprintln(out)
+	}
 }

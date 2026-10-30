@@ -76,6 +76,8 @@ type fixedAWSCreateIntentTailscale struct {
 }
 
 type fixedAWSCreateIntentCapacity struct {
+	MinVCPUs          int      `json:"minVCPUs,omitempty"`
+	MinMemoryMiB      int      `json:"minMemoryMiB,omitempty"`
 	Market            string   `json:"market"`
 	Strategy          string   `json:"strategy"`
 	Fallback          string   `json:"fallback"`
@@ -97,6 +99,9 @@ func FixedAWSCreateIntentFingerprint(cfg Config, req FixedAWSCreateIntentRequest
 }
 
 func fixedAWSCreateIntentForConfig(cfg Config, req FixedAWSCreateIntentRequest) (fixedAWSCreateIntent, error) {
+	if err := validateCapacityMinimumValues(cfg.Capacity); err != nil {
+		return fixedAWSCreateIntent{}, err
+	}
 	network, err := parseNetworkMode(string(cfg.Network))
 	if err != nil {
 		return fixedAWSCreateIntent{}, err
@@ -114,10 +119,6 @@ func fixedAWSCreateIntentForConfig(cfg Config, req FixedAWSCreateIntentRequest) 
 		return fixedAWSCreateIntent{}, err
 	}
 	publicKeyHash := sha256.Sum256([]byte(strings.TrimSpace(req.SSHPublicKey)))
-	rootGB := cfg.AWSRootGB
-	if rootGB <= 0 {
-		rootGB = 400
-	}
 	hostID := strings.TrimSpace(cfg.HostID)
 	if hostID == "" {
 		hostID = strings.TrimSpace(cfg.AWSMacHostID)
@@ -146,7 +147,7 @@ func fixedAWSCreateIntentForConfig(cfg Config, req FixedAWSCreateIntentRequest) 
 			Snapshot:           strings.TrimSpace(cfg.AWSSnapshot),
 			SubnetID:           strings.TrimSpace(cfg.AWSSubnetID),
 			InstanceProfile:    strings.TrimSpace(cfg.AWSProfile),
-			RootGB:             rootGB,
+			RootGB:             cfg.AWSRootGB,
 		},
 		Capabilities: fixedCreateIntentFeatures{
 			Desktop:           cfg.Desktop,
@@ -177,6 +178,8 @@ func fixedAWSCreateIntentForConfig(cfg Config, req FixedAWSCreateIntentRequest) 
 			},
 		},
 		Capacity: fixedAWSCreateIntentCapacity{
+			MinVCPUs:          cfg.Capacity.MinVCPUs,
+			MinMemoryMiB:      cfg.Capacity.MinMemoryMiB,
 			Market:            strings.TrimSpace(cfg.Capacity.Market),
 			Strategy:          strings.TrimSpace(cfg.Capacity.Strategy),
 			Fallback:          strings.TrimSpace(cfg.Capacity.Fallback),

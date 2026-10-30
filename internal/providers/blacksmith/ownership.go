@@ -84,33 +84,45 @@ func blacksmithClaimBinding(claim core.LeaseClaim) (blacksmithRoute, shared.Clai
 	return route, want, shared.ValidateClaimBinding(claim, want)
 }
 
-func resolveOwnedBlacksmithClaim(id string) (core.LeaseClaim, error) {
+// Tests count claim-file reads through these seams.
+var (
+	readBlacksmithClaim         = core.ReadLeaseClaimWithPresence
+	resolveBlacksmithClaimAlias = core.ResolveLeaseClaimForProviderWithExactContext
+)
+
+func resolveOwnedBlacksmithClaim(ctx context.Context, id string) (core.LeaseClaim, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return core.LeaseClaim{}, core.Exit(2, "Blacksmith requires a claimed Testbox ID or slug")
 	}
-	claim, ok, exact, err := core.ResolveLeaseClaimForProviderWithExact(id, blacksmithTestboxProvider)
+	var claim core.LeaseClaim
+	var ok bool
+	var err error
+	if strings.HasPrefix(id, "tbx_") || core.IsCanonicalLeaseID(id) {
+		if ctx.Err() != nil {
+			return claim, context.Cause(ctx)
+		}
+		claim, ok, err = readBlacksmithClaim(id)
+		ok = ok && claim.LeaseID == id && claim.Provider == blacksmithTestboxProvider
+	} else {
+		claim, ok, _, err = resolveBlacksmithClaimAlias(ctx, id, blacksmithTestboxProvider)
+	}
 	if err != nil {
 		return claim, err
 	}
-	if !ok || ((strings.HasPrefix(id, "tbx_") || core.IsCanonicalLeaseID(id)) && (!exact || claim.LeaseID != id)) {
+	if !ok {
 		return claim, core.Exit(4, "Blacksmith resource %q has no exact local ownership claim; use read-only status/list and native Blacksmith cleanup", id)
 	}
-	claims, err := core.ListLeaseClaims()
-	if err != nil {
-		return claim, err
-	}
-	for _, other := range claims {
-		if other.LeaseID != claim.LeaseID && other.CloudID == claim.CloudID && claim.CloudID != "" {
-			return claim, core.Exit(2, "Blacksmith Testbox has conflicting local claims")
-		}
-	}
+	// Only claims/<tbx id>.json can pass blacksmithClaimBinding for that resource,
+	// fenced by its per-lease lock. Other CloudID matches are inert: their binding
+	// fails or they belong to another provider's namespace.
 	_, _, err = blacksmithClaimBinding(claim)
 	return claim, err
 }
 
 type blacksmithIdentity struct {
 	ID, State, Workflow, Job, Ref string
+	Created, RunURL               string
 }
 
 var blacksmithStatusHeader = regexp.MustCompile(`^(ID) {2,}(STATUS) {2,}(IP) {2,}(WORKFLOW) {2,}(JOB) {2,}(REF) {2,}(CREATED) {2,}(RUN URL)$`)
@@ -150,7 +162,7 @@ func parseBlacksmithIdentity(output, id string) (blacksmithIdentity, error) {
 			return identity, core.Exit(2, "Blacksmith exact status has misaligned cells")
 		}
 	}
-	identity = blacksmithIdentity{ID: values[0], State: values[1], Workflow: values[3], Job: values[4], Ref: values[5]}
+	identity = blacksmithIdentity{ID: values[0], State: values[1], Workflow: values[3], Job: values[4], Ref: values[5], Created: values[6], RunURL: values[7]}
 	if identity.ID != id || identity.Workflow == "" || identity.Job == "" || identity.Ref == "" || !identity.knownState() {
 		return identity, core.Exit(2, "Blacksmith exact status has missing or mismatched identity/state")
 	}
@@ -191,22 +203,20 @@ func (b *blacksmithBackend) inspectTestbox(ctx context.Context, id string) (blac
 		err = core.Exit(result.ExitCode, "Blacksmith exact status failed")
 	}
 	if err != nil {
-		if diagnostic := strings.TrimSpace(result.Stderr); diagnostic != "" {
-			err = fmt.Errorf("%w: %s", err, diagnostic)
-		}
 		return blacksmithIdentity{}, blacksmithExitDiagnostics(err)
 	}
 	return parseBlacksmithIdentity(result.Stdout, id)
 }
 
-// Present all diagnostics through AsExitError while retaining the native code
-// and causes. The CLI prints only the first ExitError's Message.
+// Retain native codes and causes for Is/As. The CLI uses the prepared
+// diagnostic instead of traversing private command causes.
 type blacksmithCommandError struct {
 	core.ExitError
 	cause error
 }
 
-func (e blacksmithCommandError) Unwrap() []error { return []error{e.ExitError, e.cause} }
+func (e blacksmithCommandError) Unwrap() []error           { return []error{e.ExitError, e.cause} }
+func (e blacksmithCommandError) DiagnosticMessage() string { return e.Message }
 
 func blacksmithExitDiagnostics(err error) error {
 	var exitErr core.ExitError
@@ -250,7 +260,7 @@ func (b *blacksmithBackend) verifyTestbox(ctx context.Context, claim core.LeaseC
 }
 
 func (b *blacksmithBackend) ownedTestbox(ctx context.Context, id, repoRoot string, reclaim bool) (*blacksmithBackend, core.LeaseClaim, error) {
-	claim, err := resolveOwnedBlacksmithClaim(id)
+	claim, err := resolveOwnedBlacksmithClaim(ctx, id)
 	if err != nil {
 		return nil, claim, err
 	}
@@ -297,8 +307,11 @@ func (b *blacksmithBackend) withOwnedTestbox(ctx context.Context, claim core.Lea
 }
 
 type blacksmithReconciledStop struct {
-	result core.LocalCommandResult
-	err    error
+	result          core.LocalCommandResult
+	err             error
+	runURL          string
+	conclusion      string
+	nativeCompleted bool
 }
 
 func (b *blacksmithBackend) printStopOutput(result core.LocalCommandResult) {
@@ -310,42 +323,98 @@ func (b *blacksmithBackend) printStopOutput(result core.LocalCommandResult) {
 	}
 }
 
-func (b *blacksmithBackend) terminateTestbox(ctx context.Context, claim core.LeaseClaim) (*blacksmithReconciledStop, error) {
+func (b *blacksmithBackend) terminateTestbox(ctx context.Context, claim core.LeaseClaim, cancelWorkflow bool) (settled *blacksmithReconciledStop, err error) {
+	result := &blacksmithReconciledStop{}
+	// A native error can be reconciled only after both the Testbox and its exact
+	// GitHub work settle. Preserve that error through every failed verification.
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("Blacksmith cleanup phase=reconciliation: %w", err)
+			b.printStopOutput(result.result)
+			if result.err != nil {
+				err = fmt.Errorf("Blacksmith stop verification failed: %w", err)
+			}
+			err = errors.Join(result.err, err)
+		}
+	}()
 	identity, err := b.verifyTestbox(ctx, claim)
-	if err != nil || identity.terminal() {
+	if err != nil {
 		return nil, err
 	}
-	result, stopErr := b.runCommand(ctx, blacksmithStopArgs(b.cfg, claim.CloudID), nil, nil)
-	if stopErr != nil {
-		statusErr := blacksmithContextError(ctx, nil)
-		if statusErr == nil {
-			var observed blacksmithIdentity
-			observed, statusErr = b.verifyTestbox(ctx, claim)
-			if statusErr == nil && observed.terminal() {
-				return &blacksmithReconciledStop{result: result, err: stopErr}, nil
-			}
-			if statusErr == nil {
-				statusErr = fmt.Errorf("Testbox state=%s is not completed", observed.State)
-			}
-		}
-		stopErr = errors.Join(stopErr, fmt.Errorf("Blacksmith stop verification failed: %w", statusErr))
+	if err := blacksmithObserveRunURL(&result.runURL, identity.RunURL); err != nil {
+		return nil, blacksmithSettlementError(claim.LeaseID, err)
 	}
-	// A native error is suppressed only by fresh exact completion evidence.
-	b.printStopOutput(result)
-	if stopErr != nil {
-		return nil, stopErr
+	stop := func() {
+		attempt, stopErr := b.runCommand(ctx, blacksmithStopArgs(b.cfg, claim.CloudID), nil, nil)
+		result.result.Stdout += attempt.Stdout
+		result.result.Stderr += attempt.Stderr
+		if stopErr == nil && attempt.ExitCode != 0 {
+			stopErr = core.Exit(attempt.ExitCode, "Blacksmith native stop failed")
+		}
+		result.err = errors.Join(result.err, stopErr)
+	}
+	// Remember whether native stop had the association. A later association (or
+	// a retained completed claim) permits one further exact native stop attempt.
+	stoppedWithURL := ""
+	cancellationAttempted := false
+	if !identity.terminal() {
+		stoppedWithURL = identity.RunURL
+		stop()
+		if err := blacksmithContextError(ctx, nil); err != nil {
+			return nil, err
+		}
+		identity, err = b.verifyTestbox(ctx, claim)
+		if err != nil {
+			return nil, err
+		}
 	}
 	for {
-		identity, err = b.verifyTestbox(ctx, claim)
-		if err != nil || identity.terminal() {
-			return nil, err
+		if err := blacksmithObserveRunURL(&result.runURL, identity.RunURL); err != nil {
+			return nil, blacksmithSettlementError(claim.LeaseID, err)
+		}
+		if identity.terminal() {
+			if result.runURL == "" {
+				return nil, blacksmithSettlementError(claim.LeaseID, errors.New("native completion has no GitHub run association; retry after association becomes available"))
+			}
+			result.nativeCompleted = true
+			result.conclusion, err = b.githubRunConclusion(ctx, result.runURL)
+			if err != nil {
+				if errors.Is(err, errBlacksmithGitHubDeadline) {
+					return result, blacksmithSettlementError(claim.LeaseID, err)
+				}
+				return nil, blacksmithSettlementError(claim.LeaseID, err)
+			}
+			if result.conclusion != "" {
+				return result, nil
+			}
+			if stoppedWithURL != result.runURL {
+				stoppedWithURL = result.runURL
+				stop()
+			}
+			// Native completion can leave the workflow's SSH idle loop holding
+			// its concurrency slot. Only a claim-fenced stop may cancel that run;
+			// acquisition rollback has no persisted ownership claim.
+			if cancelWorkflow && !cancellationAttempted {
+				attempted, cancelErr := b.cancelGitHubRun(ctx, claim, result.runURL)
+				if !attempted {
+					return nil, blacksmithSettlementError(claim.LeaseID, cancelErr)
+				}
+				result.err = errors.Join(result.err, cancelErr)
+				cancellationAttempted = true
+			}
+		} else if result.err != nil {
+			return nil, fmt.Errorf("Blacksmith stop verification failed: Testbox state=%s is not completed", identity.State)
 		}
 		timer := time.NewTimer(time.Second)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, context.Cause(ctx)
+			return nil, blacksmithSettlementError(claim.LeaseID, context.Cause(ctx))
 		case <-timer.C:
+		}
+		identity, err = b.verifyTestbox(ctx, claim)
+		if err != nil {
+			return nil, err
 		}
 	}
 }
@@ -389,7 +458,7 @@ func (b *blacksmithBackend) rollbackTestbox(id, pendingID, repoRoot string) {
 			return err
 		}
 		claim := blacksmithIdentityClaim(id, "acquisition-rollback", repoRoot, *b.route, identity)
-		if _, err := b.terminateTestbox(ctx, claim); err != nil {
+		if _, err := b.terminateTestbox(ctx, claim, false); err != nil {
 			return err
 		}
 		if err := core.RemoveStoredTestboxConnectionArtifacts(pendingID); err != nil {

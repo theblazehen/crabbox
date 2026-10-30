@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	api "github.com/daytonaio/daytona/libs/api-client-go"
+	api "github.com/daytona/clients/api-client-go"
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
@@ -62,7 +62,7 @@ func TestDaytonaAbsenceRecoveryHTTP(t *testing.T) {
 					} else if name == "duplicate not found" {
 						fmt.Fprint(w, `{"message":"Not found","statusCode":403,"statusCode":404}`)
 					} else {
-						fmt.Fprint(w, `{"message":"Sandbox not found","statusCode":404}`)
+						_ = json.NewEncoder(w).Encode(daytonaNotFoundBody(r))
 					}
 				case "/sandbox":
 					page := lists.Add(1)

@@ -170,6 +170,26 @@ func TestFixedAWSCreateIntentExcludesSecrets(t *testing.T) {
 	}
 }
 
+func TestFixedAWSCreateIntentWarmupKeepDefaultDoesNotOverrideRequest(t *testing.T) {
+	cfg := BaseConfig()
+	cfg.Provider = "aws"
+	req := FixedAWSCreateIntentRequest{AccountID: "123456789012", SSHPublicKey: "ssh-ed25519 fixture", Keep: true}
+	before, err := FixedAWSCreateIntentFingerprint(cfg, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.WarmupKeep = !cfg.WarmupKeep
+	after, err := FixedAWSCreateIntentFingerprint(cfg, req)
+	if err != nil || after != before {
+		t.Fatalf("command default changed resolved intent: before=%s after=%s err=%v", before, after, err)
+	}
+	req.Keep = false
+	after, err = FixedAWSCreateIntentFingerprint(cfg, req)
+	if err != nil || after == before {
+		t.Fatalf("explicit keep change did not change intent: before=%s after=%s err=%v", before, after, err)
+	}
+}
+
 func TestFixedAWSCreateIntentClassifiesEveryExportedConfigField(t *testing.T) {
 	included := map[string]bool{}
 	collectFixedAWSConfigFields(reflect.TypeOf(fixedAWSCreateIntent{}), included)
@@ -183,12 +203,12 @@ func TestFixedAWSCreateIntentClassifiesEveryExportedConfigField(t *testing.T) {
 		}
 	}
 	classify("coordinator transport or credential", `
-		Coordinator BrokerMode BrokerLoginRedirectOrigins BrokerAutoWebVNC
+		Coordinator BrokerMode BrokerLoginRedirectOrigins BrokerAutoWebVNC AWSStockImage
 		CoordToken CoordTokenCommand CoordAdminToken Access SSHKey
 	`)
 	classify("non-AWS provider selection", `
 		Location Image AWSLambdaMicroVM
-		Azure AzureDynamicSessions
+		Azure AzureDynamicSessions AzureSandbox
 		GCP DigitalOcean Vultr Linode GitHubCodespaces
 		Lambda Nebius OVH Scaleway TencentCloud Incus Proxmox Firecracker XCPNg Parallels
 		Blacksmith KubeVirt SealosDevbox AgentSandbox External Namespace NamespaceInstance
@@ -196,12 +216,17 @@ func TestFixedAWSCreateIntentClassifiesEveryExportedConfigField(t *testing.T) {
 		Runpod Vast NvidiaBrev Hostinger Wandb Orgo Islo Freestyle Tenki Tensorlake Cua
 		OpenComputer CodeSandbox OpenSandbox Nomad Blaxel VercelSandbox CloudflareSandbox
 		Superserve Crownest DockerSandbox AnthropicSRT CloudRunSandbox Modal UpstashBox
-		Smolvm AsciiBox Cloudflare CloudflareDynamicWorkers Semaphore Sprites LocalContainer
+		Smolvm AsciiBox Cloudflare CloudflareDynamicWorkers Semaphore Sprites LocalContainer Serve
 		AppleContainer AppleVM MXC Multipass Machine0 Tart Lume HyperV WindowsSandbox Static
+		ManagedHost HostCapabilities
 	`)
-	classify("post-acquisition command, transport, or reporting behavior", `
-		Sync Run EnvAllow Actions Results Shard Profiles Presets ProofTemplates Jobs RecordLocal
+	classify("post-acquisition command, transport, reporting, or local maintenance behavior", `
+		Sync Run EnvAllow Actions Results Shard Profiles Presets ProofTemplates Jobs RecordLocal ClaimsAutoPrune
 	`)
+	classify("command default resolved into the explicit create request Keep field", `WarmupKeep`)
+	classify("direct lifetime ceiling resolved into the effective TTL before creation", `MaxTTL`)
+	classify("coordinator-only lifetime enrollment; direct creation rejects canary flags", `LifetimePolicy`)
+	classify("local allocation admission policy, not remote resource intent", `DirectLeases DirectLeaseAllow`)
 
 	configType := reflect.TypeOf(Config{})
 	known := map[string]bool{}

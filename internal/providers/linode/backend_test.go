@@ -17,6 +17,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 	"github.com/openclaw/crabbox/internal/testutil"
 )
 
@@ -180,7 +181,7 @@ func TestLinodeDoctorEffectiveType(t *testing.T) {
 	}{
 		{name: "native configured type", cfg: core.Config{Linode: core.LinodeConfig{Type: "g6-nanode-1"}}, want: "g6-nanode-1"},
 		{name: "explicit generic override", cfg: core.Config{ServerType: "g6-standard-2", ServerTypeExplicit: true, Linode: core.LinodeConfig{Type: "g6-nanode-1"}}, want: "g6-standard-2"},
-		{name: "class fallback", cfg: core.Config{Class: "standard"}, want: "g6-standard-1"},
+		{name: "class fallback", cfg: core.Config{Class: "standard"}, want: "g6-standard-4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			backend := newLinodeLeaseBackend(Provider{}.Spec(), tc.cfg, core.Runtime{})
@@ -333,7 +334,7 @@ func TestAcquireRecordsConfiguredLinodeTypeInMetadata(t *testing.T) {
 		{"explicit override", "g6-standard-2", "g6-nanode-1", "g6-nanode-1"},
 		{"padded explicit override", "g6-standard-2", " g6-nanode-1 ", "g6-nanode-1"},
 		{"blank explicit uses provider type", "g6-standard-2", " \t ", "g6-standard-2"},
-		{"blank explicit uses default", "", " ", defaultType},
+		{"blank explicit uses default", "", " ", "g6-standard-16"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := &fakeLinodeAPI{}
@@ -1492,7 +1493,7 @@ func TestFencedLinodeTouchReconcilesLiveTimeoutWithClaim(t *testing.T) {
 	labels := normalizedLinodeLabels(api.created[0].Tags)
 	labels["idle_timeout"] = "7200"
 	labels["idle_timeout_secs"] = "7200"
-	api.created[0].Tags = replaceCrabboxTags(api.created[0].Tags, tagsFromLabels(labels))
+	api.created[0].Tags = shared.ReplaceCrabboxTags(api.created[0].Tags, tagsFromLabels(labels))
 	backend.Cfg.IdleTimeout = 3 * time.Hour
 
 	updated, err := backend.Touch(context.Background(), core.TouchRequest{

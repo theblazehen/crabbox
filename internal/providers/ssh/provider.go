@@ -44,8 +44,14 @@ func (Provider) Spec() core.ProviderSpec {
 		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
-func (Provider) RegisterFlags(*flag.FlagSet, core.Config) any { return core.NoProviderFlags() }
-func (Provider) ApplyFlags(*core.Config, *flag.FlagSet, any) error {
+func (Provider) RegisterFlags(fs *flag.FlagSet, _ core.Config) any {
+	return fs.Bool("static-power-acknowledge-stop", false, "acknowledge retrying the dedicated static host stop hook during forced recovery")
+}
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	if ack, ok := values.(*bool); ok && ack != nil && core.FlagWasSet(fs, "static-power-acknowledge-stop") {
+		cfg.Static.PowerAcknowledgeStop = *ack
+		core.RecordProviderFlagInputs(cfg, true, staticProvider)
+	}
 	return nil
 }
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {

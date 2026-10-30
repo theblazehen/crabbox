@@ -1,11 +1,16 @@
 package lambda
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -925,6 +930,220 @@ func TestAmbiguousLaunchRecoveryPersistsBindingBeforePartialCleanup(t *testing.T
 	}
 	if _, ok, err := core.ResolveLeaseClaimForProvider("ambiguous-retry", providerName); err != nil || ok {
 		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+}
+
+func TestAcquireCleanupErrorPreservesCausesAndVetoesRetry(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		for _, tc := range []struct {
+			name             string
+			primary, cleanup error
+			keyFailure       bool
+			wantCode         int
+		}{
+			{name: "timeout and termination", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: errors.New("cleanup unavailable"), wantCode: 5},
+			{name: "timeout and key", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: errors.New("cleanup unavailable"), keyFailure: true, wantCode: 5},
+			{name: "cancellation", primary: context.Canceled, cleanup: errors.New("cleanup unavailable"), wantCode: 1},
+			{name: "primary exit wins", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: core.Exit(9, "cleanup unavailable"), wantCode: 5},
+		} {
+			t.Run(tc.name+"/keep="+strconv.FormatBool(keep), func(t *testing.T) {
+				api := &fakeLambdaAPI{}
+				if tc.keyFailure {
+					api.deleteKeyErr = tc.cleanup
+				} else {
+					api.terminateErr = tc.cleanup
+				}
+				b := newTestBackend(t, api)
+				var stderr bytes.Buffer
+				b.rt.Stderr = &stderr
+				b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error { return tc.primary }
+				_, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "cause-retained", Keep: keep})
+				if !errors.Is(err, tc.primary) || !errors.Is(err, tc.cleanup) || core.ExitCodeForError(err, 1) != tc.wantCode || len(api.launchRequests) != 1 {
+					t.Fatalf("err=%v code=%d wantCode=%d launches=%d", err, core.ExitCodeForError(err, 1), tc.wantCode, len(api.launchRequests))
+				}
+				if !strings.Contains(stderr.String(), "lambda cleanup failed:") || !strings.Contains(stderr.String(), "cleanup unavailable") || !strings.Contains(stderr.String(), "refusing a fresh lease retry") || strings.Contains(stderr.String(), "retrying with fresh lease") {
+					t.Fatalf("cleanup warning=%q", stderr.String())
+				}
+				claim, ok, claimErr := core.ResolveLeaseClaimForProvider("cause-retained", providerName)
+				if claimErr != nil || !ok || claim.CloudID != "i-100" || claim.Labels[lambdaRecoveryKeyLabel] != "rollback-cleanup" {
+					t.Fatalf("claim=%#v exists=%v err=%v", claim, ok, claimErr)
+				}
+				keyPath, pathErr := core.TestboxKeyPath(claim.LeaseID)
+				if pathErr != nil {
+					t.Fatal(pathErr)
+				}
+				if _, statErr := os.Stat(keyPath); statErr != nil {
+					t.Fatalf("retained key missing: %v", statErr)
+				}
+			})
+		}
+	}
+}
+
+func TestAcquireCleanupFailureThroughProductionClient(t *testing.T) {
+	requests := make(chan string, 16)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := r.Method + " " + r.URL.Path
+		requests <- request
+		if r.Header.Get("Authorization") != "Bearer synthetic-token" {
+			t.Error("unexpected authorization header")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch request {
+		case "GET /api/v1/instances", "GET /api/v1/ssh-keys":
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		case "POST /api/v1/ssh-keys":
+			var key struct {
+				Name      string `json:"name"`
+				PublicKey string `json:"public_key"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&key); err != nil || key.Name == "" || key.PublicKey == "" {
+				t.Error("missing generated SSH key in create request")
+				http.Error(w, "invalid fixture key", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{"id": "key-loopback", "name": key.Name, "public_key": key.PublicKey}})
+		case "POST /api/v1/instance-operations/launch":
+			_, _ = io.WriteString(w, `{"data":{"instance_ids":["i-loopback"]}}`)
+		case "GET /api/v1/instances/i-loopback":
+			_, _ = io.WriteString(w, `{"data":{"id":"i-loopback","status":"unhealthy"}}`)
+		case "POST /api/v1/instance-operations/terminate":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":"fixture/terminate-unavailable","message":"termination unavailable"}}`)
+		case "DELETE /api/v1/ssh-keys/key-loopback":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s", request)
+			http.Error(w, "unexpected fixture request", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := &Client{token: "synthetic-token", client: server.Client(), baseURL: server.URL + "/api/v1"}
+	b := newTestBackend(t, &fakeLambdaAPI{})
+	b.clientFactory = func(core.Runtime) (lambdaAPI, error) { return client, nil }
+	var stderr bytes.Buffer
+	b.rt.Stderr = &stderr
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		t.Fatal("terminal instance reached SSH")
+		return nil
+	}
+	_, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "real-transport"})
+	var primary core.ExitError
+	var cleanup *APIError
+	if !core.AsExitError(err, &primary) || primary.Code != 5 || primary.Message != "lambda instance i-loopback reached terminal status unhealthy" || !errors.As(err, &cleanup) || cleanup.Status != http.StatusServiceUnavailable || cleanup.Code != "fixture/terminate-unavailable" {
+		t.Fatalf("err=%v primary=%#v cleanup=%#v", err, primary, cleanup)
+	}
+	if !strings.Contains(stderr.String(), "refusing a fresh lease retry") || !strings.Contains(stderr.String(), "termination unavailable") || strings.Contains(stderr.String(), "retrying with fresh lease") {
+		t.Fatalf("cleanup warning=%q", stderr.String())
+	}
+	want := []string{"GET /api/v1/instances", "GET /api/v1/ssh-keys", "POST /api/v1/ssh-keys", "POST /api/v1/instance-operations/launch", "GET /api/v1/instances/i-loopback", "POST /api/v1/instance-operations/terminate", "DELETE /api/v1/ssh-keys/key-loopback"}
+	if len(requests) != len(want) {
+		t.Fatalf("requests=%d want=%d", len(requests), len(want))
+	}
+	for _, expected := range want {
+		if got := <-requests; got != expected {
+			t.Fatalf("request=%s want=%s", got, expected)
+		}
+	}
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("real-transport", providerName)
+	if claimErr != nil || !ok || claim.CloudID != "i-loopback" || claim.Labels[lambdaRecoveryKeyLabel] != "rollback-cleanup" || claim.Labels[lambdaKeyIDLabel] != "key-loopback" {
+		t.Fatalf("claim=%#v exists=%v err=%v", claim, ok, claimErr)
+	}
+	keyPath, pathErr := core.TestboxKeyPath(claim.LeaseID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if _, statErr := os.Stat(keyPath); statErr != nil {
+		t.Fatalf("retained key missing: %v", statErr)
+	}
+	t.Logf("production HTTP transport: primary exit=%d cleanup HTTP=%d requests=%d launches=1 retry veto=true recovery claim/key retained=true", primary.Code, cleanup.Status, len(want))
+}
+
+func TestAcquireRetainsRecoveryClaimFailureWhenRollbackFails(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		primary, cleanup error
+		wantCode         int
+	}{
+		{name: "primary exit wins", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: core.Exit(9, "cleanup unavailable"), wantCode: 5},
+		{name: "cleanup exit wins over claim", primary: context.Canceled, cleanup: core.Exit(9, "cleanup unavailable"), wantCode: 9},
+		{name: "claim exit surfaced", primary: context.Canceled, cleanup: errors.New("cleanup unavailable"), wantCode: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeLambdaAPI{terminateErr: tc.cleanup}
+			b := newTestBackend(t, api)
+			var stderr bytes.Buffer
+			b.rt.Stderr = &stderr
+			var keyPath string
+			_, err := b.Acquire(t.Context(), core.AcquireRequest{
+				Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "claim-failure",
+				OnAcquired: func(acquired core.LeaseTarget) error {
+					keyPath = acquired.SSH.Key
+					stateDir, pathErr := core.CrabboxStateDir()
+					if pathErr != nil {
+						t.Fatal(pathErr)
+					}
+					if writeErr := os.WriteFile(filepath.Join(stateDir, "claims"), []byte("block claim directory"), 0o600); writeErr != nil {
+						t.Fatal(writeErr)
+					}
+					return tc.primary
+				},
+			})
+			if !errors.Is(err, tc.primary) || !errors.Is(err, tc.cleanup) || core.ExitCodeForError(err, 1) != tc.wantCode || len(api.launchRequests) != 1 {
+				t.Fatalf("err=%v code=%d wantCode=%d launches=%d", err, core.ExitCodeForError(err, 1), tc.wantCode, len(api.launchRequests))
+			}
+			if !strings.Contains(err.Error(), "persist lambda rollback cleanup claim: create claim directory:") || !strings.Contains(stderr.String(), "refusing a fresh lease retry") || !strings.Contains(stderr.String(), "create claim directory:") || strings.Contains(stderr.String(), "retrying with fresh lease") {
+				t.Fatalf("err=%v warning=%q", err, stderr.String())
+			}
+			if _, statErr := os.Stat(keyPath); statErr != nil {
+				t.Fatalf("retained key missing: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestAcquireIgnoresRecoveryClaimFailureAfterSuccessfulRollback(t *testing.T) {
+	api := &fakeLambdaAPI{}
+	b := newTestBackend(t, api)
+	primary := core.Exit(5, "timed out waiting for SSH")
+	var keyPath string
+	_, err := b.acquireOnce(t.Context(), core.AcquireRequest{
+		Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "claim-cleaned",
+		OnAcquired: func(acquired core.LeaseTarget) error {
+			keyPath = acquired.SSH.Key
+			stateDir, pathErr := core.CrabboxStateDir()
+			if pathErr != nil {
+				t.Fatal(pathErr)
+			}
+			if writeErr := os.WriteFile(filepath.Join(stateDir, "claims"), []byte("block claim directory"), 0o600); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			return primary
+		},
+	})
+	if err != primary || !core.IsBootstrapWaitError(err) || len(api.terminatedIDs) != 1 || len(api.deletedKeyIDs) != 1 {
+		t.Fatalf("err=%v terminated=%v keys=%v", err, api.terminatedIDs, api.deletedKeyIDs)
+	}
+	if _, statErr := os.Stat(keyPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("key should be removed after successful rollback: %v", statErr)
+	}
+}
+
+func TestAcquireStillRetriesAfterSuccessfulRollback(t *testing.T) {
+	// Give the retry a distinct instance ID in the existing fake.
+	api := &fakeLambdaAPI{nextInstanceID: 1}
+	b := newTestBackend(t, api)
+	calls := 0
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		calls++
+		if calls == 1 {
+			return core.Exit(5, "timed out waiting for SSH")
+		}
+		return nil
+	}
+	lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "safe-retry"})
+	if err != nil || lease.Server.CloudID != "i-2" || calls != 2 || len(api.launchRequests) != 2 || len(api.terminatedIDs) != 1 || len(api.deletedKeyIDs) != 1 {
+		t.Fatalf("err=%v cloudID=%s calls=%d launches=%d terminated=%v keys=%v", err, lease.Server.CloudID, calls, len(api.launchRequests), api.terminatedIDs, api.deletedKeyIDs)
 	}
 }
 

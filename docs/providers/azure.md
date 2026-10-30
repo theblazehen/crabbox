@@ -68,13 +68,40 @@ Azure supports both execution modes:
   holds an operator-owned Azure service principal. The CLI still does SSH, sync,
   and command execution directly to the runner host.
 
+### Rejected VM creates and pending cleanup
+
+The coordinator creates the lease public IP and NIC before submitting the VM.
+The resource group, VNet and NSG are shared infrastructure and remain in place.
+Snapshot-based creation can also create an OS disk before the VM request; ordinary
+managed-image creation asks Azure to create that disk with the VM.
+
+Structured ARM rejections such as `SkuNotAvailable`, `InvalidParameter`,
+`QuotaExceeded`, quota-related `OperationNotAllowed`, and `InvalidTemplate` prove
+the VM request was rejected. The coordinator still verifies and deletes its exact
+owned companion resources before reporting no remaining allocation. Failed cleanup
+retains the attempt's name, scope and durable immutable resource identities for
+retry; timeouts, lost replies and server errors do not establish rejection.
+
+Older legacy attempts can retain uncertainty after successful rollback. Once the
+provider call has settled, interrupted-provisioning recovery waits five minutes,
+then requires 30 minutes of empty provider inventory, checking on five-minute
+retries. `keep=true` does not block this recovery after explicit deletion or
+failed provisioning. Inventory failures or conflicting ownership keep cleanup
+unresolved. New definite rejections preserve successful rollback evidence across
+SKU, market and region fallback and avoid this absence-confirmation delay.
+
+Use `crabbox status --provider azure --id <lease> --json` to inspect
+`cleanupStatus`, `cleanupRetryAt`, and `provisioningResourceMayExist`. After
+`cleanupStatus=complete`, repeat `crabbox stop --provider azure --id <lease>` to
+finish local claim and SSH-artifact cleanup. A released state alone is not
+confirmation that cleanup finished.
+
 ## Commands
 
 ```sh
 crabbox warmup --provider azure --class beast
 crabbox warmup --provider azure --arch arm64 --class fast
 crabbox warmup --provider azure --class beast --azure-os-disk ephemeral
-crabbox warmup --provider azure --class beast --azure-os-disk ephemeral-preview
 crabbox run --provider azure --class standard -- pnpm test
 crabbox run --provider azure --azure-backend dynamic-sessions -- pnpm test
 crabbox warmup --provider azure --target windows --class standard
@@ -89,9 +116,8 @@ crabbox cleanup --provider azure
 `--type` is exact (for example `--type Standard_D32ads_v6`). Use `--class` when
 you want SKU fallback. Azure leases use managed OS disks by default, so native
 checkpoint/fork works without extra flags. Pass `--azure-os-disk ephemeral` only
-for stateless leases that do not need native checkpoint/fork. Pass
-`--azure-os-disk ephemeral-preview` to opt into Azure's public-preview
-full-caching mode for ephemeral OS disks.
+for stateless leases that do not need native checkpoint/fork. This mode enables
+generally available full caching and requires at least eight vCPUs.
 
 ## Fixed operation IDs
 
@@ -107,8 +133,8 @@ SKU unless `--type` is explicit). They do not perform SKU, market, or region
 fallback, and do not roll back an ambiguous allocation. VM creation is
 create-only. Replay observes the original attempt and never submits a second
 allocation. This supports VM-image leases, including native Windows and WSL2;
-snapshot forks and `ephemeral-preview` disks are not supported on this direct
-fixed-ID path. Ordinary direct leases retain their existing fallback behavior.
+snapshot forks are not supported on this direct fixed-ID path. Full-caching
+ephemeral disks support fixed IDs through create-only SDK requests. Ordinary direct leases retain their existing fallback behavior.
 
 Use `stop --provider azure <lease-id>` for owned cleanup. Successful deletion
 retains a terminal tombstone; the ID cannot create another VM. If a failed
@@ -169,20 +195,41 @@ not supported because those VM sizes do not support nested virtualization.
 VM public IP, `private` uses the NIC private IP from the vnet. Use `private` when
 connecting through a VPN to the Azure virtual network.
 
-`azure.osDisk` accepts `managed`, `ephemeral`, `ephemeral-preview`, or `auto`:
+`azure.osDisk` accepts `managed`, `ephemeral`, or `auto`:
 
 - `managed` (default) provisions a managed `StandardSSD_LRS` OS disk so Azure
   native disk-snapshot checkpoints work.
-- `ephemeral` opts into a local OS disk. It requires a SKU with ephemeral OS disk
-  support, fails during provisioning when the selected SKU cannot support it, and
-  disables native Azure checkpoint/fork.
-- `ephemeral-preview` enables Azure ephemeral OS disk full caching with Compute
-  API `2025-04-01`. It is public preview, has the same checkpoint/fork limits as
-  `ephemeral`, and skips known unsupported 2-core, 4-core, and no-local-disk
-  Azure SKUs from Crabbox fallback lists.
+- `ephemeral` enables GA full caching with Compute API `2026-04-01`.
+  It requires ephemeral OS support, at least eight active vCPUs, and local storage
+  greater than twice the OS disk size plus 1 GiB. Supported families are
+  N/L/M/H, D/DC/E/Eb/EC v5-v7, and F v6-v7. Azure validates image capacity.
+  Crabbox filters known unsupported class fallbacks. Native checkpoint/fork
+  remains unavailable.
 - `auto` is accepted for compatibility and resolves to `managed`.
 
+`ephemeral-preview` is removed; replace it with `ephemeral`. Existing `ephemeral`
+settings now enable full caching, so smaller VMs and Fsv2 no longer qualify.
+Constrained sizes use the active count (`Standard_E8-4ds_v5` has four vCPUs).
+Choose an eligible `--type` or use `--azure-os-disk managed` to retain smaller VMs.
+Older CLIs sending `ephemeral-preview` to an updated coordinator receive an
+explicit HTTP 400 replacement error before allocation. Update
+`CRABBOX_AZURE_OS_DISK` on the coordinator too if it still names the removed mode.
+See [Microsoft's full caching prerequisites](https://learn.microsoft.com/en-us/azure/virtual-machines/ephemeral-os-disks#prerequisites-for-full-caching).
+
 ### Environment variables
+
+For direct VM leases, `--azure-user-assigned-identity-resource-id` (or
+`azure.userAssignedIdentityResourceId` in config) attaches one existing
+user-assigned managed identity. Crabbox verifies the attachment in Azure's VM
+identity field before a fixed lease becomes ready or can be adopted. The
+allocator must have permission to assign the identity at its resource scope.
+Release-only lookup and deletion remain available if the attachment is later
+removed.
+
+To enable an identity for an existing fixed lease, stop that lease and allocate
+a replacement with a new lease ID. Fixed create inputs cannot change in place,
+and a stopped fixed lease ID remains terminal. Claims created without this
+setting can still be resolved and released.
 
 Direct-mode config can be supplied entirely via environment:
 
@@ -194,9 +241,10 @@ AZURE_CLIENT_SECRET              # service-principal secret (never read from con
 CRABBOX_AZURE_BACKEND            # vm | dynamic-sessions
 CRABBOX_AZURE_LOCATION
 CRABBOX_AZURE_RESOURCE_GROUP
+CRABBOX_AZURE_USER_ASSIGNED_IDENTITY_RESOURCE_ID
 CRABBOX_AZURE_IMAGE
 CRABBOX_AZURE_WINDOWS_ARM64_IMAGE
-CRABBOX_AZURE_OS_DISK            # managed | ephemeral | ephemeral-preview | auto
+CRABBOX_AZURE_OS_DISK            # managed | ephemeral | auto
 CRABBOX_AZURE_VNET
 CRABBOX_AZURE_SUBNET
 CRABBOX_AZURE_NSG
@@ -259,6 +307,38 @@ global `CRABBOX_AZURE_IMAGE` fallback used by existing custom-image leases.
 Set `CRABBOX_AZURE_REGIONS` on the coordinator for Azure-specific capacity fallback;
 `CRABBOX_CAPACITY_REGIONS` remains the AWS region fallback list.
 
+For ordinary brokered VM creates, the coordinator checks Resource SKUs before
+allocating network resources. Within each region it prefers SKUs advertised as
+available and skips explicit subscription location restrictions. The lookup has
+a five-second budget and caches complete results for five minutes per client,
+subscription, and region. Missing entries, missing read permission, and failed
+lookups leave availability unknown and retain ordinary ARM fallback. These VMs
+are unzoned, so zone-only restrictions do not exclude a regional SKU. The
+catalogue describes subscription eligibility, not live capacity or proof that
+a VM allocation was rejected.
+
+Ordinary brokered creates retain region preference, trying the selected market
+then enabled on-demand fallback in each region. With multiple regions configured,
+the first capacity failure in each region/market ends that SKU chain so another
+region is reached sooner. Single-region requests retain the full SKU chain;
+explicit `--type` requests retain that exact SKU. Confirmed capacity rejections
+with verified companion cleanup are cached in coordinator state for five minutes,
+scoped by subscription/resource group, region, SKU, and market. Later creates skip
+those combinations; timeouts, ambiguous allocation, and pending cleanup never
+populate the cache. Cached skips confer no allocation or cleanup authority.
+Failed attempts expose `durationMs`, including network setup and checked cleanup.
+
+VM create polls default to five seconds and honor longer `Retry-After` delays
+within the remaining budget. PIP and NIC creates remain sequential because NIC
+references PIP and VM references NIC. VM attempt budgets remain 120 seconds for
+default Spot fallback and 180 seconds for on-demand; network LROs remain bounded
+at 60 seconds each. Ordinary brokered Azure creation has a 25-minute total API
+and polling budget across all candidates. Expiry stops new attempts and retains
+unresolved cleanup claims; it never establishes that an allocation was rejected.
+Native Windows durable provisioning retains its frozen candidate plan and
+30-minute continuation budget. Brokered clients wait up to 31 minutes, including
+a response margin; an earlier caller deadline or cancellation still wins.
+
 Run `crabbox doctor --provider azure --target windows` before leasing through the
 broker. The coordinator readiness check reports missing coordinator secret names
 without exposing values, and lease creation fails with `provider_not_configured`
@@ -318,6 +398,14 @@ and ambiguous API errors retain ownership for retry. Promoting the snapshot
 creates a durable pin that blocks expiry and manual checkpoint deletion until
 the exact promotion is replaced. Direct Azure snapshots and older image records
 remain operator-managed.
+
+Direct OS-disk checkpoint deletion compares the captured ARM ID and immutable
+snapshot `uniqueId` against a fresh read. Missing or mismatched identity detaches
+the local record and leaves the current snapshot untouched. Legacy records
+require manual Azure cleanup followed by `checkpoint delete <id> --local-only`;
+see [checkpoint deletion](../commands/checkpoint.md#delete), including the
+remaining GET-to-DELETE race because the snapshot API has no documented
+conditional deletion support.
 
 ## Classes
 

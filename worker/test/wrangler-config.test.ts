@@ -31,6 +31,31 @@ describe("wrangler config", () => {
     }
   });
 
+  it("leaves individual memberships and lease policy overrides out of deployment config", () => {
+    for (const name of [
+      "CRABBOX_SERVE_ALLOWED_OWNERS",
+      "CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS",
+      "CRABBOX_CAPACITY_ADMIN_OWNERS",
+      "CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS",
+      "CRABBOX_LEASE_POLICY_OVERRIDES",
+    ]) {
+      expect(configStringValues(name)).toEqual([]);
+    }
+    expect(wranglerConfig).not.toMatch(/github:\d+/);
+  });
+
+  it.each([
+    ["CRABBOX_MAX_ACTIVE_LEASES", 50],
+    ["CRABBOX_MAX_ACTIVE_LEASES_PER_ORG", 50],
+    ["CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN", 50],
+    ["CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER", 10],
+    ["CRABBOX_MAX_MONTHLY_USD", 100000],
+    ["CRABBOX_MAX_MONTHLY_USD_PER_OWNER", 50000],
+    ["CRABBOX_MAX_MONTHLY_USD_PER_ORG", 100000],
+  ])("keeps deployed and preview %s at %i", (name, limit) => {
+    expect(configValues(name)).toEqual([limit, limit]);
+  });
+
   it("keeps deployed and preview checkpoint and use-claim admission bounded", () => {
     expect(configValues("CRABBOX_MAX_CHECKPOINTS")).toEqual([100, 20]);
     expect(configValues("CRABBOX_MAX_CHECKPOINTS_PER_OWNER")).toEqual([100, 10]);
@@ -79,6 +104,13 @@ describe("wrangler config", () => {
   it("binds deployment version metadata for interrupted provisioning recovery", () => {
     expect(wranglerConfig).toContain('"version_metadata"');
     expect(wranglerConfig).toContain('"binding": "CF_VERSION_METADATA"');
+  });
+
+  it("keeps Workers Logs enabled without sampling away rare failures", () => {
+    const observability = wranglerConfig.match(/"observability"\s*:\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(observability).toMatch(/"enabled"\s*:\s*true/);
+    expect(observability).toMatch(/"head_sampling_rate"\s*:\s*1\s*,/);
+    expect(observability).toMatch(/"redact_query_string"\s*:\s*true/);
   });
 });
 

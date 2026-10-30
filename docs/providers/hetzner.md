@@ -75,12 +75,15 @@ on the client.
 
 ## OS selector
 
-Crabbox accepts the portable Linux selector `--os` (default `ubuntu:26.04`, also
-`ubuntu:24.04`). Hetzner's public image catalog does not expose an Ubuntu 26.04
-slug yet, so **both** `ubuntu:26.04` and `ubuntu:24.04` currently resolve to the
-Hetzner image `ubuntu-24.04`. If proof must actually run on Ubuntu 26.04, use
-AWS, GCP, Azure, or a container provider, whose image maps already point at a
-26.04 image.
+Crabbox accepts the portable Linux selector `--os`: the default `ubuntu:26.04`
+resolves to Hetzner's `ubuntu-26.04`, and `ubuntu:24.04` resolves to
+`ubuntu-24.04`. Explicit provider image overrides still win over the selector.
+
+Hetzner [announced Ubuntu 26.04 on May 18, 2026](https://docs.hetzner.cloud/changelog#2026-05-18-fedora-44-and-ubuntu-2604-now-available),
+with the `ubuntu-26.04` slug for both x86 and Arm. The generated Go and Worker
+catalogs use that published slug directly. Bootstrap still checks required tools
+and installs missing packages; image availability alone does not prove that a
+particular image includes `jq`.
 
 ## Lifecycle
 
@@ -163,6 +166,17 @@ when Hetzner reports a capacity or quota error.
 
 ## Gotchas
 
+Hetzner limits user-data to 32 KiB. Crabbox sends larger cloud-init configurations
+(including desktop/browser setup) as a base64-encoded gzip MIME message that
+cloud-init decodes before processing. The decoded configuration and bootstrap
+ordering are unchanged. Configurations that still exceed the limit after
+compression fail before the server create request.
+
+On Ubuntu 26.04, bootstrap package hooks report pending service restarts without
+performing them. Restarting `cloud-init-main.service` between stages leaves
+cloud-final waiting indefinitely, so desktop and browser leases never publish
+readiness. See [runner bootstrap](../features/runner-bootstrap.md).
+
 Brokered release acknowledgement queues cleanup. A durable journal records
 validated delete-action success plus exact server absence before owned key
 cleanup, or a distinct already-absent observation before any known dispatch.
@@ -182,3 +196,21 @@ owned key ID without a server receipt. See [cleanup confirmation](../features/li
 - [Provider backends](../provider-backends.md)
 - [Linux VNC](../features/vnc-linux.md)
 - [AWS](aws.md), [GCP](gcp.md), [Azure](azure.md)
+
+## Coordinator preparation reuse
+
+Fresh canonical per-lease SSH keys still receive a name lookup and ownership
+check. The coordinator then attempts registration directly, reading the full
+SSH-key inventory only after a uniqueness conflict. Shared or custom keys keep
+their existing eager identity lookup. Conflict recovery still verifies exact
+key identity and lease ownership before reusing a canonical key; differently
+named shared keys remain retained during cleanup. Inventory failures fail closed.
+
+The coordinator caches successful hourly pricing estimates in memory for five
+minutes by provider, server type, and location (including the EUR/USD conversion
+setting for Hetzner). AWS Spot estimates use the same bounded cache, with region
+and market kept separate; on-demand estimates retain their existing fallback.
+Each coordinator environment keeps at most 256 cached quotes. Failed or missing
+quotes are not cached and use the existing fallback estimate. Cold lookups keep
+the existing five-second deadline, so unavailable pricing cannot reject admission
+or leave it waiting indefinitely. These estimates are not billing guarantees.

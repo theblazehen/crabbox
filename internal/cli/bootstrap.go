@@ -54,7 +54,23 @@ func cloudInitWithExtras(cfg Config, publicKey, additionalConfig, additionalBoot
 	yamlPublicKey := yamlInlineString(publicKey)
 	shellSSHUser := shellQuote(cfg.SSHUser)
 	shellWorkRoot := shellQuote(cfg.WorkRoot)
-	readinessBootstrap := indentCloudInitRuncmd(linuxMinimalReadinessBootstrap)
+	// Optional services retain cloud-final ordering; the minimal path finishes early.
+	finish := "    retry /usr/local/lib/crabbox-ready-checks\n    touch /var/lib/crabbox/bootstrapped\n"
+	core := `    #!/bin/bash
+    exec > >(tee -a /var/log/cloud-init-output.log) 2>&1
+` + indentCloudInitRuncmd(sharedLinuxBootstrapPrelude()) + indentCloudInitRuncmd(sharedLinuxSSHRestart()) + indentCloudInitRuncmd(linuxMinimalReadinessBootstrap) + "\n" + fmt.Sprintf(`    mkdir -p %[1]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm
+    chown -R %[2]s:%[2]s %[1]s /var/cache/crabbox
+    install -d /var/lib/crabbox
+`, shellWorkRoot, shellSSHUser) + indentCloudInitRuncmd(sharedLinuxSSHRestart()) + cloudInitEarlyBootstrap(cfg) + "\n"
+	final := "    systemctl start crabbox-bootstrap.service\n"
+	workspaceAfter := "crabbox-bootstrap.service cloud-config.service"
+	core += indentCloudInitRuncmd(sharedLinuxBootstrapActivate())
+	if bootstrap == "" {
+		core += finish
+	} else {
+		final += indentCloudInitRuncmd(sharedLinuxBootstrapPrelude()) + bootstrap + "\n" + finish
+		workspaceAfter += " cloud-final.service"
+	}
 	return fmt.Sprintf(`#cloud-config
 package_update: false
 package_upgrade: false
@@ -65,6 +81,9 @@ package_upgrade: false
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     ssh_authorized_keys:
       - %[2]s
+bootcmd:
+  - |
+%[10]s
 write_files:
   - path: /etc/ssh/sshd_config.d/99-crabbox-port.conf
     permissions: '0644'
@@ -76,41 +95,53 @@ write_files:
     content: |
       #!/bin/sh
       set -eu
+      test -f /var/lib/crabbox/bootstrapped
+      exec /usr/local/lib/crabbox-ready-checks
+  - path: /usr/local/lib/crabbox-ready-checks
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
       git --version
       rsync --version >/dev/null
       curl --version >/dev/null
       jq --version >/dev/null
       tmux -V >/dev/null
       flock --version >/dev/null
-      test -f /var/lib/crabbox/bootstrapped
       test -w %[3]s
 %[5]s
+  - path: /etc/systemd/system/crabbox-workspace-ready.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Crabbox workspace per-boot readiness
+      After=%[12]s
+      ConditionPathExists=/var/lib/crabbox/bootstrapped
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/crabbox-ready
+      ExecStart=/usr/bin/install -d /run/crabbox
+      ExecStart=/usr/bin/touch /run/crabbox/workspace-ready
+
+      [Install]
+      WantedBy=cloud-init.target
 %[6]s
+  - path: /usr/local/lib/crabbox-bootstrap.sh
+    permissions: '0700'
+    content: |
+%[9]s
 runcmd:
   - |
     bash -euxo pipefail <<'BOOT'
-    export DEBIAN_FRONTEND=noninteractive
-    retry() {
-      n=1
-      until "$@"; do
-        if [ "$n" -ge 8 ]; then
-          return 1
-        fi
-        sleep $((n * 5))
-        n=$((n + 1))
-      done
-    }
-%[9]s
-    mkdir -p %[3]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm
-    chown -R %[7]s:%[7]s %[3]s /var/cache/crabbox
-    install -d /var/lib/crabbox
-    systemctl enable ssh || true
-%[10]s
 %[8]s
-    touch /var/lib/crabbox/bootstrapped
-    retry crabbox-ready
     BOOT
-`, yamlSSHUser, yamlPublicKey, shellWorkRoot, portLines, readyChecks, writeFiles, shellSSHUser, bootstrap, readinessBootstrap, indentCloudInitRuncmd(sharedLinuxSSHRestart()), additionalConfig)
+`, yamlSSHUser, yamlPublicKey, shellWorkRoot, portLines, readyChecks, writeFiles, shellSSHUser, final, indentCloudInitScriptFile(core), indentCloudInitRuncmd(sharedLinuxBootstrapStart()), additionalConfig, workspaceAfter)
+
+}
+
+func indentCloudInitScriptFile(script string) string {
+	return "  " + strings.ReplaceAll(strings.TrimRight(script, "\n"), "\n", "\n  ") + "\n"
 }
 
 func CloudInitUserData(cfg Config, publicKey string) string {
@@ -264,8 +295,22 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	  wsl.exe --set-default $wslDistro | Out-Host
 	  if ($LASTEXITCODE -ne 0) { throw "wsl --set-default failed with exit $LASTEXITCODE" }
 	}
-	$linuxSetup = @'
-set -euo pipefail
+	$linuxSetup = ` + psQuote(windowsWSL2LinuxSetup(workRoot)) + `
+	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
+	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
+	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
+	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
+	wsl.exe --terminate $wslDistro | Out-Host
+	if ($LASTEXITCODE -ne 0) { throw "WSL restart failed with exit $LASTEXITCODE" }
+	wsl.exe -d $wslDistro --exec /usr/local/bin/crabbox-ready
+	if ($LASTEXITCODE -ne 0) { throw "WSL cold-start readiness failed with exit $LASTEXITCODE" }
+	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
+	Restart-Service sshd -Force
+	`
+}
+
+func windowsWSL2LinuxSetup(workRoot string) string {
+	return `set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /etc/cloud
 # Crabbox owns this distro's setup. WSL datasource discovery can block systemd
@@ -329,19 +374,7 @@ test -w ` + shellQuote(workRoot) + `
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 touch /var/lib/crabbox/bootstrapped
-sudo -H -u crabbox /usr/local/bin/crabbox-ready
-'@
-	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
-	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
-	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
-	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
-	wsl.exe --terminate $wslDistro | Out-Host
-	if ($LASTEXITCODE -ne 0) { throw "WSL restart failed with exit $LASTEXITCODE" }
-	wsl.exe -d $wslDistro --exec /usr/local/bin/crabbox-ready
-	if ($LASTEXITCODE -ne 0) { throw "WSL cold-start readiness failed with exit $LASTEXITCODE" }
-	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
-	Restart-Service sshd -Force
-	`
+sudo -H -u crabbox /usr/local/bin/crabbox-ready`
 }
 
 // The lease owns distro lifetime: WSL's client-idle shutdown kills detached
@@ -499,8 +532,8 @@ func cloudInitOptionalReadyChecks(cfg Config) string {
 
 func cloudInitOptionalWriteFiles(cfg Config) string {
 	var parts []string
-	if cfg.Provider == "gcp" {
-		parts = append(parts, cloudInitGCPExpiryGuardFiles())
+	if files := cloudInitGuestExpiryGuardFiles(cfg); files != "" {
+		parts = append(parts, files)
 	}
 	if cfg.Desktop && isWaylandDesktopEnv(cfg.DesktopEnv) {
 		parts = append(parts, cloudInitWaylandDesktopWriteFiles(normalizedDesktopEnv(cfg.DesktopEnv)))
@@ -638,6 +671,10 @@ func cloudInitWaylandDesktopWriteFiles(desktopEnv string) string {
 `
 }
 
+func cloudInitEarlyBootstrap(cfg Config) string {
+	return cloudInitGuestExpiryGuardBootstrap(cfg)
+}
+
 func cloudInitOptionalBootstrap(cfg Config) string {
 	var parts []string
 	if cfg.Desktop || cfg.Browser {
@@ -754,9 +791,6 @@ chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
     systemctl enable crabbox-xvfb.service crabbox-desktop.service
     systemctl restart crabbox-xvfb.service crabbox-desktop.service`)
 	}
-	if cfg.Provider == "gcp" {
-		parts = append(parts, cloudInitGCPExpiryGuardBootstrap())
-	}
 	if cfg.Browser {
 		parts = append(parts, `    crabbox_install_packages gnupg build-essential python3
     browser_path="$(crabbox_existing_browser || true)"
@@ -845,101 +879,6 @@ func indentCloudInitRuncmd(script string) string {
 		lines[i] = "    " + line
 	}
 	return strings.Join(lines, "")
-}
-
-func cloudInitGCPExpiryGuardFiles() string {
-	return `  - path: /usr/local/sbin/crabbox-gcp-expiry-guard
-    permissions: '0755'
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      metadata() {
-        curl -fsS -H 'Metadata-Flavor: Google' "http://metadata.google.internal/computeMetadata/v1/$1"
-      }
-      project="$(metadata project/project-id 2>/dev/null || true)"
-      name="$(metadata instance/name 2>/dev/null || true)"
-      zone_path="$(metadata instance/zone 2>/dev/null || true)"
-      zone="${zone_path##*/}"
-      token_json="$(metadata instance/service-accounts/default/token 2>/dev/null || true)"
-      token="$(printf '%s' "$token_json" | jq -r '.access_token // empty' 2>/dev/null || true)"
-      if [ -z "$project" ] || [ -z "$name" ] || [ -z "$zone" ] || [ -z "$token" ]; then
-        exit 0
-      fi
-      instance="$(curl -fsS -H "Authorization: Bearer $token" "https://compute.googleapis.com/compute/v1/projects/$project/zones/$zone/instances/$name" 2>/dev/null || true)"
-      if [ -z "$instance" ]; then
-        exit 0
-      fi
-      label() {
-        printf '%s' "$instance" | jq -r --arg key "$1" '.labels[$key] // empty'
-      }
-      crabbox="$(label crabbox)"
-      provider="$(label provider)"
-      if [ "$crabbox" != "true" ] || { [ -n "$provider" ] && [ "$provider" != "gcp" ]; }; then
-        exit 0
-      fi
-      keep="$(label keep | tr '[:upper:]' '[:lower:]')"
-      if [ "$keep" = "true" ]; then
-        exit 0
-      fi
-      expires_at="$(label expires_at)"
-      state="$(label state | tr '[:upper:]' '[:lower:]')"
-      now="$(date -u +%s)"
-      delete=false
-      case "$state" in
-        failed|released|expired)
-          delete=true
-          ;;
-        running|provisioning)
-          if [[ "$expires_at" =~ ^[0-9]+$ ]] && [ "$now" -gt $((expires_at + 43200)) ]; then
-            delete=true
-          fi
-          ;;
-        leased|ready|active|"")
-          if [[ "$expires_at" =~ ^[0-9]+$ ]] && [ "$now" -gt "$expires_at" ]; then
-            delete=true
-          fi
-          ;;
-        *)
-          if [[ "$expires_at" =~ ^[0-9]+$ ]] && [ "$now" -gt "$expires_at" ]; then
-            delete=true
-          fi
-          ;;
-      esac
-      if [ "$delete" != "true" ]; then
-        exit 0
-      fi
-      logger -t crabbox-gcp-expiry-guard "deleting expired lease=$(label lease) state=${state:-unknown} expires_at=${expires_at:-missing}"
-      curl -fsS -X DELETE -H "Authorization: Bearer $token" "https://compute.googleapis.com/compute/v1/projects/$project/zones/$zone/instances/$name" >/dev/null || true
-  - path: /etc/systemd/system/crabbox-gcp-expiry-guard.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Crabbox GCP direct lease expiry guard
-      After=network-online.target
-      Wants=network-online.target
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/sbin/crabbox-gcp-expiry-guard
-  - path: /etc/systemd/system/crabbox-gcp-expiry-guard.timer
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Run Crabbox GCP direct lease expiry guard
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitActiveSec=2min
-      RandomizedDelaySec=30s
-      Persistent=true
-
-      [Install]
-      WantedBy=timers.target`
-}
-
-func cloudInitGCPExpiryGuardBootstrap() string {
-	return `    systemctl daemon-reload
-    systemctl enable --now crabbox-gcp-expiry-guard.timer`
 }
 
 func cloudInitTailscaleBootstrap(cfg Config) string {

@@ -13,6 +13,7 @@ import {
   type CoordinatorStorageView,
   type CoordinatorWebSocketUpgradeOptions,
 } from "../src/coordinator-runtime";
+import { isDurableObjectStorageFailure } from "../src/durable-object-errors";
 import { FleetCoordinator } from "../src/fleet";
 import { githubAuthRoute } from "../src/oauth";
 import { orgKeyForLabel } from "../src/org-identity";
@@ -164,6 +165,137 @@ class MemoryRuntime implements CoordinatorRuntime {
     this.alarmTime = undefined;
   }
 }
+
+describe("Cloudflare storage failure provenance", () => {
+  function fixture() {
+    const storage = Object.assign(new MemoryStorage(), {
+      deleteAll: vi.fn<() => Promise<void>>(async () => {}),
+      getAlarm: vi.fn<() => Promise<number>>(async () => 1),
+      setAlarm: vi.fn<(_time: number) => Promise<void>>(async (_time) => {}),
+      deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
+    });
+    const runtime = new CloudflareCoordinatorRuntime({ storage } as unknown as DurableObjectState);
+    return { storage, runtime };
+  }
+
+  it.each([
+    ["get", "get", (runtime: CloudflareCoordinatorRuntime) => runtime.storage.get("key")],
+    ["put", "put", (runtime: CloudflareCoordinatorRuntime) => runtime.storage.put("key", 1)],
+    ["delete", "delete", (runtime: CloudflareCoordinatorRuntime) => runtime.storage.delete("key")],
+    ["list", "list", (runtime: CloudflareCoordinatorRuntime) => runtime.storage.list()],
+    [
+      "deleteAll",
+      "deleteAll",
+      (runtime: CloudflareCoordinatorRuntime) => runtime.storage.deleteAll(),
+    ],
+    ["take read", "get", (runtime: CloudflareCoordinatorRuntime) => runtime.take("key")],
+    ["take delete", "delete", (runtime: CloudflareCoordinatorRuntime) => runtime.take("key")],
+    ["alarm read", "getAlarm", (runtime: CloudflareCoordinatorRuntime) => runtime.getAlarm()],
+    [
+      "alarm write",
+      "setAlarm",
+      (runtime: CloudflareCoordinatorRuntime) => runtime.scheduleAlarm(2),
+    ],
+    [
+      "alarm delete",
+      "deleteAlarm",
+      (runtime: CloudflareCoordinatorRuntime) => runtime.clearAlarm(),
+    ],
+    [
+      "transaction read",
+      "get",
+      (runtime: CloudflareCoordinatorRuntime) =>
+        runtime.storage.transaction((storage) => storage.get("key")),
+    ],
+    [
+      "transaction write",
+      "put",
+      (runtime: CloudflareCoordinatorRuntime) =>
+        runtime.storage.transaction((storage) => storage.put("key", 1)),
+    ],
+    [
+      "transaction delete",
+      "delete",
+      (runtime: CloudflareCoordinatorRuntime) =>
+        runtime.storage.transaction((storage) => storage.delete("key")),
+    ],
+    [
+      "transaction list",
+      "list",
+      (runtime: CloudflareCoordinatorRuntime) =>
+        runtime.storage.transaction((storage) => storage.list()),
+    ],
+    [
+      "commitAndWake alarm read",
+      "getAlarm",
+      (runtime: CloudflareCoordinatorRuntime) => runtime.commitAndWake(async () => undefined),
+    ],
+    [
+      "commitAndWake alarm write",
+      "setAlarm",
+      (runtime: CloudflareCoordinatorRuntime) =>
+        runtime.commitAndWake((storage) => setLegacyWake(storage, 2)),
+    ],
+    [
+      "commitAndWake alarm delete",
+      "deleteAlarm",
+      (runtime: CloudflareCoordinatorRuntime) =>
+        runtime.commitAndWake((storage) => setLegacyWake(storage)),
+    ],
+  ] as const)("preserves and marks %s rejections without replay", async (_label, method, run) => {
+    const { storage, runtime } = fixture();
+    await storage.put("key", 1);
+    const error = Object.assign(new Error("storage unavailable"), { retryable: true });
+    const operation = vi.spyOn(storage, method).mockRejectedValue(error);
+    await expect(run(runtime)).rejects.toBe(error);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(isDurableObjectStorageFailure(error)).toBe(true);
+  });
+
+  it.each(["transaction", "commitAndWake"] as const)(
+    "marks native %s commit failures without replaying a committed callback",
+    async (method) => {
+      const { storage, runtime } = fixture();
+      const error = Object.assign(new Error("commit acknowledgement lost"), { retryable: true });
+      vi.spyOn(storage, "transaction").mockImplementation(async (callback) => {
+        await callback(storage);
+        throw error;
+      });
+      const callback = vi.fn<(view: CoordinatorStorageView) => Promise<void>>(async (view) =>
+        view.put("committed", 1),
+      );
+      const operation =
+        method === "transaction"
+          ? runtime.storage.transaction(callback)
+          : runtime.commitAndWake(callback);
+      await expect(operation).rejects.toBe(error);
+      expect(isDurableObjectStorageFailure(error)).toBe(true);
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(storage.value("committed")).toBe(1);
+      await expect(runtime.readSnapshot(async () => "settled")).resolves.toBe("settled");
+    },
+  );
+
+  it.each(["transaction", "commitAndWake"] as const)(
+    "does not mark arbitrary %s callback failures",
+    async (method) => {
+      const { runtime } = fixture();
+      const error = Object.assign(new Error("provider unavailable"), {
+        retryable: true,
+        overloaded: true,
+      });
+      const callback = async () => {
+        throw error;
+      };
+      const operation =
+        method === "transaction"
+          ? runtime.storage.transaction(callback)
+          : runtime.commitAndWake(callback);
+      await expect(operation).rejects.toBe(error);
+      expect(isDurableObjectStorageFailure(error)).toBe(false);
+    },
+  );
+});
 
 describe("coordinator runtimes", () => {
   it("applies the protocol frame limit to runtime adapter upgrades", async () => {
@@ -565,10 +697,15 @@ describe("coordinator runtimes", () => {
       ["GET", "/v1/workspaces/fleet-is-101"],
       ["DELETE", "/v1/workspaces/fleet-is-101"],
       ["GET", "/v1/control"],
+      ["GET", "/v1/whoami"],
+      ["GET", "/v1/leases"],
+      ["GET", "/v1/admin/leases"],
       ["GET", "/v1/native-vnc/handoff"],
       ["GET", "/v1/leases/cbx_abcdef123456"],
       ["PUT", "/v1/leases/cbx_abcdef123456"],
       ["PUT", "/v1/leases/cbx_abcdef123456/from-checkpoint"],
+      ["PUT", "/v1/leases/cbx_abcdef123456/resource-constrained"],
+      ["POST", "/v1/leases/resource-constrained"],
       ["POST", "/v1/leases/from-checkpoint"],
       ["POST", "/v1/checkpoints"],
       ["GET", "/v1/checkpoints/chk_example"],
@@ -576,6 +713,8 @@ describe("coordinator runtimes", () => {
       ["POST", "/v1/checkpoints/chk_example/use"],
       ["DELETE", "/v1/checkpoints/chk_example"],
       ["POST", "/v1/leases/cbx_abcdef123456/tailscale"],
+      ["POST", "/v1/admin/tailscale-preflight"],
+      ["GET", "/v1/admin/leases/cbx_abcdef123456/lifetime-readback"],
       ["GET", "/v1/adapters/applied-alice"],
       ["POST", "/v1/adapters/applied-alice/proxy/v1/workspaces"],
     ]) {
@@ -612,6 +751,7 @@ describe("coordinator runtimes", () => {
       ["POST", "/v1/images/ami-1/promote-catalog"],
       ["DELETE", "/v1/images/ami-1"],
       ["DELETE", "/v1/images/ami-1/promote-catalog"],
+      ["DELETE", "/v1/images/ami-1/promote"],
     ]) {
       expect(
         coordinatorRequestQueue(new Request(`https://coordinator.test${path}`, { method })),
@@ -748,6 +888,104 @@ describe("coordinator runtimes", () => {
     expect(runtime.socketAttachment(socket)).toBe(attachment);
     await expect(storage.get("ticket:one-time")).resolves.toBeUndefined();
     await expect(runtime.getAlarm()).resolves.toBeUndefined();
+  });
+
+  it.each(["put", "delete", "transaction", "take", "commitAndWake", "rollback"] as const)(
+    "rejects a concurrent Cloudflare diagnostic snapshot after %s",
+    async (mutation) => {
+      const storage = new ProvisioningTestStorage();
+      const runtime = new CloudflareCoordinatorRuntime({
+        storage,
+      } as unknown as DurableObjectState);
+      await runtime.storage.put("lease:one", { state: "active" });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const snapshot = runtime.readSnapshot(async (view) => {
+        const value = await view.get("lease:one", { allowConcurrency: true });
+        entered();
+        await gate;
+        return value;
+      });
+      await started;
+      let failure: unknown;
+      try {
+        if (mutation === "put") await runtime.storage.put("lease:one", { state: "released" });
+        if (mutation === "delete") await runtime.storage.delete("lease:one");
+        if (mutation === "take") await runtime.take("lease:one");
+        if (mutation === "transaction") {
+          await runtime.storage.transaction((view) => view.delete("lease:one"));
+        }
+        if (mutation === "commitAndWake") {
+          await runtime.commitAndWake((view) => view.delete("lease:one"));
+        }
+        if (mutation === "rollback") {
+          await runtime.storage
+            .transaction(async (view) => {
+              await view.delete("lease:one");
+              throw new Error("rollback");
+            })
+            .catch((error) => {
+              failure = error;
+            });
+        }
+      } finally {
+        release();
+      }
+      expect(failure).toEqual(mutation === "rollback" ? new Error("rollback") : undefined);
+      await expect(snapshot).resolves.toBeUndefined();
+      await expect(runtime.readSnapshot(async () => "stable")).resolves.toBe("stable");
+    },
+  );
+
+  it("refuses snapshots while a Cloudflare write is pending and preserves native binding", async () => {
+    const storage = new ProvisioningTestStorage();
+    const runtime = new CloudflareCoordinatorRuntime({ storage } as unknown as DurableObjectState);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writer = runtime.storage.transaction(async (view) => {
+      await gate;
+      await view.put("lease:one", { state: "active" });
+    });
+    const read = vi.fn<() => Promise<string>>(async () => "unsafe");
+    try {
+      await expect(runtime.readSnapshot(read)).resolves.toBeUndefined();
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+    await writer;
+    await expect(
+      runtime.readSnapshot((view) => view.get("lease:one", { allowConcurrency: true })),
+    ).resolves.toEqual({ state: "active" });
+  });
+
+  it("preserves synchronous transaction results and observes their writes", async () => {
+    const storage = {
+      value: 0,
+      transactionSync<T>(callback: () => T): T {
+        this.value++;
+        return callback();
+      },
+    };
+    const runtime = new CloudflareCoordinatorRuntime({ storage } as unknown as DurableObjectState);
+    const snapshot = runtime.readSnapshot(async () => "before");
+    expect(runtime.storage.transactionSync(() => 42)).toBe(42);
+    expect(storage.value).toBe(1);
+    await expect(snapshot).resolves.toBeUndefined();
+    expect(() =>
+      runtime.storage.transactionSync(() => {
+        throw new Error("sync rollback");
+      }),
+    ).toThrow("sync rollback");
+    await expect(runtime.readSnapshot(async () => "after")).resolves.toBe("after");
   });
 
   it("atomically commits durable due work and alarms across rollback and concurrent clear", async () => {
@@ -942,7 +1180,7 @@ describe("coordinator runtimes", () => {
     expect(order).toEqual(["first:start", "first:end", "second"]);
   });
 
-  it("serializes fallback control socket messages with state transitions", async () => {
+  it("runs fallback control authorization outside lifecycle state transitions", async () => {
     const state = {
       storage: {},
     } as unknown as DurableObjectState;
@@ -968,7 +1206,7 @@ describe("coordinator runtimes", () => {
 
     listeners.get("message")?.({ data: "{}" } as MessageEvent);
     await Promise.resolve();
-    expect(message).not.toHaveBeenCalled();
+    expect(message).toHaveBeenCalledOnce();
 
     releaseTransition();
     await transition;

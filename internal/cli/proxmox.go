@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,6 +26,9 @@ type ProxmoxClient struct {
 	TokenSecret string
 	Node        string
 	Client      *http.Client
+	// GuestBootstrap extends the base SSH bootstrap with provider-owned setup
+	// and readiness checks for an explicitly selected prepared template.
+	GuestBootstrap func(Config) (setup, readyChecks string)
 }
 
 type ProxmoxReadinessCheck struct {
@@ -45,6 +49,8 @@ type ProxmoxError struct {
 	Path       string
 	StatusCode int
 	Body       string
+	// NativeAuthRejection excludes gateway errors and replies carrying task data.
+	NativeAuthRejection bool
 }
 
 func (e *ProxmoxError) Error() string {
@@ -134,7 +140,7 @@ func (c *ProxmoxClient) doEnvelope(ctx context.Context, method, path string, for
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &ProxmoxError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: summarizeJSON([]byte(c.redactErrorBody(string(data))))}
+		return &ProxmoxError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: summarizeJSON([]byte(c.redactErrorBody(string(data)))), NativeAuthRejection: proxmoxNativeAuthRejection(resp, data)}
 	}
 	if out == nil {
 		return nil
@@ -152,6 +158,23 @@ func (c *ProxmoxClient) doEnvelope(ctx context.Context, method, path string, for
 		return fmt.Errorf("proxmox %s %s: missing required data in response", method, path)
 	}
 	return json.Unmarshal(envelope.Data, out)
+}
+
+func proxmoxNativeAuthRejection(resp *http.Response, data []byte) bool {
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" || !strings.HasPrefix(resp.Header.Get("Server"), "pve-api-daemon/") {
+		return false
+	}
+	var envelope struct {
+		Data    json.RawMessage `json:"data"`
+		Message string          `json:"message"`
+	}
+	// Native JSON authorization failures return null data and an error message.
+	// An HTTP status alone cannot disprove allocation behind a reverse proxy.
+	return json.Unmarshal(data, &envelope) == nil && bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) && strings.TrimSpace(envelope.Message) != ""
 }
 
 func (c *ProxmoxClient) redactErrorBody(body string) string {
@@ -843,6 +866,26 @@ func (c *ProxmoxClient) NextVMID(ctx context.Context) (int, error) {
 	return c.nextID(ctx)
 }
 
+// ListVMIDsInCluster includes templates, unlabelled VMs, and containers: all
+// guest types share the VMID namespace. Filtered inventory cannot prove a gap.
+func (c *ProxmoxClient) ListVMIDsInCluster(ctx context.Context) ([]int, error) {
+	if err := c.requirePropagatedVMAudit(ctx, "/vms"); err != nil {
+		return nil, err
+	}
+	vms, err := c.listClusterVMs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int, 0, len(vms))
+	for _, vm := range vms {
+		if vm.VMID <= 0 {
+			return nil, fmt.Errorf("Proxmox inventory contains an invalid VMID")
+		}
+		ids = append(ids, int(vm.VMID))
+	}
+	return ids, nil
+}
+
 type proxmoxVM struct {
 	VMID     int    `json:"vmid"`
 	Name     string `json:"name"`
@@ -983,6 +1026,43 @@ func (c *ProxmoxClient) GetServerOnNode(ctx context.Context, node, id string) (S
 }
 
 func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool, error) {
+	return c.vmIdentityExistsInCluster(ctx, id, "")
+}
+
+// VMIdentityExistsInCluster includes unlabelled VMs and other guest types.
+// Complete visibility is required: a filtered list is not absence evidence.
+func (c *ProxmoxClient) VMIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
+	if strings.TrimSpace(name) == "" {
+		return false, fmt.Errorf("Proxmox VM name is required for identity absence")
+	}
+	if err := c.requirePropagatedVMAudit(ctx, "/vms"); err != nil {
+		return false, err
+	}
+	return c.vmIdentityExistsInCluster(ctx, id, name)
+}
+
+// VerifyNoActiveCloneTasks fences absence recovery against a clone that has
+// been accepted but has not published its VM in cluster inventory yet.
+func (c *ProxmoxClient) VerifyNoActiveCloneTasks(ctx context.Context) error {
+	path := "/nodes/" + c.Node
+	var permissions map[string]map[string]proxmoxInt
+	if err := c.doRequired(ctx, http.MethodGet, "/access/permissions?path="+url.QueryEscape(path), nil, &permissions); err != nil {
+		return err
+	}
+	if _, ok := permissions[path]["Sys.Audit"]; !ok {
+		return fmt.Errorf("permission denied: Proxmox prepared-claim recovery requires Sys.Audit on %s to inspect all active clone tasks", path)
+	}
+	var tasks []json.RawMessage
+	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/tasks?source=active&typefilter=qmclone&limit=1", nil, &tasks); err != nil {
+		return err
+	}
+	if len(tasks) != 0 {
+		return fmt.Errorf("Proxmox clone task is still active on %s; wait for completion before prepared-claim recovery", c.Node)
+	}
+	return nil
+}
+
+func (c *ProxmoxClient) vmIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
 	vmid, err := strconv.Atoi(strings.TrimSpace(id))
 	if err != nil || vmid <= 0 {
 		return false, fmt.Errorf("invalid Proxmox VM identity %q", id)
@@ -995,7 +1075,7 @@ func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool,
 		return false, err
 	}
 	for _, vm := range vms {
-		if int(vm.VMID) == vmid {
+		if int(vm.VMID) == vmid || name != "" && vm.Name == name {
 			return true, nil
 		}
 	}
@@ -1158,7 +1238,11 @@ func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Confi
 	for {
 		if proxmoxRunSSHQuietWithOptions(ctx, target, sshTransportProbeCommand(target), "5", "1") == nil {
 			out := newSynchronizedBuffer(proxmoxBootstrapDiagnosticLimit)
-			err := proxmoxRunSSHInput(ctx, target, "sudo /bin/bash -s", strings.NewReader(proxmoxBootstrapScript(cfg)), &out, &out)
+			var setup, checks string
+			if c.GuestBootstrap != nil {
+				setup, checks = c.GuestBootstrap(cfg)
+			}
+			err := proxmoxRunSSHInput(ctx, target, "sudo /bin/bash -s", strings.NewReader(proxmoxBootstrapScriptWithChecks(cfg, setup, checks)), &out, &out)
 			if err == nil {
 				return nil
 			}
@@ -1561,6 +1645,10 @@ func sortedLabelKeys(labels map[string]string) []string {
 }
 
 func proxmoxBootstrapScript(cfg Config) string {
+	return proxmoxBootstrapScriptWithChecks(cfg, "", "")
+}
+
+func proxmoxBootstrapScriptWithChecks(cfg Config, setup, checks string) string {
 	return fmt.Sprintf(`set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p %[1]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/lib/crabbox
@@ -1582,6 +1670,7 @@ retry() {
 retry apt-get update
 retry apt-get install -y --no-install-recommends openssh-server ca-certificates curl git rsync jq
 chown -R %[2]s:%[2]s %[1]s /var/cache/crabbox || true
+%[3]s
 cat >/usr/local/bin/crabbox-ready <<'READY'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1590,11 +1679,12 @@ rsync --version >/dev/null
 curl --version >/dev/null
 jq --version >/dev/null
 test -w %[1]s
+%[4]s
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 systemctl enable ssh || true
 systemctl restart ssh || systemctl restart ssh.socket || true
 touch /var/lib/crabbox/bootstrapped
 /usr/local/bin/crabbox-ready
-`, shellQuote(cfg.WorkRoot), shellQuote(cfg.SSHUser))
+`, shellQuote(cfg.WorkRoot), shellQuote(cfg.SSHUser), setup, checks)
 }

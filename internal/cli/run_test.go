@@ -860,13 +860,16 @@ type runEnvProfileTestBackend struct {
 	spec ProviderSpec
 }
 
-func (b runEnvProfileTestBackend) AcquireIsExclusiveOneShot() bool { return true }
+func (b runEnvProfileTestBackend) AcquireIsExclusiveOneShot() bool {
+	return !runEnvProfileTestCloseBeforeRelease
+}
 
 var runEnvProfileTestReleaseErr error
 var runEnvProfileTestReleaseHook func() error
 var runEnvProfileTestReleaseRequestHook func(ReleaseLeaseRequest) error
 var runEnvProfileTestConnectionCleanupSafe = true
 var runEnvProfileTestPreservesSSHWorkspace bool
+var runEnvProfileTestCloseBeforeRelease bool
 var runEnvProfileTestRetainsLease bool
 var runEnvProfileTestTerminalReleaseError bool
 var runEnvProfileTestAcquireHook func(AcquireRequest)
@@ -1110,6 +1113,10 @@ func (b runEnvProfileTestBackend) ReleaseLeaseConnectionCleanupSafe() bool {
 	return runEnvProfileTestConnectionCleanupSafe
 }
 
+func (b runEnvProfileTestBackend) RequiresSSHWorkspaceCloseBeforeRelease() bool {
+	return runEnvProfileTestCloseBeforeRelease
+}
+
 func (b runEnvProfileTestBackend) PreservesSSHWorkspaceAfterRelease() bool {
 	return runEnvProfileTestPreservesSSHWorkspace
 }
@@ -1220,7 +1227,7 @@ func TestRunDelegatedArchiveSyncValidatesSourceBeforeProviderCall(t *testing.T) 
 		if !AsExitError(err, &exitErr) || exitErr.Code != 6 {
 			t.Fatalf("error=%v, want exit 6\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 		}
-		for _, want := range []string{root, "native Jujutsu workspace", "Git-manifest-based", "wrong revision", "colocated Git workspace", "jj git init --git-repo=.", "--no-sync"} {
+		for _, want := range []string{root, "native Jujutsu workspace", "install jj", "--no-sync"} {
 			if !strings.Contains(exitErr.Message, want) {
 				t.Fatalf("message missing %q: %q", want, exitErr.Message)
 			}
@@ -1305,7 +1312,7 @@ func TestRunDelegatedArchiveSyncValidatesSourceBeforeProviderCall(t *testing.T) 
 func runWorkdirCases() []runWorkdirCase {
 	return []runWorkdirCase{
 		{name: "ordinary non-Git", diagnostic: "not a Git repository", guidance: []string{"git init", "--no-sync"}},
-		{name: "native Jujutsu", native: true, diagnostic: "native Jujutsu workspace", guidance: []string{"Git-manifest-based", "wrong revision", "colocated Git workspace", "jj git init --git-repo=.", "--no-sync"}},
+		{name: "native Jujutsu", native: true, diagnostic: "native Jujutsu workspace", guidance: []string{"install jj", "--no-sync"}},
 	}
 }
 
@@ -1583,6 +1590,9 @@ func TestPOSIXRunTransportHelper(t *testing.T) {
 			}
 			command = exec.Command("/bin/sh", "-c", remote)
 			command.Env = append(os.Environ(), "PATH="+os.Getenv("CRABBOX_POSIX_REMOTE_PATH"))
+			if home := os.Getenv("CRABBOX_POSIX_REMOTE_HOME"); home != "" {
+				command.Env = append(command.Env, "HOME="+home)
+			}
 		}
 	} else if mode == "rsync" {
 		var local []string
@@ -1617,6 +1627,198 @@ func TestPOSIXRunTransportHelper(t *testing.T) {
 		os.Exit(exitCode(err))
 	}
 	os.Exit(0)
+}
+
+func TestRunActionsWorkspaceRealFinalEffects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX transport fixture; native identity probes have separate required coverage")
+	}
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsync, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("real rsync unavailable")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"matching-custom", "configured", "bound", "foreign", "foreign-no-sync", "foreign-full-resync", "reassigned", "competing-owner"} {
+		t.Run(kind, func(t *testing.T) {
+			clearConfigEnv(t)
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			isolateRunTestUserDirs(t, root)
+			source, remoteRoot, transport := filepath.Join(root, "source"), filepath.Join(root, "remote"), filepath.Join(root, "transport")
+			workspace := filepath.Join(remoteRoot, "custom workspace")
+			for _, dir := range []string{source, workspace, transport} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			origin := filepath.Join(root, "source-origin.git")
+			runGit(t, source, "init", "-q")
+			runGit(t, source, "remote", "add", "origin", origin)
+			runGit(t, source, "config", "user.email", "test@example.com")
+			runGit(t, source, "config", "user.name", "Fixture")
+			writeFile(t, filepath.Join(source, "input.txt"), "local source bytes\n")
+			runGit(t, source, "add", ".")
+			runGit(t, source, "commit", "-qm", "fixture")
+			runGit(t, root, "clone", "-q", source, workspace)
+			remoteOrigin := origin
+			if strings.HasPrefix(kind, "foreign") {
+				remoteOrigin = filepath.Join(root, "foreign-origin.git")
+			} else if kind == "configured" || kind == "bound" {
+				remoteOrigin = "git@github.com:example-org/workflow.git"
+			}
+			runGit(t, workspace, "remote", "set-url", "origin", remoteOrigin)
+			writeFile(t, filepath.Join(workspace, "input.txt"), "retained remote bytes\n")
+			const leaseID = "cbx_workspace_effect"
+			marker := filepath.Join(os.Getenv("HOME"), actionsHydrationStatePath(leaseID))
+			envFile, envEffect := filepath.Join(remoteRoot, "environment.sh"), filepath.Join(remoteRoot, "environment-used")
+			state := actionsHydrationState{Workspace: workspace, EnvFile: envFile, RunID: "123", ReadyAt: "2026-01-01T00:00:00Z"}
+			writeFile(t, marker, "WORKSPACE="+workspace+"\nENV_FILE="+envFile+"\nRUN_ID="+state.RunID+"\nREADY_AT="+state.ReadyAt+"\n")
+			writeFile(t, envFile, "printf used > "+shellQuote(envEffect)+"\n")
+			for _, name := range []string{"ssh", "rsync"} {
+				body := "#!/bin/sh\n" + synchronousHelperRacePrefix() + "exec " + shellQuote(self) + " -test.run='^TestPOSIXRunTransportHelper$' -- " + name + " \"$@\"\n"
+				if err := os.WriteFile(filepath.Join(transport, name), []byte(body), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("CRABBOX_POSIX_TRANSPORT_HELPER", "1")
+			t.Setenv("CRABBOX_POSIX_REAL_SSH", ssh)
+			t.Setenv("CRABBOX_POSIX_REAL_RSYNC", rsync)
+			t.Setenv("CRABBOX_POSIX_REMOTE_PATH", "/usr/bin:/bin:"+os.Getenv("PATH"))
+			t.Setenv("CRABBOX_POSIX_REMOTE_HOME", os.Getenv("HOME"))
+			t.Setenv("CRABBOX_POSIX_REMOTE_ROOT", remoteRoot)
+			t.Setenv("PATH", transport+string(os.PathListSeparator)+os.Getenv("PATH"))
+			config := filepath.Join(root, "config.yaml")
+			configBody := "workRoot: " + strconv.Quote(remoteRoot) + "\n"
+			if kind == "configured" {
+				configBody += "actions:\n  repo: example-org/workflow\n"
+			}
+			writeFile(t, config, configBody)
+			t.Setenv("CRABBOX_CONFIG", config)
+			t.Chdir(source)
+			target := SSHTarget{User: "fixture", Host: "127.0.0.1", Port: startTCPReadinessFixture(t), TargetOS: targetLinux, ReadyCheck: "true"}
+			providerName := runEnvProfileTestProvider{}.Spec().Name
+			runEnvProfileTestAcquireLease = func(AcquireRequest) (LeaseTarget, error) {
+				return LeaseTarget{Server: Server{Provider: providerName}, SSH: target, LeaseID: leaseID}, nil
+			}
+			t.Cleanup(func() { runEnvProfileTestAcquireLease = nil })
+			if kind == "bound" {
+				if err := ClaimLeaseForRepoProvider(leaseID, "", providerName, source, time.Minute, false); err != nil {
+					t.Fatal(err)
+				}
+				claim, exists, err := prepareActionsWorkspaceClaim(t.Context(), leaseID, Repo{Root: source})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := bindActionsWorkspaceClaim(t.Context(), target, Repo{Root: source, RemoteURL: origin}, GitHubRepo{Owner: "example-org", Name: "workflow"}, state, claim, exists); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if kind == "competing-owner" {
+				owner, err := acquireWorkspaceOwner(t.Context(), target, leaseID, io.Discard)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := owner.Close(context.Background()); err != nil {
+						t.Errorf("release fixture owner: %v", err)
+					}
+				})
+			}
+			snapshot := func() map[string]string {
+				t.Helper()
+				files := map[string]string{}
+				err := filepath.WalkDir(remoteRoot, func(path string, entry os.DirEntry, err error) error {
+					if err != nil || entry.IsDir() {
+						return err
+					}
+					data, err := os.ReadFile(path)
+					if err == nil {
+						files[path] = string(data)
+					}
+					return err
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(marker)
+				if err != nil {
+					t.Fatal(err)
+				}
+				files[marker] = string(data)
+				return files
+			}
+			run := func() error {
+				var stdout, stderr bytes.Buffer
+				timeout := 30 * time.Second
+				if kind == "competing-owner" {
+					timeout = time.Second
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), timeout)
+				defer cancel()
+				args := []string{"--provider", providerName, "--id", leaseID, "--no-hydrate"}
+				if kind == "foreign-no-sync" {
+					args = append(args, "--no-sync")
+				} else if kind == "foreign-full-resync" {
+					args = append(args, "--full-resync")
+				}
+				args = append(args, "--", "/bin/sh", "-c", "cat input.txt > workload-effect.txt")
+				err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(ctx, args)
+				if err != nil {
+					t.Logf("run: %v\n%s", err, &stderr)
+				}
+				return err
+			}
+			before := snapshot()
+			err = run()
+			reject := strings.HasPrefix(kind, "foreign") || kind == "competing-owner"
+			if (err != nil) != reject {
+				t.Fatalf("run error=%v, want rejection=%t", err, reject)
+			}
+			if reject {
+				if strings.HasPrefix(kind, "foreign") && !strings.Contains(err.Error(), "does not match an authorized repository") {
+					t.Fatalf("foreign workspace failed for an unrelated reason: %v", err)
+				}
+				if kind == "competing-owner" && !strings.Contains(err.Error(), "workspace owner") {
+					t.Fatalf("competing owner failed for an unrelated reason: %v", err)
+				}
+				if !reflect.DeepEqual(before, snapshot()) {
+					t.Fatal("rejected workspace changed marker, environment, Git, or workload bytes")
+				}
+				return
+			}
+			for _, name := range []string{"input.txt", "workload-effect.txt"} {
+				if data, err := os.ReadFile(filepath.Join(workspace, name)); err != nil || string(data) != "local source bytes\n" {
+					t.Fatalf("real sync/workload effect %s=%q err=%v", name, data, err)
+				}
+			}
+			if _, err := os.Stat(envEffect); err != nil {
+				t.Fatalf("verified environment was not sourced: %v", err)
+			}
+			if data, err := os.ReadFile(marker); err != nil || string(data) != before[marker] {
+				t.Fatal("successful attach changed the retained marker")
+			}
+			if kind == "reassigned" {
+				runGit(t, workspace, "remote", "set-url", "origin", filepath.Join(root, "foreign-origin.git"))
+				writeFile(t, filepath.Join(source, "input.txt"), "must not transfer\n")
+				before = snapshot()
+				if err := run(); err == nil {
+					t.Fatal("workspace reassignment was not rejected on the next invocation")
+				}
+				if !reflect.DeepEqual(before, snapshot()) {
+					t.Fatal("reassigned workspace changed after rejection")
+				}
+			}
+		})
+	}
 }
 
 func TestRunDefaultSyncWithoutBash(t *testing.T) {
@@ -2703,6 +2905,7 @@ exit 0
 				testAWSBackendOverride = nil
 				RemoveLeaseClaim(leaseID)
 			})
+			disableRunAdmissionBackoff(t)
 
 			var stdout, stderr bytes.Buffer
 			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), []string{
@@ -2715,7 +2918,7 @@ exit 0
 			})
 			wantCalls := int32(1)
 			if tc.createRunFail {
-				wantCalls = 2
+				wantCalls = runAdmissionAttempts
 			}
 			if calls := createRunCalls.Load(); calls != wantCalls {
 				t.Fatalf("create run calls=%d, wrong bounded count; error=%v\nstdout=%s\nstderr=%s", calls, err, stdout.String(), stderr.String())
@@ -3293,10 +3496,12 @@ func TestRunCommandInjectsReservedMetadataIntoStaticSSH(t *testing.T) {
 	isolateRunTestUserDirs(t, dir)
 	logPath := installRecordingSSH(t, dir)
 	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	sshPort := openLoopbackSSHPort(t)
 	var stdout, stderr bytes.Buffer
 	args := []string{
 		"--provider", "ssh",
 		"--static-host", "127.0.0.1",
+		"--static-port", sshPort,
 		"--static-user", "runner",
 		"--static-work-root", "/tmp/crabbox-static-test",
 		"--no-sync",
@@ -4896,7 +5101,7 @@ func runCommandSyncOnlyFinalization(t *testing.T, missingEvents bool) {
 	}
 }
 
-func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testing.T) {
+func TestRunCommandTerminalReceiptPreservesOriginalAfterCoordinatorFinishFailure(t *testing.T) {
 	dir := t.TempDir()
 	isolateRunTestUserDirs(t, dir)
 	sshPath := filepath.Join(dir, "ssh")
@@ -5028,8 +5233,8 @@ func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testin
 	if decodeErr != nil {
 		t.Fatalf("decode terminal receipt: %v", decodeErr)
 	}
-	if localReceipt.ExitCode != 7 {
-		t.Fatalf("local receipt exit=%d, want coordinator failure exit 7", localReceipt.ExitCode)
+	if localReceipt.ExitCode != 0 {
+		t.Fatalf("local receipt exit=%d, want original task exit 0", localReceipt.ExitCode)
 	}
 
 	mu.Lock()
@@ -5051,8 +5256,8 @@ func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testin
 			t.Fatalf("finish attempt %d used a different receipt from local persistence:\nlocal=%+v\nremote=%+v", i+1, finishLocalReceipts[i], receipt)
 		}
 	}
-	if localReceipt == finishReceipts[0] {
-		t.Fatal("local failure receipt must differ from the ambiguous remote execution receipt")
+	if localReceipt != finishReceipts[0] {
+		t.Fatal("transport failure must not reconstruct or re-sign the original receipt")
 	}
 	if len(unexpectedCalls) != 0 {
 		t.Fatalf("unexpected coordinator calls: %v", unexpectedCalls)
@@ -5222,6 +5427,7 @@ exit 0
 }
 
 func TestRunCommandSSHArtifactE2E(t *testing.T) {
+	t.Setenv("CI", "true")
 	for _, targetOS := range []string{targetLinux, targetMacOS} {
 		t.Run(targetOS, func(t *testing.T) {
 			clearConfigEnv(t)
@@ -5256,7 +5462,7 @@ for arg do cmd="$arg"; done
 input="$(cat)"
 printf '%s\n%s\n---\n' "$cmd" "$input" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$cmd" in
-  mkdir\ -p*|cd\ *|\(cd\ *|bash\ -lc*|/bin/bash\ -lc*) printf '%s' "$input" | sh -c "$cmd"; exit $? ;;
+  mkdir\ -p*|cd\ *|\(cd\ *|bash\ -lc*|/bin/bash\ -lc*|/usr/bin/env\ *) printf '%s' "$input" | sh -c "$cmd"; exit $? ;;
 esac
 exit 0
 `
@@ -5756,7 +5962,12 @@ func TestRunCommandEmptyReplacementLists(t *testing.T) {
 			dir := t.TempDir()
 			t.Chdir(dir)
 			t.Setenv("CRABBOX_CONFIG", "")
-			logPath := installRecordingSSH(t, dir)
+			// Allowlist assertions observe stdin uploads as well as command strings.
+			logPath := installRecordingSSH(t, dir, `
+case "$match" in
+  *'cat > '*'/values.sh'*) /bin/cat >> "$CRABBOX_FAKE_SSH_LOG"; exit 0 ;;
+esac
+`)
 			requestPath := filepath.Join(dir, "filesystem.request")
 			t.Setenv("CRABBOX_FAKE_SSH_FILESYSTEM_PATH", nativePath)
 			t.Setenv("CRABBOX_FAKE_SSH_FILESYSTEM_REQUEST", requestPath)
@@ -5765,7 +5976,7 @@ func TestRunCommandEmptyReplacementLists(t *testing.T) {
 			}
 			writeReplacementListConfig(t, "crabbox.yaml", fmt.Sprintf("env:\n  allow: [CI, NODE_OPTIONS, BUILD_FLAVOR]\nresults:\n  junit: [old-report.xml]\n  auto: %t\nrun:\n  preflightTools: [cmake]\n", tc.auto))
 			writeReplacementListConfig(t, ".crabbox.yaml", "env:\n  allow: []\nresults:\n  junit: []\nrun:\n  preflightTools: []\n")
-			args := []string{"--provider", "ssh", "--static-host", "127.0.0.1", "--static-user", "runner", "--static-work-root", filepath.Join(dir, "remote"), "--no-sync", "--preflight"}
+			args := []string{"--provider", "ssh", "--static-host", "127.0.0.1", "--static-port", openLoopbackSSHPort(t), "--static-user", "runner", "--static-work-root", filepath.Join(dir, "remote"), "--no-sync", "--preflight"}
 			if runtime.GOOS == "darwin" {
 				args = append(args, "--target", "macos")
 			}
@@ -5928,7 +6139,11 @@ exit 0
 
 func isolateRunTestUserDirs(t *testing.T, dir string) {
 	t.Helper()
-	t.Setenv("HOME", filepath.Join(dir, "home"))
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg-config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "xdg-state"))
 }
@@ -5967,6 +6182,8 @@ func TestFullResyncSeedsPruneManifestFromGit(t *testing.T) {
 
 type fullResyncActionsTestOptions struct {
 	noHydrate        bool
+	noSync           bool
+	normalSync       bool
 	syncOnly         bool
 	failInvalidation bool
 	failBinding      bool
@@ -5974,6 +6191,13 @@ type fullResyncActionsTestOptions struct {
 	adoptedWorkspace string
 	workflow         string
 	mutateWorkflow   bool
+	markerOrigin     string
+	identityExit     string
+	hydratedOrigin   string
+	markerExit       string
+	actionsRepo      string
+	noOrigin         bool
+	explicitHydrate  bool
 }
 
 type fullResyncActionsTestResult struct {
@@ -6024,9 +6248,13 @@ jobs:
 		{"init", "-q"},
 		{"config", "user.email", "test@example.com"},
 		{"config", "user.name", "Crabbox Test"},
+		{"remote", "add", "origin", "https://github.com/example-org/crabbox.git"},
 		{"add", "."},
 		{"commit", "-qm", "fixture"},
 	} {
+		if opts.noOrigin && args[0] == "remote" {
+			continue
+		}
 		cmd := exec.Command("git", args...)
 		cmd.Dir = repoRoot
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -6064,6 +6292,21 @@ $current"
   esac
 done
 if [ -n "$decoded_view" ]; then remote=$decoded_view; fi
+case "$remote" in
+  *'CRABBOX_LOCAL_ACTIONS_NODE_PATH'*)
+    printf 'env-handoff\n' >> "$CRABBOX_FAKE_EVENTS"
+    exit 0
+    ;;
+  *'exact_git_root || exit 2'*'git remote get-url origin'*)
+    printf 'verify-workspace\n' >> "$CRABBOX_FAKE_EVENTS"
+    if [ -f "$CRABBOX_FAKE_HYDRATED" ] && [ -n "$CRABBOX_FAKE_HYDRATED_ORIGIN" ]; then
+      printf '%s\n' "$CRABBOX_FAKE_HYDRATED_ORIGIN"
+    else
+      printf '%s\n' "$CRABBOX_FAKE_MARKER_ORIGIN"
+    fi
+    exit "${CRABBOX_FAKE_IDENTITY_EXIT:-0}"
+    ;;
+esac
 # Match the dedicated probe, not metadata programs which also contain pwd -P.
 # The decoded witness quotes its registrar's command assignment once.
 if [ "$current" = 'pwd -P' ] || printf '%s\n' "$current" | grep -Fqx -- ` + shellQuote(`owner_command='\''pwd -P'\''`) + `; then
@@ -6128,6 +6371,9 @@ EOF
     exit 0
     ;;
   *"cat "*".crabbox/actions/cbx_env_profile_test.env"*)
+    if [ -n "$CRABBOX_FAKE_MARKER_EXIT" ]; then
+      exit "$CRABBOX_FAKE_MARKER_EXIT"
+    fi
     if [ -e "$CRABBOX_FAKE_HYDRATED" ]; then
       printf 'WORKSPACE=%s\n' "$CRABBOX_FAKE_CANONICAL_WORKSPACE"
       printf '%s\n' \
@@ -6160,7 +6406,7 @@ exit 0
 	if err := os.WriteFile(rsyncPath, []byte(rsyncScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	config := "actions:\n  workflow: .github/workflows/hydrate.yml\nsync:\n  fingerprint: false\n  gitSeed: false\n"
+	config := fmt.Sprintf("actions:\n  workflow: .github/workflows/hydrate.yml\n  repo: %q\nsync:\n  fingerprint: false\n  gitSeed: false\n", opts.actionsRepo)
 	if opts.workRoot != "" {
 		config += fmt.Sprintf("workRoot: %q\n", opts.workRoot)
 	}
@@ -6192,6 +6438,10 @@ exit 0
 	}
 	t.Setenv("CRABBOX_FAKE_CANONICAL_WORKSPACE", canonicalWorkspace)
 	t.Setenv("CRABBOX_FAKE_ADOPTED_WORKSPACE", adoptedWorkspace)
+	t.Setenv("CRABBOX_FAKE_MARKER_ORIGIN", blank(opts.markerOrigin, "https://github.com/example-org/crabbox.git"))
+	t.Setenv("CRABBOX_FAKE_IDENTITY_EXIT", blank(opts.identityExit, "0"))
+	t.Setenv("CRABBOX_FAKE_HYDRATED_ORIGIN", opts.hydratedOrigin)
+	t.Setenv("CRABBOX_FAKE_MARKER_EXIT", opts.markerExit)
 	if opts.failBinding {
 		t.Setenv("CRABBOX_FAKE_BINDING_FAIL", "1")
 	}
@@ -6204,7 +6454,11 @@ exit 0
 	args := []string{
 		"--provider", "run-env-profile-test",
 		"--id", "cbx_env_profile_test",
-		"--full-resync",
+	}
+	if opts.noSync {
+		args = append(args, "--no-sync")
+	} else if !opts.normalSync {
+		args = append(args, "--full-resync")
 	}
 	if opts.noHydrate {
 		args = append(args, "--no-hydrate")
@@ -6215,7 +6469,24 @@ exit 0
 		args = append(args, "--", "pnpm", "test")
 	}
 	var stdout, stderr bytes.Buffer
-	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args)
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	var err error
+	if opts.explicitHydrate {
+		cfg, configErr := loadConfig()
+		if configErr != nil {
+			t.Fatal(configErr)
+		}
+		repo, repoErr := findRepo()
+		if repoErr != nil {
+			t.Fatal(repoErr)
+		}
+		const leaseID = "cbx_env_profile_test"
+		target := SSHTarget{User: "crabbox", Host: "127.0.0.1", Port: "22", TargetOS: targetLinux}
+		fields := actionsHydrateFields(leaseID, githubActionsLeaseLabel(leaseID), cfg.Actions.Job, 0, cfg.Actions.Fields)
+		_, err = app.hydrateActionsLocally(context.Background(), cfg, repo, target, leaseID, cfg.Actions.Job, fields, time.Minute, false, false, nil)
+	} else {
+		err = app.runCommand(context.Background(), args)
+	}
 	eventsData, readErr := os.ReadFile(eventsPath)
 	if readErr != nil && !os.IsNotExist(readErr) {
 		t.Fatal(readErr)
@@ -6238,6 +6509,104 @@ exit 0
 	}
 }
 
+func TestRunCommandRejectsForeignActionsWorkspaceBeforeMutation(t *testing.T) {
+	for _, mode := range []string{"no-sync", "normal-sync", "full-resync"} {
+		t.Run(mode, func(t *testing.T) {
+			workspace := "/work/another-project"
+			if mode == "full-resync" {
+				workspace = remoteJoin(defaultConfig(), "cbx_env_profile_test", "crabbox")
+			}
+			result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{
+				noSync:           mode == "no-sync",
+				noHydrate:        mode == "no-sync",
+				normalSync:       mode == "normal-sync",
+				adoptedWorkspace: workspace,
+				markerOrigin:     "https://github.com/example-org/another-project.git",
+				actionsRepo:      "example-org/workflow",
+			})
+			var exitErr ExitError
+			if !AsExitError(result.err, &exitErr) || exitErr.Code != 2 || !strings.Contains(exitErr.Message, "does not match an authorized repository") {
+				t.Errorf("error=%v, want repository mismatch\nstderr=%s", result.err, result.stderr)
+			}
+			if result.resetCommand != "" || result.syncTarget != "" || result.hydrationScript != "" {
+				t.Error("foreign Actions workspace was mutated")
+			}
+			assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "owner-release"})
+		})
+	}
+}
+
+func TestRunCommandAcceptsExplicitActionsWorkspaceRepository(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{
+		noSync: true, noHydrate: true, adoptedWorkspace: "/work/custom-project",
+		markerOrigin: "git@github.com:example-org/another-project.git",
+		actionsRepo:  "example-org/another-project",
+	})
+	if result.err != nil {
+		t.Fatalf("explicit repository rejected: %v", result.err)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "command", "owner-release"})
+}
+
+func TestRunCommandRejectsUnverifiableActionsWorkspaceBeforeMutation(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{identityExit: "2"})
+	if result.err == nil {
+		t.Fatal("failed Git identity probe was ignored")
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "owner-release"})
+}
+
+func TestRunCommandRejectsUnreadableActionsMarkerBeforeMutation(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{markerExit: "42"})
+	if result.err == nil {
+		t.Fatal("failed marker read was treated as absence")
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+}
+
+func TestRunCommandRejectsActionsWorkspaceWithoutInvokingOrigin(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{noSync: true, noHydrate: true, noOrigin: true})
+	var exitErr ExitError
+	if !AsExitError(result.err, &exitErr) || exitErr.Code != 2 || !strings.Contains(exitErr.Message, "authorized repository origin") {
+		t.Fatalf("error=%v, want missing invoking repository origin", result.err)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+}
+
+func TestRunCommandVerifiesFreshActionsWorkspaceBeforeCommand(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{
+		hydratedOrigin: "https://github.com/example-org/other.git",
+		actionsRepo:    "example-org/other",
+	})
+	var exitErr ExitError
+	if !AsExitError(result.err, &exitErr) || exitErr.Code != 2 || !strings.Contains(exitErr.Message, "does not match an authorized repository") {
+		t.Fatalf("error=%v, want fresh workspace repository mismatch", result.err)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "invalidate", "reset", "sync", "clear", "hydrate", "verify-workspace", "owner-release"})
+}
+
+func TestExplicitLocalActionsHydrationPreservesEnvironmentHandoff(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{explicitHydrate: true, noOrigin: true})
+	if result.err != nil {
+		t.Fatalf("explicit hydration failed: %v\n%s", result.err, result.stderr)
+	}
+	assertRunEvents(t, result.events, []string{"clear", "hydrate", "env-handoff"})
+}
+
+func TestRunCommandPreservesSameRepositoryCustomActionsWorkspace(t *testing.T) {
+	result := runFullResyncActionsTest(t, fullResyncActionsTestOptions{
+		noSync: true, noHydrate: true, adoptedWorkspace: "/work/custom-project",
+		markerOrigin: "git@github.com:example-org/crabbox.git",
+	})
+	if result.err != nil {
+		t.Fatalf("same-repository custom workspace rejected: %v", result.err)
+	}
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "command", "owner-release"})
+	if !strings.Contains(result.stderr, "workdir=/work/custom-project") {
+		t.Fatalf("custom workspace not retained:\n%s", result.stderr)
+	}
+}
+
 func assertRunEvents(t *testing.T, got, want []string) {
 	t.Helper()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -6250,7 +6619,7 @@ func TestRunCommandFullResyncRehydratesAdoptedActionsWorkspaceInOrderUnderOwner(
 	if result.err != nil {
 		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
 	}
-	assertRunEvents(t, result.events, []string{"owner-acquire", "invalidate", "reset", "sync", "clear", "hydrate", "command", "owner-release"})
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "invalidate", "reset", "sync", "clear", "hydrate", "verify-workspace", "env-handoff", "command", "owner-release"})
 	canonicalWorkspace := remoteJoin(defaultConfig(), "cbx_env_profile_test", "crabbox")
 	for name, value := range map[string]string{
 		"reset command":    result.resetCommand,
@@ -6294,7 +6663,7 @@ func TestRunCommandFullResyncBindsRelativeActionsWorkspaceBeforeMutation(t *test
 					t.Error("workspace mutation occurred after refused preparation")
 				}
 				if tt.failBinding {
-					assertRunEvents(t, result.events, []string{"owner-acquire", "bind-workspace", "owner-release"})
+					assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "bind-workspace", "owner-release"})
 				} else {
 					var effects []string
 					for _, event := range result.events {
@@ -6302,14 +6671,14 @@ func TestRunCommandFullResyncBindsRelativeActionsWorkspaceBeforeMutation(t *test
 							effects = append(effects, event)
 						}
 					}
-					assertRunEvents(t, effects, []string{"owner-acquire", "owner-release"})
+					assertRunEvents(t, effects, []string{"owner-acquire", "verify-workspace", "owner-release"})
 				}
 				return
 			}
 			if result.err != nil {
 				t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
 			}
-			assertRunEvents(t, result.events, []string{"owner-acquire", "bind-workspace", "invalidate", "reset", "sync", "clear", "hydrate", "command", "owner-release"})
+			assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "bind-workspace", "invalidate", "reset", "sync", "clear", "hydrate", "verify-workspace", "env-handoff", "command", "owner-release"})
 			for name, value := range map[string]string{
 				"reset command":    result.resetCommand,
 				"sync target":      result.syncTarget,
@@ -6339,7 +6708,7 @@ func TestRunCommandFullResyncRejectsUnsupportedWorkflowBeforeRemoteMutation(t *t
 			if result.resetCommand != "" || result.syncTarget != "" || result.hydrationScript != "" {
 				t.Error("unsupported workflow reached workspace mutation")
 			}
-			assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+			assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "owner-release"})
 		})
 	}
 }
@@ -6363,7 +6732,7 @@ func TestRunCommandFullResyncRejectsNonCanonicalAdoptedActionsWorkspace(t *testi
 	if !strings.Contains(exitErr.Message, "local hydration uses") {
 		t.Fatalf("message=%q", exitErr.Message)
 	}
-	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "owner-release"})
 }
 
 func TestRunCommandFullResyncNoHydrateFailsBeforeResetOrCommand(t *testing.T) {
@@ -6375,7 +6744,7 @@ func TestRunCommandFullResyncNoHydrateFailsBeforeResetOrCommand(t *testing.T) {
 	if !strings.Contains(exitErr.Message, "cannot rehydrate") {
 		t.Fatalf("message=%q", exitErr.Message)
 	}
-	assertRunEvents(t, result.events, []string{"owner-acquire", "owner-release"})
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "owner-release"})
 }
 
 func TestRunCommandFullResyncInvalidationFailureStopsBeforeResetOrCommand(t *testing.T) {
@@ -6387,7 +6756,7 @@ func TestRunCommandFullResyncInvalidationFailureStopsBeforeResetOrCommand(t *tes
 	if !strings.Contains(exitErr.Message, "invalidate GitHub Actions hydration marker") {
 		t.Fatalf("message=%q", exitErr.Message)
 	}
-	assertRunEvents(t, result.events, []string{"owner-acquire", "invalidate", "owner-release"})
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "invalidate", "owner-release"})
 }
 
 func TestRunCommandFullResyncSyncOnlyInvalidatesWithoutRehydrate(t *testing.T) {
@@ -6396,7 +6765,7 @@ func TestRunCommandFullResyncSyncOnlyInvalidatesWithoutRehydrate(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("run error=%v\nstdout=%s\nstderr=%s", result.err, result.stdout, result.stderr)
 	}
-	assertRunEvents(t, result.events, []string{"owner-acquire", "invalidate", "reset", "sync", "owner-release"})
+	assertRunEvents(t, result.events, []string{"owner-acquire", "verify-workspace", "invalidate", "reset", "sync", "owner-release"})
 	if !strings.Contains(result.resetCommand, adoptedWorkspace) || !strings.Contains(result.syncTarget, adoptedWorkspace) {
 		t.Fatalf("sync-only did not preserve adopted workspace reset/sync:\nreset=%s\nsync=%s", result.resetCommand, result.syncTarget)
 	}
@@ -8458,7 +8827,7 @@ exec ` + shellQuote(realTar) + ` "$@"
 	}
 	lines := strings.Split(strings.TrimSpace(string(dfCalls)), "\n")
 	if len(lines) != 4 ||
-		!strings.Contains(lines[0], tempRoot) || lines[2] != lines[0] ||
+		!strings.HasPrefix(lines[0], "-Pk .crabbox/crabbox-failure-capture.") || lines[2] != lines[0] ||
 		lines[1] != "-Pk .crabbox" || lines[3] != lines[1] {
 		t.Fatalf("disk admission calls=%q", lines)
 	}
@@ -8470,6 +8839,43 @@ exec ` + shellQuote(realTar) + ` "$@"
 	}
 	if entries, err := os.ReadDir(tempRoot); err != nil || len(entries) != 0 {
 		t.Fatalf("failure capture scratch retained: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestRemoteFailureCaptureUsesOutputDiskWhenTempIsSmall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capture command")
+	}
+	workdir, tempRoot, binDir := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Tiny Linux guests can have a small /tmp tmpfs despite ample workspace disk.
+	dfScript := `#!/bin/sh
+available=9999999
+case "$2" in "$TMPDIR"/*) available=1000000 ;; esac
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fake 9999999 0 %s 0%% /\n' "$available"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "df"), []byte(dfScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "failure.log"), []byte("synthetic failure evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := remoteFailureCaptureCommand(workdir, ".crabbox/capture.tar.gz", "")
+	command = strings.Replace(command, "bash -lc ", "bash --noprofile --norc -c ", 1)
+	if out, err := exec.Command("/bin/sh", "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("capture with ample output disk failed: %v\n%s", err, out)
+	}
+	archive := filepath.Join(workdir, ".crabbox", "capture.tar.gz")
+	if got := string(readTarGzContents(t, archive)["failure.log"]); got != "synthetic failure evidence" {
+		t.Fatalf("captured log=%q", got)
+	}
+	if entries, err := os.ReadDir(filepath.Join(workdir, ".crabbox")); err != nil || len(entries) != 1 || entries[0].Name() != "capture.tar.gz" {
+		t.Fatalf("capture scratch retained beside output: entries=%v err=%v", entries, err)
+	}
+	if entries, err := os.ReadDir(tempRoot); err != nil || len(entries) != 0 {
+		t.Fatalf("capture scratch retained in temp: entries=%v err=%v", entries, err)
 	}
 }
 
@@ -8668,6 +9074,9 @@ func assertRemoteFailureCaptureFilesRemoved(t *testing.T, workdir, tempRoot stri
 	}
 	if entries, err := os.ReadDir(tempRoot); err != nil || len(entries) != 0 {
 		t.Fatalf("failure capture scratch retained: entries=%v err=%v", entries, err)
+	}
+	if paths, err := filepath.Glob(filepath.Join(workdir, ".crabbox", "crabbox-failure-capture.*")); err != nil || len(paths) != 0 {
+		t.Fatalf("failure capture scratch retained beside output: paths=%v err=%v", paths, err)
 	}
 }
 
@@ -10040,6 +10449,128 @@ func TestApplyResolvedLeaseConfigPrefersStoredLabelsAndUpdatesTarget(t *testing.
 	}
 }
 
+func TestApplyResolvedLeaseConfigRefreshesProviderReadinessForRecordedPlatform(t *testing.T) {
+	linuxGate := func(t *testing.T, readyCheck string) {
+		t.Helper()
+		if !strings.Contains(readyCheck, "cloud-init status --wait") {
+			t.Fatalf("ready check=%q, want the provider Linux bootstrap gate", readyCheck)
+		}
+	}
+	for _, test := range []struct {
+		name            string
+		configTargetOS  string
+		configMode      string
+		labels          map[string]string
+		wantReadyCheck  func(*testing.T, string)
+		wantProbeNative bool
+	}{
+		{
+			name:           "Linux defaults resolve a native Windows lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetWindows, "windows_mode": windowsModeNormal},
+			wantReadyCheck: func(t *testing.T, readyCheck string) {
+				t.Helper()
+				if readyCheck != "" {
+					t.Fatalf("ready check=%q, want the platform default for native Windows", readyCheck)
+				}
+			},
+			wantProbeNative: true,
+		},
+		{
+			name:           "Linux defaults resolve a WSL2 lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetWindows, "windows_mode": windowsModeWSL2},
+			wantReadyCheck: func(t *testing.T, readyCheck string) {
+				t.Helper()
+				if readyCheck != "" {
+					t.Fatalf("ready check=%q, want the platform default for WSL2", readyCheck)
+				}
+			},
+		},
+		{
+			name:           "Linux defaults resolve a Linux lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetLinux},
+			wantReadyCheck: linuxGate,
+		},
+		{
+			name:           "Windows defaults resolve a Linux lease",
+			configTargetOS: targetWindows,
+			configMode:     windowsModeNormal,
+			labels:         map[string]string{"target": targetLinux},
+			wantReadyCheck: linuxGate,
+		},
+		{
+			name:           "Linux defaults resolve a macOS lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetMacOS},
+			wantReadyCheck: func(t *testing.T, readyCheck string) {
+				t.Helper()
+				if readyCheck != "" {
+					t.Fatalf("ready check=%q, want the platform default for macOS", readyCheck)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.Provider = "aws"
+			cfg.TargetOS = test.configTargetOS
+			cfg.WindowsMode = test.configMode
+			normalizeTargetConfig(&cfg)
+			target := sshTargetForLease(cfg, "203.0.113.5", "", "")
+			if test.configTargetOS == targetLinux {
+				linuxGate(t, target.ReadyCheck)
+			} else if target.ReadyCheck != "" {
+				t.Fatalf("initial ready check=%q, want platform default", target.ReadyCheck)
+			}
+
+			applyResolvedLeaseConfig(&cfg, Server{Labels: test.labels}, &target)
+
+			if target.TargetOS != test.labels["target"] {
+				t.Fatalf("resolved target=%#v, want platform from lease labels", target)
+			}
+			test.wantReadyCheck(t, target.ReadyCheck)
+			command := sshReadyCommand(target)
+			if strings.Contains(command, "cloud-init") && test.labels["target"] != targetLinux {
+				t.Fatalf("readiness command=%q still carries the Linux bootstrap gate", command)
+			}
+			if test.wantProbeNative && command != sshReadyCommand(SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}) {
+				t.Fatalf("readiness command=%q, want the native Windows readiness probe", command)
+			}
+		})
+	}
+}
+
+func TestApplyResolvedLeaseConfigKeepsCustomReadinessAcrossPlatformChange(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Provider = "aws"
+	target := sshTargetForLease(cfg, "203.0.113.5", "", "")
+	target.ReadyCheck = "test -f /opt/custom-ready"
+
+	applyResolvedLeaseConfig(&cfg, Server{Labels: map[string]string{"target": targetWindows, "windows_mode": windowsModeNormal}}, &target)
+
+	if target.TargetOS != targetWindows || target.ReadyCheck != "test -f /opt/custom-ready" {
+		t.Fatalf("resolved target=%#v, want the custom readiness command preserved", target)
+	}
+}
+
+func TestApplyResolvedLeaseConfigKeepsReadinessWhenPlatformUnchanged(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Provider = "aws"
+	target := sshTargetForLease(cfg, "203.0.113.5", "", "")
+	before := target.ReadyCheck
+	if !strings.Contains(before, "cloud-init status --wait") {
+		t.Fatalf("initial ready check=%q, want the provider Linux bootstrap gate", before)
+	}
+
+	applyResolvedLeaseConfig(&cfg, Server{Labels: map[string]string{"work_root": "/srv/crabbox"}}, &target)
+
+	if target.ReadyCheck != before || cfg.WorkRoot != "/srv/crabbox" {
+		t.Fatalf("resolved target=%#v config work root=%q, want unchanged readiness", target, cfg.WorkRoot)
+	}
+}
+
 func TestApplyResolvedLeaseConfigPreservesProviderTargetUser(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Provider = "aws"
@@ -10354,4 +10885,61 @@ func TestDelegatedFixedWarmupAndReleaseRouting(t *testing.T) {
 	if b.stop.ID != id || b.stop.ExpectedProviderIdentity != want {
 		t.Fatalf("release identity=%#v", b.stop)
 	}
+}
+
+func TestRunClosesWorkspaceBeforeProviderRelease(t *testing.T) {
+	dir, _ := setupLocalContainerRunSessionTest(t, "")
+	logPath := installRecordingSSH(t, dir)
+	runEnvProfileTestCloseBeforeRelease = true
+	runEnvProfileTestPreservesSSHWorkspace = true
+	t.Cleanup(func() { runEnvProfileTestCloseBeforeRelease = false; runEnvProfileTestPreservesSSHWorkspace = false })
+	released := false
+	runEnvProfileTestReleaseHook = func() error {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(data), "protocol_action='release'") {
+			return errors.New("provider release ran before workspace authority closed")
+		}
+		released = true
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{"--provider", "run-env-profile-test", "--no-sync", "--no-hydrate", "--", "true"})
+	if err != nil || !released {
+		t.Fatalf("released=%v err=%v stderr=%s", released, err, stderr.String())
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), "protocol_action='release'"); n != 1 {
+		t.Fatalf("workspace released %d times", n)
+	}
+}
+
+func writeDelegatedRunReceipt(path, keyPath string, cfg Config, result RunResult, req RunRequest) (runArtifact, error) {
+	key, err := resolveAttestKey(keyPath)
+	if err != nil {
+		return runArtifact{}, Exit(2, "attest key: %v", err)
+	}
+	prepared, err := prepareDelegatedRunReceipt(path, key, cfg, result, req)
+	if err != nil {
+		return runArtifact{}, err
+	}
+	return persistPreparedRunReceipt(prepared)
+}
+
+func runCommandShellString(command []string, shellMode bool) string {
+	return runCommandShellStringWithLiteralArgs(command, shellMode, nil)
+}
+
+func shouldUseShell(command []string) bool {
+	return shouldUseShellWithLiteralArgs(command, nil)
+}
+
+func releaseCoordinatorLease(ctx context.Context, coord *CoordinatorClient, leaseID, expectedProvider string) error {
+	_, err := releaseCoordinatorLeaseResult(ctx, coord, leaseID, expectedProvider)
+	return err
 }

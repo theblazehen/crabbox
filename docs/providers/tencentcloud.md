@@ -12,6 +12,10 @@ through CVM user data, writes Crabbox ownership metadata as Tencent Cloud tags,
 waits for public IPv4 and SSH readiness, then uses the normal Crabbox
 SSH/sync/run/stop/cleanup path.
 
+Linux cloud-init is gzip-compressed before base64 encoding. Crabbox keeps the
+encoded user-data field within CVM's 16 KiB limit and rejects oversized payloads
+before requesting an instance.
+
 The provider is **direct-only** in this release. It does not run through the
 coordinator, so the local CLI must have Tencent Cloud API credentials and direct
 cleanup remains the operator's responsibility.
@@ -216,6 +220,21 @@ STS and `DescribeInstances`; it does not create resources.
    resources with an exact local lease, instance, provider-key, and account
    claim. The claim remains locked across live-tag verification and termination;
    matching provider tags without that local claim are never deletion authority.
+
+The IP-readiness wait applies a five-minute elapsed budget to cooperative API
+reads and the three-second retry interval. Budget expiry retains exit code 5
+and the existing timeout message. Caller cancellation stops the wait without
+losing its original cause; public cancellation diagnostics remain canonical.
+Readiness still requires only a public IPv4 address, and API response errors
+fail immediately. A completed ready response or API error retains precedence
+when it coincides with cancellation; an API client that ignores its context can
+still finish late. Lifecycle timestamp clocks do not control this wait budget.
+
+If acquisition rollback reports a termination failure, Crabbox preserves the
+original acquisition cause and typed exit-code precedence, reports the cleanup
+failure, and refuses an automatic fresh-instance retry for that acquisition.
+A successful rollback still permits the existing bootstrap retry behavior.
+This error-reporting policy does not change termination or local-key cleanup.
 
 ## Network And Security Groups
 

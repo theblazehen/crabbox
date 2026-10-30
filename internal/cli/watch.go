@@ -117,7 +117,7 @@ func (a App) watch(ctx context.Context, args []string) error {
 	if requestedSlug != "" && strings.TrimSpace(*leaseIDFlag) != "" {
 		return Exit(2, "--slug only applies when creating a new lease; omit --id or use the existing slug")
 	}
-	cfg, err := loadConfig()
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
@@ -197,6 +197,7 @@ func (a App) watchWithBackend(ctx context.Context, opts watchOptions, repo Repo,
 	if err != nil {
 		return err
 	}
+	a.reportDirectLeasePolicyNotice(cfg)
 	lease, err := backend.Acquire(ctx, AcquireRequest{Repo: repo, Options: options, Keep: opts.Keep, Reclaim: opts.Reclaim, RequestedSlug: opts.RequestedSlug})
 	if err != nil {
 		return err

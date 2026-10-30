@@ -16,6 +16,13 @@ crabbox pool ensure example/app/main/linux --min-ready 2 --max-ready 4 --compati
 
 ## Ready Pools
 
+Ordinary `run` and `warmup` do not automatically borrow matching pool entries.
+Use `prewarm --pool <key>` to prepare and register capacity, then explicitly
+select it with `run --pool <key>`. Legacy and ordinary typed pools require the
+creation SSH key on the borrowing client; a matching entry alone does not grant
+access. Cross-client access requires the separately enabled portable protocol
+described below.
+
 Ready pools are broker records for already hydrated leases. The CLI registers a
 lease after `prewarm` or `actions hydrate` has prepared it. Borrow marks one
 ready entry busy. Return either makes it ready again or drains and releases it.
@@ -165,3 +172,12 @@ lease. `pool borrow --class` and `--type` additionally require exact stored size
 metadata. See the [design and proof requirements](../features/ready-pools.md)
 before enabling this experimental controller. Drain and verify all portable
 cleanup before disabling it or rolling back the coordinator.
+
+## Managed existing hosts
+
+[`ssh-host`](../providers/ssh-host.md) uses portable access for exclusive existing
+Linux and Windows capacity. Unlike AWS, its return boundary is confirmed lease
+account/session teardown, not a reboot. Host templates are operator-attested;
+borrower-written caches do not survive return. Ordinary typed and legacy pool
+registration are rejected for this provider. Windows needs separate MXC
+interactive-context hardware qualification.

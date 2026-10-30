@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,9 @@ type fakeProxmoxDoctorClient struct {
 	getServerByID         map[string]core.Server
 	clusterExistsByID     map[string]bool
 	clusterExistsErr      error
+	activeCloneErr        error
+	vmids                 []int
+	vmidsErr              error
 	setLabels             []map[string]string
 	labelNodes            []string
 	readiness             []core.ProxmoxReadinessCheck
@@ -50,6 +54,19 @@ func (c *fakeProxmoxDoctorClient) DoctorReadiness(context.Context, core.Config) 
 func (c *fakeProxmoxDoctorClient) ListCrabboxServers(context.Context) ([]core.Server, error) {
 	c.listCalls++
 	return c.servers, c.listErr
+}
+
+func (c *fakeProxmoxDoctorClient) VMIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
+	for _, server := range c.servers {
+		if server.Name == name {
+			return true, nil
+		}
+	}
+	return c.VMExistsInCluster(ctx, id)
+}
+
+func (c *fakeProxmoxDoctorClient) VerifyNoActiveCloneTasks(context.Context) error {
+	return c.activeCloneErr
 }
 
 func (c *fakeProxmoxDoctorClient) ListCrabboxServersCluster(context.Context) ([]core.Server, error) {
@@ -77,6 +94,15 @@ func (c *fakeProxmoxDoctorClient) CreateServer(_ context.Context, _ core.Config,
 
 func (c *fakeProxmoxDoctorClient) NextVMID(context.Context) (int, error) {
 	return 101, nil
+}
+
+func (c *fakeProxmoxDoctorClient) ListVMIDsInCluster(context.Context) ([]int, error) {
+	ids := append([]int(nil), c.vmids...)
+	for _, server := range append(append([]core.Server(nil), c.servers...), c.clusterServers...) {
+		id, _ := strconv.Atoi(server.CloudID)
+		ids = append(ids, id)
+	}
+	return ids, c.vmidsErr
 }
 
 func (c *fakeProxmoxDoctorClient) CreateServerWithVMID(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, _ int, _ map[string]string, _ func(core.Server) error) (core.Server, error) {
@@ -278,6 +304,7 @@ func TestProxmoxTouchUsesMigratedVMNode(t *testing.T) {
 			newClient = func(core.Config) (proxmoxClient, error) { return fake, nil }
 			t.Cleanup(func() { newClient = oldClient })
 			server := expiredProxmoxServer("101", "cbx_migrated_touch")
+			server.Labels["ttl_secs"] = "7200"
 			server.HostID = "pve2"
 			delete(server.Labels, "idle_timeout")
 			delete(server.Labels, "idle_timeout_secs")

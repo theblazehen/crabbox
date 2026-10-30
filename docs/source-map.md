@@ -20,9 +20,11 @@ Crabbox has three implementation surfaces:
   adapter for its registration side effects; `internal/providers/shared` holds
   common helpers.
 - **Coordinator** — TypeScript, under `worker/src` and `worker/node`. Shared
-  `FleetCoordinator` behavior runs either in a Cloudflare Worker plus one
-  Durable Object or in Node.js backed by PostgreSQL and pg-boss. Only `aws`,
-  `azure`, `daytona`, `gcp`, and `hetzner` can transfer provider lifecycle to it;
+  `FleetCoordinator` behavior runs either in a Cloudflare Worker plus a Fleet
+  Durable Object or in Node.js backed by PostgreSQL and pg-boss. Serve relay
+  sessions use separate Durable Objects or an isolated in-process Node data plane.
+  Only `aws`,
+  `azure`, `daytona`, `gcp`, `hetzner`, and `serve` can transfer provider lifecycle to it;
   everything else runs direct or delegated from the CLI.
 
 ## CLI Surface
@@ -80,7 +82,7 @@ Crabbox has three implementation surfaces:
   attempt checkpoints: `internal/cli/claim.go`, `internal/providers/aws/backend.go`
 - Direct-provider labels, safe label encoding, idle-touch labels, TTL cap math: `internal/cli/provider_labels.go`
 - Lease status/inspect/list/share/unshare/stop/cleanup commands: `internal/cli/status.go`, `internal/cli/inspect.go`, `internal/cli/pool.go`, `internal/cli/share.go`, `internal/cli/rescue.go`
-- Coordinator client request/response structs, same-origin credential redirect guard, curl fallback, slug lookup, heartbeats, usage, and run history: `internal/cli/coordinator.go`, `internal/cli/provider_coordinator.go`
+- Coordinator client request/response structs, same-origin credential redirect guard, native HTTP/TLS transport, slug lookup, heartbeats, usage, and run history: `internal/cli/coordinator.go`, `internal/cli/provider_coordinator.go`
 - Lease backend selection (brokered vs direct SSH vs delegated): `internal/cli/provider_backend.go`
 - Worker env/request/record types: `worker/src/types.ts`
 - Worker lease records, public routes, slug allocation, heartbeat/expiry math, cleanup alarms: `worker/src/fleet.ts`
@@ -114,6 +116,7 @@ SSH-lease providers:
 - XCP-ng (`xcp-ng`): `internal/providers/xcpng`
 - Incus: `internal/providers/incus`
 - Static/BYO SSH host: `internal/providers/ssh`, with target mapping in `internal/cli/static.go`
+- Donated container capacity: `internal/providers/serve`, `internal/cli/serve.go`, `worker/src/serve.ts`; shared creation/bootstrap in `internal/providers/localcontainer/served.go`
 - Local Docker container: `internal/providers/localcontainer`
 - Apple `Virtualization.framework` Linux VM helper and provider:
   `internal/applevmhelper`, `internal/providers/applevm`; the Swift VM daemon
@@ -161,6 +164,8 @@ Delegated-run providers (no SSH lease):
 - Anthropic Sandbox Runtime live local enforcement smoke: `scripts/live-anthropic-sandbox-runtime-smoke.sh`
 - Azure Container Apps dynamic sessions (shares the `azure` family, but
   delegated-run): `internal/providers/azuredynamicsessions`, runner image `worker/azure-dynamic-sessions.Dockerfile`
+- Azure Container Apps Sandboxes (fixed leases, shell execution, file uploads,
+  and exact cleanup): `internal/providers/azuresandbox`
 
 Service-control providers (no SSH lease and no arbitrary command execution):
 
@@ -257,6 +262,7 @@ Provider docs:
 - HTTP response/request helpers: `worker/src/http.ts`
 - GitHub OAuth login flow and user-token issuance: `worker/src/oauth.ts`
 - Shared fleet routes and behavior: `worker/src/fleet.ts`
+- Serve relay admission, per-session data plane, and client transport: `worker/src/serve-relay-control.ts`, `worker/src/serve-relay.ts`, `internal/cli/serve_relay_transport.go`
 - Cloudflare runtime adapter: `worker/src/coordinator-runtime.ts`
 - Node.js/PostgreSQL runtime, HTTP/WebSocket server, default-chain AWS credentials, private AWS deployment guard, and durable jobs: `worker/node/node-runtime.ts`, `worker/node/postgres-storage.ts`, `worker/node/server.ts`, `worker/node/aws-credentials.ts`, `worker/node/aws-deployment.ts`
 - Node request limits, trusted proxy handling, and graceful shutdown: `worker/node/server-support.ts`, `worker/node/server.ts`
@@ -298,3 +304,11 @@ Provider docs:
 - Docs command-surface check, link check, site builder, and Pages deploy: `scripts/check-command-docs.mjs`, `scripts/check-docs-links.mjs`, `scripts/build-docs-site.mjs`, `.github/workflows/pages.yml`
 - Live provider smoke coverage: `scripts/live-smoke.sh`, plus provider-specific guarded smokes such as `scripts/live-blaxel-smoke.sh`, `scripts/live-cua-smoke.sh`, `scripts/live-digitalocean-smoke.sh`, `scripts/live-github-codespaces-smoke.sh`, `scripts/live-vultr-smoke.sh`, `scripts/live-vast-smoke.sh`, and `scripts/live-superserve-smoke.sh`
 - Live coordinator auth smoke coverage: `scripts/live-auth-smoke.sh`
+
+### Managed existing SSH hosts
+
+- `internal/providers/sshhost`: operator agent, Linux account/MXC session cleanup, isolated SSH endpoint, provider metadata.
+- `worker/src/ssh-host.ts`: transactional inventory and lease custody; uses the Fleet lifecycle.
+- `worker/src/ssh-host-provider.ts`: portable ready-pool access capability.
+- `worker/src/ssh-host-relay.ts`: generation-bound authorization over the existing SSH relay.
+- `scripts/live-managed-ssh-host-smoke.py`: disposable PostgreSQL/coordinator/host borrower proof.

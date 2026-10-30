@@ -40,8 +40,9 @@ Crabbox exchanges the key over HTTPS at the console origin
 (`POST /api/v1/auth/token`) for a JWT that lives about an hour, re-exchanges
 before expiry, and sends only the JWT — as gRPC bearer metadata over TLS.
 The raw key goes only to the validated exchange origin. Exchange redirects
-are refused, writes are never automatically retried, and vendor response
-bodies and stream error text are withheld from diagnostics. An API key is
+are refused and writes are never automatically retried. Unary gRPC failures
+include the server's status message and details, with credentials redacted;
+exchange response bodies and guest stream error text remain withheld. An API key is
 fenced to one organization on the vendor side; a handful of interactive-only
 RPCs (key minting among them) are outside this integration's surface, so a
 leaked Crabbox key can never mint more keys.
@@ -111,6 +112,9 @@ Its existing Ed25519 host public key is returned through the exec stream's
 stdout. Crabbox requires the stream to complete without a failing exit code,
 validates that key, and writes it to isolated lease `known_hosts` before the
 first SSH connection. There is no trust-on-first-use or fallback SSH port.
+If the TCP forward is still starting, readiness retries the authenticated
+forwarded port; it never probes port 22 on the public host. This also applies
+to reused leases and `status --wait` readiness checks.
 The authenticated VM `public_ip` supplies the SSH host, and the port-forward
 response must name the same immutable VM ID; its arbitrary endpoint URL is
 never used.
@@ -138,6 +142,12 @@ claimed immutable VM by default and requires deletion proof before removing
 its claim: Boxd leaves a readable tombstone (`status: destroyed`) on the
 immutable ID after destruction, which is accepted as definitive; plain
 inventory absence must instead hold across a bounded grace period.
+After the claim is removed, repeating `stop --provider boxd --id <canonical-cbx-id>`
+exits 1 and reports that the lease has no local claim. If the earlier stop
+verified absence, nothing remains to do. Boxd keeps no local terminal receipt,
+so a missing claim alone cannot prove a successful earlier stop; otherwise
+check the ID, provider, and inventory before recovery. See
+[Repeating a stop](../commands/stop.md#repeating-a-stop).
 `boxd.deleteOnRelease: false` instead stops the VM and retains both disk and
 claim; reuse restarts it. That release intent persists across processes
 unless explicitly overridden. Reuse and ordinary heartbeat preserve the
@@ -155,14 +165,26 @@ workloads. New acquisitions always write the current scope.
 Failed bootstrap rolls back under an independent bounded cleanup context,
 even after caller cancellation. `--keep` and `--keep-on-failure` preserve their
 normal Crabbox semantics. Cleanup failure retains the immutable ownership
-claim for retry. If create receives a definite rejection (invalid argument,
-authentication or permission failure, name conflict, or quota exhaustion),
+claim for retry. If create receives a definite rejection (`InvalidArgument`,
+`Unauthenticated`, `PermissionDenied`, `AlreadyExists`, `ResourceExhausted`,
+`FailedPrecondition`, `NotFound`, `Unimplemented`, or `OutOfRange`),
 Crabbox removes its unchanged pending intent and reports the rejection.
 Transport failures, server errors, or success responses without a valid
 immutable ID retain an ambiguous intent with the requested machine name.
 Inspect the Boxd console and local claim before manual recovery: Crabbox
 cannot safely infer ownership from a matching name. It will not automatically
-delete such an unbound resource or discard its recovery claim.
+delete such an unbound resource or automatically discard its recovery claim.
+
+For an orphaned claim with no immutable machine ID, use
+`crabbox stop --force --provider boxd --id <canonical-cbx-id>`. Under the unchanged
+claim's exclusive lock, recovery verifies the original endpoint, organization,
+and authenticated user, then reads complete org-scoped inventory across a
+30-second absence grace period. If no machine has the requested name, it removes
+only the local claim and reports `forgotten locally (resource absent)`. Any
+matching name, inventory failure, malformed record, cancellation, or claim
+change retains the claim. This never adopts or deletes a machine by name and
+does not apply to claims already bound to a machine ID; use ordinary `stop` for
+those leases.
 
 ## Live smoke and verification
 

@@ -68,11 +68,11 @@ func TestWebVNCURLs(t *testing.T) {
 		t.Fatal("local-container aliases should use local WebVNC")
 	}
 	for _, provider := range []string{"local-container", "direct-webvnc-test"} {
-		if !supportsDirectSSHWebVNC(provider) {
+		if !supportsDirectSSHWebVNC(Config{Provider: provider}) {
 			t.Fatalf("provider %s should support direct SSH WebVNC", provider)
 		}
 	}
-	if supportsDirectSSHWebVNC("static") || supportsDirectSSHWebVNC("aws") {
+	if supportsDirectSSHWebVNC(Config{Provider: "static"}) || supportsDirectSSHWebVNC(Config{Provider: "aws"}) {
 		t.Fatal("static and coordinator-backed providers should not use direct SSH WebVNC")
 	}
 }
@@ -3251,4 +3251,59 @@ func TestVNCForegroundTunnelHelperProcess(t *testing.T) {
 	_ = listener.Close()
 	fmt.Fprintln(os.Stderr, "intentional tunnel exit")
 	os.Exit(23)
+}
+
+func serveWebVNCLoopbackProxy(ctx context.Context, listener net.Listener, targetPort string, expectedOwnerPID ...int) <-chan error {
+	ownerPID := 0
+	if len(expectedOwnerPID) > 0 {
+		ownerPID = expectedOwnerPID[0]
+	}
+	return serveWebVNCLoopbackProxyWithEnvironment(ctx, listener, targetPort, ownerPID, nil)
+}
+
+func connectWebVNCBridge(ctx context.Context, coord *CoordinatorClient, leaseID, host, port string, target SSHTarget, credentials rfbCredentials, authMode localWebVNCAuthenticationMode, log io.Writer) (*webVNCBridge, error) {
+	return connectWebVNCBridgeWithDial(ctx, coord, leaseID, host, port, target, credentials, authMode, log, nil)
+}
+
+func isLocalContainerProvider(provider string) bool {
+	p, err := ProviderFor(provider)
+	return err == nil && p.Spec().Name == "local-container"
+}
+
+func probeDirectSSHWebVNC(ctx context.Context, localPort, password string) error {
+	return probeDirectSSHWebVNCWithSecurity(ctx, localPort, password, false)
+}
+
+func webVNCAgentURL(base, leaseID string) string {
+	return webVNCAgentURLWithCapabilities(base, leaseID, "")
+}
+
+type configuredWebVNCTestProvider struct{ directWebVNCTestProvider }
+
+func (configuredWebVNCTestProvider) Spec() ProviderSpec {
+	return ProviderSpec{Name: "configured-webvnc-test", Kind: ProviderKindSSHLease, Features: FeatureSet{FeatureSSH}, Coordinator: CoordinatorNever}
+}
+func (configuredWebVNCTestProvider) ConfiguredFeatures(cfg Config) FeatureSet {
+	if cfg.Desktop {
+		return FeatureSet{FeatureSSH, FeatureDesktop}
+	}
+	return FeatureSet{FeatureSSH}
+}
+func (configuredWebVNCTestProvider) ValidateRequestedCapabilities(Config) error { return nil }
+
+func TestConfiguredDesktopWebVNCRouting(t *testing.T) {
+	RegisterProvider(configuredWebVNCTestProvider{})
+	t.Cleanup(func() { delete(providerRegistry, "configured-webvnc-test") })
+	cfg := baseConfig()
+	cfg.Provider = "configured-webvnc-test"
+	if supportsDirectSSHWebVNC(cfg) {
+		t.Fatal("unconfigured desktop advertised")
+	}
+	cfg.Desktop = true
+	if !supportsDirectSSHWebVNC(cfg) {
+		t.Fatal("configured desktop rejected by direct WebVNC")
+	}
+	if err := validateRequestedCapabilities(cfg); err != nil {
+		t.Fatalf("configured desktop admission: %v", err)
+	}
 }

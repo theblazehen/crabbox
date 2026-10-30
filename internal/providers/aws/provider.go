@@ -14,6 +14,12 @@ func init() {
 
 type Provider struct{}
 
+func (Provider) BackendCapabilities() core.Backend { return &awsLeaseBackend{} }
+
+func (Provider) SupportsResourceRequirements(cfg core.Config) bool {
+	return cfg.TargetOS == core.TargetLinux && (cfg.Architecture == "" || cfg.Architecture == core.ArchitectureAMD64 || cfg.Architecture == core.ArchitectureARM64)
+}
+
 var (
 	_ core.ProviderClassProfileProvider             = Provider{}
 	_ core.ProviderClassSpecProvider                = Provider{}
@@ -71,7 +77,9 @@ func (Provider) ApplyFlags(*core.Config, *flag.FlagSet, any) error {
 
 func (Provider) ConfigureSSHTarget(target *core.SSHTarget, readyCommand string) {
 	if target.TargetOS == core.TargetLinux {
-		target.ReadyCheck = "timeout 20m cloud-init status --wait >/tmp/crabbox-cloud-init.log 2>&1 && " + readyCommand
+		// The tmpfs marker proves this boot completed bootstrap, including any
+		// optional cloud-final setup. Older guests retain their cloud-init gate.
+		target.ReadyCheck = "if systemctl cat crabbox-workspace-ready.service >/dev/null 2>&1; then test -f /run/crabbox/workspace-ready; else timeout 20m cloud-init status --wait >/tmp/crabbox-cloud-init.log 2>&1; fi && " + readyCommand
 	}
 }
 
@@ -285,6 +293,9 @@ func awsMacOSInstanceTypeCandidates() []string {
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	if cfg.AWSStockImage && !core.ShouldUseCoordinator(cfg, p.Spec()) {
+		return nil, core.Exit(2, "aws.stockImage requires brokered AWS leases")
+	}
 	return NewAWSLeaseBackend(p.Spec(), cfg, rt), nil
 }
 

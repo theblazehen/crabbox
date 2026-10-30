@@ -28,6 +28,12 @@ const (
 	rfbSecurityARD   = 30
 	rfbEncodingRaw   = 0
 	rfbKeyEventDelay = 5 * time.Millisecond
+	// rfbKeyReleaseTimeout bounds the key-up and its confirming framebuffer
+	// read after typing is cancelled between a key's down and up events.
+	rfbKeyReleaseTimeout = 2 * time.Second
+	// rfbKeyReleaseTunnelGrace keeps the SSH tunnel up after cancellation
+	// until that release has had its full timeout.
+	rfbKeyReleaseTunnelGrace = rfbKeyReleaseTimeout + 500*time.Millisecond
 
 	// defaultRFBInputReadySettle is a documented delay, not a protocol
 	// handshake. RFB 3.8 and Apple ARD type 30 finish ServerInit and can
@@ -157,7 +163,9 @@ func waitRFBInputReady(ctx context.Context) error {
 }
 
 func typeRemoteMacVNC(ctx context.Context, cfg Config, target SSHTarget, text string) error {
-	tunnel, localPort, err := startVNCForegroundTunnelOnReservedPort(ctx, target, "", "127.0.0.1", managedVNCPort)
+	tunnelCtx, stopTunnel := rfbKeyReleaseTunnelContext(ctx, rfbKeyReleaseTunnelGrace)
+	defer stopTunnel()
+	tunnel, localPort, err := startVNCForegroundTunnelOnReservedPort(tunnelCtx, target, "", "127.0.0.1", managedVNCPort)
 	if err != nil {
 		return err
 	}
@@ -176,6 +184,20 @@ func typeRemoteMacVNC(ctx context.Context, cfg Config, target SSHTarget, text st
 		return fmt.Errorf("type macOS VNC text: %w", err)
 	}
 	return nil
+}
+
+// rfbKeyReleaseTunnelContext follows ctx, but its cancellation lags ctx by
+// grace. The SSH tunnel dies with its context, and a key pressed when ctx ends
+// can only be released while the tunnel is still up.
+func rfbKeyReleaseTunnelContext(ctx context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	tunnelCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	stopAfter := context.AfterFunc(ctx, func() {
+		time.AfterFunc(grace, func() { cancel(context.Cause(ctx)) })
+	})
+	return tunnelCtx, func() {
+		stopAfter()
+		cancel(context.Canceled)
+	}
 }
 
 func resolveMacOSRFBAuthentication(ctx context.Context, cfg Config, target SSHTarget) (rfbCredentials, localWebVNCAuthenticationMode, error) {
@@ -224,10 +246,6 @@ func desktopCredentialsFromProvider(provider Provider, cfg Config, target SSHTar
 	}, true, nil
 }
 
-func preflightRFBAuthenticationFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials) error {
-	return preflightRFBAuthenticationFromConnWithMode(ctx, conn, creds, localWebVNCAuthAuto)
-}
-
 func preflightRFBAuthenticationFromConnWithMode(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
@@ -264,7 +282,7 @@ func preflightRFBAuthenticationForSecurityType(conn net.Conn, creds rfbCredentia
 	return readRFBSecurityResult(conn)
 }
 
-func typeRFBTextFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode, text string) error {
+func typeRFBTextFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode, text string) (resultErr error) {
 	if !utf8.ValidString(text) {
 		return fmt.Errorf("RFB text is not valid UTF-8")
 	}
@@ -292,31 +310,72 @@ func typeRFBTextFromConn(ctx context.Context, conn net.Conn, creds rfbCredential
 	if err := waitRFBInputReady(ctx); err != nil {
 		return err
 	}
+	var key uint32
+	var downWritten, upWritten int
+	defer func() {
+		// This connection has one writer. Only a complete key-down can press
+		// a key; resume a partial key-up without replaying its sent prefix.
+		if resultErr != nil && downWritten == 8 {
+			resultErr = releaseRFBKeyAfterError(conn, key, upWritten, width, height, resultErr)
+		}
+	}()
 	for _, r := range text {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		key, err := rfbKeysymForRune(r)
+		nextKey, err := rfbKeysymForRune(r)
 		if err != nil {
 			return err
 		}
-		if err := writeRFBKeyEvent(conn, true, key); err != nil {
+		key, upWritten = nextKey, 0
+		downWritten, err = writeRFBKeyEvent(conn, true, key)
+		if err != nil {
 			return err
 		}
 		if err := waitRFBKeyEventDelay(ctx); err != nil {
 			return err
 		}
-		if err := writeRFBKeyEvent(conn, false, key); err != nil {
+		upWritten, err = writeRFBKeyEvent(conn, false, key)
+		if err != nil {
 			return err
 		}
 		if err := waitRFBKeyEventDelay(ctx); err != nil {
 			return err
 		}
 	}
+	// All key-ups are complete. The normal drain owns confirmation now;
+	// retrying its request after a partial write could corrupt the stream.
+	downWritten = 0
 	if _, err := requestAndReadRFBFramebuffer(conn, width, height); err != nil {
 		return fmt.Errorf("drain RFB session after typing: %w", err)
 	}
 	return nil
+}
+
+// releaseRFBKeyAfterError sends a best-effort key-up for a key whose key-down
+// was already written; macOS Screen Sharing keeps the key held even after the
+// client disconnects. The connection deadline follows the caller context and
+// may already have passed, so the release gets its own. The server handles
+// messages in order, so a framebuffer reply confirms the key-up arrived before
+// the caller closes the tunnel. A broken transport cannot deliver it.
+func releaseRFBKeyAfterError(conn net.Conn, key uint32, upWritten int, width, height uint16, cause error) error {
+	if err := conn.SetDeadline(time.Now().Add(rfbKeyReleaseTimeout)); err != nil {
+		return fmt.Errorf("%w; release RFB key: %w", cause, err)
+	}
+	message := rfbKeyEventMessage(false, key)
+	if upWritten < len(message) {
+		n, err := conn.Write(message[upWritten:])
+		if err == nil && n != len(message)-upWritten {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			return fmt.Errorf("%w; release RFB key: %w", cause, err)
+		}
+	}
+	if _, err := requestAndReadRFBFramebuffer(conn, width, height); err != nil {
+		return fmt.Errorf("%w; confirm RFB key release: %w", cause, err)
+	}
+	return cause
 }
 
 func rfbKeysymForRune(r rune) (uint32, error) {
@@ -499,21 +558,26 @@ func writeRFBPointerEvent(conn net.Conn, buttonMask byte, x, y int) error {
 	return nil
 }
 
-func writeRFBKeyEvent(conn net.Conn, down bool, key uint32) error {
-	message := make([]byte, 8)
+func rfbKeyEventMessage(down bool, key uint32) [8]byte {
+	var message [8]byte
 	message[0] = 4
 	if down {
 		message[1] = 1
 	}
 	binary.BigEndian.PutUint32(message[4:8], key)
-	if _, err := conn.Write(message); err != nil {
-		return fmt.Errorf("write RFB key event: %w", err)
-	}
-	return nil
+	return message
 }
 
-func negotiateRFBSecurityType(conn net.Conn, creds rfbCredentials) (byte, error) {
-	return negotiateRFBSecurityTypeForMode(conn, creds, localWebVNCAuthAuto)
+func writeRFBKeyEvent(conn net.Conn, down bool, key uint32) (int, error) {
+	message := rfbKeyEventMessage(down, key)
+	n, err := conn.Write(message[:])
+	if err == nil && n != len(message) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return n, fmt.Errorf("write RFB key event: %w", err)
+	}
+	return n, nil
 }
 
 func negotiateRFBSecurityTypeForMode(conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode) (byte, error) {

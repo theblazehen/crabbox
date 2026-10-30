@@ -75,6 +75,9 @@ func TestAWSLinuxReadinessWaitsForCurrentBootCloudInit(t *testing.T) {
 
 	target := core.SSHTargetFromConfig(core.Config{Provider: "aws", TargetOS: core.TargetLinux}, "example.test")
 	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	ready := filepath.Join(dir, "crabbox-ready")
 	invoked := filepath.Join(dir, "ready-invoked")
 	cloudInit := filepath.Join(dir, "cloud-init")
@@ -140,6 +143,71 @@ func TestAWSLinuxReadinessWaitsForCurrentBootCloudInit(t *testing.T) {
 	}
 	if _, err := os.Stat(invoked); err != nil {
 		t.Fatalf("ready check did not execute crabbox-ready after cloud-init completed: %v", err)
+	}
+}
+
+func TestAWSLinuxReadinessRequiresCurrentBootWorkspaceMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("executing Linux readiness checks requires a POSIX shell")
+	}
+	for _, test := range []struct {
+		name                                 string
+		unit, workspace, bootstrap, optional bool
+		cloudInitFails, wantReady            bool
+	}{
+		{name: "new guest skips cloud-init", unit: true, workspace: true, bootstrap: true, optional: true, cloudInitFails: true, wantReady: true},
+		{name: "stale image bootstrap marker", unit: true, bootstrap: true, optional: true},
+		{name: "bootstrap unfinished", unit: true, workspace: true, optional: true},
+		{name: "optional cloud-final setup unfinished", unit: true, bootstrap: true},
+		{name: "normal predicate still required", unit: true, workspace: true, bootstrap: true},
+		{name: "optional setup finished", unit: true, workspace: true, bootstrap: true, optional: true, wantReady: true},
+		{name: "legacy guest waits", bootstrap: true, optional: true, wantReady: true},
+		{name: "legacy failed boot rejects stale markers", workspace: true, bootstrap: true, optional: true, cloudInitFails: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, present := range map[string]bool{"unit": test.unit, "workspace-ready": test.workspace, "bootstrapped": test.bootstrap, "optional-ready": test.optional, "cloud-init-fails": test.cloudInitFails} {
+				if present {
+					if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			for name, script := range map[string]string{
+				"systemctl":     "test \"$*\" = 'cat crabbox-workspace-ready.service' || exit 99\ntest -f unit\n",
+				"cloud-init":    "touch cloud-init-invoked\ntest \"$*\" = 'status --wait' || exit 99\ntest ! -f cloud-init-fails\n",
+				"timeout":       "test \"$1\" = 20m || exit 99\nshift\nexec \"$@\"\n",
+				"crabbox-ready": "touch ready-invoked\ntest -f bootstrapped && test -f optional-ready\n",
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := core.SSHTargetFromConfig(core.Config{Provider: "aws", TargetOS: core.TargetLinux}, "example.test")
+			command := strings.NewReplacer(
+				"/run/crabbox/workspace-ready", filepath.Join(dir, "workspace-ready"),
+				"/usr/local/bin/crabbox-ready", filepath.Join(dir, "crabbox-ready"),
+				"/tmp/crabbox-ready.log", filepath.Join(dir, "ready.log"),
+				"/tmp/crabbox-cloud-init.log", filepath.Join(dir, "cloud-init.log"),
+			).Replace(target.ReadyCheck)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "sh", "-c", command)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			output, err := cmd.CombinedOutput()
+			if ctx.Err() != nil || (err == nil) != test.wantReady {
+				t.Fatalf("readiness=%v want=%t: %s", err, test.wantReady, output)
+			}
+			for name, want := range map[string]bool{
+				"cloud-init-invoked": !test.unit,
+				"ready-invoked":      test.unit && test.workspace || !test.unit && !test.cloudInitFails,
+			} {
+				if _, err := os.Stat(filepath.Join(dir, name)); (err == nil) != want {
+					t.Fatalf("%s=%v want invoked=%t", name, err, want)
+				}
+			}
+		})
 	}
 }
 

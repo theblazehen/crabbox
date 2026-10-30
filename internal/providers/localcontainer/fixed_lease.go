@@ -28,6 +28,10 @@ func isReleasedFixedLocalContainerClaim(claim core.LeaseClaim) bool {
 }
 
 func fixedLocalContainerFingerprint(cfg core.Config, req core.AcquireRequest, publicKey string) (string, error) {
+	ociRuntime, err := localContainerOCIRuntime(cfg)
+	if err != nil {
+		return "", err
+	}
 	cacheVolumes, err := localContainerCacheVolumeMounts(cfg.Cache.Volumes)
 	if err != nil {
 		return "", err
@@ -52,6 +56,7 @@ func fixedLocalContainerFingerprint(cfg core.Config, req core.AcquireRequest, pu
 		{Name: "network", Value: strings.TrimSpace(cfg.LocalContainer.Network)},
 		{Name: "dockerSocket", Value: cfg.LocalContainer.DockerSocket},
 		{Name: "noHostname", Value: cfg.LocalContainer.NoHostname, OmitEmpty: true},
+		{Name: "ociRuntime", Value: ociRuntime, OmitEmpty: true},
 		{Name: "hostVolumes", Value: volumes, OmitEmpty: true},
 		{Name: "cacheVolumes", Value: cacheVolumes, OmitEmpty: true},
 		{Name: "desktop", Value: cfg.Desktop},
@@ -121,8 +126,8 @@ func (b *backend) acquireFixed(ctx context.Context, req core.AcquireRequest, cfg
 		for _, container := range containers {
 			servers = append(servers, b.serverFromContainer(container, cfg))
 		}
-		binding.Slug, err = core.AllocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
-		return binding, err
+		binding.AllocateSlug, binding.RequestedSlug, binding.Inventory = true, req.RequestedSlug, servers
+		return binding, nil
 	}, ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[inspectContainer], error) {
 		claim, intent := tx.Claim, tx.Claim.FixedCreateIntent
 		var result core.FixedObservation[inspectContainer]

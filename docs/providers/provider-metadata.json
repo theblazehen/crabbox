@@ -158,6 +158,21 @@
     "auth": "Bearer token via CRABBOX_AZURE_DYNAMIC_SESSIONS_TOKEN or az account get-access-token; delegated remote sandbox",
     "docs": "azure-dynamic-sessions.md"
   },
+  "azure-sandbox": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Azure Container Apps Sandbox",
+    "location": "cloud",
+    "ssh": "no",
+    "sync": "none",
+    "gpu": "no",
+    "lifecycle": "Crabbox fixed lease and ACA Sandbox API",
+    "cleanup": "exact owned Sandbox delete",
+    "bestFit": "Kept Linux shell workloads with explicit file uploads",
+    "caveat": "Requires an existing Sandbox group; runs require --keep --no-sync; one 2-CPU/4-GiB shape",
+    "auth": "Azure CLI credential or explicitly selected managed identity; direct delegated sandbox",
+    "docs": "azure-sandbox.md"
+  },
   "blacksmith-testbox": {
     "status": "built-in",
     "category": "ci-proof-runner",
@@ -228,7 +243,7 @@
     "lifecycle": "Cloudflare Worker",
     "cleanup": "container delete",
     "bestFit": "Fast delegated Linux container execution",
-    "caveat": "Requires Worker deployment and container availability",
+    "caveat": "Requires Worker deployment and container availability; container snapshots cannot be deleted and expire after 30 days",
     "auth": "Runner bearer token via CRABBOX_CLOUDFLARE_RUNNER_TOKEN plus runner URL; delegated remote container",
     "docs": "cloudflare.md"
   },
@@ -1198,5 +1213,33 @@
     "bestFit": "Self-hosted Linux VM pool over XAPI",
     "caveat": "Normal leases require prepared Linux templates",
     "docs": "xcp-ng.md"
+  },
+  "serve": {
+    "status": "built-in",
+    "category": "self-hosted-virtualization",
+    "substrate": "Donated Docker or Podman containers",
+    "location": "self-hosted",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "Crabbox coordinator and outbound agent",
+    "cleanup": "agent-confirmed container removal",
+    "bestFit": "Trusted owner workloads on spare machine capacity",
+    "caveat": "Brokered only; clients must reach the advertised SSH address; containers are not hostile-tenant isolation",
+    "docs": "serve.md"
+  },
+  "ssh-host": {
+    "status": "built-in",
+    "category": "byo-ssh",
+    "substrate": "Exclusive existing Linux or Windows host",
+    "location": "byo",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Coordinator and outbound host agent",
+    "cleanup": "Confirmed lease account/session teardown; never physical host deletion",
+    "bestFit": "Organization-shared existing test machines behind NAT",
+    "caveat": "Linux namespaces required; Windows MXC interactive-context integration needs hardware qualification; no network isolation",
+    "docs": "ssh-host.md"
   }
 }

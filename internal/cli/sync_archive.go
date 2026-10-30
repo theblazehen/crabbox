@@ -9,6 +9,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 func CreateSyncArchive(ctx context.Context, repo Repo, manifest SyncManifest, tempPattern string) (*os.File, error) {
@@ -67,6 +69,10 @@ func CreateSyncArchive(ctx context.Context, repo Repo, manifest SyncManifest, te
 }
 
 func appendSyncArchiveMember(ctx context.Context, tw *tar.Writer, root, rel string) error {
+	return appendSyncArchiveMemberWithFormat(ctx, tw, root, rel, tar.FormatUnknown, false)
+}
+
+func appendSyncArchiveMemberWithFormat(ctx context.Context, tw *tar.Writer, root, rel string, format tar.Format, includeDirs bool) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -81,7 +87,10 @@ func appendSyncArchiveMember(ctx context.Context, tw *tar.Writer, root, rel stri
 	if err != nil {
 		return fmt.Errorf("stat sync path %s: %w", rel, err)
 	}
-	if info.IsDir() {
+	if includeDirs && !info.IsDir() {
+		return fmt.Errorf("cold sync directory changed: %s", rel)
+	}
+	if info.IsDir() && !includeDirs {
 		return nil
 	}
 	linkname := ""
@@ -96,6 +105,14 @@ func appendSyncArchiveMember(ctx context.Context, tw *tar.Writer, root, rel stri
 		return fmt.Errorf("archive header %s: %w", rel, err)
 	}
 	header.Name = clean
+	header.Format = format
+	if format == tar.FormatPAX {
+		header.AccessTime, header.ChangeTime = time.Time{}, time.Time{}
+		// POSIX paths can contain arbitrary bytes; PAX otherwise declares UTF-8.
+		if !utf8.ValidString(header.Name) || !utf8.ValidString(header.Linkname) {
+			header.PAXRecords = map[string]string{"hdrcharset": "BINARY"}
+		}
+	}
 	if err := tw.WriteHeader(header); err != nil {
 		return fmt.Errorf("archive header %s: %w", rel, err)
 	}

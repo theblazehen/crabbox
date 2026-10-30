@@ -18,24 +18,708 @@
 - Resolve POSIX SSH script staging, cleanup, and fingerprint-invalidation utilities through the remote PATH instead of assuming `/bin` coreutils, allowing NixOS Git-workspace `run --no-sync` execution without guest shims.
 - Preserve piped stdin only at POSIX SSH workload execution, isolating sync/upload/ownership controls and preventing input replay; `--script-stdin` remains source-only, and Windows/WSL/delegated paths are unchanged.
 
+### Fixed
+
+- Coordinator recovery: preview and retire an exact interrupted create request after its cancellation token is lost, preserving ownership, generation checks, and pending cleanup evidence. [PR 2980](https://github.com/openclaw/crabbox/pull/2980). Thanks @vincentkoc.
+- Homebrew release verification: authorize the maintained formula in each credential-free verification workspace before loading it, keeping trust local even with machine Homebrew configuration, preserving formula identity, archive, signature, and installation checks. [PR 2979](https://github.com/openclaw/crabbox/pull/2979). Thanks @vincentkoc.
+- Release builds: retire completed private compiler caches between targets so multi-platform production does not retain every target's cache until packaging. [PR 2978](https://github.com/openclaw/crabbox/pull/2978). Thanks @vincentkoc.
+
+## 0.80.0 - 2026-10-28
+
+### Highlights
+
+- **Share existing Linux and Windows machines through the coordinator.** Managed hosts use outbound relays, isolated borrower execution, rotating pool access, and cleanup-confirmed reuse. Native Windows ARM64 lifecycle and revocation are qualified; MXC remains experimental, and GPU execution and Windows PTYs are not claimed. [PR 2964](https://github.com/openclaw/crabbox/pull/2964). Thanks @RomneyDa.
+- **Pause and resume Azure Sandbox sessions without losing their owned disks.** Explicit recovery and deletion retain exact resource ownership and bounded work admission. [PR 2960](https://github.com/openclaw/crabbox/pull/2960).
+
+### Added
+
+- Static SSH: add `static.noControlMaster`, `CRABBOX_STATIC_NO_CONTROL_MASTER`, and `--static-no-control-master` to opt out of SSH multiplexing, preserving explicit overrides in recovery commands. [PR 2855](https://github.com/openclaw/crabbox/pull/2855). Thanks @shunkakinoki.
+- Managed SSH hosts: enroll exclusive operator-owned capacity behind outbound, pinned SSH relays; isolate borrower accounts, rotate portable-pool access, and require cleanup receipts before reuse. Windows MXC remains experimental, with native ARM64 lifecycle qualification documented. [PR 2964](https://github.com/openclaw/crabbox/pull/2964). Thanks @RomneyDa.
+- Sync: print `still seeding remote Git metadata after ...` progress lines while a remote Git seed runs, so long seeds of large repositories no longer look stalled. [PR 2974](https://github.com/openclaw/crabbox/pull/2974).
+- Azure Sandbox: include client request and lifecycle-poll durations and counts in warmup timing reports, including failed attempts, without inferring server disk or boot timings. [PR 2959](https://github.com/openclaw/crabbox/pull/2959).
+- Azure Sandbox: retain session-owned disks through explicit pause/resume with finite per-activation work admission, durable exact-ownership recovery, and explicit deletion. [PR 2960](https://github.com/openclaw/crabbox/pull/2960).
+- Shard: cap simultaneous provisioning and execution with `--concurrency` or `shard.maxConcurrency`, preserving all-shards-at-once defaults and cancellation cleanup. [PR 2935](https://github.com/openclaw/crabbox/pull/2935). Thanks @zozo123.
+
+### Fixed
+
+- Remote Git seeding: report interrupted seeds as `exit=cancelled`, `exit=deadline`, or `exit=signal:<name>` instead of `exit=unknown`. [PR 2973](https://github.com/openclaw/crabbox/pull/2973).
+- SSH static provider: when another repository holds a static lease, the refusal now explains that a distinct `static.id` / `CRABBOX_STATIC_ID` shares the host safely, and warns that `--reclaim` takes over the other repository's lease and workdir. [PR 2972](https://github.com/openclaw/crabbox/pull/2972).
+- Local Git seeding: stream large object enumerations without the 16 MiB control-output ceiling and preserve the original limit or output failure. [PR 2841](https://github.com/openclaw/crabbox/pull/2841). Thanks @vincentkoc.
+- Coordinator: preserve retryable responses for transient Cloudflare storage failures without replaying operations, and prepare compatible readers for the staged internal grant-header migration. [PR 2847](https://github.com/openclaw/crabbox/pull/2847). Thanks @vincentkoc.
+- CI: shorten only the detached Git-seed fixture's hydration waits and balance slow seed and WSL settings tests across shards, preserving production delays and coverage. [PR 2969](https://github.com/openclaw/crabbox/pull/2969).
+- Blacksmith: reserve a separate bounded final verification phase after native stop consumes its reconciliation budget, without replaying the command or releasing unresolved claim/key custody. [PR 2967](https://github.com/openclaw/crabbox/pull/2967). Thanks @vincentkoc.
+- Blacksmith Testbox: clarify cleanup-only recovery with the exact stop command and observed run exit, preserving failed-run status and retained ownership without suggesting command replay. [PR #2966](https://github.com/openclaw/crabbox/pull/2966). Thanks @vincentkoc.
+- Local container: optionally run leases under a named OCI runtime registered with the Docker daemon (for example gVisor `runsc` or Kata), validated strictly and recorded in lease ownership; the default runtime is unchanged. [PR 2950](https://github.com/openclaw/crabbox/pull/2950). Thanks @coygeek.
+- CI: shard normal CLI tests while testing every root package and nested module once per normal lane, avoiding the redundant serial CLI suite timeout. [PR 2875](https://github.com/openclaw/crabbox/pull/2875). Thanks @vincentkoc.
+- Parallels: an explicitly configured macOS guest user (including `crabbox`, or a generic `ssh.user` / `CRABBOX_SSH_USER`) is honored instead of being replaced by the host `USER`; the host-user fallback still applies when no guest user is configured. [PR 2958](https://github.com/openclaw/crabbox/pull/2958). Thanks @rustanacexd.
+- Sync: restore Windows sync with `XDG_STATE_HOME` by comparing handle-based file identities while retaining managed-state path replacement checks. [PR 2963](https://github.com/openclaw/crabbox/pull/2963). Thanks @paulcam206.
+- Parallels: Windows guest setup retries script staging after Parallels Tools loses a result, verifies the staged bootstrap by SHA-256, runs it exactly once, and confirms a lost final result through a run-specific receipt instead of failing or replaying it. [PR 2957](https://github.com/openclaw/crabbox/pull/2957). Thanks @rustanacexd.
+- CI: the serve relay test fixture forwards data only after both READY frames, matching the coordinator relay, which removes a concurrent large-transfer flake. [PR 2955](https://github.com/openclaw/crabbox/pull/2955).
+
+## 0.79.3 - 2026-10-24
+
+### Highlights
+
+- **Refresh managed developer tools with verified security updates.** Bun 1.4.4, uv 0.13.5, TruffleHog 3.99.4, Tailscale 1.104.2, and Git for Windows 2.56.0.windows.3 use verified checksums; existing managed Bun/uv slots can be refreshed during image rebakes. [PR 2944](https://github.com/openclaw/crabbox/pull/2944). Thanks @joshavant.
+- **Keep lease cleanup moving after local-container checkpoint failures.** Failures before checkpoint submission release their reservations, while ambiguous commits retain their safety holds. [PR 2952](https://github.com/openclaw/crabbox/pull/2952). Thanks @coygeek.
+
+### Fixed
+
+- Security: refresh managed developer toolchains to Bun 1.4.4, uv 0.13.5, TruffleHog 3.99.4, Tailscale 1.104.2, and Git for Windows 2.56.0.windows.3 with verified checksums, and let pin-only image rebakes replace the known previous Bun/uv slots instead of rejecting them as foreign. [PR 2944](https://github.com/openclaw/crabbox/pull/2944). Thanks @joshavant.
+- Local-container: release checkpoint reservations after pre-submission failures so lease cleanup can proceed, while retaining holds for ambiguous commits. [PR 2952](https://github.com/openclaw/crabbox/pull/2952). Thanks @coygeek.
+- AWS: distinguish recognized CloudTrail lookup errors during original root readback without exposing provider messages or weakening account, Region, or evidence checks. [PR 2942](https://github.com/openclaw/crabbox/pull/2942). Thanks @vincentkoc.
+- Init: nested module jobs detected on Windows use slash-separated repository paths in generated commands instead of backslashes. [PR 2946](https://github.com/openclaw/crabbox/pull/2946). Thanks @paulcam206.
+- Docs: Azure Dynamic Sessions name the real `azure.tenantId` / `azure.subscriptionId` keys and their environment variables instead of nonexistent `azure.tenant` / `azure.subscription` keys. [PR 2943](https://github.com/openclaw/crabbox/pull/2943). Thanks @KrasimirKralev.
+
+## 0.79.2 - 2026-10-22
+
+### Highlights
+
+- **Keep Windows values intact and prevent PowerShell injection.** Typographic single quotes stay inside string literals across commands, forwarded environment values, bootstrap, Hyper-V, and Windows Sandbox. [PR 2924](https://github.com/openclaw/crabbox/pull/2924). Thanks @parth-garg01.
+- **Connect only to the Static SSH port you selected.** An unavailable explicit port no longer falls back to port 22 on the same address, preventing a forwarded endpoint from reaching the wrong machine. [PR 2933](https://github.com/openclaw/crabbox/pull/2933). Thanks @valkyriweb.
+- **Refresh managed runtime trust and keep coordinator recovery on native TLS.** Updated runtime inputs remove compromised trust data, Linux rebakes preserve managed aliases, and native connection recovery retains the configured authentication, TLS, and proxy boundaries. [PR 2927](https://github.com/openclaw/crabbox/pull/2927), [PR 2939](https://github.com/openclaw/crabbox/pull/2939). Thanks @joshavant.
+
+### Upgrade notes
+
+- Static SSH configurations with an explicit port must make that endpoint available; scripts that relied on silent fallback to port 22 now fail instead. Omitted ports retain the existing fallback policy, and stored leases need no migration. [PR 2933](https://github.com/openclaw/crabbox/pull/2933). Thanks @valkyriweb.
+- Coordinator connections use native HTTP/TLS for every request and retry. Move curl-only CA, proxy, or connectivity workarounds to native OS/runtime trust and proxy configuration. [PR 2927](https://github.com/openclaw/crabbox/pull/2927). Thanks @joshavant.
+
+### Fixed
+
+- Security: refresh managed runtime trust inputs, preserve predecessor Node aliases during Linux rebakes, and keep coordinator retries on native TLS with Windows connection recovery. Curl-specific coordinator trust and connectivity workarounds must move to native configuration. [PR 2927](https://github.com/openclaw/crabbox/pull/2927). Thanks @joshavant.
+- Coordinator: bound capacity snapshots, use maintained lease indexes, and keep diagnostic reads off the lifecycle mutex so retained history cannot stall completion and heartbeats. Incomplete or oversized snapshots fail closed without reporting partial capacity. [PR 2932](https://github.com/openclaw/crabbox/pull/2932). Thanks @vincentkoc.
+- AWS: preserve the original root disk identity after instance loss, fail closed when historical evidence is unavailable, and prevent replacement disks from acquiring the original identity. [PR 2926](https://github.com/openclaw/crabbox/pull/2926). Thanks @roboclaw-bot, @Surendra-4 and @cropsgg.
+- Run: retain private original signed completion bytes before delivery and support exact-byte receipt recovery after coordinator failures, without reconstructing missing historical signatures. [PR 2925](https://github.com/openclaw/crabbox/pull/2925). Thanks @roboclaw-bot, @Surendra-4 and @cropsgg.
+- Coordinator client: recover idempotent reads from native HTTP idle-connection closes and socket/pipe drops within the existing retry budget, without retrying mutations. [PR 2939](https://github.com/openclaw/crabbox/pull/2939). Thanks @joshavant.
+- CI: give the real-PowerShell WSL bootstrap parsing test its own 60 s budget and a bounded pwsh probe, since cold pwsh starts on runners exceeded the 5 s default. [PR 2938](https://github.com/openclaw/crabbox/pull/2938).
+- CI: retry coordinator health verification for up to three minutes during edge propagation, preserving deployment consistency checks and reporting the last version ID and tag on failure. [PR 2937](https://github.com/openclaw/crabbox/pull/2937).
+- Windows: quote PowerShell values containing typographic single quotes (‘ ’ ‚ ‛), which PowerShell treats as string delimiters, across commands, forwarded environment values, bootstrap generators, Hyper-V and Windows Sandbox, so such values no longer break runs or execute as code. [PR 2924](https://github.com/openclaw/crabbox/pull/2924). Thanks @parth-garg01.
+- Static SSH: an explicitly configured SSH port is exclusive, so a port-forwarded host that is not ready yet no longer falls back to port 22 on the same address (for loopback, the operator's own machine); unset ports and provider fallbacks are unchanged, and reused leases keep the pinned port. [PR 2933](https://github.com/openclaw/crabbox/pull/2933). Thanks @valkyriweb.
+- Providers: consistently list `serve` under `self-hosted-virtualization`, generate the category index from metadata, and check README category membership. [PR 2936](https://github.com/openclaw/crabbox/pull/2936). Thanks @aitrawog.
+- Docs: Daytona API key, JWT token, and organization ID are environment-only; the docs no longer list them as config keys that Crabbox silently ignores. [PR 2931](https://github.com/openclaw/crabbox/pull/2931). Thanks @KrasimirKralev.
+- Tests: wait for settled predecessor state in upgrade proofs, create private Windows recovery fixtures, and give Apple VM validation enough time to finish. [PR 2934](https://github.com/openclaw/crabbox/pull/2934). Thanks @vincentkoc.
+
+## 0.79.1 - 2026-10-20
+
+### Highlights
+
+- **Patch certificate validation across Go builds.** Source, release binaries, container runners, and developer-image toolchains now select Go 1.27.3 to fix GO-2026-6809, retaining the Go 1.26 minimum.
+
+- Local Actions hydration: hydrate detached source mirrors from a verified published ancestor with only a local base ref, preserving selected-file exclusions during cold sync. [PR 2916](https://github.com/openclaw/crabbox/pull/2916). Thanks @shakkernerd.
+
+- Local Actions hydration: prepare cold unpublished detached sources from a verified published ancestor while preserving selected files, privacy filters, and repository identity checks. [PR 2914](https://github.com/openclaw/crabbox/pull/2914). Thanks @shakkernerd.
+
+### Fixed
+
+- smolvm: upload workspace archives and environment profiles through the files API instead of base64 in exec requests, so repositories over ~750 KiB compressed no longer fail with 413, and keep complete command output past 1 MiB (or report truncation). Narrowed API keys now need the `machine:files` scope. [PR 2915](https://github.com/openclaw/crabbox/pull/2915). Thanks @NickyHeC.
+- Security: build source, release binaries, container runners, and developer-image toolchains with Go 1.27.3 to fix reachable GO-2026-6809 certificate validation, retaining the Go 1.26 minimum.
+- Cloudflare Dynamic Workers: cancel stalled response reads at their deadline instead of blocking while closing the response body.
+- Run: verify forwarded environment file removal after cleanup failures, preserve success when only the staging directory remains, and distinguish present files from unconfirmed removal. [PR 2917](https://github.com/openclaw/crabbox/pull/2917). Thanks @mr3od.
+
+## 0.79.0 - 2026-10-19
+
+### Highlights
+
+- **Release owned resources with stronger replacement checks.** Tart validates recorded VM ownership, AWS matches immutable key-pair IDs, Azure checks snapshot identity, and Windows Sandbox stops only verified run-owned sessions. [PR 2902](https://github.com/openclaw/crabbox/pull/2902), [PR 2890](https://github.com/openclaw/crabbox/pull/2890), [PR 2905](https://github.com/openclaw/crabbox/pull/2905), [PR 2906](https://github.com/openclaw/crabbox/pull/2906). Thanks @goutamadwant and @coygeek.
+- **Keep credentials within their intended boundaries.** Browser login preserves broker provenance, non-admin control sessions revalidate continuing authorization, and persisted Windows configuration uses an owner-only DACL. [PR 2903](https://github.com/openclaw/crabbox/pull/2903), [PR 2907](https://github.com/openclaw/crabbox/pull/2907), [PR 2901](https://github.com/openclaw/crabbox/pull/2901). Thanks @coygeek.
+- **Run relay-backed serve leases faster and see each machine's contribution.** Reusing one relay connection per invocation cut measured end-to-end runtime by about 3.5×; usage, machine listings, and the portal report leases, runtime, and allocated CPU-hours per machine. [PR 2865](https://github.com/openclaw/crabbox/pull/2865), [PR 2864](https://github.com/openclaw/crabbox/pull/2864).
+- **Sync and run reliably over static SSH.** Fish login shells work again after the 0.72.0 regression, acknowledged renewals retry failed transports, and macOS work roots follow the final static login user. [PR 2874](https://github.com/openclaw/crabbox/pull/2874), [PR 2872](https://github.com/openclaw/crabbox/pull/2872), [PR 2871](https://github.com/openclaw/crabbox/pull/2871). Thanks @shunkakinoki and @holgergruenhagen.
+- **Restore prepared Azure Sandboxes and run Freestyle with its current API.** Fresh Azure leases can use pinned clean snapshots; Freestyle validates VM readiness and reports timed-out commands as failures. [PR 2850](https://github.com/openclaw/crabbox/pull/2850), [PR 2897](https://github.com/openclaw/crabbox/pull/2897), [PR 2896](https://github.com/openclaw/crabbox/pull/2896). Thanks @galiniliev and @coygeek.
+
+### Upgrade notes
+
+- Direct Azure checkpoints without a recorded snapshot `uniqueId`, or with a mismatched identity, become `detached` instead of deleting by name. Reconcile those snapshots manually; `--local-only` removes only the local record. [PR 2905](https://github.com/openclaw/crabbox/pull/2905). Thanks @coygeek.
+- Explicit Tart release refuses VMs whose recorded ownership, storage, or current claim does not match. Resolve the ownership mismatch before retrying; failed releases preserve recovery state. [PR 2902](https://github.com/openclaw/crabbox/pull/2902). Thanks @coygeek.
+- Non-admin control clients already connected without a verifiable authorization grant must reconnect once after the coordinator update. [PR 2907](https://github.com/openclaw/crabbox/pull/2907). Thanks @coygeek.
+- Windows Sandbox cleanup leaves unverifiable sessions running with a warning and preserves the host workspace for manual inspection. [PR 2906](https://github.com/openclaw/crabbox/pull/2906). Thanks @coygeek.
+
+### Changed
+
+- Serve: reuse invocation-owned relay SSH connections across readiness, sync, commands, and cleanup while preserving pinned host keys and independent workspace ownership. [PR 2865](https://github.com/openclaw/crabbox/pull/2865).
+
+### Added
+
+- Azure Sandbox: optionally restore fresh independently owned leases from pinned clean snapshots, verify source and lifecycle settings, and preserve safe recovery and exact-owned cleanup. [PR 2850](https://github.com/openclaw/crabbox/pull/2850). Thanks @galiniliev.
+- Serve: report per-machine lease counts, runtime, and allocated CPU-hours; machine listings and the portal use durable completion rollups starting at deployment without a history scan or backfill, while usage retains full recorded history. [PR 2864](https://github.com/openclaw/crabbox/pull/2864).
+- Coordinator: allow an explicit legacy AWS account attestation to reconcile pre-cutover retained records without enabling resource deletion. [PR 2861](https://github.com/openclaw/crabbox/pull/2861).
+
+### Fixed
+
+- CI: make Blacksmith's buffered artifact-timeout regression deterministic under scheduler pressure without changing production timeouts or workload results. [PR 2909](https://github.com/openclaw/crabbox/pull/2909).
+- Config: protect persisted Windows credentials with a verified current-user-only DACL before writing, without inheriting parent read grants. [PR 2901](https://github.com/openclaw/crabbox/pull/2901). Thanks @coygeek.
+- Freestyle: create and resume VMs through the current Freestyle API contract, validating readiness for stopped or paused creation responses. [PR 2897](https://github.com/openclaw/crabbox/pull/2897). Thanks @coygeek.
+- Coordinator: revoke non-admin control sessions after shared-token rotation or GitHub authorization withdrawal, including restored sessions, event delivery, and queued heartbeats. [PR 2907](https://github.com/openclaw/crabbox/pull/2907). Thanks @coygeek.
+- Freestyle: report commands whose exec response has no exit status (timeouts) as failures instead of success, keeping output and failure retention. [PR 2896](https://github.com/openclaw/crabbox/pull/2896). Thanks @coygeek.
+- Tests: preserve literal SSH username and transport coverage across OpenSSH parser versions, including clients that reject combined backslash/percent usernames. [PR 2904](https://github.com/openclaw/crabbox/pull/2904). Thanks @coygeek.
+- Windows Sandbox: stop only captured run-owned process identities during cleanup, preserve replacement sessions, and report unconfirmed ownership. [PR 2906](https://github.com/openclaw/crabbox/pull/2906). Thanks @coygeek.
+- AWS: release deletes the lease key pair only by its recorded immutable key-pair ID and skips replacement keys registered under the reused name, explaining every skip. [PR 2890](https://github.com/openclaw/crabbox/pull/2890). Thanks @goutamadwant and @coygeek.
+- Azure: bind direct checkpoint deletion to the captured snapshot identity and detach stale or legacy records for manual cleanup. [PR 2905](https://github.com/openclaw/crabbox/pull/2905). Thanks @coygeek.
+- Login: preserve configured broker provenance during browser authentication so repository-selected destinations cannot use inherited coordinator credentials. [PR 2903](https://github.com/openclaw/crabbox/pull/2903). Thanks @coygeek.
+- Tart: enforce recorded VM ownership and current claims during explicit release, preserve retry state on failure, and verify storage absence before pruning missing leases. [PR 2902](https://github.com/openclaw/crabbox/pull/2902). Thanks @coygeek.
+- Sync: preserve Darwin symlink permissions in local Git seed and overlay snapshots without changing symlink targets or weakening source validation. [PR 2900](https://github.com/openclaw/crabbox/pull/2900). Thanks @vincentkoc.
+- Sync: retain redacted attempt, stage, and failed-check diagnostics when local Git-seed snapshot preparation exhausts its retries, without changing acceptance or cleanup. [PR 2899](https://github.com/openclaw/crabbox/pull/2899). Thanks @vincentkoc.
+- CI: move macOS checks and release verification to macOS 27, preserving macOS 13 deployment gates and Intel verification through Rosetta. [PR 2881](https://github.com/openclaw/crabbox/pull/2881).
+- Docs: clarify command-specific `--provider` selection, doctor readiness failures, and `providers describe <name>` for catalog inspection. [PR 2873](https://github.com/openclaw/crabbox/pull/2873). Thanks @aitrawog.
+- Static SSH: derive the macOS work root from the final `--static-user` flag instead of the default or config user, while explicit work roots still win and the generic SSH user remains the fallback. [PR 2871](https://github.com/openclaw/crabbox/pull/2871). Thanks @holgergruenhagen.
+- Sync: stage rsync receivers through an explicit POSIX shell for Fish-login SSH hosts and identify receiver setup failures without weakening workspace ownership. [PR 2874](https://github.com/openclaw/crabbox/pull/2874). Thanks @shunkakinoki.
+- Run: retry workspace-owner `RENEWED` replies with transport errors within the existing same-token retry budget and confirmed deadline; only an error-free reply confirms ownership. [PR 2872](https://github.com/openclaw/crabbox/pull/2872). Thanks @shunkakinoki.
+- Coordinator: read run-log previews from the latest chunks without scanning the full retained log. [PR 2869](https://github.com/openclaw/crabbox/pull/2869). Thanks @vincentkoc.
+- CI: stop aggregate checks when a run is cancelled while preserving failed dependency results, and check coverage producers before toolchain setup. [PR 2868](https://github.com/openclaw/crabbox/pull/2868). Thanks @vincentkoc.
+- Security: update the Incus client and HTTP/2 dependencies to address reachable advisories, and use Go 1.27.2 for builds while retaining the Go 1.26 module minimum. [PR 2870](https://github.com/openclaw/crabbox/pull/2870).
+- Coordinator deployment: reject lease-policy overrides the runtime would ignore, while preserving acknowledged repair of invalid live policy values. [PR 2867](https://github.com/openclaw/crabbox/pull/2867). Thanks @vincentkoc.
+- Coordinator: reconcile retained AWS records with filtered batches of at most 200 unique instance IDs, avoiding missing-instance fallback storms and isolating transient chunk failures while preserving successful observations and bounded backoff. [PR 2866](https://github.com/openclaw/crabbox/pull/2866).
+- Sync: keep finalization fetches blob-filtered when completing shallow Git history, and explain live-child owner release refusals with safe lease recovery guidance. [PR 2854](https://github.com/openclaw/crabbox/pull/2854).
+
+- Tests: use small controller fixtures in archive tests while preserving companion and manifest validation. [PR 2876](https://github.com/openclaw/crabbox/pull/2876). Thanks @vincentkoc.
+- CI: use keyless OIDC intake for review dispatch. [PR 2892](https://github.com/openclaw/crabbox/pull/2892).
+
+## 0.78.1 - 2026-10-15
+
+### Highlights
+
+- **Put busy-but-usable machines back in the pool.** Heavily loaded Macs now report real availability instead of staying `unknown` and never being offered for new leases. [PR 2845](https://github.com/openclaw/crabbox/pull/2845).
+- **Capture AWS checkpoints before returning success.** Direct AWS `checkpoint create --wait=false` now establishes every backing snapshot before returning, so subsequent work cannot race an unstarted capture. [PR 2834](https://github.com/openclaw/crabbox/pull/2834).
+
+### Fixed
+
+- Azure Sandbox: report original allocation expiry without discarding cleanup ownership, and expose safe operation-specific transport failure categories without leaking private causes. [PR 2849](https://github.com/openclaw/crabbox/pull/2849). Thanks @galiniliev.
+- Coordinator Node image: re-pin the AWS RDS global CA bundle after AWS added the `sa-west-1` root CAs (114 Amazon RDS certificates, all self-signed Amazon roots). [PR 2853](https://github.com/openclaw/crabbox/pull/2853).
+- Checkpoints: establish every direct AWS backing snapshot before non-waiting success, expose provider-owned `captureEstablished` attestations while preserving other providers' success semantics, and reduce native availability and AWS public-IP polling slack. [PR 2834](https://github.com/openclaw/crabbox/pull/2834).
+- Serve: preserve CPU and user-idle readings on heavily loaded Macs with independent sampling deadlines and interval-idle CPU measurement, accept CPU totals above 100%, fall back to raw host CPU when container stats fail, and add opt-in per-signal diagnostics. [PR 2845](https://github.com/openclaw/crabbox/pull/2845).
+
+## 0.78.0 - 2026-10-14
+
+### Highlights
+
+- **Donate spare capacity without slowing down your own work.** `crabbox serve` offers new leases only when host CPU, memory, user activity, and power policies allow; running leases continue, and the CLI and portal explain why a machine is busy. [PR 2838](https://github.com/openclaw/crabbox/pull/2838).
+- **Tell accepted release from confirmed cleanup.** Run history preserves retained or unconfirmed lease outcomes in the `cleanup` phase instead of claiming the machine has stopped. [PR 2819](https://github.com/openclaw/crabbox/pull/2819). Thanks @vincentkoc.
+- **Get the configured runtimes and clearer Testbox failures.** Native commands use the selected Node and Go versions, readiness waits for successful setup, and settlement and cleanup failures retain safe, phase-specific diagnostics. [PR 2818](https://github.com/openclaw/crabbox/pull/2818), [PR 2831](https://github.com/openclaw/crabbox/pull/2831), [PR 2835](https://github.com/openclaw/crabbox/pull/2835), [PR 2837](https://github.com/openclaw/crabbox/pull/2837). Thanks @vincentkoc.
+- **Verify release installs more reliably.** Native-host notarization checks, bounded lookup retries, and attributable diagnostics improve macOS verification; Homebrew verification accepts the current egress runtime packs. [PR 2829](https://github.com/openclaw/crabbox/pull/2829), [PR 2836](https://github.com/openclaw/crabbox/pull/2836), [PR 2842](https://github.com/openclaw/crabbox/pull/2842), [PR 2823](https://github.com/openclaw/crabbox/pull/2823), [PR 2828](https://github.com/openclaw/crabbox/pull/2828), [PR 2840](https://github.com/openclaw/crabbox/pull/2840). Thanks @vincentkoc.
+
+### Upgrade notes
+
+- Automation reading `lease.released` must use the `cleanup` phase and `leaseStopped=false` to distinguish an accepted release request from confirmed machine cleanup. [PR 2819](https://github.com/openclaw/crabbox/pull/2819). Thanks @vincentkoc.
+- Serve availability gating is enabled by default. Set `--availability always` only when a donor should accept new leases regardless of host activity; laptop defaults also require ten minutes of user idle and AC power. [PR 2838](https://github.com/openclaw/crabbox/pull/2838).
+
+### Changed
+
+- Coordinator: remove per-owner lease lifetime overrides from the production configuration; every owner uses the global lease policy, and the deploy guard now protects the complete live override document generically. [PR 2830](https://github.com/openclaw/crabbox/pull/2830).
+
+### Added
+
+- Serve: offer machines only while host CPU, memory, user activity, and power policies allow, with availability reasons, portal measurements, and a read-only local probe; running leases continue. [PR 2838](https://github.com/openclaw/crabbox/pull/2838).
+
+### Fixed
+
+- Release verification: retry fully captured transient online notarization-daemon errors for up to four strict checks with bounded backoff, retaining every failure diagnostic and preserving rejection and interruption guards. [PR 2836](https://github.com/openclaw/crabbox/pull/2836), [PR 2842](https://github.com/openclaw/crabbox/pull/2842).
+- Release verification: accept provenance schema 4 (egress runtime packs) in the installed-Homebrew verifier, checking it against the same exact filesystem-layout archive inventory as schema 3. [PR 2840](https://github.com/openclaw/crabbox/pull/2840).
+- CI: Go CLI race shards keep the restored Go build cache, so the race build's cache trim no longer deletes the non-race packages the one-time CLI test build reuses; that build drops from about 135 s to about 30 s per shard. [PR 2833](https://github.com/openclaw/crabbox/pull/2833).
+- Testbox: announce readiness only after setup succeeds, so failed preparation does not keep an unprepared runner in its idle loop. [PR 2831](https://github.com/openclaw/crabbox/pull/2831). Thanks @vincentkoc.
+- CI: skip production coordinator deployment for changes limited to Worker tests while retaining runtime, configuration, and deployment-helper triggers. [PR 2839](https://github.com/openclaw/crabbox/pull/2839). Thanks @vincentkoc.
+- CLI: distinguish accepted release from confirmed cleanup in run events, preserving retained or unconfirmed outcomes in the `cleanup` phase. [PR 2819](https://github.com/openclaw/crabbox/pull/2819). Thanks @vincentkoc.
+- Release verification: check online notarization on each binary's native macOS host while retaining foreign-architecture static checks and a manual online opt-in. [PR 2829](https://github.com/openclaw/crabbox/pull/2829).
+- Release verification: report bounded, attributable macOS notarization diagnostics without changing failed checks or executing rejected binaries. [PR 2823](https://github.com/openclaw/crabbox/pull/2823). Thanks @vincentkoc.
+- CI: assign Go CLI race and coverage shards by test-name hash, with a checked-in weight list spreading known-slow tests, so adding a test no longer moves hundreds of existing tests between shards and pushes one past its 10-minute race timeout. [PR 2826](https://github.com/openclaw/crabbox/pull/2826).
+- CI: Go CLI race shards stream test events like the coverage shards, print only failed or unfinished test output, and end with listed and unlisted slow-test timings; the slow-test weights now come from those linux race timings. [PR 2832](https://github.com/openclaw/crabbox/pull/2832).
+- Release verification: retain attributable notarization errors after unrelated log floods, while bounding streamed records and sanitized diagnostics. [PR 2828](https://github.com/openclaw/crabbox/pull/2828). Thanks @vincentkoc.
+- Blacksmith Testbox: expose the configured Node and Go runtimes to native commands instead of using the runner image defaults. [PR 2818](https://github.com/openclaw/crabbox/pull/2818). Thanks @vincentkoc.
+- Blacksmith Testbox: report typed command causes and remaining cleanup budget when GitHub settlement fails, while keeping private error details out of CLI output. [PR 2835](https://github.com/openclaw/crabbox/pull/2835). Thanks @vincentkoc.
+- Blacksmith Testbox: distinguish native status or stop failures from later cleanup phases, preserving command timing and typed causes with display-safe error diagnostics. Native stop output remains unchanged. [PR 2837](https://github.com/openclaw/crabbox/pull/2837). Thanks @vincentkoc.
+
+## 0.77.0 - 2026-10-13
+
+### Highlights
+
+- **Stop leases without waiting on cloud cleanup.** `crabbox stop --wait=false` hands confirmed deletion to the coordinator and keeps local recovery state until cleanup completes; plain `stop` still waits. [PR 2809](https://github.com/openclaw/crabbox/pull/2809).
+- **Scripted runs start faster.** No-sync runs batch SSH workspace preparation and script upload and overlap telemetry and event delivery, with idempotent retries after transient transport failures. [PR 2809](https://github.com/openclaw/crabbox/pull/2809).
+- **Egress works from installed CLIs.** Setup wrappers receive verified architecture-specific runtime-pack helpers, public destinations are opt-in, and cleanup errors fail the run without hiding the workload outcome. [PR 2812](https://github.com/openclaw/crabbox/pull/2812).
+- **Lifetime cleanup and Blacksmith failures are more trustworthy.** Ordinary TTL deletion takes precedence over maximum-lifetime retention, and Blacksmith Testbox failures keep their native diagnostics through cleanup and reporting. [PR 2795](https://github.com/openclaw/crabbox/pull/2795), [PR 2820](https://github.com/openclaw/crabbox/pull/2820). Thanks @vincentkoc.
+
+### Changed
+
+- CLI: add `stop --wait=false` for coordinator-owned queued cleanup while preserving pending local recovery state; ordinary stop still waits for confirmed deletion. [PR 2809](https://github.com/openclaw/crabbox/pull/2809).
+- CLI: batch no-sync SSH workspace preparation and script upload, overlap independent telemetry and event delivery, and preserve retained scripts and terminal run records. [PR 2809](https://github.com/openclaw/crabbox/pull/2809).
+- Coordinator: deployments refuse to overwrite live lifetime-policy overrides that are missing from source. [PR 2816](https://github.com/openclaw/crabbox/pull/2816). Thanks @vincentkoc.
+
+### Added
+
+- Egress: provision verified architecture-specific runtime-pack helpers for installed setup wrappers, add opt-in public destinations, and fail runs on redacted environment cleanup errors while preserving primary workload and owner outcomes. [PR 2812](https://github.com/openclaw/crabbox/pull/2812).
+
+### Fixed
+
+- Coordinator deployment: the lease-policy preservation guard accepts authorized maximum-TTL changes without discarding other live overrides. [PR 2822](https://github.com/openclaw/crabbox/pull/2822).
+- Blacksmith Testbox: preserve native failures and safe diagnostics through cleanup and reporting, finish independent proof and failure captures, and keep lease recovery handles accurate. [PR 2820](https://github.com/openclaw/crabbox/pull/2820). Thanks @vincentkoc.
+- Coordinator: preserve ordinary TTL deletion ahead of maximum-lifetime retention, reject conflicting delete requests during lifetime work, and reconcile shared AWS ingress after lifetime deletion. [PR 2795](https://github.com/openclaw/crabbox/pull/2795). Thanks @vincentkoc.
+- CLI: retain idempotent SSH retries for batched workspace preparation and script upload after transient transport failures. [PR 2809](https://github.com/openclaw/crabbox/pull/2809).
+
+## 0.76.0 - 2026-10-13
+
+### Highlights
+
+- **Boxes now die on time by default.** Every lease defaults to a 30-minute lifetime and 30-minute idle timeout with a 4-hour maximum that also clamps running leases. Coordinator policies set defaults, maximums, and extension rules globally or per organization and owner; `crabbox extend` and in-run auto-extension are budget-checked. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- **Direct-provider machines reclaim themselves.** Shared-bootstrap Linux providers install an on-box expiry guard (AWS instances terminate on shutdown), expired `keep=true` machines are no longer exempt from cleanup, and `directLeases: deny` requires coordinator allocation on a machine. [PR 2806](https://github.com/openclaw/crabbox/pull/2806).
+- **`crabbox list` answers in seconds.** Listings stream live leases first and show only live leases by default; `--retained` adds kept history, `--jsonl` streams machine-readable rows, and `--all` keeps orphaned provider inventory visible without a 1,000-row cap. [PR 2802](https://github.com/openclaw/crabbox/pull/2802).
+- **The coordinator cleans up stale lease records itself.** Retained AWS records are reconciled against their exact instances in bounded, resumable passes, with progress in `crabbox admin retained-reconcile`. [PR 2803](https://github.com/openclaw/crabbox/pull/2803).
+- **Serve machines are reachable from anywhere.** Agents advertise LAN and tailnet front doors with pinned-key, LAN-first selection, fall back to an end-to-end encrypted coordinator relay, and appear in the portal with live capacity. [PR 2794](https://github.com/openclaw/crabbox/pull/2794), [PR 2796](https://github.com/openclaw/crabbox/pull/2796), [PR 2797](https://github.com/openclaw/crabbox/pull/2797), [PR 2807](https://github.com/openclaw/crabbox/pull/2807), [PR 2811](https://github.com/openclaw/crabbox/pull/2811).
+
+### Upgrade notes
+
+- Leases default to a 30-minute lifetime and 30-minute idle timeout, and coordinators clamp any requested or existing lease to 4 hours unless a lifetime policy allows more; on upgrade, running leases older than the maximum expire at the next maintenance pass. `crabbox run` auto-extends while its command executes; request a longer `--ttl` or use `crabbox extend` for interactive work. Daytona and other creation-fixed providers cannot be extended after creation. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- `crabbox list` and `crabbox list --json` now return only active and provisioning leases; add `--retained` where scripts relied on kept terminal records. [PR 2802](https://github.com/openclaw/crabbox/pull/2802).
+- `crabbox cleanup` for direct providers now deletes expired machines labeled `keep=true` and gives running or provisioning machines a 1-hour grace instead of 12 hours. [PR 2806](https://github.com/openclaw/crabbox/pull/2806).
+- Lease extensions reserve their additional cost; an extension that would exceed a fleet, owner, or organization budget is refused with `lease_extension_budget_exceeded`. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+
+### Changed
+
+- Default lease lifetime to 30 minutes with a 4-hour maximum and coordinator global, organization, and owner lifetime policies that also clamp live leases. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- Direct lease allocations and explicit idle-timeout updates report policy clamps and persist the effective timeout consistently; coordinator heartbeats also report clamped idle overrides. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- Lease extensions atomically reserve their additional cost against fleet, owner, and organization budgets; running commands report when exhausted budgets prevent extension. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- Registered external leases retain their renewable heartbeat deadline when lifetime policy is tightened. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- CLI: `crabbox list` streams and shows live leases by default; `--retained` includes kept terminal leases. Add `--jsonl` streaming and uncapped `--all` lease lookups while preserving the buffered `--json` array. [PR 2802](https://github.com/openclaw/crabbox/pull/2802).
+- Direct cleanup now expires `keep=true` leases and reduces running/provisioning expiry grace from 12 hours to 1 hour; unowned machines remain untouched. [PR 2806](https://github.com/openclaw/crabbox/pull/2806).
+- Direct leases: preserve provider user-data limits with compressed Tencent Cloud bootstrap, retain renewed leases during cleanup, and normalize Sealos ownership labels. [PR 2806](https://github.com/openclaw/crabbox/pull/2806).
+- Coordinator monthly reserved-USD budgets are raised to $100,000 fleet-wide, $50,000 per owner and $100,000 per org; reservations from finished leases had exhausted the per-owner cap at roughly a quarter of the estimated spend. [PR 2800](https://github.com/openclaw/crabbox/pull/2800).
+- CI: run CLI coverage in three isolated shards, retaining atomic whole-suite coverage and the 90% core gate; report the slowest top-level tests without summing nested timings. [PR 2810](https://github.com/openclaw/crabbox/pull/2810). Thanks @vincentkoc.
+
+### Added
+
+- `crabbox extend` requests bounded lifetime extensions; running commands can auto-extend when policy and provider lifetime capabilities allow. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- Direct Linux guest expiry guards across shared-bootstrap providers, plus `directLeases: deny` and trusted provider exceptions to require coordinator allocation. [PR 2806](https://github.com/openclaw/crabbox/pull/2806).
+- Coordinator: reconcile retained terminal AWS leases from the current index with scoped cleanup proof, bounded resumable passes, opt-in owned deletion, and `crabbox admin retained-reconcile` status. [PR 2803](https://github.com/openclaw/crabbox/pull/2803).
+- Serve agents advertise LAN and tailnet front-door candidates, with pinned-key LAN-first client selection and per-lease route caching. [PR 2796](https://github.com/openclaw/crabbox/pull/2796).
+- Serve leases can fall back to an owner-authorized, end-to-end encrypted coordinator relay when LAN and tailnet routes are unavailable. [PR 2797](https://github.com/openclaw/crabbox/pull/2797), [PR 2807](https://github.com/openclaw/crabbox/pull/2807).
+- Portal: show owners their donated serve machines, online status, capacity, allocated leases, and runtime details. [PR 2794](https://github.com/openclaw/crabbox/pull/2794).
+- Blacksmith Testbox: configure the native total readiness wait (queue and hydration) through `blacksmith.waitTimeout`, `CRABBOX_BLACKSMITH_WAIT_TIMEOUT`, or `--blacksmith-wait-timeout`, preserving the native 15-minute default when unset. [PR 2805](https://github.com/openclaw/crabbox/pull/2805). Thanks @vincentkoc.
+
+### Fixed
+
+- Direct lease extension refreshes file-backed guest expiry guards after saving provider labels; failed guest writes report both deadlines and can be retried without adding lifetime twice. [PR 2804](https://github.com/openclaw/crabbox/pull/2804).
+- AWS: honor the requested region before coordinator and capacity fallbacks, using a regional promoted image or the normal stock image without redirecting to another region's promotion. [PR 2808](https://github.com/openclaw/crabbox/pull/2808).
+- Serve: allow relay pairing and both SSH handshakes to complete during bootstrap and sync; add bounded, payload-free client and agent diagnostics with `CRABBOX_SERVE_RELAY_DEBUG=1`. [PR 2811](https://github.com/openclaw/crabbox/pull/2811).
+- Blacksmith Testbox: cancel the exact owned GitHub workflow after native stop leaves it active, releasing concurrency slots without waiting for the SSH idle timer; retain recovery state until both sides confirm completion. [PR 2813](https://github.com/openclaw/crabbox/pull/2813). Thanks @vincentkoc.
+- AWS deployment smoke: pin Linux/amd64 `t3.small` with class `tiny` and On-Demand capacity so inherited defaults cannot launch a larger instance. [PR 2814](https://github.com/openclaw/crabbox/pull/2814). Thanks @vincentkoc.
+- Preserve worst-case `reservedUSD` in usage reports and expose enforced cost as `committedUSD`, with compatible CLI output and conservative reservations for retained legacy VMs and unresolved provisioning. [PR 2801](https://github.com/openclaw/crabbox/pull/2801).
+- Settle terminal lease budget reservations at elapsed compute cost capped by the admission reservation, preserve observed runtime through late release and cleanup retries, and charge confirmed never-allocated leases zero compute runtime. [PR 2799](https://github.com/openclaw/crabbox/pull/2799).
+- Coordinator deployments fail when credentials are missing or the public health endpoint does not confirm the active version and requested commit. [PR 2798](https://github.com/openclaw/crabbox/pull/2798). Thanks @vincentkoc.
+
+## 0.75.0 - 2026-10-12
+
+### Highlights
+
+- **Turn spare machines into private container capacity.** `crabbox serve` offers owner-only leases through one authenticated SSH front door, with pinned end-to-end container SSH, warm package caches, and opt-in capacity fallback. [PR 2768](https://github.com/openclaw/crabbox/pull/2768), [PR 2770](https://github.com/openclaw/crabbox/pull/2770), [PR 2789](https://github.com/openclaw/crabbox/pull/2789).
+- **Keep coordinator requests moving as lease history grows.** Separate current and maintenance indexes avoid repeated history scans; bounded reads reduce memory pressure, while structured 503 responses and CLI backoff recover transient overload and resets. [PR 2769](https://github.com/openclaw/crabbox/pull/2769), [PR 2774](https://github.com/openclaw/crabbox/pull/2774), [PR 2777](https://github.com/openclaw/crabbox/pull/2777), [PR 2782](https://github.com/openclaw/crabbox/pull/2782), [PR 2786](https://github.com/openclaw/crabbox/pull/2786), [PR 2788](https://github.com/openclaw/crabbox/pull/2788).
+- **Set an optional safety net for retained AWS leases.** Default-off maximum-age policies expose stop and deletion deadlines, allow bounded extensions, and verify stop permissions before enforcement. [PR 2759](https://github.com/openclaw/crabbox/pull/2759), [PR 2771](https://github.com/openclaw/crabbox/pull/2771). Thanks @vincentkoc.
+- **Scan and filter the lease portal more easily.** Clickable fleet readouts, provider activity, and compact state filters bring a refreshed layout to the home, admin, and detail pages. [PR 2773](https://github.com/openclaw/crabbox/pull/2773).
+- **Sync native Jujutsu working copies directly.** Git-backed `jj` workspaces now sync their exact `@` tree, including working-copy edits and octopus merges, to ordinary SSH leases. [PR 2780](https://github.com/openclaw/crabbox/pull/2780), [Issue 1081](https://github.com/openclaw/crabbox/issues/1081). Thanks @atimmer.
+
+### Upgrade notes
+
+- Automation using `crabbox run` should allow up to 30 seconds for run admission when the coordinator is unavailable, increased from 10 seconds; shorter caller deadlines still win. [PR 2777](https://github.com/openclaw/crabbox/pull/2777).
+- `crabbox list --all` now paginates active-lease lookups, so results can include active leases beyond the former single-page cap. Older coordinators retain the legacy fallback with a warning when its limit is reached. [PR 2788](https://github.com/openclaw/crabbox/pull/2788).
+
+### Added
+
+- Sync: support native Git-backed Jujutsu workspaces by syncing the exact `@` tree, including octopus merges and working-copy edits, with explicit origin-bookmark seeding and fail-closed revision checks. [PR 2780](https://github.com/openclaw/crabbox/pull/2780), [Issue 1081](https://github.com/openclaw/crabbox/issues/1081). Thanks @atimmer.
+- Proxmox: add opt-in prepared XFCE/TigerVNC and browser templates with per-clone credentials, fail-closed readiness and capability-safe adapter replay. [PR 2781](https://github.com/openclaw/crabbox/pull/2781), [Issue 2549](https://github.com/openclaw/crabbox/issues/2549). Thanks @ahkohd.
+- Docs: translate the landing page and core introductions into Simplified Chinese, Japanese, Korean, Spanish, German, French, and Brazilian Portuguese, with language navigation, English fallback, preserved examples, and source-hash staleness notices. [PR 2784](https://github.com/openclaw/crabbox/pull/2784), [Issue 1065](https://github.com/openclaw/crabbox/issues/1065). Thanks @alexandre-leng.
+- Coordinator: add default-off maximum-age policies and explicit admin rollout canaries for retained AWS leases, with verified stop permissions, visible stop/deletion deadlines, bounded extensions, and root-disk cleanup. [PR 2759](https://github.com/openclaw/crabbox/pull/2759). Thanks @vincentkoc.
+- Serve: run `crabbox serve` on trusted machines to donate spare CPU as owner-only container leases (`--provider serve`), with outbound coordinator polling, local deadline enforcement, a single authenticated SSH front door (`--ssh-port`) with pinned end-to-end container SSH, warm package caches, per-user service install, and opt-in capacity fallback. Coordinators enable it per owner with `CRABBOX_SERVE_ALLOWED_OWNERS` (off by default). [PR 2768](https://github.com/openclaw/crabbox/pull/2768), [PR 2770](https://github.com/openclaw/crabbox/pull/2770), [PR 2789](https://github.com/openclaw/crabbox/pull/2789).
+
+### Changes
+
+- Coordinator: enable Cloudflare Workers Logs with full head sampling so Worker requests, Durable Object alarms, and structured coordinator failure lines are retained for incident attribution, with query strings redacted from logged URLs. [PR 2783](https://github.com/openclaw/crabbox/pull/2783), [PR 2785](https://github.com/openclaw/crabbox/pull/2785).
+- Portal: redesign the lease portal with clickable fleet readouts, a per-provider activity bar, a segmented state filter with compact filter chips, calmer text-only state labels, and a refreshed dark/light skin across admin and detail pages. [PR 2773](https://github.com/openclaw/crabbox/pull/2773).
+- Portal: omit stale external runners from the home page while preserving runner list API and detail access. [PR 2775](https://github.com/openclaw/crabbox/pull/2775).
+- Docs: consolidate provider selection, class catalogs, and lifecycle references; correct stale provider support, sizing, and transport guidance. [PR 2763](https://github.com/openclaw/crabbox/pull/2763).
+
 ### Fixes
 
-- Restore complete branch history before coherence checks when reusing shallow Git workspaces, while preserving wrong-branch rejection and index rollback. [PR 2529](https://github.com/openclaw/crabbox/pull/2529). Thanks @steipete.
+- Coordinator/CLI: use independent current and maintenance indexes for lease listings and paginate active admin lookups, preserving filters, history fallback and cursor source checks. [PR 2788](https://github.com/openclaw/crabbox/pull/2788).
+- AWS: resolve automatic runner images in each fallback region, recover missing promotions with stock images, and let exact-type Spot requests promptly use enabled On-Demand fallback. [PR 2787](https://github.com/openclaw/crabbox/pull/2787). Thanks @vincentkoc.
+- Coordinator: index leases with pending maintenance so alarm reconciliation, discovery, provider access, slug lookup, and registration avoid scanning settled history, with bounded backfill and daily repair audits. [PR 2786](https://github.com/openclaw/crabbox/pull/2786).
+- Coordinator/CLI: return structured retryable 503 responses with Retry-After for Durable Object overload/reset instead of Cloudflare 1101, and retry reads and run admission with bounded backoff. [PR 2777](https://github.com/openclaw/crabbox/pull/2777).
+- Coordinator: stop alarm reconciliation from issuing a storage read per retained historical lease, and keep read-only lifetime readbacks out of the lifecycle queue, reducing request queueing and overload errors on long-lived fleets. [PR 2782](https://github.com/openclaw/crabbox/pull/2782).
+- Coordinator: allow explicitly configured capacity admins to use their owner allowance when shared fleet or org caps are full, while preserving spending limits and ordinary admission. [PR 2778](https://github.com/openclaw/crabbox/pull/2778). Thanks @vincentkoc.
+- Coordinator: preserve deployment-managed capacity-admin membership across deploys without replacing secret-backed members or raising ordinary owner limits. [PR 2776](https://github.com/openclaw/crabbox/pull/2776). Thanks @vincentkoc.
+- Coordinator: reconcile org-wide external runner inventories across owners, deduplicate visible runners with two bounded streaming scans, hide observations older than two hours, and prune rows last seen more than seven days ago. [PR 2779](https://github.com/openclaw/crabbox/pull/2779).
+- Coordinator: preserve leading zero bytes in generated Ed25519 SSH host keys so the public identity and injected private key remain a valid pair. [PR 2772](https://github.com/openclaw/crabbox/pull/2772). Thanks @vincentkoc.
+- Bound coordinator storage scans for pools, image catalogs, checkpoints, and dynamic runner indexes to uncached pages. [PR 2774](https://github.com/openclaw/crabbox/pull/2774).
+- Coordinator: prevent the portal from exhausting coordinator memory when many external runner records are stored by bounding reads and pruning old stale records. [PR 2769](https://github.com/openclaw/crabbox/pull/2769).
+- Serve: stop spurious `serve_rate_limited` heartbeat errors by pacing each heartbeat at least `--poll-interval` after the previous response. [PR 2770](https://github.com/openclaw/crabbox/pull/2770).
+- Serve: prepare bootstrap packages in the background without delaying restart heartbeats or reconciliation; prepared leases start in about a second instead of ~30s, recover automatically after shared-image pruning, and retain unique SSH host keys. [PR 2770](https://github.com/openclaw/crabbox/pull/2770).
+- Coordinator: confirm lifetime-cap stops every 30 seconds for the first five minutes instead of waiting for the five-minute retry, and retire a lease's lifetime policy when an explicit stop deletes it; harden the lifetime canary live proof. [PR 2771](https://github.com/openclaw/crabbox/pull/2771).
+- Sync: explain incomplete shallow sources and Git overlay conflicts during local Git seeding, with actionable configuration fixes. [PR 2662](https://github.com/openclaw/crabbox/pull/2662), related [Issue 2661](https://github.com/openclaw/crabbox/issues/2661). Thanks @shunkakinoki.
+- CLI: resolve explicit provider, target, Windows mode, architecture, OS, class, and type flags before validating inherited configuration, preserving unrelated defaults and recorded-lease identity checks. [PR 2767](https://github.com/openclaw/crabbox/pull/2767).
+- Jobs: apply a selected job's provider and platform selectors before validating inherited defaults, including dry runs and existing-lease reuse. [PR 2767](https://github.com/openclaw/crabbox/pull/2767).
 
-## 0.66.0 - 2026-09-23
+## 0.74.0 - 2026-10-10
+
+### Highlights
+
+- **Recover GitHub Codespaces leases safely after interrupted requests.** Caller-supplied lease IDs now bind recovery to the exact account and creation intent, with receipts that prevent accidental recreation. [PR 2752](https://github.com/openclaw/crabbox/pull/2752), [Issue 2660](https://github.com/openclaw/crabbox/issues/2660). Thanks @jcxmt125.
+- **Start exe.dev leases from a prepared VM.** Use `--exe-dev-from` to copy a ready workspace into a separately owned lease with fresh ownership tags and a persistent work root. [PR 2757](https://github.com/openclaw/crabbox/pull/2757), [PR 2754](https://github.com/openclaw/crabbox/pull/2754). Thanks @salmonumbrella.
+- **See what AWS capacity checks actually know.** Doctor distinguishes sufficient quota from unchecked regional usage instead of reporting available capacity from the quota ceiling alone. [PR 2753](https://github.com/openclaw/crabbox/pull/2753). Thanks @vincentkoc.
+- **Run more concurrent coordinator leases.** Fleet, org, and capacity-admin active-lease caps rise from 20 to 50; the ordinary owner cap and monthly budgets remain unchanged. [PR 2756](https://github.com/openclaw/crabbox/pull/2756).
+
+### Upgrade notes
+
+- Automation parsing AWS doctor capacity output should handle `capacity=unknown quota_limit=sufficient usage=unchecked region=...`: a sufficient quota no longer implies available regional capacity. [PR 2753](https://github.com/openclaw/crabbox/pull/2753). Thanks @vincentkoc.
+
+### Added
+
+- exe.dev: start separately claimed leases from prepared VMs with `--exe-dev-from`, fresh ownership tags, and persistent work roots while preserving existing claim paths. [PR 2757](https://github.com/openclaw/crabbox/pull/2757), [PR 2754](https://github.com/openclaw/crabbox/pull/2754). Thanks @salmonumbrella.
+- GitHub Codespaces: support replay-safe caller-supplied lease IDs with account- and intent-bound recovery, exact-resource cleanup, and terminal receipts. [PR 2752](https://github.com/openclaw/crabbox/pull/2752), [Issue 2660](https://github.com/openclaw/crabbox/issues/2660). Thanks @jcxmt125.
+
+### Changes
+
+- Coordinator: raise fleet, org, and capacity-admin active-lease caps from 20 to 50, preserving the ordinary owner cap and monthly budgets. [PR 2756](https://github.com/openclaw/crabbox/pull/2756).
+
+### Fixes
+
+- AWS: stop reporting available capacity from quota ceilings alone; mark regional usage unchecked and clarify that class fallback still requires quota headroom. [PR 2753](https://github.com/openclaw/crabbox/pull/2753). Thanks @vincentkoc.
+- DigitalOcean: prefer the first available region near San Francisco when no region is configured, preserve explicit regions, and reuse the recorded region on fixed-lease replay. [PR 2758](https://github.com/openclaw/crabbox/pull/2758).
+- Azure: refuse retained network-companion cleanup when provider-key or fixed-attempt tags conflict with the original claim, even when immutable resource IDs still match. [PR 2751](https://github.com/openclaw/crabbox/pull/2751).
+
+## 0.73.0 - 2026-10-08
+
+### Highlights
+
+- **Start AWS Windows leases on Server 2025.** The promoted eu-west-1 developer image and stock fallback now use Windows Server 2025; an explicit OS selector keeps Server 2022 available. [PR 2748](https://github.com/openclaw/crabbox/pull/2748), [PR 2734](https://github.com/openclaw/crabbox/pull/2734), [Issue 2717](https://github.com/openclaw/crabbox/issues/2717). Thanks @saftall.
+- **Run shell workloads in Azure sandboxes and recover failed Azure VMs safely.** The new Azure Container Apps Sandboxes provider supports kept Linux workloads, uploads, idle resume, and verified cleanup. Azure VM leases retain cleanup ownership after VM loss, with `crabbox hold` for salvage. [PR 2738](https://github.com/openclaw/crabbox/pull/2738), [PR 2733](https://github.com/openclaw/crabbox/pull/2733). Thanks @galiniliev.
+- **Keep Windows command arguments intact.** Native programs and uploaded PowerShell scripts receive embedded quotes, empty arguments, backslashes, and Unicode without the legacy argument binder losing or merging them. [PR 2736](https://github.com/openclaw/crabbox/pull/2736).
+- **Recover interrupted creates after a coordinator reset.** Bounded history reads, streamed log downloads, and capped caches reduce memory pressure; interrupted creates fail promptly while preserving provider cleanup ownership. [PR 2745](https://github.com/openclaw/crabbox/pull/2745).
+- **Know how to stop every retained lease.** Runs print the exact stop command and retention reason, Cloudflare retries failed container cleanup, and stop respects cleanup already owned by expiry. [PR 2741](https://github.com/openclaw/crabbox/pull/2741), [PR 2735](https://github.com/openclaw/crabbox/pull/2735), [PR 2747](https://github.com/openclaw/crabbox/pull/2747), [Issue 2740](https://github.com/openclaw/crabbox/issues/2740), [Issue 2746](https://github.com/openclaw/crabbox/issues/2746). Thanks @coygeek and @shakkernerd.
+
+### Upgrade notes
+
+- AWS Windows leases now boot Server 2025 by default. Pin `--os windows-server:2022` to keep Server 2022. [PR 2748](https://github.com/openclaw/crabbox/pull/2748), [PR 2734](https://github.com/openclaw/crabbox/pull/2734), [Issue 2717](https://github.com/openclaw/crabbox/issues/2717). Thanks @saftall.
+- After an Azure VM disappears, automatic cleanup resumes only previously admitted deletion. Otherwise choose `crabbox stop` or `crabbox hold` explicitly, even for an expired lease; retain local claims for recovery. Holds do not expire automatically and need explicit finalization after salvage and disposal. [PR 2733](https://github.com/openclaw/crabbox/pull/2733). Thanks @galiniliev.
+
+### Added
+
+- Azure Sandbox: run kept Linux shell workloads in existing Azure Container Apps Sandbox groups with fixed lease recovery, explicit uploads, idle resume, and verified cleanup that can interrupt active requests. [PR 2738](https://github.com/openclaw/crabbox/pull/2738). Thanks @galiniliev.
+
+### Changes
+
+- AWS Windows leases: default the stock AMI fallback to Server 2025 in direct and brokered mode while preserving explicit Server 2022 selection and promoted-image precedence. [Issue 2717](https://github.com/openclaw/crabbox/issues/2717). [PR 2748](https://github.com/openclaw/crabbox/pull/2748). Thanks @saftall.
+- AWS Windows images: enable guarded Server 2025 bakes from stock with source-only OS selection, guest-version proof, and matching Server Core containers; explicit Server 2022 leases retain stock selection. [Issue 2717](https://github.com/openclaw/crabbox/issues/2717). [PR 2734](https://github.com/openclaw/crabbox/pull/2734). Thanks @saftall.
+
+### Fixes
+
+- Stop: observe expiry-owned cleanup and reconcile its confirmed completion without duplicate provider deletion, preserving local recovery material while pending. [PR 2747](https://github.com/openclaw/crabbox/pull/2747). [Issue 2746](https://github.com/openclaw/crabbox/issues/2746). Thanks @shakkernerd.
+- Coordinator: bound historical lease reads, log downloads, cleanup scans, and bridge history caches; fail interrupted creates promptly before dispatch or after resource-ID publication while retaining provider cleanup custody. [PR 2745](https://github.com/openclaw/crabbox/pull/2745).
+- Windows developer images: reboot through validated SSH without racing workspace ownership release, require bounded SSH down/up transitions before resuming prep, and fail on rejected shutdown commands. [PR 2744](https://github.com/openclaw/crabbox/pull/2744).
+- Windows developer images: retry and verify container pulls and native package downloads, report the failing prep step, exception and longer log tail, and distinguish accepted release from unconfirmed cleanup after prep failure. [PR 2743](https://github.com/openclaw/crabbox/pull/2743).
+- AWS developer images: wait up to `CRABBOX_IMAGE_CAPACITY_WAIT` (default 45 minutes per acquisition) for fleet, owner, or org active-lease capacity, preserving cleanup and excluding rejected attempts from measured timings. [PR 2742](https://github.com/openclaw/crabbox/pull/2742).
+- Windows developer images: keep staged TruffleHog binaries executable on stock Server 2025 and report validation exit codes, stdout, stderr, and launch errors before atomic installation. [PR 2739](https://github.com/openclaw/crabbox/pull/2739).
+- Run: print the exact provider-scoped stop command and retention reason when ownership checks fail closed or automatic cleanup cannot confirm the lease stopped, including timing JSON. [Issue 2740](https://github.com/openclaw/crabbox/issues/2740). [PR 2741](https://github.com/openclaw/crabbox/pull/2741). Thanks @coygeek.
+- Validate OS selector compatibility after lease flags resolve the provider and target, so a configured or environment Windows Server selector accepts `--target windows` while incompatible final selections still fail. [PR 2737](https://github.com/openclaw/crabbox/pull/2737).
+- Windows: preserve embedded quotes, empty arguments, backslashes, and Unicode when running native executables or passing arguments to uploaded PowerShell scripts. [PR 2736](https://github.com/openclaw/crabbox/pull/2736).
+- Azure: preserve original fixed-lease companion identities before readiness and across endpoint refresh, resume automatic cleanup only after durable deletion admission, and validate current attachments across the full companion set before deletion; reject reassigned or replacement resources and verify every resource slot before completion. [PR 2733](https://github.com/openclaw/crabbox/pull/2733). Thanks @galiniliev.
+- Azure: retain failed leases for salvage with durable holds that block reuse and deletion, including observation-only holds when the original local claim is lost; finalize holds explicitly after read-only verification of operator cleanup. [PR 2733](https://github.com/openclaw/crabbox/pull/2733). Thanks @galiniliev.
+- Azure: report fixed-lease capacity rejections as settled only after exact companion cleanup and local claim removal. [PR 2733](https://github.com/openclaw/crabbox/pull/2733). Thanks @galiniliev.
+- Cloudflare: retain cleanup alarms after container destruction fails and retry terminal leases before reporting stopped or expired status. [PR 2735](https://github.com/openclaw/crabbox/pull/2735).
+- Warmup: report definitive coordinator quota rejection in timing output while preserving recovery for interrupted or ambiguous creation. [PR 2732](https://github.com/openclaw/crabbox/pull/2732). [Issue 2731](https://github.com/openclaw/crabbox/issues/2731). Thanks @shakkernerd.
+- Scaleway: create fixed leases from public images without snapshot access, recover the exact server after lost responses, and revalidate root-disk attempt ownership before cleanup. [PR 2728](https://github.com/openclaw/crabbox/pull/2728).
+
+## 0.72.0 - 2026-10-06
+
+### Highlights
+
+- **Start cached Cloudflare containers in about 1–2 seconds, then checkpoint and fork them.** Native container execution speeds up startup, while checkpoints capture reusable workspaces and forks start new leases from them. [PR 2625](https://github.com/openclaw/crabbox/pull/2625), [PR 2713](https://github.com/openclaw/crabbox/pull/2713). Thanks @altaywtf.
+- **Use class-sized AWS disks without a 400 GB image minimum.** The promoted eu-west-1 Linux developer image now has a 32 GB root snapshot, so `tiny` leases request 40 GB; a live lease reported a 38 GB root filesystem. [PR 2668](https://github.com/openclaw/crabbox/pull/2668), [PR 2704](https://github.com/openclaw/crabbox/pull/2704), [PR 2714](https://github.com/openclaw/crabbox/pull/2714).
+- **Get clearer AWS acquisition and Windows readiness results.** Reclaimed instances fail promptly, recorded Windows leases use Windows readiness, and `--os windows-server:2022|2025` selects the server version explicitly. [PR 2721](https://github.com/openclaw/crabbox/pull/2721), [PR 2722](https://github.com/openclaw/crabbox/pull/2722), [PR 2720](https://github.com/openclaw/crabbox/pull/2720), [Issue 2716](https://github.com/openclaw/crabbox/issues/2716), [Issue 2715](https://github.com/openclaw/crabbox/issues/2715), [Issue 2717](https://github.com/openclaw/crabbox/issues/2717). Thanks @saftall.
+- **Keep run output through transient coordinator append failures.** Atomic, idempotent event appends and bounded retries preserve event order and recover lost acknowledgements without duplicating output. [PR 2723](https://github.com/openclaw/crabbox/pull/2723), [Issue 1561](https://github.com/openclaw/crabbox/issues/1561).
+- **Find the right on-demand computer and access workflow more easily.** The README, crabbox.sh home page, provider catalog, and desktop/VNC/browser guides now explain the current agent workflow and supported providers together. [PR 2697](https://github.com/openclaw/crabbox/pull/2697), [PR 2699](https://github.com/openclaw/crabbox/pull/2699), [PR 2698](https://github.com/openclaw/crabbox/pull/2698). Thanks @shakkernerd.
+
+### Upgrade notes
+
+- Stop kept Cloudflare leases before redeploying the runner: the one-time cutover deletes the old classes' Durable Object state. Then run `crabbox cleanup` to retire old claims and delete the six legacy container applications as described in [the Cloudflare upgrade guide](docs/providers/cloudflare.md). `--type basic` now maps to the higher-cost `standard-1` with a warning; `--type lite` is rejected because the bundled image cannot start on it. [PR 2625](https://github.com/openclaw/crabbox/pull/2625). Thanks @altaywtf.
+- Explicit target or Windows-mode flags that contradict a recorded lease now fail before guest access. Remove the conflicting flags or select the lease's recorded platform; release-only resolution remains available for cleanup. [PR 2722](https://github.com/openclaw/crabbox/pull/2722), [Issue 2715](https://github.com/openclaw/crabbox/issues/2715). Thanks @saftall.
+- Repository contributors must install the shared autoreview skill from `openclaw/agent-skills`; the repository no longer carries its own executable helper. Existing copy-mode consumers should reinstall to receive updates. [PR 2663](https://github.com/openclaw/crabbox/pull/2663). Thanks @vincentkoc.
+
+### Added
+
+- AWS Windows leases accept `--os windows-server:2022` or `windows-server:2025` (also `os` / `CRABBOX_OS`) in direct and brokered mode; the default remains Server 2022 and promoted Windows AMIs still win without a Windows selector. [PR 2720](https://github.com/openclaw/crabbox/pull/2720). [Issue 2717](https://github.com/openclaw/crabbox/issues/2717). Thanks @saftall.
+- **Checkpoint and fork Cloudflare containers.** `crabbox checkpoint create` captures a running Cloudflare lease as a `cloudflare-container-snapshot` in about 8 seconds, and `checkpoint fork` starts new leases from it in seconds, retrying while a fresh snapshot propagates. Delegated-run providers can now implement native checkpoints through `DelegatedCheckpointBackend`. Cloudflare has no snapshot delete API; snapshots expire after 30 days and `checkpoint delete --local-only` removes the record. Cloudflare lease commands keep using the runner URL and workdir the lease was created with, and a create or fork whose runner response is lost keeps its claim so `status` and `stop` can still reach the container. Stopping a lease while it starts keeps it stopped; unresolved creates retain cleanup custody regardless of elapsed time or a temporary stopped status during snapshot retries, and retries reuse containers already started by concurrent requests. [PR 2713](https://github.com/openclaw/crabbox/pull/2713), [PR 2626](https://github.com/openclaw/crabbox/pull/2626). Thanks @altaywtf.
+- Add optional vCPU and memory minimums for new AWS Linux leases while preserving existing class fallback behavior. [PR 2710](https://github.com/openclaw/crabbox/pull/2710). [Issue 2709](https://github.com/openclaw/crabbox/issues/2709). Thanks @shakkernerd.
+
+### Changes
+
+- Use one shared autoreview installation from `openclaw/agent-skills`; repository entrypoints receive upstream fixes without copied helpers or tests. [PR 2663](https://github.com/openclaw/crabbox/pull/2663). Thanks @vincentkoc.
+- AWS Linux leases now get their class root-disk size (40 GB for `tiny` instead of 400 GB): the promoted eu-west-1 developer image was rebaked from stock Ubuntu with a 32 GB root. [PR 2668](https://github.com/openclaw/crabbox/pull/2668), [PR 2704](https://github.com/openclaw/crabbox/pull/2704), [PR 2714](https://github.com/openclaw/crabbox/pull/2714).
+- **Cached Cloudflare containers start in about 1–2 seconds.** The `cloudflare` runner moves to the Containers `durable_object` scheduling policy: one Durable Object class starts each lease's image and instance type through `ctx.container`, commands and uploads use native `exec()`, and the in-container Go runner, six per-type classes, and `max_instances: 4` cap are gone. `--type basic` now uses `standard-1` with a warning, `--type lite` is rejected because the bundled image cannot start on it, `--cloudflare-image` selects a named runner image, canceled commands stop their process group, and a lease whose container stops ends instead of continuing in an empty workspace. Upgrading is a one-time cutover: stop kept leases first, because redeploying deletes the old classes' Durable Object state. [PR 2625](https://github.com/openclaw/crabbox/pull/2625). Thanks @altaywtf.
+- Rewrite the README around on-demand computers for agents, with every supported provider listed. [PR 2697](https://github.com/openclaw/crabbox/pull/2697).
+- Redesign the crabbox.sh home page around on-demand computers for agents, with a provider wall generated from the catalog, a new crab-in-a-box icon, and a tokenized visual system shared by the docs and Features pages. [PR 2699](https://github.com/openclaw/crabbox/pull/2699). Thanks @shakkernerd.
+- Refresh the docs against the current CLI and provider catalog, including a single guide to desktop, VNC, browser and portal access. [PR 2698](https://github.com/openclaw/crabbox/pull/2698).
+
+### Fixes
+
+- Accept native Tenki SSH certificates on the first connection and during refresh by comparing the decoded session extension directly, while retaining key, signature, and expiry checks. [PR 2727](https://github.com/openclaw/crabbox/pull/2727).
+- DigitalOcean: check size availability before creating resources and retain definite fixed-lease rejections as retryable, locally releasable attempts. [PR 2725](https://github.com/openclaw/crabbox/pull/2725).
+- Scaleway: accept the same SSH public key after API comment normalization, allowing first fixed-lease acquisition and safe cleanup of stranded key-only attempts. [PR 2724](https://github.com/openclaw/crabbox/pull/2724).
+- Boat (ASCII Box): release absent sandboxes without waiting for blocked background data purges, while preserving the purge operation ID in fixed-lease terminal receipts. [PR 2726](https://github.com/openclaw/crabbox/pull/2726).
+- Probe resolved SSH leases with their recorded platform, preserve Linux bootstrap gates, and reject contradictory explicit target flags. [Issue 2715](https://github.com/openclaw/crabbox/issues/2715), [PR 2722](https://github.com/openclaw/crabbox/pull/2722), [PR 2718](https://github.com/openclaw/crabbox/pull/2718). Thanks @saftall.
+- Fail AWS acquire promptly when EC2 terminates an instance or closes its Spot request during network, SSH, Windows, or coordinator SSM readiness, preserving the reclaim reason and existing cleanup ownership. [PR 2721](https://github.com/openclaw/crabbox/pull/2721), [Issue 2716](https://github.com/openclaw/crabbox/issues/2716). Thanks @saftall.
+- Retry transient run-event append failures with stable IDs, atomic sequence updates, and bounded publication deadlines while preserving ordered output and capped queues. [PR 2723](https://github.com/openclaw/crabbox/pull/2723), [Issue 1561](https://github.com/openclaw/crabbox/issues/1561).
+- Blacksmith Testbox: `run --id tbx_...` and stop read only the exact claim file instead of scanning every local claim. [PR 2719](https://github.com/openclaw/crabbox/pull/2719).
+- Apply explicit lifecycle target flags before provider validation so Linux defaults cannot block macOS stop/release, pause/resume, list, or cleanup. [PR 2712](https://github.com/openclaw/crabbox/pull/2712), [Issue 2706](https://github.com/openclaw/crabbox/issues/2706). Thanks @coygeek.
+- Stop coordinator alarm rearm loops from stale prewarm retries, clamped overdue work, and controller-owned wakes, with diagnostics and bounded backoff that survives concurrent heartbeats without postponing future deadlines. [PR 2711](https://github.com/openclaw/crabbox/pull/2711).
+- Transfer only verified seeded-worktree deltas on POSIX SSH targets, prune exclusions from fresh verified seeds, include reverted and remote edits on reused leases, and witness rsync receivers directly so failed transfers do not strand a detached workspace guard. [PR 2707](https://github.com/openclaw/crabbox/pull/2707).
+- Reject AWS developer-image mints outside the requested region and clean up failed unpromoted candidate checkpoints and snapshots while preserving promotion rollback. [PR 2704](https://github.com/openclaw/crabbox/pull/2704).
+- Keep lease reads, heartbeats, and releases responsive during maintenance history discovery by releasing the lifecycle mutex and Cloudflare storage input gate while scanning candidates; retain fenced rereads before mutations. [PR 2705](https://github.com/openclaw/crabbox/pull/2705).
+- Keep the homepage workload router's Copy button fully visible for short command snippets. [PR 2703](https://github.com/openclaw/crabbox/pull/2703). [Issue 2701](https://github.com/openclaw/crabbox/issues/2701). Thanks @shakkernerd.
+- Advertise Scaleway's existing `fixed-lease-id` support in the provider catalog and enforce capability parity across registered backends. [PR 2702](https://github.com/openclaw/crabbox/pull/2702).
+
+## 0.71.0 - 2026-10-04
+
+### Highlights
+
+- **Retry cloud allocations with the same lease ID.** RunPod, Scaleway, and Linode now support fixed idempotent lease IDs, and the provider catalog advertises support so orchestrators can check before creating a lease. [PR 2680](https://github.com/openclaw/crabbox/pull/2680), [PR 2684](https://github.com/openclaw/crabbox/pull/2684), [PR 2678](https://github.com/openclaw/crabbox/pull/2678), [PR 2674](https://github.com/openclaw/crabbox/pull/2674).
+- **Get timely coordinator responses under load.** Lease creates that cannot start committing admission within 30 seconds return a retryable 503; provider deadlines, compact polling, and bounded history reads reduce stalls and memory pressure. [PR 2687](https://github.com/openclaw/crabbox/pull/2687), [PR 2689](https://github.com/openclaw/crabbox/pull/2689), [PR 2672](https://github.com/openclaw/crabbox/pull/2672), [PR 2671](https://github.com/openclaw/crabbox/pull/2671), [PR 2693](https://github.com/openclaw/crabbox/pull/2693), [PR 2695](https://github.com/openclaw/crabbox/pull/2695), [Issue 1561](https://github.com/openclaw/crabbox/issues/1561), [Issue 2694](https://github.com/openclaw/crabbox/issues/2694). Thanks @shakkernerd.
+- **Spend less time scanning local claims.** Generated slugs avoid a full claim-directory scan, exact lease IDs use one-file lookups, ambiguous stop targets fail clearly, and resumable pruning removes eligible expired claims. [PR 2685](https://github.com/openclaw/crabbox/pull/2685).
+- **Choose the CPU and memory your workload needs.** DigitalOcean, Scaleway, and Linode now map portable machine classes to distinct real sizes, with explicit native type overrides preserved. Review the higher-cost `standard` defaults below before upgrading. [PR 2676](https://github.com/openclaw/crabbox/pull/2676).
+
+### Upgrade notes
+
+- The `standard` class now selects larger, higher-cost machines: DigitalOcean `s-1vcpu-1gb` → `s-4vcpu-8gb`, Scaleway `DEV1-S` → `DEV1-L`, and Linode `g6-standard-1` → `g6-standard-4`. Keep the old size with `--type <old type>` or `class: tiny`; explicitly configured native types still take precedence. [PR 2676](https://github.com/openclaw/crabbox/pull/2676).
+- Successful stop/release now triggers bounded daily pruning of expired E2B and sufficiently old Blacksmith Testbox local claims. Set `claims.autoPrune: false` or `CRABBOX_CLAIMS_AUTO_PRUNE=false` to retain them; recovery claims and provider resources remain protected. [PR 2685](https://github.com/openclaw/crabbox/pull/2685).
+- Generated slugs now end in an eight-hex lease-ID suffix. Update scripts that assume the previous generated format; explicit `--slug` values retain their existing behavior. Ambiguous stop/release slugs now require an exact lease ID. [PR 2685](https://github.com/openclaw/crabbox/pull/2685).
+
+### Added
+
+- Support fixed idempotent RunPod lease IDs with account-bound replay, lost-create recovery, and durable stop receipts for fixed-lease orchestrators. [PR 2680](https://github.com/openclaw/crabbox/pull/2680).
+- Support fixed idempotent Scaleway lease IDs with replay, journaled SSH-key and root-volume recovery, and terminal release receipts for fixed-lease orchestrators. [PR 2684](https://github.com/openclaw/crabbox/pull/2684).
+- Support fixed idempotent Linode lease IDs with account-bound replay, lost-create recovery, and terminal stop receipts. [PR 2678](https://github.com/openclaw/crabbox/pull/2678).
+- Advertise backend-derived `fixed-lease-id` support in the provider catalog so fixed-lease orchestrators can preflight caller-supplied lease IDs. [PR 2674](https://github.com/openclaw/crabbox/pull/2674).
+- Add `claims prune` and resumable daily maintenance after successful stop/release for providers with proven remote expiry bounds (E2B, and Blacksmith Testbox past GitHub's 35-day run cap); preserve recovery claims, concurrent updates, and provider resources, with `claims.autoPrune` / `CRABBOX_CLAIMS_AUTO_PRUNE` opt-out. [PR 2685](https://github.com/openclaw/crabbox/pull/2685).
+- Let the guarded AWS Linux image publisher bake a smaller root snapshot from stock Ubuntu with `linux_root_gb`, keeping candidate, baseline, and promoted proofs on normal sizing. [PR 2668](https://github.com/openclaw/crabbox/pull/2668).
+
+### Changed
+
+- Make `--class` select real machine sizes on DigitalOcean, Scaleway, and Linode, with CPU/RAM profiles and explicit type overrides preserved. The `standard` class mapping increases size and cost (DigitalOcean `s-1vcpu-1gb` → `s-4vcpu-8gb`, Scaleway `DEV1-S` → `DEV1-L`, Linode `g6-standard-1` → `g6-standard-4`); keep the old size with `--type <old type>` or `class: tiny`. [PR 2676](https://github.com/openclaw/crabbox/pull/2676).
+- Avoid the local claim-directory scan before coordinator create by giving generated slugs an eight-hex ID suffix, use O(1) exact canonical lease-ID claim lookups, and make AWS/coordinator acquisition, core claim routing, and Testbox ownership scans cancellable. [PR 2685](https://github.com/openclaw/crabbox/pull/2685).
+- Page coordinator CLI lists with compact summaries, bound slug lookup and durable admission memory, keep identity/list reads out of the lifecycle queue, and arm cleanup recovery before provider I/O; preserve legacy list and full inspect responses. [PR 2672](https://github.com/openclaw/crabbox/pull/2672).
+
+### Fixes
+
+- Bound runner synchronization history reads and pending writes while preserving complete stale responses, legacy identities, and retry behavior. [PR 2695](https://github.com/openclaw/crabbox/pull/2695), [Issue 2694](https://github.com/openclaw/crabbox/issues/2694). Thanks @shakkernerd.
+- Prevent queued coordinator uploads from retaining every run log in memory, page run-event reads at storage, and return structured failures for interrupted event appends instead of uncaught Worker errors. [PR 2693](https://github.com/openclaw/crabbox/pull/2693).
+- Buffer POSIX sync manifest writes, time out rsync only after I/O inactivity, and retain workspace-witness stop requests when interrupted transfers are still settling. [PR 2692](https://github.com/openclaw/crabbox/pull/2692).
+- Return a retryable 503 when coordinator lease creates cannot begin committing admission within 30 seconds instead of hanging. [PR 2687](https://github.com/openclaw/crabbox/pull/2687); related [Issue 1561](https://github.com/openclaw/crabbox/issues/1561).
+- Bound coordinator AWS, Azure, and Tailscale requests with retryable 503 deadlines, and verify Mac host ownership outside the coordinator lock, so stalled image or Mac host operations cannot indefinitely block queued lease creates. [PR 2689](https://github.com/openclaw/crabbox/pull/2689).
+- Tolerate up to ±5 seconds of ASCII Box (Boat) create/read timestamp skew while preserving the original fixed-lease witness, and keep failed own creates inspectable and stoppable. [PR 2681](https://github.com/openclaw/crabbox/pull/2681).
+- Report fleet, org, and owner lease headroom with the blocking cap in `capacity`, and identify fleet limits in allocation errors. [PR 2679](https://github.com/openclaw/crabbox/pull/2679).
+- End interrupted coordinator provisioning waits on the first recovery tick, retain safe cleanup of uncertain cloud resources, and show the current attempt phase in lease diagnostics. [PR 2677](https://github.com/openclaw/crabbox/pull/2677).
+- Refresh Tenki SSH gateway certificates before new connections so long-running commands retain workspace-owner renewal, collection, and cleanup access; report credential expiry when refresh fails. [PR 2675](https://github.com/openclaw/crabbox/pull/2675).
+- Allow heartbeat and `status --wait` to renew owned direct fixed leases on DigitalOcean and Azure by validating the acquired account scope and exact resource identity. [PR 2673](https://github.com/openclaw/crabbox/pull/2673).
+- Reject ambiguous local slugs before stop/release instead of selecting the first claim, and extend coordinator cancel-create recovery and final-attempt windows from 10 to 30 seconds each. [PR 2685](https://github.com/openclaw/crabbox/pull/2685).
+- Bound coordinator lease-list memory as retained history grows, preserving visibility, filters, and result ordering. [PR 2671](https://github.com/openclaw/crabbox/pull/2671), [Issue 1561](https://github.com/openclaw/crabbox/issues/1561). Thanks @shakkernerd.
+- Retain Blacksmith Testbox claims and keys until the exact associated GitHub work settles, and report exact native queue and terminal status. [PR 2670](https://github.com/openclaw/crabbox/pull/2670), [Issue 2669](https://github.com/openclaw/crabbox/issues/2669). Thanks @shakkernerd.
+- Authenticate hosted Homebrew verifier metadata reads with the workflow's read-only token to avoid anonymous GitHub API rate limits while keeping installation credential-free. [PR 2665](https://github.com/openclaw/crabbox/pull/2665).
+- Retry dropped connections in release asset downloads during public release and Homebrew verification instead of failing on one transient network error. [PR 2667](https://github.com/openclaw/crabbox/pull/2667).
+- Expose the exact Blacksmith workflow association and verified remote settlement through read-only status, including after local claim finalization. [PR 2683](https://github.com/openclaw/crabbox/pull/2683), [Issue 2682](https://github.com/openclaw/crabbox/issues/2682). Thanks @shakkernerd.
+
+### Credits
+
+- Thanks @shakkernerd for [PR 2650](https://github.com/openclaw/crabbox/pull/2650) (cold Actions hydration from GitHub SSH checkouts) and [PR 2651](https://github.com/openclaw/crabbox/pull/2651) (AWS SSH access refresh over IPv4), which shipped in 0.70.0 without the thanks in its notes.
+
+## 0.70.0 - 2026-10-01
+
+### Highlights
+
+- **Use less storage for small cloud leases.** Automatic AWS/GCP root disks now scale from 40 GB for `tiny` to 400 GB for `beast`, raised to the image or snapshot minimum. Explicit sizes still win; the current promoted AWS AMI still requires 400 GB. [PR 2632](https://github.com/openclaw/crabbox/pull/2632).
+- **Skip repeated GCP image lookups.** The coordinator caches image and snapshot minimums for up to 30 minutes, removing that metadata round trip from warm creates and invalidating cached ingress verification when metadata requests fail. [PR 2633](https://github.com/openclaw/crabbox/pull/2633), [PR 2634](https://github.com/openclaw/crabbox/pull/2634).
+- **Start Hetzner desktops and browsers again.** Oversized bootstrap configurations fit the provider's 32 KiB limit, and package hooks no longer restart cloud-init midway through Ubuntu 26.04 setup. [PR 2637](https://github.com/openclaw/crabbox/pull/2637), [PR 2647](https://github.com/openclaw/crabbox/pull/2647).
+- **Keep long runs alive through a lost renewal response.** Bounded workspace-owner retries prevent a single transport failure from ending a healthy run with exit 7, while explicit ownership denials still stop it. File copies and tunnels also try every candidate SSH port. [PR 2653](https://github.com/openclaw/crabbox/pull/2653), [PR 2641](https://github.com/openclaw/crabbox/pull/2641), [PR 2642](https://github.com/openclaw/crabbox/pull/2642), [Issue 1712](https://github.com/openclaw/crabbox/issues/1712). Thanks @youssef-tharwat.
+- **Retry Apple Container allocations with the same lease ID.** Caller-supplied IDs support verified replay, interrupted-start recovery, and terminal release receipts. [PR 2654](https://github.com/openclaw/crabbox/pull/2654), [PR 2644](https://github.com/openclaw/crabbox/pull/2644), [Issue 2643](https://github.com/openclaw/crabbox/issues/2643). Thanks @genaro23.
+
+### Upgrade notes
+
+- Automatic AWS/GCP root disks are now 40/80/150/150/250/400 GB for `tiny`/`small`/`standard`/`fast`/`large`/`beast`, raised to the source minimum. Set `aws.rootGB: 400` or `CRABBOX_AWS_ROOT_GB=400`, and `gcp.rootGB: 400` or `CRABBOX_GCP_ROOT_GB=400`, to retain 400 GB. Automatic sizing requires image or snapshot metadata access and fails if that lookup fails; positive explicit sizes bypass it. Older clients still request 400 GB, ready-pool leases retain their disks, and GCP machine-image restores inherit their original disks. [PR 2632](https://github.com/openclaw/crabbox/pull/2632).
+- GCP image-family aliases can retain the inspected image for the coordinator cache's 30-minute window. Relevant provider errors invalidate the cached source hints. [PR 2633](https://github.com/openclaw/crabbox/pull/2633).
+- Workspace-owner transport retries extend the ownership TTL by two transport-call budgets, so recovery of an abandoned workspace can take longer. Explicit denial responses and exhausted ownership windows remain terminal. [PR 2653](https://github.com/openclaw/crabbox/pull/2653), [PR 2641](https://github.com/openclaw/crabbox/pull/2641). Thanks @youssef-tharwat.
+
+### Added
+
+- Support caller-supplied Apple Container lease IDs with verified replay, recovery of interrupted startup, and terminal release receipts. [PR 2654](https://github.com/openclaw/crabbox/pull/2654), [PR 2644](https://github.com/openclaw/crabbox/pull/2644), [Issue 2643](https://github.com/openclaw/crabbox/issues/2643). Thanks @genaro23.
+
+### Changed
+
+- Scale automatic AWS/GCP root disks by lease class (40/80/150/150/250/400 GB), raised to the source image or snapshot minimum; explicit sizes retain their existing behavior. [PR 2632](https://github.com/openclaw/crabbox/pull/2632).
+- Cache GCP root-disk source minimums in coordinator memory for up to 30 minutes and expose lookup time as `gcp.image_minimum`, removing repeated image reads before warm creates while preserving explicit-size bypass. [PR 2633](https://github.com/openclaw/crabbox/pull/2633).
+
+### Fixes
+
+- Let `cp` and `tunnel` try every candidate SSH port when the post-claim endpoint probe cannot create a session for the first one, and warn with each candidate's failure when none answers. [PR 2642](https://github.com/openclaw/crabbox/pull/2642). Thanks @youssef-tharwat.
+- Seed public GitHub SSH origins through anonymous HTTPS before local Actions hydration, preventing cold workspace Git-root adoption failures. [PR 2650](https://github.com/openclaw/crabbox/pull/2650), [Issue 2649](https://github.com/openclaw/crabbox/issues/2649).
+- Classify missing Unix daemon sockets as network failures in `doctor`, preserving endpoint guidance instead of incorrectly recommending CLI installation. [PR 2652](https://github.com/openclaw/crabbox/pull/2652).
+- Prevent bootstrap package hooks from restarting cloud-init between stages, which leaves Hetzner Ubuntu 26.04 desktop and browser leases waiting indefinitely for readiness. [PR 2647](https://github.com/openclaw/crabbox/pull/2647).
+- Preserve non-UTF-8 POSIX filenames and symlink targets during cold tar sync instead of failing extraction on bsdtar targets. [PR 2636](https://github.com/openclaw/crabbox/pull/2636).
+- Stage remote failure archives on the workspace disk so small `/tmp` filesystems on tiny Linux boxes do not prevent collecting failure evidence. [PR 2638](https://github.com/openclaw/crabbox/pull/2638).
+- Compress oversized Hetzner cloud-init into a gzip MIME envelope so desktop and browser leases fit the provider's 32 KiB user-data limit without changing bootstrap ordering. [PR 2637](https://github.com/openclaw/crabbox/pull/2637).
+- Use `connect` in interactive-shell quickstart and troubleshooting examples so copied commands open the box instead of only printing an SSH command. [PR 2635](https://github.com/openclaw/crabbox/pull/2635).
+- Let Actions hydration start directly after warmup even when the guest's Bash logout hook fails; missing-workspace fingerprint cleanup no longer invokes that hook. [PR 2639](https://github.com/openclaw/crabbox/pull/2639).
+- Point generated `actions.workflow` at the custom `init --workflow` path. [PR 2624](https://github.com/openclaw/crabbox/pull/2624). Thanks @KrasimirKralev.
+- Print empty JSON inventories as `[]` (or `{}` for object-shaped provider lists) instead of `null` across lease lists, events, history, ready pools, cache volumes, provider sizes, ports, and admin inventories. [PR 2631](https://github.com/openclaw/crabbox/pull/2631).
+- Release a pressed macOS VNC key when `desktop type` or `desktop paste` is cancelled between its key-down and key-up; Screen Sharing otherwise kept it held after disconnect. [PR 2630](https://github.com/openclaw/crabbox/pull/2630), [PR 2628](https://github.com/openclaw/crabbox/pull/2628), [Issue 2627](https://github.com/openclaw/crabbox/issues/2627). Thanks @altaywtf for the fix and @saariuslystoned for the report.
+- Invalidate cached GCP firewall verification when root-image or snapshot metadata requests fail, so the next create rechecks the managed ingress policy. [PR 2634](https://github.com/openclaw/crabbox/pull/2634).
+- Prefer IPv4 for AWS coordinator connections so heartbeats refresh the source used by public SSH, while preserving IPv6 fallback and configured proxies. [PR 2651](https://github.com/openclaw/crabbox/pull/2651), [Issue 2648](https://github.com/openclaw/crabbox/issues/2648).
+- Keep long runs alive across bounded workspace-owner renewal transport failures while preserving fail-closed token and expiry checks. [PR 2653](https://github.com/openclaw/crabbox/pull/2653), [PR 2641](https://github.com/openclaw/crabbox/pull/2641), [Issue 1712](https://github.com/openclaw/crabbox/issues/1712). Thanks @youssef-tharwat.
+- Correct the Hetzner provider documentation to describe the existing Ubuntu 26.04 image mapping. [PR 2640](https://github.com/openclaw/crabbox/pull/2640).
+- Extract release-verifier source archives from files so bsdtar closing its input early cannot interrupt verification with a broken pipe. [PR 2622](https://github.com/openclaw/crabbox/pull/2622).
+
+## 0.69.0 - 2026-09-29
+
+### Highlights
+
+- **Keep commands and files in the intended repository.** Retained Actions workspaces must prove their Git root and origin before reuse, closing cross-repository command execution and file transfer even with `--no-sync --no-hydrate`. Explicit cross-repository hydration keeps claim-bound consent. [PR 2605](https://github.com/openclaw/crabbox/pull/2605), [PR 2564](https://github.com/openclaw/crabbox/pull/2564). Thanks @vincentkoc.
+- **Spend less time preparing brokered cloud leases.** GCP skips unchanged firewall updates, shares OAuth tokens, and reuses exact firewall checks for five minutes; AWS skips redundant SSH ingress mutations and caches VPC discovery. Fresh Hetzner lease keys avoid full key inventories, and successful AWS Spot/Hetzner price quotes are cached for five minutes. [PR 2610](https://github.com/openclaw/crabbox/pull/2610), [PR 2614](https://github.com/openclaw/crabbox/pull/2614), [PR 2609](https://github.com/openclaw/crabbox/pull/2609), [PR 2611](https://github.com/openclaw/crabbox/pull/2611).
+- **Get clear failures without losing cleanup or logs.** Definite capacity rejections stop recovery and cancellation, ambiguous AWS allocations retain cleanup custody, completed runs keep logs after lost commit acknowledgements, and coordinator stop cleanup uses the lease's SSH identity. [PR 2616](https://github.com/openclaw/crabbox/pull/2616), [PR 2604](https://github.com/openclaw/crabbox/pull/2604), [Issue 1561](https://github.com/openclaw/crabbox/issues/1561), [PR 2617](https://github.com/openclaw/crabbox/pull/2617).
+- **Start Parallels macOS guests more reliably.** Apple silicon defaults to full clones unless a snapshot selects linked mode, and guest preparation waits for a working Tools execution session within the startup deadline. Linked-clone warnings and Local Network diagnostics explain common failure paths. [PR 2606](https://github.com/openclaw/crabbox/pull/2606), [PR 2615](https://github.com/openclaw/crabbox/pull/2615), [Issue 2398](https://github.com/openclaw/crabbox/issues/2398), [Issue 2612](https://github.com/openclaw/crabbox/issues/2612). Thanks @saariuslystoned.
+- **See where lease creation time goes.** Lease events and timing JSON now expose bounded coordinator admission and provider-preparation step durations, repeated calls, and failures without provider payloads. [PR 2607](https://github.com/openclaw/crabbox/pull/2607).
+- **Use compatible GCP boot disks and build the Node coordinator again.** GCP chooses the boot disk type for each machine family and falls back on disk incompatibility; the Node image pins the updated AWS RDS CA bundle, including me-west-1 roots. [PR 2608](https://github.com/openclaw/crabbox/pull/2608), [PR 2618](https://github.com/openclaw/crabbox/pull/2618).
+
+### Upgrade notes
+
+- Parallels macOS guests on Apple silicon now default to `full` clones when no snapshot is selected. To keep linked cloning, use `--parallels-clone-mode linked` or `parallels.cloneMode: linked`; an existing snapshot name or ID also preserves the linked default. Full clones use the source VM's current state and require snapshot selectors to be cleared. [PR 2606](https://github.com/openclaw/crabbox/pull/2606), [PR 2615](https://github.com/openclaw/crabbox/pull/2615), [Issue 2398](https://github.com/openclaw/crabbox/issues/2398), [Issue 2612](https://github.com/openclaw/crabbox/issues/2612). Thanks @saariuslystoned.
+- The coordinator caches exact GCP managed-firewall verification for up to five minutes. External firewall drift can go unnoticed during that window; the next uncached create reconciles it. Policy changes, credential rotation, and relevant provider errors invalidate reuse. [PR 2614](https://github.com/openclaw/crabbox/pull/2614).
+- Definite coordinator create failures with no possible provider resource return `422 provisioning_failed`, including matching bound replays. Clients should treat that exact status/code as terminal; ambiguous allocation outcomes retain recovery and cleanup custody. [PR 2608](https://github.com/openclaw/crabbox/pull/2608), [PR 2616](https://github.com/openclaw/crabbox/pull/2616).
+
+### Added
+
+- Expose bounded coordinator admission and provider preparation step durations in lease creation events and timing JSON, including repeated-call and failure counts without provider payloads. [PR 2607](https://github.com/openclaw/crabbox/pull/2607).
+
+### Changed
+
+- Reuse exact coordinator GCP firewall verifications for five minutes with policy/credential isolation and error invalidation, and separate Compute request timings from token acquisition. [PR 2614](https://github.com/openclaw/crabbox/pull/2614).
+- Avoid full Hetzner SSH-key inventory reads for fresh lease keys and cache successful coordinator AWS Spot/Hetzner price estimates for five minutes without blocking admission on quote failures. [PR 2611](https://github.com/openclaw/crabbox/pull/2611).
+- Skip redundant brokered AWS SSH ingress mutations and cache account/region-scoped VPC discovery while preserving fresh policy checks and legacy world-rule cleanup. [PR 2609](https://github.com/openclaw/crabbox/pull/2609).
+- Skip unchanged brokered GCP firewall updates and reuse coordinator OAuth tokens until their existing refresh margin, preserving drift reconciliation and credential isolation. [PR 2610](https://github.com/openclaw/crabbox/pull/2610).
+
+### Fixes
+
+- Verify retained Actions workspace identity before run, sync, cache warm, or editor handoff; preserve custom paths and explicit cross-repository hydration with claim-bound consent. [PR 2605](https://github.com/openclaw/crabbox/pull/2605), [PR 2564](https://github.com/openclaw/crabbox/pull/2564). Thanks @vincentkoc.
+- Prepare the lease's SSH key and authoritative host-key pin before best-effort coordinator stop cleanup, so the Actions hydration stop marker and egress client cleanup no longer fail host verification; preparation failures warn without blocking provider release. [PR 2617](https://github.com/openclaw/crabbox/pull/2617).
+- Preserve definite provider rejection diagnostics on coordinator create replays and stop client recovery without cancellation; ambiguous public AWS allocations retain cleanup custody and cannot fall back to another candidate or region. [PR 2616](https://github.com/openclaw/crabbox/pull/2616).
+- Preserve run-history logs after an ambiguous terminal commit, confirming the exact stored finish before acknowledging recovery and retaining evidence when rereads fail. [PR 2604](https://github.com/openclaw/crabbox/pull/2604), [Issue 1561](https://github.com/openclaw/crabbox/issues/1561).
+- Select GCP boot disks by machine family, using Hyperdisk Balanced for Hyperdisk-only families and `pd-balanced` elsewhere; fall back on disk/machine incompatibilities and reject image-strategy checkpoints of Hyperdisk leases with guidance to use disk snapshots. [PR 2608](https://github.com/openclaw/crabbox/pull/2608).
+- Return `422 provisioning_failed` with attempt diagnostics when a coordinator create definitively failed with no possible provider resource, instead of an HTTP 500 that clients replayed as uncertain. [PR 2608](https://github.com/openclaw/crabbox/pull/2608).
+- Pin the current AWS RDS global CA bundle in the Node coordinator image, including the me-west-1 root CAs, fixing image builds broken by the stale checksum. [PR 2618](https://github.com/openclaw/crabbox/pull/2618).
+- Bound Parallels guest-exec readiness and macOS preparation retries, preserve linked clones for unset mode with snapshot selectors, and diagnose macOS host network access. Clarify the existing retention contract: `--keep-on-failure` starts after acquisition; generated-ID acquisition failures roll back, while fixed IDs retain their replay/cleanup contract. [PR 2615](https://github.com/openclaw/crabbox/pull/2615), [Issue 2612](https://github.com/openclaw/crabbox/issues/2612). Thanks @saariuslystoned.
+- Default Parallels macOS guests on Apple silicon to full clones without snapshot selectors, warn before linked macOS clones about observed IP/Tools failures, and clarify snapshot-clearing guidance while retaining linked defaults elsewhere. [PR 2606](https://github.com/openclaw/crabbox/pull/2606), [PR 2615](https://github.com/openclaw/crabbox/pull/2615), [Issue 2398](https://github.com/openclaw/crabbox/issues/2398). Thanks @saariuslystoned.
+- Return precise diagnostics and `native_unsupported` JSON receipts when checkpoint capability resolution refuses capture, and reject invalid modes before lease resolution. [PR 2613](https://github.com/openclaw/crabbox/pull/2613).
+
+## 0.68.0 - 2026-09-28
+
+### Highlights
+
+- **Reach a usable Linux workspace sooner.** Minimal bootstrap can finish before unrelated services reach multi-user.target. In two guest-boot replay samples per variant, median readiness fell from 19.0 to 12.7 seconds on AWS, 28.3 to 15.8 seconds on GCP, and 32.2 to 28.7 seconds on Hetzner; these measure guest boot, not end-to-end creation. [PR 2595](https://github.com/openclaw/crabbox/pull/2595).
+- **Detect readiness without repeated SSH sessions.** Bounded guest-side polling and AWS's current-boot marker reduced median AWS readiness lag from 10.4 to 2.1 seconds and command wall time from 70.7 to 61.6 seconds across three interleaved pairs. Legacy guests and optional setup retain their completion gates. [PR 2600](https://github.com/openclaw/crabbox/pull/2600).
+- **Spend less time synchronizing cloud workspaces.** Reusing the workspace-owner SSH connection improved all 12 cloud repository sync pairs; the unchanged-repository median fell from 10.9 to 7.5 seconds. For an empty workspace with Git seeding and overlays disabled, streaming tar reduced the 20,002-file cold-sync median from 18.7 to 13.2 seconds across three pairs on one AWS lease. [PR 2593](https://github.com/openclaw/crabbox/pull/2593), [PR 2592](https://github.com/openclaw/crabbox/pull/2592).
+- **Keep the idle window after a slow create and reach Azure capacity sooner.** Managed idle expiry starts when the lease becomes active, while the hard TTL still starts at admission. Azure checks SKU eligibility before network allocation and reaches other configured regions after one capacity failure per market. [PR 2596](https://github.com/openclaw/crabbox/pull/2596), [PR 2587](https://github.com/openclaw/crabbox/pull/2587).
+- **See where creation time goes and control sync compression.** Lease events and Linux timing JSON expose creation milestones with clock provenance; explicit compression overrides support link-specific tuning while keeping the compressed default. [PR 2588](https://github.com/openclaw/crabbox/pull/2588), [PR 2591](https://github.com/openclaw/crabbox/pull/2591).
+- **Build Rust and Python-tool projects from prepared Linux images.** The x86_64 developer-image recipe includes checksum-pinned Rust/Cargo and uv/uvx with nonroot offline functional checks; image qualification also preserves smoke results when login-shell logout hooks fail. [PR 2584](https://github.com/openclaw/crabbox/pull/2584), [PR 2585](https://github.com/openclaw/crabbox/pull/2585). Thanks @vincentkoc.
+
+### Upgrade notes
+
+- Hetzner's default `ubuntu:26.04` selector now selects the published Ubuntu 26.04 image instead of Ubuntu 24.04. Choose `ubuntu:24.04` explicitly to retain the older OS; custom image choices remain unchanged. Brokered defaults require the updated coordinator, and direct selection requires the updated CLI. [PR 2599](https://github.com/openclaw/crabbox/pull/2599).
+- The broker client create wait is now 31 minutes, including Azure Linux requests that previously used a ten-minute wait. Caller cancellation and earlier deadlines still win; lease TTL remains admission-based even though idle expiry starts at activation. [PR 2596](https://github.com/openclaw/crabbox/pull/2596).
+
+### Added
+
+- Expose brokered creation observations in lease events and Linux timing JSON, with clock provenance for admission, provider requests, SSH, and current-boot readiness. [PR 2588](https://github.com/openclaw/crabbox/pull/2588).
+- Allow explicit `sync.compression` and `CRABBOX_SYNC_COMPRESSION` overrides while retaining compression by default on every link. [PR 2591](https://github.com/openclaw/crabbox/pull/2591).
+- Include checksum-pinned Rust/Cargo and uv/uvx in Linux x86_64 developer images, with nonroot offline build and Python-tool smoke checks. [PR 2584](https://github.com/openclaw/crabbox/pull/2584). Thanks @vincentkoc.
+
+### Changed
+
+- Detect Linux bootstrap completion within one authenticated SSH session with bounded guest-side readiness polling; require AWS's per-boot workspace-ready marker on new guests while retaining cloud-init waits for legacy guests and optional setup gates. [PR 2600](https://github.com/openclaw/crabbox/pull/2600).
+- Start minimal Linux lease bootstrap before multi-user.target, avoid SSH restarts when configured listeners are already active, and retain readiness checks and optional setup gates. [PR 2595](https://github.com/openclaw/crabbox/pull/2595).
+- Route ordinary brokered Azure capacity fallback across regions after one capacity failure per market, cache confirmed rejections for five minutes, expose attempt durations, and bound legacy creation to 25 minutes with a 31-minute broker client wait. [PR 2596](https://github.com/openclaw/crabbox/pull/2596).
+- Detect newly ready guests sooner with short initial SSH readiness retries and a bounded five-second backoff, preserving host trust, authentication, cancellation, and bootstrap checks. [PR 2586](https://github.com/openclaw/crabbox/pull/2586).
+- Preflight brokered Azure VM SKU eligibility before allocating network fragments and reduce create polling delays while honoring per-response Retry-After and preserving exact cleanup. [PR 2587](https://github.com/openclaw/crabbox/pull/2587).
+- Reuse a private foreground SSH connection for direct POSIX workspace ownership checks, with complete stdin-frame validation and joined cleanup after acquisition failure, cancellation, and release. [PR 2593](https://github.com/openclaw/crabbox/pull/2593).
+- Stream the first transfer into an empty POSIX workspace over one tar SSH channel when Git seeding and overlays are disabled, retaining manifest scope, metadata, ownership checks, pruning, and finalization; nonempty workspaces and Git fallback paths keep rsync. [PR 2592](https://github.com/openclaw/crabbox/pull/2592).
+- Detect brokered AWS and GCP network addresses sooner with bounded exponential polling, retaining provider error handling and existing deadlines. [PR 2590](https://github.com/openclaw/crabbox/pull/2590).
+- Skip baseline APT work on stock Linux images only when every required tool passes existing capability probes; retain package installation, readiness repair, and per-lease SSH setup when needed. [PR 2589](https://github.com/openclaw/crabbox/pull/2589).
+
+### Fixes
+
+- Map Hetzner's default `ubuntu:26.04` selector to the publicly available `ubuntu-26.04` image, preserving explicit Ubuntu 24.04 and custom image choices. [PR 2599](https://github.com/openclaw/crabbox/pull/2599).
+- Start managed lease idle expiry at activation across providers, preserving the admission-based TTL cap so slow provisioning cannot consume the idle window. [PR 2596](https://github.com/openclaw/crabbox/pull/2596).
+- Preserve Linux smoke and cleanup exit status when login-shell logout hooks fail during image minting or retained-image qualification. [PR 2585](https://github.com/openclaw/crabbox/pull/2585). Thanks @vincentkoc.
+
+## 0.67.0 - 2026-09-26
+
+### Highlights
+
+- **Power lab hosts only when work needs them.** Static SSH power hooks start a dedicated host before its first lease and shut it down after the last lease, retaining retryable custody if shutdown fails; the explicit dedicated-host contract keeps power control with one controller.
+- **Use Proxmox through a runtime adapter with safer lease recovery.** `adapter serve` now supports fixed-ID Linux workspaces; VMID reservations skip locally bound IDs and are serialized through durable publication to prevent concurrent collisions. Definite native pre-allocation 401/403 rejections free the attempt, while proxy-generated 403s and other ambiguous replies retain custody.
+- **Keep forwarded environment values out of command lines.** SSH commands, preflight, Windows/WSL2, and cache warming receive values through private temporary files over stdin; unsupported NUL values are rejected by variable name, and checkpoint archives exclude staged environment files left by interrupted cleanup.
+- **Recover coordinator failures without duplicate allocations or lost leases.** Atomic lease admission and publication, exact rereads after ambiguous commits, and provider-owned failure facts preserve recovery authority; Azure leases settle after definite VM rejection and verified companion cleanup. Kept warmed leases also honor recorded idle/TTL expiry where automatic reaping is supported.
+- **Use Azure GA ephemeral disks and managed identities.** Eligible VMs can use ephemeral OS disks with full caching, while managed disks remain the default; direct VMs can attach an existing user-assigned managed identity and verify it before fixed-lease readiness.
+- **Spend less time preparing sync snapshots.** On a shared Apple M3 Ultra, unchanged-fixture median snapshot preparation fell from 5.195 s to 2.698 s for a realistic repository and from 48.547 s to 25.378 s for 20,002 files. The local Git-seed path uses 17 Git calls instead of 50 and reads 25% fewer logical source bytes while retaining independent content verification.
+- **Run more reliably across local and hosted targets.** SSH workspace locks work with BusyBox `flock`, Blacksmith joins canceled sync children and closes native SSH masters before returning, and WSL2 static targets support non-administrator Windows accounts. Parallels IP discovery stops admitting probes at its deadline and preserves the latest VM-query error instead of giving stale recovery advice.
+
+### Upgrade notes
+
+- Replace `azure.osDisk: ephemeral-preview`, `--azure-os-disk ephemeral-preview`, and `CRABBOX_AZURE_OS_DISK=ephemeral-preview` with `ephemeral`, including coordinator environment settings. GA full caching requires at least 8 active vCPUs, a supported family (N/L/M/H, D/DC/E/Eb/EC v5-v7, or F v6-v7), and sufficient local storage; existing `ephemeral` settings now use full caching, so smaller VMs and Fsv2 no longer qualify. `managed` remains the default and the option for smaller VMs or native checkpoints; released CLIs sending the removed value to an updated coordinator receive HTTP 400 before allocation. [PR 2565](https://github.com/openclaw/crabbox/pull/2565), [PR 2567](https://github.com/openclaw/crabbox/pull/2567). Thanks @jwmoss.
+- Static SSH power hooks require `static.power.dedicated: true` in trusted user configuration, exclusive host ownership by one controller/state directory, a canonical IP, explicit SSH credentials, and absolute hook executable paths. Preserve the claims and `ssh-power` state until shutdown completes; use distinct static IDs for concurrent leases, and do not use prepared `run --id` reuse while power custody remains. [PR 2545](https://github.com/openclaw/crabbox/pull/2545), [PR 2576](https://github.com/openclaw/crabbox/pull/2576). Thanks @altaywtf.
+- `warmup.keep` is a new configuration key and still defaults to `true`; retention across runs no longer exempts kept warmups from recorded idle/TTL expiry where automatic reaping is available. Recreate existing direct GCP guests to install the updated expiry guard, and ensure their service account can delete the VM. Manual `cleanup` still skips kept machines; for providers without an automatic idle reaper, use `warmup.keep: false` with scheduled cleanup or stop explicitly. Tenki retains its documented sticky-lease exception. [Issue 2536](https://github.com/openclaw/crabbox/issues/2536), [PR 2553](https://github.com/openclaw/crabbox/pull/2553). Thanks @youssef-tharwat for the report.
+- Drain Proxmox adapter workspaces under their original configuration before changing the token ID, endpoint, node, or clone settings; rotating only the token secret is supported. For older prepared claims left by definite clone rejection, restore permissions and use checked `stop --force` recovery only after inspecting the task and VM; keep claims after ambiguous proxy responses. [PR 2577](https://github.com/openclaw/crabbox/pull/2577), [PR 2562](https://github.com/openclaw/crabbox/pull/2562), [PR 2566](https://github.com/openclaw/crabbox/pull/2566), [PR 2570](https://github.com/openclaw/crabbox/pull/2570). Thanks @ahkohd.
+- SSH command environment values containing NUL now fail before upload; remove the NUL or pass binary data as a file instead. Empty and multiline values remain supported. [PR 2573](https://github.com/openclaw/crabbox/pull/2573).
+- Daytona API-key fixed acquisition now requires `organizationId` from `/api-keys/current`; older deployments must update that endpoint or use an OAuth organization profile. Existing saved claims remain supported. [PR 2574](https://github.com/openclaw/crabbox/pull/2574). Thanks @Patrick-Erichsen.
+- Ordinary Blacksmith Testbox runs now require macOS/Linux process-group support and compatible `ps`, matching artifact runs; unsupported controllers fail before acquiring a lease. [PR 2547](https://github.com/openclaw/crabbox/pull/2547).
+
+### Added
+
+- Power dedicated static SSH hosts on for their first lease and off after the last, with durable host references, retryable shutdown, and joined hook cancellation. [Issue 2544](https://github.com/openclaw/crabbox/issues/2544), [PR 2545](https://github.com/openclaw/crabbox/pull/2545), [PR 2576](https://github.com/openclaw/crabbox/pull/2576). Thanks @altaywtf.
+- Run Proxmox fixed-ID Linux workspaces behind `adapter serve`, with immutable routing and token-identity scopes, secret rotation, and exact registered cleanup receipts so deleted VMs do not leave workspaces stuck stopping. [Issue 2558](https://github.com/openclaw/crabbox/issues/2558), [PR 2560](https://github.com/openclaw/crabbox/pull/2560), [PR 2577](https://github.com/openclaw/crabbox/pull/2577). Thanks @ahkohd.
+- Attach an existing user-assigned managed identity to direct Azure VMs with `azure.userAssignedIdentityResourceId` or `--azure-user-assigned-identity-resource-id`, verifying attachment before fixed-lease readiness or adoption. To add an identity to an existing fixed lease, stop it and allocate a replacement with a new lease ID. [PR 2575](https://github.com/openclaw/crabbox/pull/2575). Thanks @galiniliev.
+
+### Fixes
+
+- Keep allowlisted SSH environment values out of command lines and workspace-owner launchers using private temporary files delivered over stdin, including preflight, Windows/WSL2, and cache warming; reject NUL-containing values by variable name and refuse remote cleanup after workspace ownership renewal fails. [Issue 2535](https://github.com/openclaw/crabbox/issues/2535), [PR 2556](https://github.com/openclaw/crabbox/pull/2556), [PR 2573](https://github.com/openclaw/crabbox/pull/2573). Thanks @youssef-tharwat for the report.
+- Exclude staged SSH command environment files left by interrupted cleanup from workspace checkpoint archives. [PR 2569](https://github.com/openclaw/crabbox/pull/2569).
+- Reserve Proxmox VMIDs without colliding with live local bindings or concurrent local acquisitions, checking alternatives against cluster inventory and holding the reservation fence through durable claim publication. [Issue 2559](https://github.com/openclaw/crabbox/issues/2559), [PR 2566](https://github.com/openclaw/crabbox/pull/2566), [PR 2571](https://github.com/openclaw/crabbox/pull/2571). Thanks @ahkohd.
+- Retire Proxmox prepared claims after definite native pre-allocation authorization rejection and support checked `stop --force` recovery for absent, unbound attempts; retain custody after proxy-generated, task-bearing, or otherwise ambiguous 401/403 responses. [Issue 2559](https://github.com/openclaw/crabbox/issues/2559), [PR 2562](https://github.com/openclaw/crabbox/pull/2562), [PR 2570](https://github.com/openclaw/crabbox/pull/2570). Thanks @ahkohd.
+- Commit legacy coordinator lease admission and publication atomically and resolve ambiguous commits through exact bound-record rereads, avoiding duplicate provisioning while preserving cancellation and cleanup authority. [Issue 1561](https://github.com/openclaw/crabbox/issues/1561), [PR 2555](https://github.com/openclaw/crabbox/pull/2555).
+- Retain unresolved coordinator allocations after cancellation without a cloud ID, using provider-owned provisioning-failure facts while core owns recovery timing. Settle Azure leases only after definite VM rejection and verified companion cleanup, preserve uncertainty across mixed fallback failures, and explain scheduled cleanup retries in `stop`. [PR 2478](https://github.com/openclaw/crabbox/pull/2478), [PR 2552](https://github.com/openclaw/crabbox/pull/2552), [PR 2578](https://github.com/openclaw/crabbox/pull/2578). Thanks @steipete.
+- Allow Azure fixed-lease `stop --force` to finish retained claims after external cleanup, verifying VM and companion absence with read-only checks and preserving interrupted recovery for retry. [PR 2572](https://github.com/openclaw/crabbox/pull/2572). Thanks @galiniliev.
+- Honor recorded idle/TTL expiry for kept direct cloud warmups, including the GCP guest expiry guard, and add `warmup.keep` without changing the retention default or manual cleanup protection. [Issue 2536](https://github.com/openclaw/crabbox/issues/2536), [PR 2553](https://github.com/openclaw/crabbox/pull/2553). Thanks @youssef-tharwat for the report.
+- Support BusyBox `flock` for SSH workspace locks without mistaking its unsupported timed-wait option for workspace contention. [PR 2579](https://github.com/openclaw/crabbox/pull/2579).
+- Finish Blacksmith sync-child cleanup before returning from canceled runs and disable detached native SSH masters for sync and artifact transfers, closing connections after successful, failed, or canceled runs. [PR 2547](https://github.com/openclaw/crabbox/pull/2547), [PR 2580](https://github.com/openclaw/crabbox/pull/2580).
+- Support WSL2 static targets under non-administrator Windows accounts by removing WMI shell discovery and accepting read-only app-capability grants on HOME while keeping private staging ACLs strict. [Issue 2543](https://github.com/openclaw/crabbox/issues/2543), [PR 2546](https://github.com/openclaw/crabbox/pull/2546), [PR 2554](https://github.com/openclaw/crabbox/pull/2554). Thanks @altaywtf.
+- Stop Parallels IP discovery from admitting probes after its startup deadline, preserve caller cancellation and the final VM-query error, and suppress stale DHCP or clone-mode advice when current inventory is unavailable. [PR 2480](https://github.com/openclaw/crabbox/pull/2480), [PR 2548](https://github.com/openclaw/crabbox/pull/2548). Thanks @steipete.
+- Preserve Lambda acquisition causes when rollback fails, report recovery-claim write failures, and block automatic fresh-allocation retries after failed cleanup. [PR 2463](https://github.com/openclaw/crabbox/pull/2463). Thanks @steipete.
+- Bound Tencent Cloud IP-readiness reads and retry waits, preserve cancellation and acquisition causes after rollback failure, and prevent cleanup errors from triggering fresh-instance retries. [PR 2464](https://github.com/openclaw/crabbox/pull/2464). Thanks @steipete.
+- Keep background telemetry from replacing workspace command witnesses and failing successful hydration reads with exit 74. [PR 2563](https://github.com/openclaw/crabbox/pull/2563).
+- Report missing local claims accurately when replaying `stop` after verified absence, retaining exit 1 without a terminal receipt and preserving provider resolver and genuine identity-mismatch errors. [PR 2551](https://github.com/openclaw/crabbox/pull/2551).
+
+### Changed
+
+- Use GA full caching for Azure ephemeral OS disks through the SDK and coordinator, with supported-family and active-vCPU eligibility checks; managed OS disks remain the default. [PR 2565](https://github.com/openclaw/crabbox/pull/2565), [PR 2567](https://github.com/openclaw/crabbox/pull/2567). Thanks @jwmoss.
+- Build local Git-seed snapshot manifests once, validate captured Git inputs at acceptance, reuse copied-file digests between mandatory content reads, and avoid rescanning unrelated parent directories. The unchanged 20,002-file fixture used 17 rather than 50 Git calls and 894,566,442 rather than 1,192,755,256 logical source bytes; median snapshot preparation fell from 48.547 s to 25.378 s on a shared Apple M3 Ultra. These measure local preparation, not network-transfer throughput; final uncached content and byte-count verification remain mandatory. [PR 2581](https://github.com/openclaw/crabbox/pull/2581).
+- Move direct Daytona integration to the maintained Go clients and typed organization/lifetime metadata, and reconcile fixed cleanup through exact sandbox lookup so retirement of the paginated endpoint cannot strand cleanup. [PR 2574](https://github.com/openclaw/crabbox/pull/2574). Thanks @Patrick-Erichsen.
+
+## 0.66.0 - 2026-09-24
 
 ### Highlights
 
 - **Run proxy-aware commands through host egress.** `egress run` manages proxy setup, command execution, and session cleanup; optional HTTP(S) upstream credentials stay on the host.
-- **Safer fixed-lease cleanup and recovery.** Uncertain cleanup preserves claims, Azure records companion cleanup identities before deletion, and Parallels rejects inconsistent identities and invalid terminal receipts.
-- **More reliable NVIDIA Brev connections.** Native OpenSSH resolves certificate-backed routes, while saved host/container targets survive fresh processes, reuse, and stop/start.
-- **Provider observations preserve lease policy.** OVH, Sprites, and Boat retain recorded lifetime and idle settings across status, reuse, and heartbeat operations; unknown observations stay unknown.
-- **Uploads and request budgets fail cleanly.** Multipart producers finish before archives are released, oversized execution budgets fail before dispatch, and Vultr retries release the previous response first.
+- **Safer cleanup and recovery.** The shared fixed-lease engine owns cleanup-binding persistence and recovery transactions, preserves uncertain claims, and validates cleanup identities and terminal receipts. Incus accepts repeated stop by exact lease ID after confirmed deletion.
+- **More reliable provider connections and diagnostics.** NVIDIA Brev uses native OpenSSH, retains host/container targets, and probes only provenance-matched status routes. Parallels fails early when guest tools stay unavailable; Boxd waits on the authenticated forwarded port and reports definite create rejections with their server diagnostics.
+- **Preserve workspaces and verify developer images.** Origin seeding leaves non-empty raw workspaces intact, and shallow checkout reuse restores branch ancestry. Linux developer-image acceptance requires trusted builder verification and functional offline smokes before publication.
+- **Provider observations preserve lease policy.** OVH, Sprites, and Boat/ASCII Box retain recorded lifetime and idle settings across status, reuse, and heartbeat operations; unknown observations stay unknown.
+- **Bound optional waits and reject overflowing budgets.** AWS and Hetzner price quotes fall back after five seconds, oversized execution and lifetime budgets fail before dispatch, and readiness waits preserve cancellation. Multipart uploads retain archives until their producers finish, and Vultr retries release the previous response first.
+- **Consolidate internal implementation paths.** Shared WebSocket upgrade checks, slug allocation, provider flag provenance, and tag and metadata helpers reduce duplication while preserving existing behavior.
 
 ### Upgrade notes
 
 - `egress run` requires an existing, exclusively owned Linux SSH lease, and the command must opt into its lease-local proxy. Scoped cleanup requires the current Linux helper and pidfd support. [PR 2506](https://github.com/openclaw/crabbox/pull/2506).
 - Keep local claims and journals when upgrading hosts with unfinished fixed-ID cleanup. Inconsistent Parallels identities and invalid terminal receipts now fail instead of being reported as cleaned up. [PR 2515](https://github.com/openclaw/crabbox/pull/2515).
+- Linux developer-image preparation and publication must use the updated standalone verifier from the same trusted source as the installer and publisher, and require the `linux-builder` profile. Existing valid builder manifests retain their canonical-byte contract; older installed scripts do not gain `--verify` automatically. [PR 2533](https://github.com/openclaw/crabbox/pull/2533).
 
 ### Added
 
@@ -43,12 +727,25 @@
 
 ### Fixes
 
+- Keep Boxd lease SSH readiness on the authenticated forwarded port instead of falling back to port 22 while the forward starts. [PR 2519](https://github.com/openclaw/crabbox/pull/2519), [PR 2530](https://github.com/openclaw/crabbox/pull/2530). Thanks @MichielMAnalytics.
+- Reject unverified Linux developer images with trusted-source builder verification, functional offline smokes, contained scratch, and fail-closed archive publication. [PR 1995](https://github.com/openclaw/crabbox/pull/1995), [PR 2533](https://github.com/openclaw/crabbox/pull/2533). Thanks @vincentkoc.
+- Accept BOM-prefixed GitHub Runner registrations when seeding verified tool caches and create new registration files privately regardless of the caller's umask. [PR 1995](https://github.com/openclaw/crabbox/pull/1995), [PR 2533](https://github.com/openclaw/crabbox/pull/2533). Thanks @vincentkoc.
+- Classify definite Boxd create rejections without retaining orphaned claims, preserve gRPC server diagnostics, and allow forced local recovery after authenticated inventory proves an unbound create absent. [PR 2537](https://github.com/openclaw/crabbox/pull/2537).
+- Print joined CLI error causes alongside exit diagnostics while preserving command exit codes and standalone error output. [PR 2537](https://github.com/openclaw/crabbox/pull/2537).
+- Restore complete branch history before coherence checks when reusing shallow Git workspaces, while preserving wrong-branch rejection and index rollback. [PR 2529](https://github.com/openclaw/crabbox/pull/2529). Thanks @steipete.
+- Allow repeated Incus stop with the exact canonical lease ID after confirmed deletion, validating the retained terminal receipt and connection identity while keeping slug lookups live. [PR 2486](https://github.com/openclaw/crabbox/pull/2486), [PR 2523](https://github.com/openclaw/crabbox/pull/2523). Thanks @vincentkoc.
+- Bound optional AWS and Hetzner price quotes to five seconds so stalled pricing falls back to existing estimates. [PR 2524](https://github.com/openclaw/crabbox/pull/2524). Analysis: [PR 1630](https://github.com/openclaw/crabbox/pull/1630). Thanks @steipete.
+- Probe NVIDIA Brev SSH readiness during ordinary status only when the cached config matches the workspace claim's prepared provenance, preserving host/container targets and rejecting stale organization routes. [PR 2434](https://github.com/openclaw/crabbox/pull/2434), [PR 2527](https://github.com/openclaw/crabbox/pull/2527). Thanks @vincentkoc.
+- Preserve non-empty raw workspaces when origin seeding becomes available by using plain manifest sync, and reject malformed Git destinations before transfer. [PR 2526](https://github.com/openclaw/crabbox/pull/2526). Narrows [PR 2284](https://github.com/openclaw/crabbox/pull/2284). Thanks @vincentkoc.
+- Fail Parallels IP discovery early after repeated post-boot Tools-unavailable probes, preserve DHCP/SSH fallback, and name clone-mode, snapshot-reset, and startup-timeout flags in diagnostics. [Issue 2398](https://github.com/openclaw/crabbox/issues/2398), [PR 2525](https://github.com/openclaw/crabbox/pull/2525). Thanks @saariuslystoned.
 - Preserve OVH heartbeat policy, including pre-upgrade overrides, across reuse and status reads, recording activity and explicit idle-timeout changes atomically in the local lease claim. [PR 2420](https://github.com/openclaw/crabbox/pull/2420). Thanks @steipete.
 - Retain OVH SSH targets for plain status readiness checks and keep both status modes out of repository admission, while preserving metadata-only observations without a public address. [PR 2420](https://github.com/openclaw/crabbox/pull/2420). Thanks @steipete.
 - Bound OVH IP-readiness lookups and retry waits with an elapsed-time deadline, preserving caller cancellation causes and provider error precedence. [PR 2420](https://github.com/openclaw/crabbox/pull/2420). Thanks @steipete.
 - Resolve NVIDIA Brev SSH routes with native OpenSSH, preserve captured routes across commands, sync, copying, forwarding, and interactive sessions, and retain bounded, redacted certificate-hook diagnostics. [PR 2429](https://github.com/openclaw/crabbox/pull/2429), [PR 2516](https://github.com/openclaw/crabbox/pull/2516). Thanks @vincentkoc.
 - Preserve NVIDIA Brev leases' host/container target across fresh-process status, reuse, and stop/start, while honoring explicit target changes. [PR 2430](https://github.com/openclaw/crabbox/pull/2430), [PR 2517](https://github.com/openclaw/crabbox/pull/2517). Thanks @vincentkoc.
 - Preserve fixed-lease claims after uncertain cleanup, durably bind Azure companion cleanup identities before deletion, honor existing deletion markers on retries, and reject inconsistent Parallels cleanup identities and invalid terminal receipts. [PR 2515](https://github.com/openclaw/crabbox/pull/2515). Thanks @steipete.
+- Fail AWS Lambda microVM runs when stdout or stderr delivery fails, preserving the output error through cleanup instead of reporting remote success. [PR 2513](https://github.com/openclaw/crabbox/pull/2513). Thanks @steipete.
+- Prevent polling and delegated exit error wrappers from panicking during self-matching with non-comparable causes, preserving diagnostics and classification. [PR 2513](https://github.com/openclaw/crabbox/pull/2513). Thanks @steipete.
 - Finish E2B and CubeSandbox upload producers before releasing source archives and surface source-read failures, using the same multipart lifetime owner as Blaxel. [PR 2509](https://github.com/openclaw/crabbox/pull/2509). Thanks @steipete.
 - Finish Blaxel multipart producers before retrying or releasing borrowed archives, preserving HTTP error precedence and early-success uploads. [PR 2505](https://github.com/openclaw/crabbox/pull/2505). Thanks @steipete.
 - Keep Sprites status and list factual: omit unavailable birth and expiry, show recorded lease policy instead of reader defaults, and preserve acquisition policy through endpoint preparation and reuse. [PR 2289](https://github.com/openclaw/crabbox/pull/2289). Thanks @steipete.
@@ -63,6 +760,8 @@
 
 ### Maintenance
 
+- Make fixed-lease cleanup-binding persistence the shared engine default and consolidate recovery transactions, journal writes, and completion handling across direct provider adapters. [PR 2528](https://github.com/openclaw/crabbox/pull/2528).
+- Consolidate WebSocket upgrade predicates, slug allocation, provider flag provenance, and tag sanitization and metadata validation without changing their public behavior. [PR 2531](https://github.com/openclaw/crabbox/pull/2531), [PR 2532](https://github.com/openclaw/crabbox/pull/2532), [PR 2534](https://github.com/openclaw/crabbox/pull/2534), [PR 2538](https://github.com/openclaw/crabbox/pull/2538).
 - Recover notarization upload deadlines with one bounded S3 acceleration retry or an explicit accelerated route, and require successful signer exit plus online verification before capturing a receipt. [PR 2518](https://github.com/openclaw/crabbox/pull/2518). Thanks @steipete.
 - Preserve selected release-verification tools and clean up read-only temporary Go caches without following symlinks or masking earlier failures. [PR 2520](https://github.com/openclaw/crabbox/pull/2520). Thanks @steipete.
 

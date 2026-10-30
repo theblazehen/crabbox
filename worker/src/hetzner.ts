@@ -6,6 +6,13 @@ import {
   type LeaseConfig,
 } from "./config";
 import {
+  creationEvent,
+  observedRunning,
+  measureCreationStep,
+  measureCreationStepSync,
+} from "./creation-events";
+import { hetznerUserData } from "./hetzner-user-data";
+import {
   leaseIDForProviderKey,
   providerKeyForLease,
   providerKeyOwnedByLease,
@@ -13,6 +20,7 @@ import {
   sshPublicKeyIdentity,
 } from "./provider-key";
 import { leaseProviderLabels, providerLabelValue } from "./provider-labels";
+import { withPricingDeadline } from "./provider-pricing";
 import { leaseProviderName } from "./slug";
 import type { Env, HetznerSSHKey, HetznerServer, ProviderMachine } from "./types";
 
@@ -199,14 +207,11 @@ export class HetznerClient {
       }
     }
 
-    const existingIdentity = reusableHetznerSSHKey(
-      await this.listSSHKeys(),
-      name,
-      identity,
-      leaseOwned ? leaseID : undefined,
-    );
-    if (existingIdentity) {
-      return { key: existingIdentity, created: false };
+    // Fresh per-lease keys normally cannot collide. Let the uniqueness response
+    // trigger the full inventory read; shared/custom keys retain eager reuse.
+    if (!leaseOwned) {
+      const existingIdentity = reusableHetznerSSHKey(await this.listSSHKeys(), name, identity);
+      if (existingIdentity) return { key: existingIdentity, created: false };
     }
 
     try {
@@ -276,19 +281,21 @@ export class HetznerClient {
   }
 
   async hourlyPriceUSD(name: string, location: string): Promise<number | undefined> {
-    const response = await this.request<HetznerListServerTypesResponse>(
-      "GET",
-      `/server_types?${new URLSearchParams({ per_page: "100" })}`,
-    );
-    const serverType = response.server_types.find((candidate) => candidate.name === name);
-    const price =
-      serverType?.prices.find((candidate) => candidate.location === location) ??
-      serverType?.prices[0];
-    const hourlyEUR = positiveFloat(price?.price_hourly.gross ?? price?.price_hourly.net ?? "");
-    if (hourlyEUR === undefined) {
-      return undefined;
-    }
-    return roundUSD(hourlyEUR * eurToUSD(this.env));
+    return withPricingDeadline(async (signal) => {
+      const response = await this.request<HetznerListServerTypesResponse>(
+        "GET",
+        `/server_types?${new URLSearchParams({ per_page: "100" })}`,
+        undefined,
+        undefined,
+        signal,
+      );
+      const serverType = response.server_types.find((candidate) => candidate.name === name);
+      const price =
+        serverType?.prices.find((candidate) => candidate.location === location) ??
+        serverType?.prices[0];
+      const hourlyEUR = positiveFloat(price?.price_hourly.gross ?? price?.price_hourly.net ?? "");
+      return hourlyEUR === undefined ? undefined : roundUSD(hourlyEUR * eurToUSD(this.env));
+    });
   }
 
   async createServerWithFallback(
@@ -300,10 +307,8 @@ export class HetznerClient {
     const requireRunning = config.providerKey.startsWith(workspaceProviderKeyPrefix);
     let ensuredKey: EnsuredHetznerSSHKey;
     try {
-      ensuredKey = await this.ensureSSHKeyForProvisioning(
-        config.providerKey,
-        config.sshPublicKey,
-        leaseID,
+      ensuredKey = await measureCreationStep("hetzner.ssh_key_registration", () =>
+        this.ensureSSHKeyForProvisioning(config.providerKey, config.sshPublicKey, leaseID),
       );
     } catch (error) {
       const message = errorText(error);
@@ -397,6 +402,7 @@ export class HetznerClient {
   toMachine(server: HetznerServer): ProviderMachine {
     return {
       provider: "hetzner",
+      ...(server.creationEvents ? { creationEvents: server.creationEvents } : {}),
       id: server.id,
       cloudID: String(server.id),
       name: server.name,
@@ -417,22 +423,28 @@ export class HetznerClient {
     const now = new Date();
     const name = leaseProviderName(leaseID, slug);
     const labels = leaseProviderLabels(config, leaseID, slug, owner, "hetzner", now);
+    const userData = await measureCreationStep("hetzner.user_data_render", () =>
+      hetznerUserData(cloudInit(config)),
+    );
+    const requested = creationEvent("provider_create_request");
     let response: HetznerServerResponse;
     try {
-      response = await this.request<HetznerServerResponse>("POST", "/servers", {
-        name,
-        server_type: config.serverType,
-        image: config.image,
-        location: config.location,
-        labels,
-        ssh_keys: [config.providerKey],
-        user_data: cloudInit(config),
-        start_after_create: true,
-        public_net: {
-          enable_ipv4: true,
-          enable_ipv6: false,
-        },
-      });
+      response = await measureCreationStep("hetzner.server_create", () =>
+        this.request<HetznerServerResponse>("POST", "/servers", {
+          name,
+          server_type: config.serverType,
+          image: measureCreationStepSync("hetzner.image_selection", () => config.image),
+          location: config.location,
+          labels,
+          ssh_keys: [config.providerKey],
+          user_data: userData,
+          start_after_create: true,
+          public_net: {
+            enable_ipv4: true,
+            enable_ipv6: false,
+          },
+        }),
+      );
     } catch (error) {
       const message = errorText(error);
       const status = /hetzner POST \/servers: http (\d{3})/.exec(message)?.[1];
@@ -442,14 +454,19 @@ export class HetznerClient {
         transientHetznerError(message) || isRetryableProvisioningError(message),
       );
     }
+    const events = [requested, creationEvent("provider_create_response")];
     if (
       response.server.public_net.ipv4.ip &&
       (!requireRunning || response.server.status === "running")
     ) {
-      return response.server;
+      return {
+        ...response.server,
+        creationEvents: [...events, ...observedRunning(response.server.status)],
+      };
     }
     try {
-      return await this.waitForServerIP(response.server.id, requireRunning);
+      const server = await this.waitForServerIP(response.server.id, requireRunning);
+      return { ...server, creationEvents: [...events, ...observedRunning(server.status)] };
     } catch (error) {
       const message = errorText(error);
       try {
@@ -490,9 +507,11 @@ export class HetznerClient {
     path: string,
     body?: unknown,
     deadline?: number,
+    signal?: AbortSignal,
   ): Promise<T> {
     const init: RequestInit = {
       method,
+      ...(signal ? { signal } : {}),
       headers: {
         authorization: `Bearer ${this.token}`,
         "content-type": "application/json",

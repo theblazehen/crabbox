@@ -11,11 +11,14 @@ import {
   awsInstanceTypeCandidatesForClass,
   awsInstanceTypeCandidatesForTargetClass,
   azureARM64VMSizeCandidatesForClass,
+  azureFullCachingSeriesEligible,
   azureWindowsVMSizeCandidatesForClass,
   azureVMSizeCandidatesForArchitectureClass,
   azureVMSizeCandidatesForClass,
   azureVMSizeCandidatesForTargetClass,
   gcpMachineTypeCandidatesForClass,
+  gcpBootDiskTypeForMachineType,
+  gcpHyperdiskOnlyFamilies,
   leaseConfig,
   parseTarget,
   serverTypeCandidatesForClass,
@@ -28,6 +31,53 @@ import { gcpProvisioningCandidatesForConfig } from "../src/gcp";
 import { hetznerProvisioningCandidatesForConfig } from "../src/hetzner";
 
 describe("machine class config", () => {
+  it("normalizes optional resource minimums without changing unconstrained config", () => {
+    const input = { provider: "aws" as const, sshPublicKey: "ssh-ed25519 test" };
+    expect(leaseConfig({ ...input, capacity: { minVCPUs: 0, minMemoryMiB: 0 } })).toEqual(
+      leaseConfig(input),
+    );
+    expect(
+      leaseConfig({ ...input, capacity: { minVCPUs: 4, minMemoryMiB: 15360 } })
+        .capacityRequirements,
+    ).toEqual({ minVCPUs: 4, minMemoryMiB: 15360 });
+    expect(() => leaseConfig({ ...input, provider: "azure", capacity: { minVCPUs: 4 } })).toThrow(
+      /provider=aws and target=linux/,
+    );
+    expect(() => leaseConfig({ ...input, target: "windows", capacity: { minVCPUs: 4 } })).toThrow(
+      /provider=aws and target=linux/,
+    );
+  });
+
+  it.each([-1, 1.5, NaN, Infinity, 2147483648, "4", null])(
+    "rejects invalid capacity minimum %s",
+    (value) => {
+      for (const name of ["minVCPUs", "minMemoryMiB"] as const) {
+        expect(() =>
+          leaseConfig({
+            provider: "aws",
+            sshPublicKey: "ssh-ed25519 test",
+            capacity: { [name]: value as number },
+          }),
+        ).toThrow(/must be an integer/);
+      }
+    },
+  );
+
+  it("parses an AWS stock image source", () => {
+    expect(
+      leaseConfig({
+        provider: "aws",
+        sshPublicKey: "ssh-ed25519 test",
+        awsUseStockImage: true,
+      }).awsUseStockImage,
+    ).toBe(true);
+  });
+
+  it("uses active vCPUs for constrained Azure full-caching sizes", () => {
+    expect(azureFullCachingSeriesEligible("Standard_E8-4ds_v5")).toBe(false);
+    expect(azureFullCachingSeriesEligible("Standard_E16-8ds_v5")).toBe(true);
+  });
+
   const classCandidateSelectors = [
     serverTypeCandidatesForClass,
     (value: string) => awsInstanceTypeCandidatesForArchitectureClass("amd64", value),
@@ -503,6 +553,62 @@ describe("machine class config", () => {
     }
   });
 
+  it("matches the Go boot disk family set and machine class disk compatibility", () => {
+    const source = readFileSync(new URL("../../internal/cli/gcp.go", import.meta.url), "utf8");
+    const familySet = source.match(
+      /var gcpHyperdiskOnlyFamilies = map\[string\]struct\{\}\{([\s\S]*?)\n\}/,
+    );
+    expect(familySet).not.toBeNull();
+    const families = [...familySet![1]!.matchAll(/"([a-z0-9-]+)":/g)].map((match) => match[1]!);
+    expect([...gcpHyperdiskOnlyFamilies].toSorted()).toEqual(families.toSorted());
+    for (const family of families) {
+      expect(
+        gcpBootDiskTypeForMachineType(`zones/z/machineTypes/${family.toUpperCase()}-standard-4`),
+      ).toBe("hyperdisk-balanced");
+    }
+    for (const machineType of [
+      "c4n-standard-4",
+      "m4n-megamem-28",
+      "x5-688-12t-metal",
+      "a3-ultragpu-8g",
+    ]) {
+      expect(gcpBootDiskTypeForMachineType(machineType)).toBe("hyperdisk-balanced");
+    }
+    for (const machineType of ["a3-megagpu-8g", "a3-highgpu-8g", "a3-edgegpu-8g"]) {
+      expect(gcpBootDiskTypeForMachineType(machineType)).toBe("pd-balanced");
+    }
+    for (const family of [
+      "c3",
+      "c3d",
+      "h3",
+      "m1",
+      "m2",
+      "m3",
+      "z3",
+      "n2",
+      "n2d",
+      "e2",
+      "n1",
+      "t2a",
+      "t2d",
+      "c2",
+      "c2d",
+      "a2",
+      "g2",
+      "unknown",
+    ]) {
+      expect(gcpBootDiskTypeForMachineType(`${family}-standard-4`)).toBe("pd-balanced");
+    }
+    for (const name of ["tiny", "small", "standard", "fast", "large", "beast"]) {
+      for (const candidate of gcpMachineTypeCandidatesForClass(name)) {
+        expect(candidate).toMatch(/^(c4|c3|n2|n2d)-/);
+        expect(gcpBootDiskTypeForMachineType(candidate)).toBe(
+          candidate.startsWith("c4-") ? "hyperdisk-balanced" : "pd-balanced",
+        );
+      }
+    }
+  });
+
   it("matches the Go CLI machine class tables", () => {
     const goAWS = readFileSync(
       new URL("../../internal/providers/aws/provider.go", import.meta.url),
@@ -902,9 +1008,9 @@ describe("lease config", () => {
     expect(config.desktopEnv).toBe("xfce");
     expect(config.browser).toBe(false);
     expect(config.code).toBe(false);
-    expect(config.ttlSeconds).toBe(86_400);
-    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: 0 }).ttlSeconds).toBe(5400);
-    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: -1 }).ttlSeconds).toBe(5400);
+    expect(config.ttlSeconds).toBe(14_400);
+    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: 0 }).ttlSeconds).toBe(1800);
+    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: -1 }).ttlSeconds).toBe(1800);
     expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: 42.9 }).ttlSeconds).toBe(42);
     expect(
       leaseConfig({ sshPublicKey: "ssh-ed25519 test", idleTimeoutSeconds: 0 }).idleTimeoutSeconds,
@@ -915,7 +1021,7 @@ describe("lease config", () => {
     expect(
       leaseConfig({ sshPublicKey: "ssh-ed25519 test", idleTimeoutSeconds: 999_999 })
         .idleTimeoutSeconds,
-    ).toBe(86_400);
+    ).toBe(1800);
     expect(
       leaseConfig({ sshPublicKey: "ssh-ed25519 test", idleTimeoutSeconds: 42.9 })
         .idleTimeoutSeconds,
@@ -1222,12 +1328,12 @@ describe("lease config", () => {
     expect(config.azureImage).toBe("Canonical:ubuntu-26_04-lts:server-arm64:latest");
   });
 
-  it("filters Azure defaults for ephemeral-preview full caching", () => {
+  it("filters Azure defaults for ephemeral full caching", () => {
     const arm = leaseConfig({
       provider: "azure",
       architecture: "arm64",
       class: "standard",
-      azureOSDisk: "ephemeral-preview",
+      azureOSDisk: "ephemeral",
       sshPublicKey: "ssh-ed25519 test",
     });
     expect(arm.serverType).toBe("Standard_D32pds_v6");
@@ -1235,7 +1341,7 @@ describe("lease config", () => {
       provider: "azure",
       target: "windows",
       class: "standard",
-      azureOSDisk: "ephemeral-preview",
+      azureOSDisk: "ephemeral",
       sshPublicKey: "ssh-ed25519 test",
     });
     expect(windows.serverType).toBe("Standard_D8ads_v6");
@@ -1245,7 +1351,7 @@ describe("lease config", () => {
       class: "standard",
       azureSnapshot:
         "/subscriptions/sub/resourceGroups/crabbox-leases/providers/Microsoft.Compute/snapshots/checkpoint-azure",
-      azureOSDisk: "ephemeral-preview",
+      azureOSDisk: "ephemeral",
       sshPublicKey: "ssh-ed25519 test",
     });
     expect(snapshot.serverType).toBe("Standard_D2ads_v6");
@@ -1455,34 +1561,25 @@ describe("lease config", () => {
   });
 
   it("normalizes Azure OS disk requests", () => {
-    expect(
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "MANAGED",
-        sshPublicKey: "ssh-ed25519 test",
-      }).azureOSDisk,
-    ).toBe("managed");
-    expect(
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "ephemeral-preview",
-        sshPublicKey: "ssh-ed25519 test",
-      }).azureOSDisk,
-    ).toBe("ephemeral-preview");
-    expect(
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "auto",
-        sshPublicKey: "ssh-ed25519 test",
-      }).azureOSDisk,
-    ).toBe("managed");
-    expect(() =>
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "premium",
-        sshPublicKey: "ssh-ed25519 test",
-      }),
-    ).toThrow("azureOSDisk must be auto, managed, ephemeral, or ephemeral-preview");
+    for (const [azureOSDisk, expected] of [
+      ["MANAGED", "managed"],
+      ["ephemeral", "ephemeral"],
+      [" EPHEMERAL ", "ephemeral"],
+      ["auto", "managed"],
+    ]) {
+      expect(
+        leaseConfig({ provider: "azure", azureOSDisk, sshPublicKey: "ssh-ed25519 test" })
+          .azureOSDisk,
+      ).toBe(expected);
+    }
+    for (const [azureOSDisk, message] of [
+      ["ephemeral-preview", "azureOSDisk=ephemeral-preview has been removed; use ephemeral"],
+      ["premium", "azureOSDisk must be auto, managed, or ephemeral"],
+    ]) {
+      expect(() =>
+        leaseConfig({ provider: "azure", azureOSDisk, sshPublicKey: "ssh-ed25519 test" }),
+      ).toThrow(message);
+    }
   });
 
   it("uses Worker Azure OS disk defaults when the request omits one", () => {
@@ -1516,6 +1613,16 @@ describe("lease config", () => {
     expect(config.gcpNetwork).toBe("");
     expect(config.gcpTags).toEqual([]);
     expect(config.gcpRootGB).toBe(0);
+  });
+
+  it("uses Hetzner Ubuntu 26.04 by default while preserving explicit images", () => {
+    const input = { provider: "hetzner" as const, sshPublicKey: "ssh-ed25519 test" };
+    expect(leaseConfig(input).image).toBe("ubuntu-26.04");
+    expect(leaseConfig({ ...input, os: "ubuntu:26.04" }).image).toBe("ubuntu-26.04");
+    expect(leaseConfig({ ...input, os: "ubuntu:24.04" }).image).toBe("ubuntu-24.04");
+    expect(leaseConfig({ ...input, os: "ubuntu:26.04", image: "custom-image" }).image).toBe(
+      "custom-image",
+    );
   });
 
   it("maps explicit portable OS selectors", () => {

@@ -12,7 +12,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -66,19 +65,41 @@ func coordinatorReadRetryReason(err error) string {
 	}
 	var response CoordinatorHTTPError
 	if errors.As(err, &response) {
-		switch response.StatusCode {
-		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			return fmt.Sprintf("http_%d", response.StatusCode)
-		default:
-			return ""
-		}
+		return coordinatorTransientUnavailableReason(err)
 	}
 	var network net.Error
 	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &network) && network.Timeout() {
 		return "timeout"
 	}
-	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	if coordinatorReadConnectionInterrupted(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 		return "connection_reset"
+	}
+	// net/http's idle-close sentinel is private and does not wrap io.EOF.
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if cause.Error() == "http: server closed idle connection" {
+			return "connection_reset"
+		}
+	}
+	return ""
+}
+
+func coordinatorTransientUnavailableReason(err error) string {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return ""
+	}
+	var response CoordinatorHTTPError
+	if errors.As(err, &response) {
+		switch response.StatusCode {
+		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return fmt.Sprintf("http_%d", response.StatusCode)
+		case http.StatusInternalServerError:
+			switch strings.TrimSpace(response.Message) {
+			case "error code: 1101":
+				return "cloudflare_1101"
+			case "error code: 1102":
+				return "cloudflare_1102"
+			}
+		}
 	}
 	return ""
 }

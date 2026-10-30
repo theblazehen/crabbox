@@ -173,15 +173,15 @@ func coordinatorInvalidLeaseSSHNamespace(t *testing.T, leaseID string) string {
 	return path
 }
 
-func TestCoordinatorListUsesUserLeasesWithoutAdminProbe(t *testing.T) {
+func TestListStreamingCoordinatorUsesUserLeasesWithoutAdminProbe(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/pool":
 			t.Error("ordinary list must not probe the admin pool")
 			http.Error(w, "unexpected admin probe", http.StatusInternalServerError)
 		case "/v1/leases":
-			if got := r.URL.Query().Get("state"); got != "" {
-				t.Fatalf("leases state=%q", got)
+			if got := r.URL.Query().Get("state"); got != "active" && got != "provisioning" {
+				t.Errorf("leases state=%q", got)
 			}
 			if got := r.Header.Get("Authorization"); got != "Bearer user-token" {
 				t.Fatalf("leases auth=%q", got)
@@ -238,7 +238,7 @@ func TestCoordinatorListUsesUserLeasesWithoutAdminProbe(t *testing.T) {
 	}
 }
 
-func TestCoordinatorListAllFallsBackToUserLeasesWhenAdminTokenUnauthorized(t *testing.T) {
+func TestListStreamingCoordinatorAllFallsBackToUserLeasesWhenAdminTokenUnauthorized(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/pool":
@@ -282,13 +282,13 @@ func TestCoordinatorListAllFallsBackToUserLeasesWhenAdminTokenUnauthorized(t *te
 	}
 }
 
-func TestCoordinatorListJSONUsesUserLeasesWhenAdminTokenMissing(t *testing.T) {
+func TestListStreamingCoordinatorJSONUsesUserLeasesWhenAdminTokenMissing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/leases" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("state"); got != "" {
-			t.Fatalf("leases state=%q", got)
+		if got := r.URL.Query().Get("state"); got != "active" && got != "provisioning" {
+			t.Errorf("leases state=%q", got)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"leases": []CoordinatorLease{
 			{
@@ -823,6 +823,7 @@ func TestCoordinatorInspectJSONPreservesProvisioningFailureState(t *testing.T) {
 			TargetOS:                     targetLinux,
 			State:                        "failed",
 			FailureError:                 "provider response was interrupted",
+			ProvisioningPhase:            "interrupted-recovering",
 			ProvisioningResourceMayExist: &explicitTrue,
 			ProvisioningFailureRetryable: &explicitTrue,
 		},
@@ -892,6 +893,9 @@ func TestCoordinatorInspectJSONPreservesProvisioningFailureState(t *testing.T) {
 			}
 			if got["state"] != "failed" || got["hasHost"] != false {
 				t.Fatalf("inspect JSON state=%#v hasHost=%#v, want failed hostless lease", got["state"], got["hasHost"])
+			}
+			if test.id == "cbx_true" && got["provisioningPhase"] != "interrupted-recovering" {
+				t.Fatalf("missing recovery phase: %#v", got)
 			}
 			for field, want := range map[string]*bool{
 				"provisioningResourceMayExist": test.wantMayExist,
@@ -1110,6 +1114,9 @@ func TestCoordinatorAcquireRetainsCurrentProvisioningTiming(t *testing.T) {
 	lease := CoordinatorLease{
 		ID: "cbx_abcdef123468", Slug: "current-timing", Provider: "aws", TargetOS: targetLinux,
 		State: "active", CloudID: "i-current", Host: host, SSHUser: "crabbox", SSHPort: port, WorkRoot: defaultPOSIXWorkRoot,
+		CreationEvents: []CreationEvent{
+			{Phase: "admission_started", At: "2026-01-01T00:00:00Z", Source: "coordinator"},
+		},
 		ProvisioningTiming: &CoordinatorProvisioningTiming{
 			RequestMs: 2,
 			TotalMs:   5,
@@ -1140,15 +1147,43 @@ func TestCoordinatorAcquireRetainsCurrentProvisioningTiming(t *testing.T) {
 	cfg.CoordToken = "user-token"
 	coord := mustNewCoordinatorClient(t, cfg)
 	backend := &coordinatorLeaseBackend{cfg: cfg, coord: coord, rt: Runtime{Stderr: io.Discard}}
+	started := time.Now()
 	acquired, err := backend.Acquire(context.Background(), AcquireRequest{
 		Keep: true, RequestedLeaseID: lease.ID, RequestedSlug: lease.Slug,
 	})
+	finished := time.Now()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if acquired.runnerTiming == nil {
+		t.Fatal("missing current provisioning timing")
+	}
+	// Creation observations are additive; every provider duration field stays exact.
+	providerTiming := *acquired.runnerTiming
+	providerTiming.Events = nil
 	want := coordinatorRunnerTiming(lease)
-	if !reflect.DeepEqual(acquired.runnerTiming, want) {
-		t.Fatalf("runner timing=%#v want current provisioning timing %#v", acquired.runnerTiming, want)
+	if !reflect.DeepEqual(&providerTiming, want) {
+		t.Fatalf("provider timing=%#v want current provisioning timing %#v", &providerTiming, want)
+	}
+	events := acquired.runnerTiming.Events
+	clientPhases := []string{"ssh_tcp_accept", "ssh_authenticated", "workspace_ready"}
+	if len(events) != len(lease.CreationEvents)+len(clientPhases) {
+		t.Fatalf("creation events=%#v want coordinator events and exactly %v", events, clientPhases)
+	}
+	if !reflect.DeepEqual(events[:len(lease.CreationEvents)], lease.CreationEvents) {
+		t.Fatalf("coordinator events changed: got %#v want %#v", events, lease.CreationEvents)
+	}
+	previous := started
+	for i, phase := range clientPhases {
+		event := events[len(lease.CreationEvents)+i]
+		if event.Phase != phase || event.Source != "client" {
+			t.Fatalf("client event %d=%#v want phase=%s source=client", i, event, phase)
+		}
+		at, err := time.Parse(time.RFC3339Nano, event.At)
+		if err != nil || at.Before(previous) || at.After(finished) {
+			t.Fatalf("client event %d timestamp=%q outside ordered acquisition interval [%s, %s]: %v", i, event.At, previous, finished, err)
+		}
+		previous = at
 	}
 }
 
@@ -1880,6 +1915,7 @@ func TestCoordinatorCreateLeaseTreatsAllServerErrorsAsAmbiguous(t *testing.T) {
 		}
 	}
 	for _, body := range []string{
+		`{"error":"provisioning_failed","message":"capacity unavailable"}`,
 		`{"error":"provider_failure","message":"tailscale_unavailable"}`,
 		`{"error":"tailscale_unavailable"`,
 		`tailscale_unavailable`,
@@ -2530,7 +2566,7 @@ func TestCoordinatorRecoveredProvisioningKeepsCreationLifetime(t *testing.T) {
 			wantErr       error
 		}{
 			{name: "activation beyond recovery window", createDelay: 2 * time.Minute, readyAfter: 4 * time.Minute, wantElapsed: 4 * time.Minute},
-			{name: "original creation deadline", createDelay: 29 * time.Minute, readyAfter: 31 * time.Minute, wantElapsed: 30 * time.Minute, wantErr: context.DeadlineExceeded},
+			{name: "original creation deadline", createDelay: 29 * time.Minute, readyAfter: coordinatorHTTPTimeout + time.Minute, wantElapsed: coordinatorHTTPTimeout, wantErr: context.DeadlineExceeded},
 			{name: "caller cancellation", createDelay: 2 * time.Minute, readyAfter: 4 * time.Minute, cancelAfter: 3 * time.Minute, wantElapsed: 3 * time.Minute, wantErr: context.Canceled},
 			{name: "earlier caller deadline", createDelay: 2 * time.Minute, readyAfter: 4 * time.Minute, callerTimeout: 3 * time.Minute, wantElapsed: 3 * time.Minute, wantErr: context.DeadlineExceeded},
 		} {
@@ -3458,76 +3494,95 @@ func assertCoordinatorProviderIdentityError(t *testing.T, err error, returnedPro
 }
 
 func TestCoordinatorReleaseFallsBackToAdminToken(t *testing.T) {
-	isolateTestUserDirs(t)
-	configureCoordinatorReleaseTestTiming(t, time.Second, 0)
-	adminReleased := false
-	adminObservations := 0
-	var payloads []map[string]any
-	var paths []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/v1/leases/cbx_admin" {
-			if r.Header.Get("Authorization") != "Bearer admin-token" {
-				t.Fatalf("observation auth=%q, want admin token", r.Header.Get("Authorization"))
-			}
-			adminObservations++
-			_ = json.NewEncoder(w).Encode(map[string]any{"lease": confirmedCoordinatorRelease("cbx_admin", "aws")})
-			return
-		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/admin/leases/cbx_admin/release" && r.URL.Path != "/v1/leases/cbx_admin/release" {
-			http.NotFound(w, r)
-			return
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		payloads = append(payloads, body)
-		paths = append(paths, r.URL.Path)
-		switch r.Header.Get("Authorization") {
-		case "Bearer user-token":
-			http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
-		case "Bearer admin-token":
-			if r.URL.Path != "/v1/admin/leases/cbx_admin/release" {
-				t.Fatalf("admin release path=%s", r.URL.Path)
-			}
-			adminReleased = true
-			deleting := true
-			_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{ID: "cbx_admin", Provider: "aws", State: "released", CleanupStartedAt: "2026-08-19T00:00:00Z", ReleaseDeletesServer: &deleting}})
-		default:
-			t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
-		}
-	}))
-	defer server.Close()
+	for _, expiry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expiry=%t", expiry), func(t *testing.T) {
+			isolateTestUserDirs(t)
+			configureCoordinatorReleaseTestTiming(t, time.Second, 0)
+			adminReleases := 0
+			adminObservations := 0
+			var payloads []map[string]any
+			var paths []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/v1/leases/cbx_admin" {
+					if r.Header.Get("Authorization") != "Bearer admin-token" {
+						t.Fatalf("observation auth=%q, want admin token", r.Header.Get("Authorization"))
+					}
+					adminObservations++
+					lease := confirmedCoordinatorRelease("cbx_admin", "aws")
+					if expiry {
+						lease.State, lease.CleanupStatus = "expired", ""
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"lease": lease})
+					return
+				}
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/admin/leases/cbx_admin/release" && r.URL.Path != "/v1/leases/cbx_admin/release" {
+					http.NotFound(w, r)
+					return
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				payloads = append(payloads, body)
+				paths = append(paths, r.URL.Path)
+				switch r.Header.Get("Authorization") {
+				case "Bearer user-token":
+					http.Error(w, `{"error":"not_found"}`, http.StatusNotFound)
+				case "Bearer admin-token":
+					if r.URL.Path != "/v1/admin/leases/cbx_admin/release" {
+						t.Fatalf("admin release path=%s", r.URL.Path)
+					}
+					adminReleases++
+					deleting := true
+					lease := CoordinatorLease{ID: "cbx_admin", Provider: "aws", State: "released", CleanupStartedAt: "2026-08-19T00:00:00Z", ReleaseDeletesServer: &deleting}
+					if expiry {
+						lease.State = "active"
+					}
+					if adminReleases > 1 {
+						lease = confirmedCoordinatorRelease("cbx_admin", "aws")
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"lease": lease})
+				default:
+					t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
+				}
+			}))
+			defer server.Close()
 
-	cfg := Config{
-		Provider:        "aws",
-		TargetOS:        targetLinux,
-		Coordinator:     server.URL,
-		CoordToken:      "user-token",
-		CoordAdminToken: "admin-token",
-	}
-	coord := mustNewCoordinatorClient(t, cfg)
-	backend := &coordinatorLeaseBackend{cfg: cfg, coord: coord, rt: Runtime{Stderr: &bytes.Buffer{}}}
+			cfg := Config{
+				Provider:        "aws",
+				TargetOS:        targetLinux,
+				Coordinator:     server.URL,
+				CoordToken:      "user-token",
+				CoordAdminToken: "admin-token",
+			}
+			coord := mustNewCoordinatorClient(t, cfg)
+			backend := &coordinatorLeaseBackend{cfg: cfg, coord: coord, rt: Runtime{Stderr: &bytes.Buffer{}}}
 
-	err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{
-		LeaseID: "cbx_admin", Server: Server{Provider: "aws"},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !adminReleased {
-		t.Fatal("admin release was not called")
-	}
-	if adminObservations != 1 {
-		t.Fatalf("admin observations=%d want 1", adminObservations)
-	}
-	if len(payloads) != 6 || paths[len(paths)-1] != "/v1/admin/leases/cbx_admin/release" {
-		t.Fatalf("release paths=%#v payloads=%#v", paths, payloads)
-	}
-	for i, payload := range payloads {
-		if payload["expectedProvider"] != "aws" {
-			t.Fatalf("release payload %d=%#v, want expectedProvider=aws", i, payload)
-		}
+			err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{
+				LeaseID: "cbx_admin", Server: Server{Provider: "aws"},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if adminReleases == 0 {
+				t.Fatal("admin release was not called")
+			}
+			if adminObservations != 1 {
+				t.Fatalf("admin observations=%d want 1", adminObservations)
+			}
+			wantRequests := 6
+			if expiry {
+				wantRequests++
+			}
+			if len(payloads) != wantRequests || paths[len(paths)-1] != "/v1/admin/leases/cbx_admin/release" {
+				t.Fatalf("release paths=%#v payloads=%#v", paths, payloads)
+			}
+			for i, payload := range payloads {
+				if payload["expectedProvider"] != "aws" {
+					t.Fatalf("release payload %d=%#v, want expectedProvider=aws", i, payload)
+				}
+			}
+		})
 	}
 }
 
@@ -3841,4 +3896,43 @@ func TestCoordinatorInspectJSONPreservesProviderCleanupReceipt(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCoordinatorCancelCreateDefaultBudgets(t *testing.T) {
+	if coordinatorCanceledCreateRecoveryTimeout != 30*time.Second || coordinatorCanceledCreateFinalTimeout != 30*time.Second {
+		t.Fatalf("cancel-create budgets recovery=%s final=%s", coordinatorCanceledCreateRecoveryTimeout, coordinatorCanceledCreateFinalTimeout)
+	}
+	if coordinatorCreateLeaseRecoveryInterval != 5*time.Second {
+		t.Fatalf("retry interval=%s", coordinatorCreateLeaseRecoveryInterval)
+	}
+}
+
+func TestCanceledCoordinatorCreateSlowRetryFitsRecoveryWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		attempts := 0
+		var firstBudget time.Duration
+		coord := &CoordinatorClient{BaseURL: "http://coordinator.test", Token: "fixture-token", Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			deadline, ok := req.Context().Deadline()
+			if !ok {
+				return nil, errors.New("missing deadline")
+			}
+			if attempts == 1 {
+				firstBudget = deadline.Sub(time.Now())
+				time.Sleep(12 * time.Second)
+				if err := req.Context().Err(); err != nil {
+					return nil, fmt.Errorf("recovery expired before slow response: %w", err)
+				}
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"temporarily_unavailable"}`)), Request: req}, nil
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"canceledCreate":{"version":1,"requestedLeaseID":"cbx_slow_retry","createAttemptID":"cat_11111111111111111111111111111111","state":"canceled"}}`)), Request: req}, nil
+		})}}
+		b := &coordinatorLeaseBackend{coord: coord, rt: Runtime{Stderr: io.Discard}}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		err := b.canceledCoordinatorLeaseCreateError(ctx, "cbx_slow_retry", "slow-retry", "cat_11111111111111111111111111111111", false, context.Canceled)
+		if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "cancel coordinator lease") || attempts != 2 || firstBudget != 30*time.Second {
+			t.Fatalf("attempts=%d budget=%s err=%v", attempts, firstBudget, err)
+		}
+	})
 }

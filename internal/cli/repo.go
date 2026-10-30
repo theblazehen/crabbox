@@ -471,6 +471,7 @@ func cleanRemoteRepoName(name string) string {
 func defaultExcludes() []string {
 	excludes := []string{
 		".git",
+		".jj",
 		"._*",
 		"node_modules",
 		".ignored",
@@ -882,7 +883,7 @@ func syncFingerprintForManifest(ctx context.Context, repo Repo, cfg Config, mani
 	}
 	h := sha256.New()
 	if cfg.Sync.GitOverlay {
-		fmt.Fprintf(h, "v1-overlay\nremote=%s\nbranch=%s\nhead=%s\ntree=%s\n", plan.RemoteURL, plan.Branch, plan.Target, plan.Tree)
+		fmt.Fprintf(h, "v2-overlay\nremote=%s\nbranch=%s\nhead=%s\ntree=%s\n", plan.RemoteURL, plan.Branch, plan.Target, plan.Tree)
 		fmt.Fprintf(h, "delete=%t\nchecksum=%t\ngitOverlay=true\n", cfg.Sync.Delete, cfg.Sync.Checksum)
 	} else {
 		fmt.Fprintf(h, "v6\nremote=%s\nbranch=%s\nhead=%s\ntree=%s\n", plan.RemoteURL, plan.Branch, plan.Target, plan.Tree)
@@ -893,23 +894,32 @@ func syncFingerprintForManifest(ctx context.Context, repo Repo, cfg Config, mani
 	for _, exclude := range excludes.rules {
 		fmt.Fprintf(h, "exclude=%d:%s\n", exclude.origin, exclude.pattern)
 	}
-	if err := syncFingerprintPaths(ctx, h, repo.Root, manifest.Changed, false); err != nil {
+	if err := syncFingerprintPathsWithDigests(ctx, h, repo.Root, manifest.Changed, false, cfg.Sync.GitOverlay); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func syncFingerprintPaths(ctx context.Context, h hash.Hash, root string, paths []string, requirePresent bool) error {
+	return syncFingerprintPathsWithDigests(ctx, h, root, paths, requirePresent, false)
+}
+
+func syncFingerprintPathsWithDigests(ctx context.Context, h hash.Hash, root string, paths []string, requirePresent, digests bool) error {
+	_, err := syncFingerprintPathsAndSize(ctx, h, root, paths, requirePresent, digests)
+	return err
+}
+
+func syncFingerprintPathsAndSize(ctx context.Context, h hash.Hash, root string, paths []string, requirePresent, digests bool) (size int64, result error) {
 	for _, rel := range paths {
 		if err := ctx.Err(); err != nil {
-			return err
+			return size, err
 		}
 		fmt.Fprintf(h, "path=%s\n", rel)
 		full := filepath.Join(root, filepath.FromSlash(rel))
 		info, err := os.Lstat(full)
 		if err != nil {
 			if requirePresent {
-				return err
+				return size, err
 			}
 			fmt.Fprintf(h, "missing\n")
 			continue
@@ -918,24 +928,33 @@ func syncFingerprintPaths(ctx context.Context, h hash.Hash, root string, paths [
 		if info.IsDir() {
 			continue
 		}
+		size += info.Size()
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(full)
 			if err != nil {
-				return err
+				return size, err
 			}
 			fmt.Fprintf(h, "symlink=%s\n", target)
 			h.Write([]byte{0})
 			continue
 		}
-		if _, err := copyObservedSourceFileBytes(ctx, h, full, info); err != nil {
-			return err
+		if digests {
+			if err := writeSyncFileDigest(ctx, h, full, info); err != nil {
+				return size, err
+			}
+		} else {
+			if _, err := copyObservedSourceFileBytes(ctx, h, full, info); err != nil {
+				return size, err
+			}
 		}
 		h.Write([]byte{0})
 	}
-	return ctx.Err()
+	return size, ctx.Err()
 }
 
 type SyncManifest struct {
+	seededExtraFiles         []string
+	hasSpecialFiles          bool
 	Files                    []string
 	Deleted                  []string
 	Changed                  []string
@@ -979,7 +998,7 @@ func gitSyncFileList(root string) ([]byte, error) {
 			return nil, err
 		}
 		if boundary.kind == repositoryBoundaryNativeJujutsu {
-			return nil, fmt.Errorf("%s is a native Jujutsu workspace without colocated Git metadata: Crabbox sync is Git-manifest-based, and native Jujutsu sync is not supported yet because it risks syncing the wrong revision; use a colocated Git workspace instead (for example, from an existing Git checkout, initialize Jujutsu with `jj git init --git-repo=.`; this does not convert the current native workspace in place), or pass --no-sync to run without syncing local files", boundary.root)
+			return nil, fmt.Errorf("%s is a native Jujutsu workspace: use `crabbox sync-plan` or `crabbox run` with jj installed to prepare the exact @ tree before Git manifest enumeration, or pass --no-sync", boundary.root)
 		}
 	}
 	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
@@ -1131,6 +1150,10 @@ func projectSyncManifest(root string, excludes SyncExcludeRules, includes, paths
 		seen[rel] = true
 		manifest.Files = append(manifest.Files, rel)
 		manifest.Bytes += info.Size()
+		if info.Mode().IsRegular() && (info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || info.Mode().Perm() != 0o644 && info.Mode().Perm() != 0o755) {
+			manifest.seededExtraFiles = append(manifest.seededExtraFiles, rel)
+		}
+		manifest.hasSpecialFiles = manifest.hasSpecialFiles || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0)
 		if protectedPattern != "" {
 			manifest.ProtectedTrackedExcludes = append(manifest.ProtectedTrackedExcludes, SyncProtectedTrackedExclude{
 				Path:    rel,

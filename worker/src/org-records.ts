@@ -1,4 +1,5 @@
 import { leaseProviderCleanupCompleted } from "./lease-cleanup";
+import { publicLifetimePolicy } from "./lease-lifetime";
 import {
   MISSING_ORG_KEY,
   isCurrentOrgKey,
@@ -9,7 +10,14 @@ import type { ExternalRunnerRecord, LeaseRecord, ReadyPoolEntry, RunRecord } fro
 
 export type PortalOrgKind = "missing" | "legacy" | "unsupported";
 type LeaseCleanupStatus = "pending" | "failed" | "complete" | "retained";
-export type PublicLeaseRecord = LeaseRecord & { cleanupStatus?: LeaseCleanupStatus };
+export type PublicLeaseRecord = LeaseRecord & {
+  cleanupStatus?: LeaseCleanupStatus;
+  provisioningPhase?:
+    | "preparing"
+    | "provider-request"
+    | "awaiting-instance"
+    | "interrupted-recovering";
+};
 export type PortalLeaseRecord = PublicLeaseRecord & { portalOrgKind?: PortalOrgKind };
 export type PortalExternalRunnerRecord = ExternalRunnerRecord & {
   portalOrgKind?: PortalOrgKind;
@@ -20,12 +28,24 @@ export function publicLeaseRecord(record: LeaseRecord): PublicLeaseRecord {
     ...record,
     org: orgLabelForDisplay(record.org),
   };
+  if (record.lifetimePolicy)
+    publicRecord.lifetimePolicy = publicLifetimePolicy(record.lifetimePolicy);
+  if (record.provisioningRecoveryObservedAt || record.provisioningRecoveryMissingSince) {
+    publicRecord.provisioningPhase = "interrupted-recovering";
+  } else if (record.state === "provisioning") {
+    publicRecord.provisioningPhase = record.cloudID
+      ? "awaiting-instance"
+      : record.provisioningRequestStartedAt
+        ? "provider-request"
+        : "preparing";
+  }
   if (record.state === "released") {
     publicRecord.cleanupStatus = releaseCleanupStatus(record);
     if (leaseProviderCleanupCompleted(record)) {
       publicRecord.host = "";
       delete publicRecord.tailscale;
       delete publicRecord.sshHostKey;
+      delete publicRecord.sshJump;
       delete publicRecord.providerAccessExpiresAt;
     }
   }
@@ -33,6 +53,7 @@ export function publicLeaseRecord(record: LeaseRecord): PublicLeaseRecord {
   delete publicRecord.provisioningRequestSettledAt;
   delete publicRecord.provisioningRecoveryObservedAt;
   delete publicRecord.provisioningRecoveryMissingSince;
+  delete publicRecord.sshHostAllocation;
   delete publicRecord.fixedCreateIntentVersion;
   delete publicRecord.fixedCreateIntentHash;
   delete publicRecord.createAttemptID;
@@ -82,6 +103,7 @@ function releaseCleanupStatus(record: LeaseRecord): LeaseCleanupStatus {
 export function publicRunRecord(record: RunRecord): RunRecord {
   const publicRecord = {
     ...record,
+    eventAppendIdempotent: true,
     org: orgLabelForDisplay(record.org),
   };
   delete publicRecord.terminalReceipt;

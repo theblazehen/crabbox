@@ -9,6 +9,9 @@ import (
 )
 
 type TimingReport struct {
+	SSHRoute           string                   `json:"sshRoute,omitempty"`
+	CreationRejected   *CreationRejection       `json:"creationRejected,omitempty"`
+	CreationEvents     []CreationEvent          `json:"creationEvents,omitempty"`
 	Provider           string                   `json:"provider"`
 	LeaseID            string                   `json:"leaseId,omitempty"`
 	Slug               string                   `json:"slug,omitempty"`
@@ -52,8 +55,17 @@ type TimingReport struct {
 	SchemaValidations []SchemaValidationResult `json:"schemaValidations,omitempty"`
 	ArtifactChanges   []ArtifactChangeResult   `json:"artifactChanges,omitempty"`
 
-	LeaseStopped *bool  `json:"leaseStopped,omitempty"`
-	LeaseStopErr string `json:"leaseStopError,omitempty"`
+	LeaseStopped        *bool  `json:"leaseStopped,omitempty"`
+	LeaseStopErr        string `json:"leaseStopError,omitempty"`
+	LeaseRetainedReason string `json:"leaseRetainedReason,omitempty"`
+}
+
+// CreationRejection describes a requested fixed identity rejected before lease
+// admission. It is not an allocated lease or a cleanup confirmation.
+type CreationRejection struct {
+	Version          int    `json:"version"`
+	RequestedLeaseID string `json:"requestedLeaseId"`
+	Code             string `json:"code"`
 }
 
 type TimingPhase struct {
@@ -78,6 +90,7 @@ type RunnerPhase struct {
 }
 
 type runnerProviderTiming struct {
+	Events  []CreationEvent
 	TotalMs int64
 	Phases  []RunnerPhase
 }
@@ -153,6 +166,7 @@ func DurationMinutesCeil(duration time.Duration) int {
 
 func timingReportFromRun(provider, leaseID, slug string, timings runTimings, total time.Duration, exitCode int) timingReport {
 	report := timingReport{
+		CreationEvents:     creationTimingEvents(timings.providerTiming),
 		Provider:           provider,
 		LeaseID:            leaseID,
 		Slug:               slug,
@@ -205,6 +219,7 @@ func syncTimingPhases(steps syncStepTimings) []timingPhase {
 	appendDuration("manifest_write", steps.manifestWrite)
 	appendDuration("prune", steps.prune)
 	appendDuration("rsync", steps.rsync)
+	appendDuration("tar", steps.tar)
 	appendDuration("manifest_apply", steps.manifestApply)
 	appendDuration("sanity", steps.sanity)
 	appendDuration("git_hydrate", steps.gitHydrate)

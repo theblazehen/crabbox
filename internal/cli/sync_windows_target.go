@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,7 +21,15 @@ func syncWindowsNative(ctx context.Context, target SSHTarget, repo Repo, cfg Con
 	}
 	if coherence.seedEnabled() {
 		if out, err := runSSHCombinedOutputLimit(ctx, target, windowsGitSeed(workdir, coherence), gitSeedDiagnosticLimit); err != nil {
-			warnRemoteGitSeedFailure(stderr, out, err)
+			if exitCode(err) == gitSeedRawWorkspaceExitCode {
+				coherence = gitCoherencePlan{}
+				fmt.Fprintln(stderr, "git origin fallback reason=raw_workspace; using plain manifest sync")
+			} else if exitCode(err) == gitSeedUnsafeWorkspaceExitCode {
+				reportRemoteGitSeedFailure(ctx, stderr, out, err, "aborting before file sync")
+				return Exit(6, "remote git seed failed: %v", err)
+			} else {
+				warnRemoteGitSeedFailure(ctx, stderr, out, err)
+			}
 		}
 	}
 	if opts.FullResync && coherence.seedEnabled() {
@@ -175,6 +184,24 @@ if (Test-UsableGitWorkspace $workdir) {
   Repair-Origin $workdir
   exit 0
 }
+function Stop-UnsafeSeedDestination {
+  Write-Output 'crabbox-git-seed: unsafe workspace; refusing seed publication'
+  exit ` + strconv.Itoa(gitSeedUnsafeWorkspaceExitCode) + `
+}
+function Assert-EmptySeedDestination {
+  try {
+    $item = Get-Item -LiteralPath $workdir -Force -ErrorAction Stop
+  } catch [System.Management.Automation.ItemNotFoundException] {
+    return
+  } catch { Stop-UnsafeSeedDestination }
+  if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-UnsafeSeedDestination }
+  try { $entries = @(Get-ChildItem -LiteralPath $workdir -Force -ErrorAction Stop) }
+  catch { Stop-UnsafeSeedDestination }
+  $names = @($entries | ForEach-Object { $_.Name })
+  if ($names -contains '.git' -or ($names -contains 'HEAD' -and ($names -contains 'objects' -or $names -contains 'refs'))) { Stop-UnsafeSeedDestination }
+  if ($entries.Count) { exit ` + strconv.Itoa(gitSeedRawWorkspaceExitCode) + ` }
+}
+Assert-EmptySeedDestination
 $tmp = Join-Path $parent (".seed-" + [System.Guid]::NewGuid().ToString("N"))
 try {
   Write-Output 'crabbox-git-seed phase=clone'
@@ -194,10 +221,13 @@ try {
   Write-Output 'crabbox-git-seed phase=origin'
   Repair-Origin $tmp
   Write-Output 'crabbox-git-seed phase=publish'
+  Assert-EmptySeedDestination
   if (Test-Path -LiteralPath $workdir) {
-    Remove-Item -LiteralPath $workdir -Recurse -Force
+    try { [IO.Directory]::Delete($workdir) }
+    catch { Stop-UnsafeSeedDestination }
   }
-  Move-Item -LiteralPath $tmp -Destination $workdir
+  try { [IO.Directory]::Move($tmp, $workdir) }
+  catch { Stop-UnsafeSeedDestination }
   $tmp = $null
 } finally {
   if ($tmp -and (Test-Path -LiteralPath $tmp)) {
@@ -380,14 +410,39 @@ func windowsRemoteCommandWithEnvFiles(workdir string, env map[string]string, env
 	if len(command) == 0 {
 		b.WriteString("exit 0\n")
 	} else {
-		b.WriteString("& " + psQuote(command[0]))
-		for _, arg := range command[1:] {
-			b.WriteByte(' ')
-			b.WriteString(psQuote(arg))
-		}
-		b.WriteString("\nexit $LASTEXITCODE\n")
+		writeWindowsCommandInvocation(&b, command)
 	}
 	return PowershellCommand(b.String())
+}
+
+func writeWindowsCommandInvocation(b *bytes.Buffer, command []string) {
+	// PowerShell 5.1's native binder drops empty args and embedded quotes. Give
+	// CreateProcess the quoted command line directly, inheriting the SSH streams.
+	b.WriteString(`$__crabboxCommand = $ExecutionContext.InvokeCommand.GetCommand(` + psQuote(command[0]) + `, [System.Management.Automation.CommandTypes]::All)
+if ($null -eq $__crabboxCommand) { throw 'Command not found' }
+while ($__crabboxCommand -is [System.Management.Automation.AliasInfo]) { $__crabboxCommand = $__crabboxCommand.ResolvedCommand }
+if ($__crabboxCommand.CommandType -eq 'Application' -and [IO.Path]::GetExtension($__crabboxCommand.Path) -in @('.exe', '.com') -and [IO.Path]::GetFileName($__crabboxCommand.Path) -notin @('cmd.exe', 'cscript.exe', 'find.exe', 'sqlcmd.exe', 'wscript.exe')) {
+    $__crabboxStart = New-Object System.Diagnostics.ProcessStartInfo
+    $__crabboxStart.FileName = $__crabboxCommand.Path
+`)
+	b.WriteString("$__crabboxStart.Arguments = " + psQuote(quoteWindowsCommandArgs(command[1:])) + "\n")
+	b.WriteString(`    $__crabboxStart.WorkingDirectory = (Get-Location).ProviderPath
+    $__crabboxStart.UseShellExecute = $false
+    $__crabboxProcess = [System.Diagnostics.Process]::Start($__crabboxStart)
+    try {
+        $__crabboxProcess.WaitForExit()
+        exit $__crabboxProcess.ExitCode
+    } finally { $__crabboxProcess.Dispose() }
+}
+`)
+	// Keep PowerShell binding for scripts, associations, and the nonstandard
+	// parsers excluded by PowerShell's own Windows argument-passing mode.
+	b.WriteString("& " + psQuote(command[0]))
+	for _, arg := range command[1:] {
+		b.WriteByte(' ')
+		b.WriteString(psQuote(arg))
+	}
+	b.WriteString("\nexit $LASTEXITCODE\n")
 }
 
 func windowsRemoteShellCommandWithEnvFile(workdir string, env map[string]string, envFile, script string) string {
@@ -406,7 +461,19 @@ func windowsRemoteShellCommandWithEnvFiles(workdir string, env map[string]string
 func writeWindowsRemotePrefix(b *bytes.Buffer, workdir string, env map[string]string, envFiles []string) {
 	b.WriteString(`$ErrorActionPreference = "Stop"` + "\n")
 	b.WriteString(`Set-Location -LiteralPath ` + psQuote(workdir) + "\n")
-	if len(envFiles) > 0 {
+	var profileFiles, commandFiles []string
+	for _, path := range envFiles {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if isSSHCommandEnvFile(path) {
+			commandFiles = append(commandFiles, path)
+		} else {
+			profileFiles = append(profileFiles, path)
+		}
+	}
+	if len(profileFiles) > 0 {
 		b.WriteString(`function Import-CrabboxEnvFile($Path) {
   if ($Path -match '^/([A-Za-z])/(.*)$') {
     $Path = ($matches[1].ToUpperInvariant() + ':\' + $matches[2].Replace('/', '\'))
@@ -430,14 +497,10 @@ function Add-CrabboxPath($Path) {
 }
 `)
 	}
-	for _, envFile := range envFiles {
-		envFile = strings.TrimSpace(envFile)
-		if envFile == "" {
-			continue
-		}
+	for _, envFile := range profileFiles {
 		b.WriteString(`Import-CrabboxEnvFile ` + psQuote(envFile) + "\n")
 	}
-	if len(envFiles) > 0 {
+	if len(profileFiles) > 0 {
 		b.WriteString(`Add-CrabboxPath $env:PNPM_HOME
 if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_TOOL_CACHE)) {
   $nodeRoot = Join-Path $env:RUNNER_TOOL_CACHE 'node'
@@ -447,6 +510,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_TOOL_CACHE)) {
   }
 }
 `)
+	}
+	for _, envFile := range commandFiles {
+		b.WriteString(`. (Join-Path (Get-Location) ` + psQuote(envFile) + ")\n")
 	}
 	for key, value := range env {
 		if !ValidShellEnvName(key) {

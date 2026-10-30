@@ -1,10 +1,15 @@
 # capacity
 
-`crabbox capacity [--json]` reports the authenticated owner's current admission
-count and effective owner limit. It requires a configured coordinator and uses
+`crabbox capacity [--json]` reports current fleet, org, and owner admission
+counts and limits for the authenticated caller. It requires a configured coordinator and uses
 the normal coordinator credentials, including the existing resolved shared or
 `unknown` owner identity. It never falls back to a direct provider or local lease
 list. Older coordinators without `GET /v1/capacity` return an unsupported error.
+
+These are coordinator admission limits, not AWS vCPU quotas or available cloud
+capacity. [Doctor](doctor.md) reports AWS quota ceilings separately; even
+`admissible: yes` and a sufficient quota ceiling do not establish unused
+regional quota or guarantee that a provider can launch the requested VM.
 
 ```sh
 crabbox capacity
@@ -12,35 +17,60 @@ crabbox capacity --json
 ```
 
 The only option is `--json` (plus `--help`). There are no positional arguments or
-owner, user, org, month, or scope selectors. Even admin requests report only the
-owner resolved by normal authentication. The API rejects every query parameter
+owner, user, org, month, or scope selectors. Even admin requests use the
+owner and org resolved by normal authentication. The API rejects every query parameter
 with HTTP 400.
 
 ```text
-self-owner admission count: owner=github:12345 activeLeases=10
-effective owner limit: 10
+fleet 51/50 (blocked)
+org example-org 17/50
+owner github:12345 17/50
 observed at: 2026-09-02T12:00:00.000Z
 Snapshot only; not a reservation or approval to allocate.
+admissible: no — fleet cap reached
 ```
 
-JSON contains exactly four fields:
+JSON preserves the original owner fields and adds fleet and org dimensions plus
+an active-lease admission decision:
 
 ```json
 {
   "owner": "github:12345",
-  "activeLeases": 10,
-  "effectiveLimit": 10,
-  "observedAt": "2026-09-02T12:00:00.000Z"
+  "activeLeases": 17,
+  "effectiveLimit": 50,
+  "observedAt": "2026-09-02T12:00:00.000Z",
+  "fleet": { "activeLeases": 51, "limit": 50 },
+  "org": { "key": "example-org", "activeLeases": 17, "limit": 50 },
+  "admissible": false,
+  "blockedBy": "fleet"
 }
 ```
 
-`effectiveLimit: 0` means the selected owner limit is off; text prints `off`.
+`fleet.limit` and `org.limit` are `null` when the caller's effective shared limit is
+unlimited. This applies when the configured limit is zero or an eligible capacity
+admin has the explicit shared-capacity override. The original `effectiveLimit: 0`
+retains its meaning of an unlimited owner limit for compatibility; text prints `unlimited` for every unlimited limit.
+`org.key` is the authenticated org's display label. Older coordinators that omit
+the new fields still render an owner line and snapshot metadata, with no admission
+decision; their JSON remains unchanged.
+
+The example shows a capacity admin with the deployed limit of 50; ordinary
+owners retain a limit of 10.
+
 The selected limit uses the existing capacity-owner policy, independently of
 admin authentication. A positive elevated limit for a configured member selects
 the larger of ordinary and elevated limits, including when the ordinary limit
 is zero. The response does not expose membership or the underlying limit config.
+An explicitly configured shared-capacity override requires capacity-admin membership
+and a positive admin owner limit. It bypasses fleet and org active caps for that owner
+only; the owner limit and monthly budgets still apply. Aggregate counts remain real.
 
 `activeLeases` counts existing admission entries only, with no candidate added.
+The fleet dimension counts all owners; the org dimension counts all owners in
+the caller's org. `admissible` answers whether one additional lease fits the
+active-lease caps. `blockedBy` is `"fleet"`, `"owner"`, `"org"`, or `null`, using
+the same fleet → owner → org ordering as allocation. A fixed-lease orchestrator
+can use this to diagnose a cap reached even while its own owner has headroom.
 At ten existing leases and a limit of ten, the diagnostic succeeds with `10`;
 an attempted new allocation would instead be checked as `11/10`. Successful
 diagnostics exit 0 even at or above the cap. Invalid syntax/configuration and
@@ -50,23 +80,36 @@ go to stdout. Malformed successful responses fail instead of displaying zeros.
 Unlike [monthly usage](usage.md), the count spans every creation month and org
 for the exact, case-sensitive owner identity. Active and provisioning managed
 leases count even after their canonical expiry, until a terminal state is
-committed. Released, expired, failed, and registered inventory records do not
-count. A live, unexpired admission reservation overrides its canonical lease
+committed. Released leases with unconfirmed running lifetime compute still count;
+other released, expired, failed, and registered inventory records do not.
+A live, unexpired admission reservation overrides its canonical lease
 by ID and counts once; reservation-only IDs count too. Stale reservations are
 ignored without cleanup, with canonical records used when present. Shared
-leases owned by someone else and direct-only leases absent from the coordinator
-do not count.
+leases owned by someone else do not count toward the owner dimension, but do
+count toward the fleet and, where applicable, org dimensions. Direct-only leases
+absent from the coordinator do not count.
 
-This read-only snapshot uses the same serialized boundary as admission on
-Cloudflare and Node. Normal service startup and background recovery retain their
+This read-only snapshot does not hold the lifecycle mutex. Node uses a storage
+transaction. Cloudflare permits concurrent events during its reads and rejects
+the snapshot if any storage write overlaps, without holding the input gate for
+the scan. It reads the maintained lease index instead of
+scanning retained history or calculating monthly spend. Before the current
+runtime finishes index backfill or audit, only a store with at most 128 lease
+records can use the bounded historical fallback. A larger unindexed store or
+a snapshot exceeding 4,096 lease-index and reservation entries, or a concurrent
+Cloudflare write returns
+retryable HTTP 503 `capacity_unavailable`, never a partial count. Each index or
+reservation page contains at most 128 entries.
+
+Normal service startup and background recovery retain their
 existing behavior; the capacity handler itself neither allocates nor reconciles
 resources, deletes stale records, schedules maintenance, nor calls providers.
-It reveals no lease IDs,
-records, org/provider breakdowns, costs, or other owners' counts. The aggregate
-is a narrow exception to owner/org visibility, not expanded access to lease
-records or monthly reports.
+Fleet or org cap exhaustion caused by other owners is reported as an aggregate
+count only. The response reveals no other owners' identities, lease IDs, records,
+per-owner breakdowns, or costs. These aggregates are a narrow exception to
+owner/org visibility, not expanded access to lease records or monthly reports.
 
-The snapshot is not a reservation or approval to allocate. Fleet, org, budget,
-and provider gates may still reject allocation, and the count can change after
+The snapshot is not a reservation or approval to allocate. Budget and provider
+gates may still reject allocation, and any count can change after
 `observedAt`. See [cost and usage](../features/cost-usage.md) and
 [auth and routing](../features/broker-auth-routing.md).

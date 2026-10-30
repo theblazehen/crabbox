@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openclaw/crabbox/internal/privatefile"
 	"golang.org/x/sys/windows"
 )
 
@@ -468,7 +469,7 @@ func writeWSLStageReady(t *testing.T, home, nonce string, data []byte) string {
 
 func createWindowsStageTestDirectory(t *testing.T, path string) {
 	t.Helper()
-	security, _, err := privateWindowsSecurityAttributes(true)
+	security, _, err := privatefile.WindowsAttributes(true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +568,7 @@ func TestWSLStageRootPreparationSecuresInheritedWindowsACL(t *testing.T) {
 				if err := os.MkdirAll(root, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				user, err := currentWindowsUserSID()
+				user, err := privatefile.WindowsUserSID()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -702,7 +703,7 @@ func TestWSLStageRootPreparationSecuresInheritedWindowsACL(t *testing.T) {
 			if err := os.MkdirAll(root, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			user, err := currentWindowsUserSID()
+			user, err := privatefile.WindowsUserSID()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -823,6 +824,110 @@ func TestWSLStageRootPreparationRejectsFilesAndReparsePoints(t *testing.T) {
 			output, err := runWSLStageRootScript(t, decodePowerShellCommand(t, wslStageRootPreparationCommand()))
 			if err == nil || !bytes.Contains(output, []byte("WSL2 private stage preparation failed")) || bytes.Contains(output, []byte(path)) {
 				t.Fatalf("unsafe root error leaked or succeeded: output=%q err=%v", output, err)
+			}
+		})
+	}
+}
+
+func TestWSLStageRootPreparationCapabilityGrants(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		ace   string
+		allow bool
+	}{
+		{name: "stock profile traverse capability", ace: "(A;;0x100020;;;S-1-15-3-1)", allow: true},
+		{name: "read capability", ace: "(A;;FR;;;S-1-15-3-1)", allow: true},
+		{name: "generic read capability", ace: "(A;OICIIO;GR;;;S-1-15-3-1)", allow: true},
+		{name: "add subdirectory capability", ace: "(A;;0x100024;;;S-1-15-3-1)"},
+		{name: "write capability", ace: "(A;;FW;;;S-1-15-3-1)"},
+		{name: "delete capability", ace: "(A;;0x110020;;;S-1-15-3-1)"},
+		{name: "change permissions capability", ace: "(A;;0x140020;;;S-1-15-3-1)"},
+		{name: "take ownership capability", ace: "(A;;0x180020;;;S-1-15-3-1)"},
+		{name: "generic all capability", ace: "(A;OICIIO;GA;;;S-1-15-3-1)"},
+		{name: "read-only package grant", ace: "(A;;0x100020;;;S-1-15-2-1)"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := newWindowsStageTestHome(t)
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			addWindowsStageTestACE(t, home, test.ace)
+			nonce := strings.Repeat("c", 32)
+			output, err := runWSLStageRootScript(t, decodePowerShellCommand(t, wslStageRootPreparationCommand(nonce)))
+			_, statErr := os.Lstat(filepath.Join(home, ".crabbox"))
+			if test.allow {
+				if err != nil || strings.TrimSpace(string(output)) != wslStagePreparationMarker+" "+nonce+" cmd" || statErr != nil {
+					t.Fatalf("preparation rejected %s: output=%q err=%v stat=%v", test.ace, output, err, statErr)
+				}
+				return
+			}
+			if err == nil || !bytes.Contains(output, []byte("WSL2 private stage preparation failed")) || !os.IsNotExist(statErr) {
+				t.Fatalf("preparation accepted %s: output=%q err=%v stat=%v", test.ace, output, err, statErr)
+			}
+		})
+	}
+}
+
+func TestWSLStageRootPreparationRejectsCapabilityGrantsOnStagePaths(t *testing.T) {
+	for _, stage := range []string{".crabbox", "wsl-stage"} {
+		t.Run(stage, func(t *testing.T) {
+			home := newWindowsStageTestHome(t)
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			parent := filepath.Join(home, ".crabbox")
+			root := filepath.Join(parent, "wsl-stage")
+			createWindowsStageTestDirectory(t, parent)
+			createWindowsStageTestDirectory(t, root)
+			target := parent
+			if stage == "wsl-stage" {
+				target = root
+			}
+			addWindowsStageTestACE(t, target, "(A;;0x100020;;;S-1-15-3-1)")
+			parentBefore, rootBefore := windowsStageSecuritySnapshot(t, parent), windowsStageSecuritySnapshot(t, root)
+			nonce := strings.Repeat("d", 32)
+			output, err := runWSLStageRootScript(t, decodePowerShellCommand(t, wslStageRootPreparationCommand(nonce)))
+			if err == nil || !bytes.Contains(output, []byte("WSL2 private stage preparation failed")) {
+				t.Fatalf("preparation accepted a capability grant on %s: output=%q err=%v", stage, output, err)
+			}
+			if windowsStageSecuritySnapshot(t, parent) != parentBefore || windowsStageSecuritySnapshot(t, root) != rootBefore {
+				t.Fatal("rejected preparation changed a stage ACL")
+			}
+			if _, err := os.Lstat(filepath.Join(root, "."+nonce+".proof")); !os.IsNotExist(err) {
+				t.Fatalf("rejected preparation wrote a route proof: %v", err)
+			}
+		})
+	}
+}
+
+func addWindowsStageTestACE(t *testing.T, path, ace string) {
+	t.Helper()
+	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := windows.SecurityDescriptorFromString(descriptor.String() + ace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := updated.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWSLStageShellDiscoveryWithoutWMI(t *testing.T) {
+	// Shadow the WMI cmdlets with the denial a non-administrator NETWORK logon receives.
+	script := `$ErrorActionPreference = "Stop"
+function Get-CimInstance { throw "Access denied" }
+function Get-WmiObject { throw "Access denied" }
+` + wslStageShellDiscoveryScript + `[Console]::Out.Write($shell)`
+	for _, shell := range []wslStageShell{wslStageCMD, wslStagePowerShell} {
+		t.Run(string(shell), func(t *testing.T) {
+			stdout, stderr, err := runWSLStageDefaultShell(t, shell, wslStagePowerShellCommand(script, wslStageCMD), "")
+			if err != nil || string(stdout) != string(shell) {
+				t.Fatalf("discovered shell=%q err=%v stderr=%s", stdout, err, stderr)
 			}
 		})
 	}

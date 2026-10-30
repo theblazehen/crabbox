@@ -1,5 +1,9 @@
 import {
+  psQuote,
   sharedLinuxSSHRestart,
+  sharedLinuxBootstrapStart,
+  sharedLinuxBootstrapActivate,
+  sharedLinuxBootstrapPrelude,
   sharedLinuxOptionalPackages,
   sharedLinuxNodeInstall,
   sharedGnomeDesktopTheme,
@@ -86,8 +90,25 @@ export function cloudInit(
   const sshHostKeys = optionalSSHHostKeys(config);
   const writeFiles = optionalWriteFiles(config);
   const bootstrap = [optionalBootstrap(config), additionalBootstrap].filter(Boolean).join("\n");
-  const readinessBootstrap = indentRuncmdScript(linuxMinimalReadinessBootstrap);
+  const finish =
+    "    retry /usr/local/lib/crabbox-ready-checks\n    touch /var/lib/crabbox/bootstrapped\n";
   const sshRestart = indentRuncmdScript(sharedLinuxSSHRestart());
+  let core = `    #!/bin/bash
+    exec > >(tee -a /var/log/cloud-init-output.log) 2>&1
+${indentRuncmdScript(sharedLinuxBootstrapPrelude())}${sshRestart}${indentRuncmdScript(linuxMinimalReadinessBootstrap)}
+    mkdir -p ${config.workRoot} /var/cache/crabbox/pnpm /var/cache/crabbox/npm
+    chown -R ${config.sshUser}:${config.sshUser} ${config.workRoot} /var/cache/crabbox
+    install -d /var/lib/crabbox
+${sshRestart}`;
+  let final = "    systemctl start crabbox-bootstrap.service\n";
+  let workspaceAfter = "crabbox-bootstrap.service cloud-config.service";
+  core += indentRuncmdScript(sharedLinuxBootstrapActivate());
+  if (bootstrap === "") {
+    core += finish;
+  } else {
+    final += indentRuncmdScript(sharedLinuxBootstrapPrelude()) + bootstrap + "\n" + finish;
+    workspaceAfter += " cloud-final.service";
+  }
   return `#cloud-config
 package_update: false
 package_upgrade: false
@@ -99,6 +120,9 @@ ${additionalCloudConfig}users:
     ssh_authorized_keys:
       - ${config.sshPublicKey}
 ${sshHostKeys}
+bootcmd:
+  - |
+${indentRuncmdScript(sharedLinuxBootstrapStart())}
 write_files:
   - path: /etc/ssh/sshd_config.d/99-crabbox-port.conf
     permissions: '0644'
@@ -110,7 +134,7 @@ ${portLines}
     content: |
       [Unit]
       Description=Crabbox workspace per-boot readiness
-      After=cloud-final.service
+      After=${workspaceAfter}
       ConditionPathExists=/var/lib/crabbox/bootstrapped
 
       [Service]
@@ -120,8 +144,15 @@ ${portLines}
       ExecStart=/usr/bin/touch /run/crabbox/workspace-ready
 
       [Install]
-      WantedBy=cloud-final.service
+      WantedBy=cloud-init.target
   - path: /usr/local/bin/crabbox-ready
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
+      test -f /var/lib/crabbox/bootstrapped
+      exec /usr/local/lib/crabbox-ready-checks
+  - path: /usr/local/lib/crabbox-ready-checks
     permissions: '0755'
     content: |
       #!/bin/sh
@@ -132,37 +163,21 @@ ${portLines}
       jq --version >/dev/null
       tmux -V >/dev/null
       flock --version >/dev/null
-      test -f /var/lib/crabbox/bootstrapped
       test -w ${config.workRoot}
 ${readyChecks}
 ${writeFiles}
+  - path: /usr/local/lib/crabbox-bootstrap.sh
+    permissions: '0700'
+    content: |
+${core
+  .trimEnd()
+  .split("\n")
+  .map((line) => `  ${line}`)
+  .join("\n")}
 runcmd:
   - |
     bash -euxo pipefail <<'BOOT'
-    export DEBIAN_FRONTEND=noninteractive
-${sshRestart}
-    retry() {
-      n=1
-      until "$@"; do
-        if [ "$n" -ge 8 ]; then
-          return 1
-        fi
-        sleep $((n * 5))
-        n=$((n + 1))
-      done
-    }
-${readinessBootstrap}
-    mkdir -p ${config.workRoot} /var/cache/crabbox/pnpm /var/cache/crabbox/npm
-    chown -R ${config.sshUser}:${config.sshUser} ${config.workRoot} /var/cache/crabbox
-    install -d /var/lib/crabbox
-    systemctl enable ssh || true
-${sshRestart}
-${bootstrap}
-    systemctl daemon-reload
-    systemctl enable crabbox-workspace-ready.service
-    systemctl start --no-block crabbox-workspace-ready.service
-    touch /var/lib/crabbox/bootstrapped
-    retry crabbox-ready
+${final}
     BOOT
 `;
 }
@@ -366,8 +381,18 @@ function windowsWSL2BootstrapPowerShell(config: LeaseConfig): string {
 	  wsl.exe --set-default $wslDistro | Out-Host
 	  if ($LASTEXITCODE -ne 0) { throw "wsl --set-default failed with exit $LASTEXITCODE" }
 	}
-	$linuxSetup = @'
-set -euo pipefail
+	$linuxSetup = ${psQuote(windowsWSL2LinuxSetup(workRoot))}
+	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
+	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
+	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
+	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
+	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
+	Restart-Service sshd -Force
+	`;
+}
+
+function windowsWSL2LinuxSetup(workRoot: string): string {
+  return `set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p ${shellQuote(workRoot)} /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/lib/crabbox
 cat >/etc/apt/apt.conf.d/80-crabbox-retries <<'APT'
@@ -405,15 +430,7 @@ test -w ${shellQuote(workRoot)}
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 touch /var/lib/crabbox/bootstrapped
-crabbox-ready
-'@
-	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
-	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
-	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
-	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
-	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
-	Restart-Service sshd -Force
-	`;
+crabbox-ready`;
 }
 
 export function azureWindowsBootstrapPowerShell(config: LeaseConfig): string {
@@ -914,10 +931,6 @@ function tailscaleBootstrap(config: LeaseConfig): string {
     fi
     chown ${shellQuote(`${sshUser}:${sshUser}`)} /var/lib/crabbox/tailscale-* || true
     chmod 0640 /var/lib/crabbox/tailscale-* || true`;
-}
-
-function psQuote(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function shellQuote(value: string): string {

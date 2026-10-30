@@ -34,6 +34,7 @@ func TestRunFunctionalPreflightContinuation(t *testing.T) {
 		code, workloadCode                                                                                  int
 		cancelCause                                                                                         error
 		timeout, canceled, lostAck, lostRetire, cleanedError, lateCancel, ownerStoredFailure, ownerDeadline bool
+		envCleanup                                                                                          bool
 	}{
 		{name: "ready", state: "ready"},
 		{name: "workload failure", state: "ready", workloadCode: 7},
@@ -47,6 +48,7 @@ func TestRunFunctionalPreflightContinuation(t *testing.T) {
 		{name: "canceled", state: "canceled", canceled: true},
 		{name: "stored owner failure", state: "unavailable", ownerStoredFailure: true},
 		{name: "stored owner timeout", state: "unavailable", ownerStoredFailure: true, ownerDeadline: true},
+		{name: "cleanup error after primary timeout", state: "unavailable", ownerStoredFailure: true, ownerDeadline: true, envCleanup: true},
 		{name: "caller deadline", state: "canceled", canceled: true, cancelCause: context.DeadlineExceeded},
 		{name: "named caller cancellation", state: "canceled", canceled: true, cancelCause: fmt.Errorf("interrupt signal received: %w", context.Canceled)},
 		{name: "operational cancellation cause", state: "unavailable", canceled: true, cancelCause: &workspaceOwnerSetupError{phase: "renew", cause: errors.New("workspace ownership lost")}},
@@ -58,6 +60,10 @@ func TestRunFunctionalPreflightContinuation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			isolateRunTestUserDirs(t, dir)
+			if tc.envCleanup {
+				// Exercise staging even outside CI, where no default env is present.
+				t.Setenv("CI", "true")
+			}
 			t.Chdir(dir)
 			workloadHandler := ""
 			if tc.workloadCode != 0 {
@@ -201,7 +207,7 @@ func TestRunFunctionalPreflightContinuation(t *testing.T) {
 			}
 			var stdout, stderr bytes.Buffer
 			timingPath := filepath.Join(dir, "timing.jsonl")
-			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommandWithBenchmarkRecord(ctx, []string{"--record-local", "--timing-record", timingPath, "--provider", "ssh", "--static-host", "127.0.0.1", "--static-user", "runner", "--static-work-root", filepath.Join(dir, "remote"), "--no-sync", "--preflight", "--preflight-tools", "python3-venv,python3-venv", "--", "printf", "cbx-after-functional"}, benchmarkRecordContext{OnRecord: func() {
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommandWithBenchmarkRecord(ctx, []string{"--record-local", "--timing-record", timingPath, "--provider", "ssh", "--static-host", "127.0.0.1", "--static-port", openLoopbackSSHPort(t), "--static-user", "runner", "--static-work-root", filepath.Join(dir, "remote"), "--no-sync", "--preflight", "--preflight-tools", "python3-venv,python3-venv", "--", "printf", "cbx-after-functional"}, benchmarkRecordContext{OnRecord: func() {
 				if tc.lateCancel {
 					cancel(nil)
 				}
@@ -223,6 +229,9 @@ func TestRunFunctionalPreflightContinuation(t *testing.T) {
 				}
 			}
 			if tc.ownerStoredFailure {
+				if tc.envCleanup && !strings.Contains(err.Error(), "could not confirm removal of forwarded environment file") {
+					t.Fatalf("missing additional cleanup diagnostic: %v", err)
+				}
 				if !errors.Is(err, ownerFailure) || ExitCodeForError(err, 1) != 7 {
 					t.Fatalf("stored owner failure or its exit policy lost: %v", err)
 				}
@@ -606,6 +615,82 @@ func workspaceOwnerBSDPath(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+func TestWorkspaceOwnerPOSIXUntimedFlock(t *testing.T) {
+	path := workspaceOwnerBSDPath(t)
+	// BusyBox flock supports nonblocking locks, but rejects util-linux's -w.
+	writeExecutable(t, filepath.Join(path, "flock"), `#!/bin/sh
+if [ "$1" = -h ]; then
+  printf 'Usage: flock [-sxun] FD | { FILE [-c] PROG ARGS }\n'
+  exit 1
+fi
+if [ "$*" = '-x -n 9' ]; then exit 0; fi
+printf "flock: unrecognized option: w\n" >&2
+exit 1
+`)
+	home := t.TempDir()
+	req := workspaceOwnerRemoteRequest{Action: workspaceOwnerAcquire, Key: workspaceOwnerKey("untimed-flock"), Token: strings.Repeat("a", 64), TTL: time.Minute}
+	run := func(want string) {
+		t.Helper()
+		cmd := exec.Command("/bin/sh", "-c", remoteWorkspaceOwnerPOSIX(req))
+		cmd.Env = []string{"HOME=" + home, "PATH=" + path}
+		out, err := cmd.CombinedOutput()
+		if err != nil || string(out) != want {
+			t.Fatalf("%s: output=%q err=%v; want %s", req.Action, out, err, want)
+		}
+	}
+	run("ACQUIRED")
+	run("BUSY")
+	req.Action = workspaceOwnerRenew
+	run("RENEWED")
+	req.Action = workspaceOwnerRelease
+	run("RELEASED")
+	req.Action = workspaceOwnerAcquire
+	run("ACQUIRED")
+}
+
+func TestWorkspaceOwnerPOSIXFlockGate(t *testing.T) {
+	for _, tc := range []struct {
+		name, help, lockBody, body, timeout string
+		wantCalls                           int
+		wantCode                            int
+		wantBody                            string
+	}{
+		{name: "util-linux", help: " -w, --timeout <secs>", lockBody: `printf '%s\n' "$@" >"$HOME/args"; exec /bin/sh -c "$7"`, body: "printf ran; exit 42", timeout: "5", wantCalls: 1, wantCode: 42, wantBody: "ran"},
+		{name: "busybox body failure is not retried", lockBody: "exit 0", body: "printf ran; exit 1", timeout: "5", wantCalls: 1, wantCode: 1, wantBody: "ran"},
+		{name: "busybox immediate contention", lockBody: "exit 1", body: "printf unexpected", timeout: "0", wantCalls: 1, wantCode: 1},
+		{name: "busybox bounded contention", lockBody: "exit 1", body: "printf unexpected", timeout: "1", wantCalls: 2, wantCode: 1},
+		{name: "busybox retry then acquire", lockBody: `if [ -f "$HOME/first" ]; then exit 0; fi; : >"$HOME/first"; exit 1`, body: "printf ran", timeout: "1", wantCalls: 2, wantBody: "ran"},
+		{name: "busybox lock error", lockBody: "exit 74", body: "printf unexpected", timeout: "5", wantCalls: 1, wantCode: 74},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := workspaceOwnerBSDPath(t)
+			home := t.TempDir()
+			help := tc.help
+			if help == "" {
+				help = "Usage: flock [-sxun] FD | { FILE [-c] PROG ARGS }"
+			}
+			writeExecutable(t, filepath.Join(path, "flock"), "#!/bin/sh\nif [ \"$1\" = -h ]; then printf '%s\\n' "+shellQuote(help)+"; exit 0; fi\nprintf x >>\"$HOME/calls\"\n"+tc.lockBody+"\n")
+			cmd := exec.Command("/bin/sh", "-c", `gate="$HOME/gate"`+"\n"+workspaceOwnerPOSIXGate(tc.timeout)+"\nrun_owner_gate "+shellQuote(tc.body))
+			cmd.Env = []string{"HOME=" + home, "PATH=" + path}
+			out, err := cmd.CombinedOutput()
+			if exitCode(err) != tc.wantCode || string(out) != tc.wantBody {
+				t.Fatalf("output=%q exit=%d; want output=%q exit=%d", out, exitCode(err), tc.wantBody, tc.wantCode)
+			}
+			calls, err := os.ReadFile(filepath.Join(home, "calls"))
+			if err != nil || string(calls) != strings.Repeat("x", tc.wantCalls) {
+				t.Fatalf("calls=%q err=%v; want %d", calls, err, tc.wantCalls)
+			}
+			if tc.name == "util-linux" {
+				args, err := os.ReadFile(filepath.Join(home, "args"))
+				want := "-x\n-w\n5\n" + home + "/gate\n/bin/sh\n-c\n" + tc.body + "\n"
+				if err != nil || string(args) != want {
+					t.Fatalf("timed flock invocation=%q err=%v; want %q", args, err, want)
+				}
+			}
+		})
+	}
 }
 
 func TestWorkspaceOwnerBSDProtocol(t *testing.T) {

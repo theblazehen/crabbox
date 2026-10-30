@@ -19,7 +19,7 @@ func TestShouldCleanupServerSkipsRunningAndProvisioningStates(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	for _, state := range []string{"running", "provisioning"} {
 		server := Server{Labels: map[string]string{
-			"keep":       "false",
+			"crabbox": "true", "keep": "false",
 			"state":      state,
 			"expires_at": now.Add(-time.Hour).Format(time.RFC3339),
 		}}
@@ -33,7 +33,7 @@ func TestShouldCleanupServerDeletesExpiredIdleStates(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	for _, state := range []string{"leased", "ready", "active"} {
 		server := Server{Labels: map[string]string{
-			"keep":       "false",
+			"crabbox": "true", "keep": "false",
 			"state":      state,
 			"expires_at": now.Add(-time.Minute).Format(time.RFC3339),
 		}}
@@ -46,7 +46,7 @@ func TestShouldCleanupServerDeletesExpiredIdleStates(t *testing.T) {
 func TestShouldCleanupServerDeletesStaleRunningStates(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	server := Server{Labels: map[string]string{
-		"keep":       "false",
+		"crabbox": "true", "keep": "false",
 		"state":      "running",
 		"expires_at": now.Add(-13 * time.Hour).Format(time.RFC3339),
 	}}
@@ -58,7 +58,7 @@ func TestShouldCleanupServerDeletesStaleRunningStates(t *testing.T) {
 func TestShouldCleanupServerDeletesExpiredInactive(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	server := Server{Labels: map[string]string{
-		"keep":       "false",
+		"crabbox": "true", "keep": "false",
 		"expires_at": now.Add(-time.Minute).Format(time.RFC3339),
 	}}
 	if ok, reason := shouldCleanupServer(server, now); !ok {
@@ -66,17 +66,37 @@ func TestShouldCleanupServerDeletesExpiredInactive(t *testing.T) {
 	}
 }
 
-func TestShouldCleanupServerKeepsUnexpiredAndKept(t *testing.T) {
+func TestShouldCleanupServerKeepsUnexpiredAndMissingExpiry(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	tests := []Server{
-		{Labels: map[string]string{"keep": "true", "expires_at": now.Add(-time.Hour).Format(time.RFC3339)}},
-		{Labels: map[string]string{"keep": "false", "expires_at": now.Add(time.Hour).Format(time.RFC3339)}},
-		{Labels: map[string]string{"keep": "false"}},
+		{Labels: map[string]string{"crabbox": "true", "keep": "true", "expires_at": now.Add(time.Hour).Format(time.RFC3339)}},
+
+		{Labels: map[string]string{"crabbox": "true", "keep": "false", "expires_at": now.Add(time.Hour).Format(time.RFC3339)}},
+		{Labels: map[string]string{"crabbox": "true", "keep": "false"}},
 	}
 	for _, server := range tests {
 		if ok, reason := shouldCleanupServer(server, now); ok {
 			t.Fatalf("shouldCleanupServer=%v, %s; want skip", ok, reason)
 		}
+	}
+}
+
+func TestShouldCleanupServerReapsKeptExpiredLeases(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	for _, state := range []string{"ready", "leased", "active", "failed", "released", "expired", "running", "provisioning"} {
+		t.Run(state, func(t *testing.T) {
+			server := Server{Labels: map[string]string{
+				"crabbox": "true", "keep": "true", "state": state,
+				"expires_at": now.Add(-24 * time.Hour).Format(time.RFC3339),
+			}}
+			if got, reason := shouldCleanupServer(server, now); !got {
+				t.Fatalf("cleanup=%t (%s), want expired lease cleanup", got, reason)
+			}
+			server.Labels["expires_at"] = now.Add(time.Minute).Format(time.RFC3339)
+			if got, reason := shouldCleanupServer(server, now); got && state != "failed" && state != "released" && state != "expired" {
+				t.Fatalf("cleanup before expiry: %s", reason)
+			}
+		})
 	}
 }
 
@@ -173,7 +193,7 @@ func (b *testListRequestBackend) List(_ context.Context, req ListRequest) ([]Lea
 	return []LeaseView{{CloudID: "cbx_list_all", Name: "list-all", Status: "ready"}}, nil
 }
 
-func TestListForwardsAllAndRefreshToBackend(t *testing.T) {
+func TestListMachinesForwardsAllRefreshAndRetainedToDirectBackend(t *testing.T) {
 	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 	t.Setenv("CRABBOX_COORDINATOR", "")
 	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
@@ -182,13 +202,13 @@ func TestListForwardsAllAndRefreshToBackend(t *testing.T) {
 	defer func() { testAWSBackendOverride = nil }()
 
 	var stdout, stderr bytes.Buffer
-	if err := (App{Stdout: &stdout, Stderr: &stderr}).list(context.Background(), []string{"--provider", "aws", "--all", "--refresh", "--json"}); err != nil {
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).list(context.Background(), []string{"--provider", "aws", "--all", "--refresh", "--retained", "--json"}); err != nil {
 		t.Fatalf("list error=%v stderr=%q", err, stderr.String())
 	}
 	if len(backend.requests) != 1 {
 		t.Fatalf("list requests=%#v, want one request", backend.requests)
 	}
-	if got := backend.requests[0]; !got.All || !got.Refresh {
+	if got := backend.requests[0]; !got.All || !got.Refresh || !got.Retained {
 		t.Fatalf("list request=%#v, want all and refresh", got)
 	}
 	if stdout.Len() == 0 {
@@ -268,7 +288,7 @@ external:
 	if err != nil {
 		t.Fatalf("list error=%v stderr=%q", err, stderr.String())
 	}
-	if strings.TrimSpace(stdout.String()) != "null" {
+	if strings.TrimSpace(stdout.String()) != "[]" {
 		t.Fatalf("list output=%q", stdout.String())
 	}
 }
@@ -320,8 +340,9 @@ func TestLifecycleProviderOverrideRecomputesSingleTargetDefaults(t *testing.T) {
 
 func TestSyncExternalRunnersBestEffortPostsBlacksmithJSONList(t *testing.T) {
 	var posted struct {
-		Provider string                      `json:"provider"`
-		Runners  []CoordinatorExternalRunner `json:"runners"`
+		Provider       string                      `json:"provider"`
+		InventoryScope string                      `json:"inventoryScope"`
+		Runners        []CoordinatorExternalRunner `json:"runners"`
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/runners/sync" {
@@ -349,11 +370,19 @@ func TestSyncExternalRunnersBestEffortPostsBlacksmithJSONList(t *testing.T) {
 	if len(backend.requests) != 1 || !backend.requests[0].All {
 		t.Fatalf("list requests=%#v, want one all request", backend.requests)
 	}
-	if posted.Provider != "blacksmith-testbox" || len(posted.Runners) != 1 {
+	// Without an explicit Blacksmith org the listing may be another org's inventory.
+	if posted.Provider != "blacksmith-testbox" || posted.InventoryScope != "" || len(posted.Runners) != 1 {
 		t.Fatalf("posted=%#v", posted)
 	}
 	if got := posted.Runners[0]; got.ID != "tbx_01sync" || got.Provider != "blacksmith-testbox" {
 		t.Fatalf("runner=%#v", got)
+	}
+
+	cfg := Config{Provider: "blacksmith-testbox", Coordinator: server.URL}
+	cfg.Blacksmith.Org = "example-org"
+	app.syncExternalRunnersBestEffort(context.Background(), cfg, backend)
+	if posted.InventoryScope != "org" {
+		t.Fatalf("explicit org sync posted=%#v, want inventoryScope org", posted)
 	}
 }
 

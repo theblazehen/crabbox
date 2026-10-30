@@ -18,13 +18,16 @@ import (
 )
 
 type leaseClaim struct {
-	ImageEvidence     *ImageEvidence            `json:"imageEvidence,omitempty"`
-	LeaseID           string                    `json:"leaseID"`
-	Revision          string                    `json:"revision,omitempty"`
-	CheckpointCapture *CheckpointCaptureBinding `json:"checkpointCapture,omitempty"`
-	Slug              string                    `json:"slug,omitempty"`
-	Provider          string                    `json:"provider,omitempty"`
-	CloudID           string                    `json:"cloudID,omitempty"`
+	PendingGuestExtension *PendingGuestExtension    `json:"pendingGuestExtension,omitempty"`
+	RecoveryHold          *LeaseRecoveryHold        `json:"recoveryHold,omitempty"`
+	ImageEvidence         *ImageEvidence            `json:"imageEvidence,omitempty"`
+	LeaseID               string                    `json:"leaseID"`
+	Revision              string                    `json:"revision,omitempty"`
+	CheckpointCapture     *CheckpointCaptureBinding `json:"checkpointCapture,omitempty"`
+	ActionsWorkspace      *ActionsWorkspaceBinding  `json:"actionsWorkspace,omitempty"`
+	Slug                  string                    `json:"slug,omitempty"`
+	Provider              string                    `json:"provider,omitempty"`
+	CloudID               string                    `json:"cloudID,omitempty"`
 	// CloudNumericID binds providers whose CloudID is a reusable resource name.
 	CloudNumericID int64 `json:"cloudNumericID,omitempty"`
 	// CloudImmutableID binds providers whose immutable identity is a string.
@@ -65,21 +68,27 @@ type CheckpointCaptureBinding struct {
 	BoundRevision string `json:"boundRevision"`
 }
 
+type ActionsWorkspaceBinding struct {
+	Origin            string `json:"origin"`
+	MarkerFingerprint string `json:"markerFingerprint"`
+}
+
 // FixedCreateIntent is the durable, provider-neutral envelope for a
 // caller-supplied lease identity. Provider adapters own the opaque attempt
 // fields and their interpretation; the claim layer only persists and locks it.
 type FixedCreateIntent struct {
-	Version        int               `json:"version"`
-	Fingerprint    string            `json:"fingerprint"`
-	ProviderScope  string            `json:"providerScope"`
-	CheckpointID   string            `json:"checkpointId,omitempty"`
-	Slug           string            `json:"slug"`
-	CreatedAt      string            `json:"createdAt"`
-	State          string            `json:"state"`
-	Attempt        map[string]string `json:"attempt,omitempty"`
-	FailedAttempts []string          `json:"failedAttempts,omitempty"`
-	// Journal is additive: the original fields remain the downgrade-safe
-	// ownership record. A legacy record without a journal grants no new authority.
+	Retention      *SessionDiskRetentionPolicy `json:"retention,omitempty"`
+	Version        int                         `json:"version"`
+	Fingerprint    string                      `json:"fingerprint"`
+	ProviderScope  string                      `json:"providerScope"`
+	CheckpointID   string                      `json:"checkpointId,omitempty"`
+	Slug           string                      `json:"slug"`
+	CreatedAt      string                      `json:"createdAt"`
+	State          string                      `json:"state"`
+	Attempt        map[string]string           `json:"attempt,omitempty"`
+	FailedAttempts []string                    `json:"failedAttempts,omitempty"`
+	// Version 1 journals preserve legacy ownership. Retained policy requires
+	// version 2 so older readers refuse the claim before provider effects.
 	Journal *FixedLeaseJournal `json:"journal,omitempty"`
 }
 
@@ -116,6 +125,13 @@ func (e *leaseClaimFileError) Error() string { return e.err.Error() }
 func (e *leaseClaimFileError) Unwrap() error { return e.err }
 
 func snapshotLeaseClaims() (leaseClaimsSnapshot, error) {
+	return snapshotLeaseClaimsContext(context.Background())
+}
+
+func snapshotLeaseClaimsContext(ctx context.Context) (leaseClaimsSnapshot, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return leaseClaimsSnapshot{}, err
+	}
 	dir, err := CrabboxStateDir()
 	if err != nil {
 		return leaseClaimsSnapshot{}, err
@@ -129,6 +145,9 @@ func snapshotLeaseClaims() (leaseClaimsSnapshot, error) {
 	}
 	snapshot := leaseClaimsSnapshot{invalid: make(map[string]error)}
 	for _, entry := range entries {
+		if err := claimScanErr(ctx); err != nil {
+			return leaseClaimsSnapshot{}, err
+		}
 		if filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
@@ -154,75 +173,78 @@ func snapshotLeaseClaims() (leaseClaimsSnapshot, error) {
 
 type leaseClaimSnapshotReader func(path, leaseID string, expected os.FileInfo) (leaseClaim, bool, error)
 
-// snapshotLeaseClaimsReadOnly is the public inventory reader. It intentionally
-// bounds file size and rejects files changed during the scan. Runtime paths use
-// snapshotLeaseClaims, which accepts complete atomic publications without that limit.
-func snapshotLeaseClaimsReadOnly() (leaseClaimsSnapshot, error) {
-	snapshot, err := snapshotLeaseClaimsReadOnlyWithReader(readLeaseClaimSnapshotWithPresence)
-	if err != nil {
-		return leaseClaimsSnapshot{}, Exit(1, "%v", err)
-	}
-	return snapshot, nil
+func snapshotLeaseClaimsReadOnlyWithReader(read leaseClaimSnapshotReader) (leaseClaimsSnapshot, error) {
+	return snapshotLeaseClaimsReadOnlyContext(context.Background(), read)
 }
 
-func snapshotLeaseClaimsReadOnlyWithReader(read leaseClaimSnapshotReader) (leaseClaimsSnapshot, error) {
+func snapshotLeaseClaimsReadOnlyContext(ctx context.Context, read leaseClaimSnapshotReader) (leaseClaimsSnapshot, error) {
+	snapshot := leaseClaimsSnapshot{invalid: make(map[string]error)}
+	_, err := walkLeaseClaimsReadOnly(ctx, "", read, func(id string, claim leaseClaim, problem error) error {
+		if problem != nil {
+			snapshot.invalid[id] = problem
+		} else {
+			snapshot.claims = append(snapshot.claims, claim)
+		}
+		return nil
+	})
+	return snapshot, err
+}
+
+// after is an exclusive filename cursor for bounded maintenance. A cursor is
+// advanced only after visiting a file, so interrupted work can safely resume.
+func walkLeaseClaimsReadOnly(ctx context.Context, after string, read leaseClaimSnapshotReader, visit func(string, leaseClaim, error) error) (cursor string, err error) {
+	cursor = after
+	if err := claimScanErr(ctx); err != nil {
+		return cursor, err
+	}
 	dir, err := CrabboxStateDir()
 	if err != nil {
-		return leaseClaimsSnapshot{}, err
+		return cursor, err
 	}
 	claimsDir := filepath.Join(dir, "claims")
 	entries, err := os.ReadDir(claimsDir)
 	if errors.Is(err, os.ErrNotExist) {
-		return leaseClaimsSnapshot{}, nil
+		return cursor, nil
 	}
 	if err != nil {
-		return leaseClaimsSnapshot{}, Exit(2, "read claims directory: %v", err)
+		return cursor, Exit(2, "read claims directory: %v", err)
 	}
-
-	snapshot := leaseClaimsSnapshot{invalid: make(map[string]error)}
 	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) != ".json" {
+		if err := claimScanErr(ctx); err != nil {
+			return cursor, err
+		}
+		if entry.Name() <= after || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		leaseID := strings.TrimSuffix(entry.Name(), ".json")
-		if !validLeaseClaimPathID(leaseID) {
-			snapshot.invalid[leaseID] = &leaseClaimFileError{
-				code: "invalid_filename",
-				err:  Exit(2, "claim filename is not a valid lease id"),
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		var claim leaseClaim
+		var problem error
+		if !validLeaseClaimPathID(id) {
+			problem = &leaseClaimFileError{code: "invalid_filename", err: Exit(2, "claim filename is not a valid lease id")}
+		} else if info, statErr := entry.Info(); statErr != nil {
+			problem = leaseClaimSnapshotReadError(id, "inspect", statErr)
+		} else if !info.Mode().IsRegular() {
+			problem = &leaseClaimFileError{code: "non_regular_file", err: Exit(2, "claim file %s is not a regular file", id)}
+		} else {
+			var exists bool
+			claim, exists, problem = read(filepath.Join(claimsDir, entry.Name()), id, info)
+			if problem == nil && !exists {
+				cursor = entry.Name()
+				continue
 			}
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			snapshot.invalid[leaseID] = leaseClaimSnapshotReadError(leaseID, "inspect", err)
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			snapshot.invalid[leaseID] = &leaseClaimFileError{
-				code: "non_regular_file",
-				err:  Exit(2, "claim file %s is not a regular file", leaseID),
+			if problem == nil && claim.LeaseID == "" {
+				problem = &leaseClaimFileError{code: "empty_lease_id", err: Exit(2, "claim file %s has an empty lease id", id)}
 			}
-			continue
 		}
-
-		claim, exists, err := read(filepath.Join(claimsDir, entry.Name()), leaseID, info)
-		if err != nil {
-			snapshot.invalid[leaseID] = err
-			continue
+		if err := claimScanErr(ctx); err != nil {
+			return cursor, err
 		}
-		if !exists {
-			continue
+		if err := visit(id, claim, problem); err != nil {
+			return cursor, err
 		}
-		if claim.LeaseID == "" {
-			snapshot.invalid[leaseID] = &leaseClaimFileError{
-				code: "empty_lease_id",
-				err:  Exit(2, "claim file %s has an empty lease id", leaseID),
-			}
-			continue
-		}
-		snapshot.claims = append(snapshot.claims, claim)
+		cursor = entry.Name()
 	}
-	return snapshot, nil
+	return cursor, claimScanErr(ctx)
 }
 
 func claimLeaseForRepo(leaseID, slug, repoRoot string, idleTimeout time.Duration, reclaim bool) error {
@@ -512,6 +534,9 @@ func transformLeaseClaimForRepo(existing *leaseClaim, leaseID, slug, provider, p
 	if normalizeIdle {
 		existing.Labels = claimLabelsWithIdleTimeout(existing.Labels, idleTimeout)
 	}
+	if reclaim || !sameActionsWorkspaceClaimOwner(original, *existing) {
+		existing.ActionsWorkspace = nil
+	}
 	return nil
 }
 
@@ -800,6 +825,9 @@ func updateLeaseClaimEndpointIfUnchangedActionMode(
 				if touch.idleTimeoutOverride != nil {
 					claim.IdleTimeoutSeconds = int(touch.idleTimeoutOverride.Round(time.Second) / time.Second)
 				}
+				if effective, ok := directLeaseIdleTimeout(server.Labels); ok {
+					claim.IdleTimeoutSeconds = int(effective.Round(time.Second) / time.Second)
+				}
 			}
 			return nil
 		},
@@ -897,6 +925,9 @@ func UpdateLeaseClaimTouchIfUnchanged(ctx context.Context, leaseID string, expec
 					return Exit(2, "lease %s idle timeout override must be at least one second", leaseID)
 				}
 			}
+			if effective, ok := directLeaseIdleTimeout(labels); ok {
+				claim.IdleTimeoutSeconds = int(effective.Round(time.Second) / time.Second)
+			}
 			return nil
 		},
 	})
@@ -918,16 +949,34 @@ func UpdateLeaseClaimLabelsIfUnchangedAfter(leaseID string, expected leaseClaim,
 }
 
 func cloneLeaseClaim(claim leaseClaim) leaseClaim {
+	if claim.PendingGuestExtension != nil {
+		pending := *claim.PendingGuestExtension
+		claim.PendingGuestExtension = &pending
+	}
+	if claim.RecoveryHold != nil {
+		hold := *claim.RecoveryHold
+		hold.Resources = append([]LeaseHeldResource(nil), hold.Resources...)
+		claim.RecoveryHold = &hold
+	}
 	claim.ImageEvidence = CloneImageEvidence(claim.ImageEvidence)
 	if claim.CheckpointCapture != nil {
 		binding := *claim.CheckpointCapture
 		claim.CheckpointCapture = &binding
+	}
+	if claim.ActionsWorkspace != nil {
+		binding := *claim.ActionsWorkspace
+		claim.ActionsWorkspace = &binding
 	}
 	claim.Labels = cloneStringMap(claim.Labels)
 	claim.TailscaleTags = append([]string(nil), claim.TailscaleTags...)
 	claim.CacheVolumes = append([]string(nil), claim.CacheVolumes...)
 	if claim.FixedCreateIntent != nil {
 		intent := *claim.FixedCreateIntent
+		if intent.Retention != nil {
+			policy := *intent.Retention
+			intent.Retention = &policy
+		}
+		intent.Journal = cloneFixedJournal(intent.Journal)
 		intent.Attempt = cloneStringMap(intent.Attempt)
 		intent.FailedAttempts = append([]string(nil), intent.FailedAttempts...)
 		claim.FixedCreateIntent = &intent
@@ -968,6 +1017,9 @@ func endpointClaimGuard(leaseID string, next func(leaseClaim, bool) error) func(
 // SetLeaseClaimResourceIdentity updates an in-memory claim's exact resource
 // identity. Callers retain their existing publication and identity-admission policy.
 func SetLeaseClaimResourceIdentity(claim *LeaseClaim, cloudID string, numericID int64, immutableID string, evidence *ImageEvidence) {
+	if claim.CloudID != cloudID || claim.CloudNumericID != numericID || claim.CloudImmutableID != immutableID {
+		claim.ActionsWorkspace = nil
+	}
 	if evidence != nil {
 		claim.ImageEvidence = CloneImageEvidence(evidence)
 	} else if claim.CloudID != cloudID || claim.CloudNumericID != numericID || claim.CloudImmutableID != immutableID {
@@ -980,6 +1032,7 @@ func applyLeaseClaimEndpoint(claim *leaseClaim, server Server, target SSHTarget,
 	if mode == claimEndpointReplace {
 		clearLeaseClaimTailscaleFields(claim)
 		claim.BridgeURL = ""
+		claim.ActionsWorkspace = nil
 	}
 	cloudID, numericID, immutableID := claim.CloudID, claim.CloudNumericID, claim.CloudImmutableID
 	if server.CloudID != "" {
@@ -1015,6 +1068,16 @@ func applyLeaseClaimEndpoint(claim *leaseClaim, server Server, target SSHTarget,
 	} else if mode == claimEndpointReplace || claimEndpointInactiveState(server.Labels["state"]) {
 		claim.SSHPort = 0
 	}
+}
+
+// Hydration consent belongs to one repository and exact lease resource, not to
+// a reusable lease name or a later claimant.
+func sameActionsWorkspaceClaimOwner(a, b leaseClaim) bool {
+	return a.LeaseID == b.LeaseID && a.RepoRoot == b.RepoRoot &&
+		a.Provider == b.Provider && a.ProviderScope == b.ProviderScope &&
+		a.CloudID == b.CloudID && a.CloudNumericID == b.CloudNumericID && a.CloudImmutableID == b.CloudImmutableID &&
+		a.StaticHost == b.StaticHost && a.StaticUser == b.StaticUser && a.StaticPort == b.StaticPort &&
+		a.StaticWorkRoot == b.StaticWorkRoot && a.TargetOS == b.TargetOS && a.WindowsMode == b.WindowsMode
 }
 
 func claimEndpointInactiveState(state string) bool {
@@ -1347,7 +1410,7 @@ func claimLookupSlug(identifier string) string {
 	return NormalizeLeaseSlug(identifier)
 }
 
-func claimProviderForIdentifier(identifier string) (string, bool, error) {
+func claimProviderForIdentifierContext(ctx context.Context, identifier string) (string, bool, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
 		return "", false, nil
@@ -1360,7 +1423,10 @@ func claimProviderForIdentifier(identifier string) (string, bool, error) {
 		provider := canonicalClaimProvider(exact.Provider)
 		return provider, provider != "", nil
 	}
-	claims, err := ListLeaseClaims()
+	if IsCanonicalLeaseID(identifier) {
+		return "", false, nil
+	}
+	claims, err := ListLeaseClaimsContext(ctx)
 	if err != nil {
 		return "", false, err
 	}
@@ -1392,6 +1458,14 @@ func providerClaimScope(provider string, cfg Config) string {
 }
 
 func ResolveLeaseClaim(identifier string) (leaseClaim, bool, error) {
+	return ResolveLeaseClaimContext(context.Background(), identifier)
+}
+
+func ResolveLeaseClaimContext(ctx context.Context, identifier string) (leaseClaim, bool, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return leaseClaim{}, false, err
+	}
+
 	if identifier == "" {
 		return leaseClaim{}, false, nil
 	}
@@ -1400,30 +1474,49 @@ func ResolveLeaseClaim(identifier string) (leaseClaim, bool, error) {
 	} else if claim.LeaseID != "" {
 		return claim, true, nil
 	}
-	return findLeaseClaim(identifier, func(leaseClaim) bool { return true })
+	return findUniqueLeaseClaim(ctx, identifier, func(leaseClaim) bool { return true })
 }
 
 func ResolveLeaseClaimForProvider(identifier, provider string) (leaseClaim, bool, error) {
-	if provider == "" {
-		return ResolveLeaseClaim(identifier)
-	}
-	claim, ok, err := ResolveLeaseClaim(identifier)
-	if err != nil || !ok {
-		return claim, ok, err
-	}
-	if canonicalClaimProvider(claim.Provider) == provider {
-		return claim, true, nil
-	}
-	claim, ok, err = findLeaseClaim(identifier, func(candidate leaseClaim) bool {
-		return canonicalClaimProvider(candidate.Provider) == provider
-	})
-	if err != nil || !ok {
+	return ResolveLeaseClaimForProviderContext(context.Background(), identifier, provider)
+}
+
+func ResolveLeaseClaimForProviderContext(ctx context.Context, identifier, provider string) (leaseClaim, bool, error) {
+	if err := claimScanErr(ctx); err != nil {
 		return leaseClaim{}, false, err
 	}
-	return claim, true, nil
+	if provider == "" {
+		return ResolveLeaseClaimContext(ctx, identifier)
+	}
+	if identifier == "" {
+		return leaseClaim{}, false, nil
+	}
+	claim, exists, err := ReadLeaseClaimWithPresence(identifier)
+	if err != nil {
+		return leaseClaim{}, false, err
+	}
+	if exists && claim.LeaseID != "" && canonicalClaimProvider(claim.Provider) == provider {
+		return claim, true, nil
+	}
+	if IsCanonicalLeaseID(identifier) {
+		return leaseClaim{}, false, nil
+	}
+	// Scope the uniqueness check before matching aliases: another provider may
+	// legitimately use the same slug, but two claims in this provider may not.
+	return findUniqueLeaseClaim(ctx, identifier, func(candidate leaseClaim) bool {
+		return canonicalClaimProvider(candidate.Provider) == provider
+	})
 }
 
 func ResolveLeaseClaimForProviderWithExact(identifier, provider string) (leaseClaim, bool, bool, error) {
+	return ResolveLeaseClaimForProviderWithExactContext(context.Background(), identifier, provider)
+}
+
+func ResolveLeaseClaimForProviderWithExactContext(ctx context.Context, identifier, provider string) (leaseClaim, bool, bool, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return leaseClaim{}, false, false, err
+	}
+
 	if identifier == "" {
 		return leaseClaim{}, false, false, nil
 	}
@@ -1437,11 +1530,19 @@ func ResolveLeaseClaimForProviderWithExact(identifier, provider string) (leaseCl
 		}
 		return exact, true, true, nil
 	}
-	claim, ok, err := ResolveLeaseClaimForProvider(identifier, provider)
+	claim, ok, err := ResolveLeaseClaimForProviderContext(ctx, identifier, provider)
 	return claim, ok, false, err
 }
 
 func ResolveLeaseClaimForProviderScopeWithExact(identifier, provider, providerScope string) (leaseClaim, bool, bool, error) {
+	return ResolveLeaseClaimForProviderScopeWithExactContext(context.Background(), identifier, provider, providerScope)
+}
+
+func ResolveLeaseClaimForProviderScopeWithExactContext(ctx context.Context, identifier, provider, providerScope string) (leaseClaim, bool, bool, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return leaseClaim{}, false, false, err
+	}
+
 	if identifier == "" {
 		return leaseClaim{}, false, false, nil
 	}
@@ -1455,7 +1556,7 @@ func ResolveLeaseClaimForProviderScopeWithExact(identifier, provider, providerSc
 		}
 		return exact, true, true, nil
 	}
-	claim, ok, err := findUniqueLeaseClaim(identifier, func(candidate leaseClaim) bool {
+	claim, ok, err := findUniqueLeaseClaim(ctx, identifier, func(candidate leaseClaim) bool {
 		return canonicalClaimProvider(candidate.Provider) == provider && candidate.ProviderScope == providerScope
 	})
 	return claim, ok, false, err
@@ -1466,6 +1567,14 @@ func ResolveLeaseClaimForProviderCloudID(cloudID, provider string) (leaseClaim, 
 }
 
 func ResolveLeaseClaimForProviderCloudIDScope(cloudID, provider, providerScope string) (leaseClaim, bool, error) {
+	return ResolveLeaseClaimForProviderCloudIDScopeContext(context.Background(), cloudID, provider, providerScope)
+}
+
+func ResolveLeaseClaimForProviderCloudIDScopeContext(ctx context.Context, cloudID, provider, providerScope string) (leaseClaim, bool, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return leaseClaim{}, false, err
+	}
+
 	if cloudID == "" || provider == "" {
 		return leaseClaim{}, false, nil
 	}
@@ -1482,6 +1591,9 @@ func ResolveLeaseClaimForProviderCloudIDScope(cloudID, provider, providerScope s
 	}
 	var match leaseClaim
 	for _, entry := range entries {
+		if err := claimScanErr(ctx); err != nil {
+			return leaseClaim{}, false, err
+		}
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
@@ -1514,40 +1626,31 @@ func LeaseClaimMatchesIdentifier(claim leaseClaim, identifier string) bool {
 	return slug != "" && NormalizeLeaseSlug(claim.Slug) == slug
 }
 
-func findLeaseClaim(identifier string, match func(leaseClaim) bool) (leaseClaim, bool, error) {
-	if identifier == "" {
-		return leaseClaim{}, false, nil
-	}
-	dir, err := CrabboxStateDir()
-	if err != nil {
-		return leaseClaim{}, false, err
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, "claims"))
-	if errors.Is(err, os.ErrNotExist) {
-		return leaseClaim{}, false, nil
-	}
-	if err != nil {
-		return leaseClaim{}, false, Exit(2, "read claims directory: %v", err)
-	}
-	slug := claimLookupSlug(identifier)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		leaseID := strings.TrimSuffix(entry.Name(), ".json")
-		claim, err := ReadLeaseClaim(leaseID)
-		if err != nil {
-			return leaseClaim{}, false, err
-		}
-		if (claim.LeaseID == identifier || (slug != "" && NormalizeLeaseSlug(claim.Slug) == slug)) && match(claim) {
-			return claim, true, nil
-		}
-	}
-	return leaseClaim{}, false, nil
+func findLeaseClaim(ctx context.Context, identifier string, match func(leaseClaim) bool) (leaseClaim, bool, error) {
+	return findMatchingLeaseClaim(ctx, identifier, match, false, ReadLeaseClaimWithPresence)
 }
 
-func findUniqueLeaseClaim(identifier string, match func(leaseClaim) bool) (leaseClaim, bool, error) {
+func findUniqueLeaseClaim(ctx context.Context, identifier string, match func(leaseClaim) bool) (leaseClaim, bool, error) {
+	return findMatchingLeaseClaim(ctx, identifier, match, true, ReadLeaseClaimWithPresence)
+}
+
+func findMatchingLeaseClaim(ctx context.Context, identifier string, match func(leaseClaim) bool, unique bool, read func(string) (leaseClaim, bool, error)) (leaseClaim, bool, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return leaseClaim{}, false, err
+	}
 	if identifier == "" {
+		return leaseClaim{}, false, nil
+	}
+	// Canonical IDs are never slug aliases (claimLookupSlug). Other valid
+	// filenames may overlap normalized slugs and still need the uniqueness scan.
+	if IsCanonicalLeaseID(identifier) {
+		claim, exists, err := read(identifier)
+		if err != nil || !exists {
+			return leaseClaim{}, false, err
+		}
+		if claim.LeaseID != "" && match(claim) {
+			return claim, true, nil
+		}
 		return leaseClaim{}, false, nil
 	}
 	dir, err := CrabboxStateDir()
@@ -1562,24 +1665,44 @@ func findUniqueLeaseClaim(identifier string, match func(leaseClaim) bool) (lease
 		return leaseClaim{}, false, Exit(2, "read claims directory: %v", err)
 	}
 	slug := claimLookupSlug(identifier)
-	var found leaseClaim
+	// A released fixed-create receipt may keep a slug that a newer live lease
+	// reuses; only competing live claims (or competing receipts) are ambiguous.
+	var live, receipt leaseClaim
+	liveCount, receiptCount := 0, 0
 	for _, entry := range entries {
+		if err := claimScanErr(ctx); err != nil {
+			return leaseClaim{}, false, err
+		}
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		claim, err := ReadLeaseClaim(strings.TrimSuffix(entry.Name(), ".json"))
+		claim, _, err := read(strings.TrimSuffix(entry.Name(), ".json"))
 		if err != nil {
 			return leaseClaim{}, false, err
 		}
 		if (claim.LeaseID != identifier && (slug == "" || NormalizeLeaseSlug(claim.Slug) != slug)) || !match(claim) {
 			continue
 		}
-		if found.LeaseID != "" {
-			return leaseClaim{}, false, Exit(2, "multiple claims match identifier %s", identifier)
+		if !unique {
+			return claim, true, nil
 		}
-		found = claim
+		if claim.FixedCreateIntent != nil && claim.FixedCreateIntent.State == "released" {
+			receipt = claim
+			receiptCount++
+		} else if liveCount++; liveCount > 1 {
+			return leaseClaim{}, false, Exit(2, "multiple claims match identifier %s", identifier)
+		} else {
+			live = claim
+		}
 	}
-	return found, found.LeaseID != "", nil
+	switch {
+	case liveCount == 0 && receiptCount > 1:
+		return leaseClaim{}, false, Exit(2, "multiple claims match identifier %s", identifier)
+	case liveCount == 1:
+		return live, true, nil
+	default:
+		return receipt, receiptCount == 1, nil
+	}
 }
 
 func RemoveLeaseClaim(leaseID string) {
@@ -1791,6 +1914,9 @@ func replaceLeaseClaimTransactionContext(ctx context.Context, leaseID string, cu
 		revision: claimRevisionAfterMutation,
 		write:    write,
 		mutate: func(claim *leaseClaim) error {
+			if !sameActionsWorkspaceClaimOwner(*claim, replacement) {
+				replacement.ActionsWorkspace = nil
+			}
 			*claim = cloneLeaseClaim(replacement)
 			return nil
 		},
@@ -1798,10 +1924,22 @@ func replaceLeaseClaimTransactionContext(ctx context.Context, leaseID string, cu
 }
 
 func ListLeaseClaims() ([]leaseClaim, error) {
-	return ListLeaseClaimsWithPrefix("")
+	return ListLeaseClaimsContext(context.Background())
+}
+
+func ListLeaseClaimsContext(ctx context.Context) ([]leaseClaim, error) {
+	return ListLeaseClaimsWithPrefixContext(ctx, "")
 }
 
 func ListLeaseClaimsWithPrefix(prefix string) ([]leaseClaim, error) {
+	return ListLeaseClaimsWithPrefixContext(context.Background(), prefix)
+}
+
+func ListLeaseClaimsWithPrefixContext(ctx context.Context, prefix string) ([]leaseClaim, error) {
+	if err := claimScanErr(ctx); err != nil {
+		return nil, err
+	}
+
 	dir, err := CrabboxStateDir()
 	if err != nil {
 		return nil, err
@@ -1815,6 +1953,9 @@ func ListLeaseClaimsWithPrefix(prefix string) ([]leaseClaim, error) {
 	}
 	claims := make([]leaseClaim, 0, len(entries))
 	for _, entry := range entries {
+		if err := claimScanErr(ctx); err != nil {
+			return nil, err
+		}
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
@@ -2019,7 +2160,7 @@ func decodeLeaseClaim(path string, data []byte) (leaseClaim, error) {
 			err:  Exit(2, "parse claim %s: %v", path, err),
 		}
 	}
-	if claim.FixedCreateIntent != nil && claim.FixedCreateIntent.Journal != nil {
+	if claim.FixedCreateIntent != nil && (claim.FixedCreateIntent.Journal != nil || claim.FixedCreateIntent.Retention != nil) {
 		if err := validateFixedJournal(claim.FixedCreateIntent); err != nil {
 			return leaseClaim{}, &leaseClaimFileError{code: "invalid_fixed_journal", err: err}
 		}
@@ -2158,4 +2299,13 @@ func ServerLeaseClaimSnapshot(server Server) (LeaseClaim, bool, bool) {
 		return LeaseClaim{}, false, false
 	}
 	return cloneLeaseClaim(server.claimSnapshot), server.claimSnapshotExists, true
+}
+
+// claimScanErr reports a canceled claim scan with the caller's cancellation
+// cause, so callers can tell their own cancellation apart from a scan failure.
+func claimScanErr(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	return context.Cause(ctx)
 }

@@ -27,7 +27,24 @@ import (
 	xssh "golang.org/x/crypto/ssh"
 )
 
+// SSHJump describes an authenticated SSH transport hop; the destination still
+// has its own end-to-end SSH host key and authentication.
+type SSHJump struct {
+	RelayOnly    bool `json:"relayOnly,omitempty"`
+	Relay        bool `json:"relay,omitempty"`
+	useRelay     bool
+	Candidates   []SSHJumpCandidate `json:"candidates,omitempty"`
+	HostKeyAlias string             `json:"-"`
+	Host         string             `json:"host"`
+	Port         int                `json:"port"`
+	HostKey      string             `json:"hostKey"`
+	Fingerprint  string             `json:"fingerprint,omitempty"`
+}
+
 type SSHTarget struct {
+	relayConfig             *Config
+	relayCoordinator        *CoordinatorClient
+	SSHJump                 *SSHJump
 	User                    string
 	Host                    string
 	SSHHostKey              string
@@ -49,6 +66,7 @@ type SSHTarget struct {
 	// RequireControlMaster forbids reconnecting if an admitted mux disappears.
 	RequireControlMaster   bool
 	ControlPath            string
+	ownerControlPath       string // Private foreground master with an explicit local lifetime owner.
 	DisableHostKeyChecking bool
 	NetworkKind            NetworkMode
 	SSHConfigProxy         bool
@@ -59,6 +77,8 @@ type SSHTarget struct {
 	// Transport-only overrides can contain credentials; never serialize them.
 	ChildEnv          map[string]string `json:"-"`
 	DiagnosticSecrets []string          `json:"-"` // Provider credentials echoed by local authentication hooks.
+	// Refresh provider-owned credential files before a new transport starts.
+	PrepareConnection func(context.Context) error `json:"-"`
 }
 
 func isLocalMacTarget(target SSHTarget) bool {
@@ -91,6 +111,10 @@ func SSHTargetFromConfig(cfg Config, host string) SSHTarget {
 }
 
 func sshTargetForLease(cfg Config, host, user, port string) SSHTarget {
+	return sshTargetForLeaseConnection(cfg, host, user, port, "", nil)
+}
+
+func sshTargetForLeaseConnection(cfg Config, host, user, port, hostKey string, jump *SSHJump) SSHTarget {
 	if user == "" {
 		user = cfg.SSHUser
 	}
@@ -98,6 +122,7 @@ func sshTargetForLease(cfg Config, host, user, port string) SSHTarget {
 		port = cfg.SSHPort
 	}
 	target := SSHTarget{
+		SSHHostKey: hostKey, SSHJump: jump,
 		User:             user,
 		Host:             host,
 		Key:              cfg.SSHKey,
@@ -107,12 +132,35 @@ func sshTargetForLease(cfg Config, host, user, port string) SSHTarget {
 		WindowsMode:      cfg.WindowsMode,
 		ChildEnvDenylist: externalDesktopChildEnvDenylist(cfg, cfg.TargetOS),
 	}
+	if jump != nil && jump.Relay {
+		relayCfg := cfg
+		target.relayConfig = &relayCfg
+	}
+	configureProviderSSHTarget(cfg, &target)
+	return target
+}
+
+// configureProviderSSHTarget lets the configured provider adjust a target for
+// its platform, such as installing a bootstrap gate ahead of the default
+// readiness command. Providers without the hook leave the target unchanged.
+func configureProviderSSHTarget(cfg Config, target *SSHTarget) {
+	if target == nil {
+		return
+	}
 	if provider, err := ProviderFor(cfg.Provider); err == nil {
 		if configurer, ok := provider.(ProviderSSHTargetConfigurer); ok {
-			configurer.ConfigureSSHTarget(&target, sshReadyCommand(target))
+			configurer.ConfigureSSHTarget(target, sshReadyCommand(*target))
 		}
 	}
-	return target
+}
+
+// providerReadyCheck reports the readiness check the configured provider
+// installs for a target of the given platform, or "" when the provider keeps
+// the platform default.
+func providerReadyCheck(cfg Config, target SSHTarget) string {
+	probe := SSHTarget{TargetOS: target.TargetOS, WindowsMode: target.WindowsMode}
+	configureProviderSSHTarget(cfg, &probe)
+	return probe.ReadyCheck
 }
 
 // PreserveExternalDesktopChildEnvironmentBoundary records a valid, trusted or
@@ -251,6 +299,9 @@ func sshCommandContext(ctx context.Context, target SSHTarget, args ...string) *e
 	if cmd.Err == nil {
 		cmd.Err = context.Cause(ctx)
 		if cmd.Err == nil {
+			cmd.Err = prepareSSHConnection(ctx, target)
+		}
+		if cmd.Err == nil {
 			cmd.Err = ensureSSHControlDirectory(target)
 		}
 	}
@@ -260,6 +311,18 @@ func sshCommandContext(ctx context.Context, target SSHTarget, args ...string) *e
 	cmd.WaitDelay = sshCommandWaitDelay
 	applyTargetChildEnvironment(cmd, target)
 	return cmd
+}
+
+func prepareSSHConnection(ctx context.Context, target SSHTarget) error {
+	if err := context.Cause(ctx); err != nil {
+		return sshPreparationError{err}
+	}
+	if target.PrepareConnection != nil {
+		if err := target.PrepareConnection(ctx); err != nil {
+			return sshPreparationError{err}
+		}
+	}
+	return nil
 }
 
 func waitForSSH(ctx context.Context, target *SSHTarget, stderr io.Writer) error {
@@ -315,6 +378,7 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 	// reachability and authentication. Recording that keeps a readiness-only
 	// failure from being reported as an unknown-authentication timeout.
 	authenticated := false
+	retryDelay := 250 * time.Millisecond
 	check := func(probeErr error) error {
 		if stopped := sshReadinessProbeContextError(ctx, lastProbe); stopped != nil {
 			return stopped.cause
@@ -410,10 +474,11 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 					if stopped := check(err); stopped != nil {
 						return stopped
 					}
-					probes = append(probes, port+":closed")
+					probes = append(probes, port+":"+sshDialFailureStatus(err))
 					continue
 				}
 				_ = conn.Close()
+				recordCreationObservation(probeCtx, "ssh_tcp_accept")
 				if reachablePort == "" {
 					reachablePort = probe.Port
 				}
@@ -460,6 +525,30 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 				authenticated = true
 				lastProbe = "readiness"
 				probes = append(probes, port+":ready")
+				if canWaitForLinuxReadiness(probe) {
+					lastPorts = strings.Join(probes, ",")
+					err := waitForLinuxReadiness(probeCtx, probe, profile, 30*time.Second, func() {
+						fmt.Fprintln(stderr, sshWaitProgressMessage(target, phase, reachablePort, transportPort, lastPorts, time.Since(start), time.Until(deadline)))
+					})
+					if stopped := check(err); stopped != nil {
+						return stopped
+					}
+					if err == nil {
+						if target.Port != probe.Port {
+							fmt.Fprintf(stderr, "using ssh port %s for %s (configured %s not ready)\n", probe.Port, target.Host, target.Port)
+						}
+						target.recordPreparedEndpoint(probe.Port)
+						return nil
+					}
+					if setupErr := sshReadinessError(err, phase); setupErr != nil {
+						return setupErr
+					}
+					if errors.Is(err, context.DeadlineExceeded) || exitCode(err) == 124 {
+						// A full guest wait already paced this retry. Do not add
+						// the boot-time backoff just as the marker may appear.
+						retryDelay = 250 * time.Millisecond
+					}
+				}
 			}
 			lastPorts = strings.Join(probes, ",")
 			if transportPort != "" {
@@ -470,10 +559,20 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 		if err := check(nil); err != nil {
 			return err
 		}
-		if err := sleepContext(probeCtx, 10*time.Second); err != nil {
+		// Newly booted guests often become ready just after the first probe.
+		// Back off for longer boots without delaying the first retries.
+		if err := sleepContext(probeCtx, retryDelay); err != nil {
 			return check(err)
 		}
+		retryDelay = min(2*retryDelay, 5*time.Second)
 	}
+}
+
+func sshDialFailureStatus(err error) string {
+	if errors.Is(err, syscall.EHOSTUNREACH) {
+		return "no-route-to-host"
+	}
+	return "closed"
 }
 
 func WaitForSSHReady(ctx context.Context, target *SSHTarget, stderr io.Writer, phase string, timeout time.Duration) error {
@@ -925,6 +1024,11 @@ func prepareSSHTransport(ctx context.Context, target SSHTarget, command string, 
 }
 
 func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, connectTimeout, connectionAttempts string, stdout, stderr io.Writer) error {
+	preparedTarget, err := prepareServeRelayControl(ctx, *target)
+	if err != nil {
+		return err
+	}
+	*target = preparedTarget
 	if p.stage != nil {
 		p.retirementUnconfirmed = true
 		p.stage.setupMarker = p.setupMarker
@@ -939,11 +1043,12 @@ func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, co
 			return err
 		}
 	}
-	multiplexed := runtime.GOOS != "windows" && !target.AuthSecret && !target.NoControlMaster && !target.AuthoritativeKnownHosts && target.SSHConfigFile == ""
+	multiplexed := target.ownerControlPath != "" || runtime.GOOS != "windows" && !target.AuthSecret && !target.NoControlMaster && !target.AuthoritativeKnownHosts && target.SSHConfigFile == ""
 	for attempt := 0; ; attempt++ {
 		probe := *target
 		if attempt == 2 {
 			probe.NoControlMaster = true
+			probe.ownerControlPath = ""
 		}
 		muxFailure, err := p.runOnce(ctx, probe, connectTimeout, connectionAttempts, stdout, stderr, multiplexed && attempt < 2)
 		if err == nil || ctx.Err() != nil || exitCode(err) != 255 || !muxFailure || attempt == 2 || p.stream {
@@ -1355,7 +1460,19 @@ func (e *gitOriginDiagnosticsTruncatedError) Unwrap() error {
 	return e.err
 }
 
-func runIdempotentSSHSyncScriptGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+const gitSeedPublishedReceipt = "crabbox-git-seed published"
+
+func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	out, _, err := runIdempotentSSHGitOriginAttemptCapture(ctx, target, remote, retryDelay, false)
+	return out, err
+}
+
+func runIdempotentSSHGitOriginAttemptWithPublication(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, bool, error) {
+	return runIdempotentSSHGitOriginAttemptCapture(ctx, target, remote, retryDelay, true)
+}
+
+func runIdempotentSSHGitOriginAttemptCapture(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration, capturePublication bool) (string, bool, error) {
+	published := false
 	var (
 		out       synchronizedBuffer
 		lastErr   error
@@ -1363,7 +1480,23 @@ func runIdempotentSSHSyncScriptGitOriginAttempt(ctx context.Context, target SSHT
 	)
 	for attempt := 0; attempt < 2; attempt++ {
 		out = newSynchronizedBuffer(gitSeedDiagnosticLimit)
-		lastErr = runSSHSyncScriptInputTarget(ctx, &target, remote, nil, &out, &out)
+		// Keep diagnostics scoped to the last attempt, but retain an observed
+		// publication across transport retries. Origin diagnostics on stderr
+		// cannot supply the native producer's stdout receipt.
+		if capturePublication {
+			stdout := newSynchronizedBuffer(gitSeedDiagnosticLimit)
+			lastErr = runSSHSyncScriptInputTarget(ctx, &target, remote, nil, io.MultiWriter(&out, &stdout), &out)
+			if receipt, clipped := stdout.boundedString(); !clipped {
+				for _, line := range strings.Split(receipt, "\n") {
+					if line == gitSeedPublishedReceipt {
+						published = true
+					}
+				}
+			}
+		} else {
+			// The shared writer preserves the ordinary combined-pipe ordering.
+			lastErr = runSSHSyncScriptInputTarget(ctx, &target, remote, nil, &out, &out)
+		}
 		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
 			break
 		}
@@ -1377,7 +1510,7 @@ func runIdempotentSSHSyncScriptGitOriginAttempt(ctx context.Context, target SSHT
 	if truncated && lastErr != nil {
 		lastErr = &gitOriginDiagnosticsTruncatedError{err: lastErr}
 	}
-	return output, lastErr
+	return output, published, lastErr
 }
 
 func isSSHCommandExitError(err error) bool {
@@ -1429,6 +1562,7 @@ func sshForwardingDenyArgs() []string {
 }
 
 func sshBaseArgsWithOptions(target SSHTarget, connectTimeout, connectionAttempts string) []string {
+	connectTimeout = relaySSHConnectTimeout(connectTimeout, usesServeRelay(target))
 	args := append(sshForwardingDenyArgs(),
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout="+connectTimeout,
@@ -1442,7 +1576,9 @@ func sshBaseArgsWithOptions(target SSHTarget, connectTimeout, connectionAttempts
 			"-o", "RemoteCommand=none", "-o", "RequestTTY=auto", "-o", "ClearAllForwardings=yes")
 	}
 	args = append(args, sshHostKeyVerificationArgs(target)...)
-	if target.AuthSecret || target.NoControlMaster || target.AuthoritativeKnownHosts || target.SSHConfigFile != "" {
+	if target.ownerControlPath != "" {
+		args = append(args, "-o", "ControlMaster=no", "-o", "ControlPersist=no", "-o", "ControlPath="+target.ownerControlPath)
+	} else if target.AuthSecret || target.NoControlMaster || target.AuthoritativeKnownHosts || target.SSHConfigFile != "" {
 		args = append(args,
 			"-o", "ControlMaster=no",
 			"-o", "ControlPath=none",
@@ -1586,6 +1722,7 @@ func sshControlPath(target SSHTarget) string {
 }
 
 type rsyncOptions struct {
+	Compression       string
 	Debug             bool
 	Delete            bool
 	Checksum          bool
@@ -1606,19 +1743,23 @@ func normalizeRsyncOptions(opts rsyncOptions) rsyncOptions {
 
 func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []string, stdout, stderr io.Writer, opts rsyncOptions) (err error) {
 	opts = normalizeRsyncOptions(opts)
-	if opts.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
-	}
 	session, wslExe, mountRoot, err := newWorkspaceRsyncSession(ctx, target)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, session.Close()) }()
+	archiveMode := "-az"
+	if !syncCompressionEnabled(opts.Compression) {
+		archiveMode = "-a"
+	}
 	args := []string{
-		"-az",
+		archiveMode,
 		"-e", session.rsyncRemoteShellWithOptions("10", "3"),
+	}
+	if opts.Timeout > 0 {
+		// Rsync observes protocol I/O even in quiet mode. A wall-clock context
+		// deadline kills healthy large transfers; console output is not progress.
+		args = append(args, fmt.Sprintf("--timeout=%d", (opts.Timeout-1)/time.Second+1))
 	}
 	if opts.NoTimes {
 		args = append(args, "--no-times", "--omit-dir-times")
@@ -1632,8 +1773,18 @@ func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []st
 	if opts.UseFilesFrom {
 		args = append(args, "--files-from=-", "--from0")
 	}
+	owner := workspaceOwnerFromContext(ctx)
 	if isWindowsWSL2Target(target) {
 		args = append(args, "--rsync-path", "wsl.exe rsync")
+	} else if owner != nil && !isWindowsNativeTarget(target) {
+		// openrsync removes shell quoting from --rsync-path before invoking SSH.
+		// A single private executable path works with both rsync implementations.
+		receiver, stageErr := stageRsyncWorkspaceReceiver(ctx, target, owner)
+		if stageErr != nil {
+			return stageErr
+		}
+		defer func() { err = errors.Join(err, receiver.close(ctx, target)) }()
+		args = append(args, "--rsync-path", receiver.command)
 	}
 	if !opts.UseFilesFrom {
 		for _, exclude := range excludes {
@@ -1649,9 +1800,8 @@ func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []st
 		return err
 	}
 	cmd := handle.cmd
-	owner := workspaceOwnerFromContext(ctx)
 	guardStarted := false
-	if owner != nil && !isWindowsNativeTarget(target) {
+	if owner != nil && isWindowsWSL2Target(target) {
 		rawCtx := contextWithoutWorkspaceOwner(ctx)
 		if err := runSSHQuiet(rawCtx, target, owner.rsyncPrepareCommand()); err != nil {
 			return Exit(7, "prepare rsync workspace witness: %v", err)
@@ -1676,24 +1826,26 @@ func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []st
 		err = handle.Wait()
 	}
 	stopHeartbeat()
+	if ctx.Err() != nil {
+		err = errors.Join(err, ctx.Err())
+	} else if opts.Timeout > 0 && exitCode(err) == 30 {
+		err = Exit(6, "rsync stalled with no I/O progress for %s; next_action=retry with --full-resync, then use a fresh lease if sync still stalls", opts.Timeout)
+	}
 	if guardStarted {
 		guardCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
-		rawGuardCtx := contextWithoutWorkspaceOwner(guardCtx)
-		guardErr := runSSHQuiet(rawGuardCtx, target, owner.rsyncStopCommand())
-		if guardErr == nil {
-			guardErr = waitWorkspaceOwnerNoChild(rawGuardCtx, owner, owner.callTimeout())
-		}
-		cleanupErr := runSSHQuiet(rawGuardCtx, target, owner.rsyncPrepareCommand())
+		guardErr := finishRsyncWorkspaceWitness(guardCtx, target, owner)
 		cancel()
-		if guardErr == nil {
-			guardErr = cleanupErr
-		}
-		if guardErr != nil && err == nil {
-			err = Exit(7, "finish rsync workspace witness: %v", guardErr)
+		if guardErr != nil {
+			err = errors.Join(err, Exit(7, "finish rsync workspace witness: %v", guardErr))
 		}
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return Exit(6, "rsync timed out after %s; next_action=retry with --full-resync, then use a fresh lease if sync still stalls", opts.Timeout)
+	if owner != nil && !isWindowsNativeTarget(target) && !isWindowsWSL2Target(target) {
+		quiesceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
+		quiesceErr := waitWorkspaceOwnerNoChild(quiesceCtx, owner, owner.callTimeout())
+		cancel()
+		if quiesceErr != nil {
+			err = errors.Join(err, Exit(7, "finish rsync workspace receiver: %v", quiesceErr))
+		}
 	}
 	if opts.Debug {
 		fmt.Fprintf(stderr, "rsync elapsed=%s checksum=%t delete=%t\n", time.Since(start).Round(time.Millisecond), opts.Checksum, opts.Delete)
@@ -1734,29 +1886,68 @@ try {
 exit $code`)
 }
 
+// gitSeedHeartbeatInterval spaces progress lines while a remote Git seed runs
+// with captured output.
+const gitSeedHeartbeatInterval = 15 * time.Second
+
+// startSyncHeartbeat prints periodic "still syncing" progress lines to stderr
+// until the returned stop function is called.
 func startSyncHeartbeat(stderr io.Writer, start time.Time, interval time.Duration) func() {
+	return startProgressHeartbeat(stderr, start, interval, "syncing", " watchdog=sync-quiet next_action=wait, or cancel and retry with --full-resync/fresh lease if no progress")
+}
+
+// startGitSeedHeartbeat prints periodic progress lines while a remote Git
+// seed runs, because the seed's own output is captured until it finishes.
+func startGitSeedHeartbeat(stderr io.Writer, start time.Time, interval time.Duration) func() {
+	return startProgressHeartbeat(stderr, start, interval, "seeding remote Git metadata", "")
+}
+
+// startProgressHeartbeat prints "still <label> after <elapsed>..." every
+// interval, appending quietHint once the step has run for four minutes.
+// A nonpositive interval disables the heartbeat. The returned stop function
+// waits for the heartbeat goroutine to exit, so no progress line is printed
+// after it returns.
+func startProgressHeartbeat(stderr io.Writer, start time.Time, interval time.Duration, label, quietHint string) func() {
 	if interval <= 0 {
 		return func() {}
 	}
+	ticker := time.NewTicker(interval)
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(interval)
+		defer close(exited)
 		defer ticker.Stop()
-		for {
+		writeProgressHeartbeats(stderr, start, ticker.C, done, label, quietHint)
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
+}
+
+// writeProgressHeartbeats prints one progress line per tick until done is
+// closed. A closed done wins over a tick that is ready at the same time.
+func writeProgressHeartbeats(stderr io.Writer, start time.Time, ticks <-chan time.Time, done <-chan struct{}, label, quietHint string) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticks:
+			// select picks randomly among ready cases; recheck done so a
+			// stop that raced with this tick suppresses the line.
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
-				elapsed := time.Since(start).Round(time.Second)
-				if elapsed >= 4*time.Minute {
-					fmt.Fprintf(stderr, "still syncing after %s... watchdog=sync-quiet next_action=wait, or cancel and retry with --full-resync/fresh lease if no progress\n", elapsed)
-				} else {
-					fmt.Fprintf(stderr, "still syncing after %s...\n", elapsed)
-				}
+			default:
 			}
+			elapsed := time.Since(start).Round(time.Second)
+			hint := ""
+			if elapsed >= 4*time.Minute {
+				hint = quietHint
+			}
+			fmt.Fprintf(stderr, "still %s after %s...%s\n", label, elapsed, hint)
 		}
-	}()
-	return func() { close(done) }
+	}
 }
 
 func ensureTrailingSlash(path string) string {
@@ -2006,18 +2197,15 @@ func shellAbsolutePath(value string) string {
 	return shellQuote(value)
 }
 
-func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
 func PowershellCommand(script string) string {
 	script = `$ProgressPreference = "SilentlyContinue"` + "\n" + script
 	encoded := base64.StdEncoding.EncodeToString(utf16LE([]byte(script)))
 	return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 }
 
-// Win32-OpenSSH inherits an overlapped pipe. Use its asynchronous handle contract
-// so a pending SSH write can complete before the server closes stdin at EOF.
+// Win32-OpenSSH inherits an overlapped pipe; managed endpoints inherit a
+// synchronous pipe. Select the matching FileStream before reading any bytes.
+// Overlapped input must retain async reads so pending SSH writes can complete.
 func windowsPowerShellCopyExactInput(destination string, inputSize int64) string {
 	// An empty frame must not bind stdin, which may already be at EOF.
 	// Disable FileStream read-ahead so bytes after this frame remain on stdin.
@@ -2029,7 +2217,11 @@ if ($remaining -gt 0) {
 	$stdinHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new([Cbx.SshStdin]::GetStdHandle(-10), $false)
 	$stdin = $null
 	try {
-		$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true)
+		try { $stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true) }
+		catch {
+			if ($_.Exception.InnerException -isnot [ArgumentException]) { throw }
+			$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $false)
+		}
 		$buffer = New-Object byte[] 65536
 		while ($remaining -gt 0) {
 			$readSize = [int][Math]::Min([Int64]$buffer.Length, $remaining)
@@ -2175,6 +2367,10 @@ func writeRemoteCommandPrefix(b *strings.Builder, workdir string, env map[string
 		if envFile == "" {
 			continue
 		}
+		if isSSHCommandEnvFile(envFile) {
+			fmt.Fprintf(b, `. "$1"/%s && `, shellQuote(envFile))
+			continue
+		}
 		fmt.Fprintf(b, "if [ -f %s ]; then . %s; fi && ", shellQuote(envFile), shellQuote(envFile))
 	}
 	for k, v := range env {
@@ -2214,13 +2410,17 @@ func remoteResetWorkdir(workdir string) string {
 	return remotePortableShellInvocation(script, nil)
 }
 
-func remoteGitWorkspaceFunctions() string {
+func remoteExactGitRootFunction() string {
 	return `exact_git_root() {
   git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
   git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" || return 1
   [ "$git_root" = "$(pwd -P)" ]
 }
-usable_git_workspace() (
+`
+}
+
+func remoteGitWorkspaceFunctions() string {
+	return remoteExactGitRootFunction() + `usable_git_workspace() (
   exact_git_root || exit 1
   git rev-parse --verify HEAD^{commit} >/dev/null 2>&1 || exit 1
   workspace_index="$(git rev-parse --git-path index 2>/dev/null)" || exit 1
@@ -2280,6 +2480,14 @@ func remoteGitSeed(workdir string, plan gitCoherencePlan) string {
 	}
 	seed := `origin_git clone --quiet --filter=blob:none --no-checkout --single-branch --branch ` + shellQuote(plan.Branch) + ` "$expected_origin" "$tmp"`
 	prepare, seedManifest := "", ""
+	if plan.Tree != "" {
+		// A verified private seed owns its tracked files, including excluded
+		// paths that the first manifest must prune. Seed-only trees may have
+		// gitlinks, which must not become managed file deletions.
+		seedManifest = remoteSyncMetaDirScript() + `mkdir -p "$meta_dir"
+git ls-files -z > "$meta_dir/sync-manifest"
+`
+	}
 	checkoutGit := "git"
 	prerequisiteExitCode := 127
 	if plan.Branch == "" {
@@ -2289,16 +2497,11 @@ origin_git -C "$tmp" remote add origin "$expected_origin"
 `
 		seed = `origin_git -C "$tmp" fetch --quiet --filter=blob:none --no-tags origin ` + shellQuote(plan.Target)
 		checkoutGit = "origin_git"
-		// The private seed owns these files. Recording them lets the normal
-		// manifest prune excluded paths before local files are transferred.
-		seedManifest = remoteSyncMetaDirScript() + `mkdir -p "$meta_dir"
-git ls-files -z > "$meta_dir/sync-manifest"
-`
 	}
 	script := `set -e
-printf 'crabbox-git-seed phase=prerequisite\n'
+printf 'crabbox-git-seed phase=prerequisite\n' >&2
 command -v git >/dev/null 2>&1 || exit ` + strconv.Itoa(prerequisiteExitCode) + `
-printf 'crabbox-git-seed phase=prepare\n'
+printf 'crabbox-git-seed phase=prepare\n' >&2
 workdir=` + shellAbsolutePath(workdir) + `
 # Keep clone publication and cleanup anchored across directory changes.
 [ -n "$workdir" ] || { echo 'crabbox-git-seed: missing workspace path' >&2; exit 2; }
@@ -2317,41 +2520,62 @@ expected_origin=` + shellQuote(plan.RemoteURL) + `
 expected_tree=` + shellQuote(plan.Tree) + `
 ` + remoteGitOriginTransportFunctions() + `
 ` + remoteGitWorkspaceFunctions() + `
+reject_seed_destination() {
+  echo 'crabbox-git-seed: unsafe workspace; refusing seed publication' >&2
+  exit ` + strconv.Itoa(gitSeedUnsafeWorkspaceExitCode) + `
+}
+require_empty_seed_destination() {
+  if [ -e "$workdir" ] || [ -L "$workdir" ]; then
+    [ -d "$workdir" ] && [ ! -L "$workdir" ] || reject_seed_destination
+    [ -r "$workdir" ] && [ -x "$workdir" ] || reject_seed_destination
+    if [ -e "$workdir/.git" ] || [ -L "$workdir/.git" ] ||
+       { [ -e "$workdir/HEAD" ] && { [ -d "$workdir/objects" ] || [ -d "$workdir/refs" ]; }; }; then
+      reject_seed_destination
+    fi
+    # The sentinel also detects entries whose names consist only of newlines.
+    entries="$(ls -A -- "$workdir" && printf .)" || reject_seed_destination
+    [ "$entries" = . ] || exit ` + strconv.Itoa(gitSeedRawWorkspaceExitCode) + `
+  fi
+}
 if [ -d "$workdir" ]; then
-  cd "$workdir"
+  cd "$workdir" || reject_seed_destination
   if usable_git_workspace; then
-    printf 'crabbox-git-seed phase=origin\n'
+    printf 'crabbox-git-seed phase=origin\n' >&2
     repair_origin
     exit 0
   fi
 fi
+require_empty_seed_destination
 mkdir -p "$parent"
 tmp="$(mktemp -d "$parent/.seed.XXXXXX")"
 transport_error="$tmp.transport-error"
 cleanup_seed() { rm -rf -- "$tmp"; rm -f -- "$transport_error"; }
 trap cleanup_seed EXIT
 ` + prepare + `
-printf 'crabbox-git-seed phase=clone\n'
+printf 'crabbox-git-seed phase=clone\n' >&2
 if ! { ` + seed + `; } >/dev/null 2>"$transport_error"; then
   cat "$transport_error" >&2
   exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
 fi
-printf 'crabbox-git-seed phase=checkout\n'
+printf 'crabbox-git-seed phase=checkout\n' >&2
 ` + checkoutGit + ` -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `
-printf 'crabbox-git-seed phase=verify\n'
+printf 'crabbox-git-seed phase=verify\n' >&2
 [ "$(git -C "$tmp" rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
 cd "$tmp"
 usable_git_workspace
 if [ -n "$expected_tree" ]; then
   [ "$(git write-tree)" = "$expected_tree" ]
 fi
-printf 'crabbox-git-seed phase=origin\n'
+printf 'crabbox-git-seed phase=origin\n' >&2
 repair_origin
 ` + seedManifest + `
-printf 'crabbox-git-seed phase=publish\n'
+printf 'crabbox-git-seed phase=publish\n' >&2
 cd /
-rm -rf -- "$workdir"
+require_empty_seed_destination
+# Never recursively remove files that appeared while the clone was prepared.
+if [ -d "$workdir" ]; then rmdir -- "$workdir" || reject_seed_destination; fi
 mv -- "$tmp" "$workdir"
+printf '%s\n' ` + shellQuote(gitSeedPublishedReceipt) + `
 rm -f -- "$transport_error"
 trap - EXIT
 `
@@ -2430,12 +2654,12 @@ if [ ! -d "$1" ]; then
     parent=${parent:-/}
   done
   (cd -- "$parent")
-  /bin/rm -f -- "$1/.crabbox/sync-fingerprint"
-  exit
-fi
+  rm -f -- "$1/.crabbox/sync-fingerprint"
+else
 cd -- "$1"
 ` + metadataScript + `
-rm -f -- "$meta_dir/sync-fingerprint"`
+rm -f -- "$meta_dir/sync-fingerprint"
+fi`
 	return shellCommand(script)
 }
 
@@ -2557,13 +2781,17 @@ func remoteWriteSyncManifestsNewWithMetadata(workdir, finalizeToken, metadataScr
 	return remoteWriteSyncManifestsNewWithMetadataMode(workdir, finalizeToken, metadataScript, true)
 }
 
-func remoteWriteSyncManifestsNewWithMetadataMode(workdir, finalizeToken, metadataScript string, hermetic bool) string {
+func remoteWriteSyncManifestsNewWithMetadataMode(workdir, finalizeToken, metadataScript string, hermetic bool, coldProbe ...bool) string {
 	manifestName := remoteSyncPendingManifestName(finalizeToken)
 	deletedName := remoteSyncPendingDeletedName(finalizeToken)
 	if hermetic {
 		metadataScript = gitOverlayHermeticFunctions() + metadataScript
 	}
-	script := "set -e\nmkdir -p " + shellPathQuote(workdir) + "\ncd " + shellPathQuote(workdir) + "\n" + metadataScript + `mkdir -p "$meta_dir"
+	probe := ""
+	if len(coldProbe) != 0 && coldProbe[0] {
+		probe = remoteColdSyncProbe(workdir)
+	}
+	script := "set -e\n" + probe + "mkdir -p " + shellPathQuote(workdir) + "\ncd " + shellPathQuote(workdir) + "\n" + metadataScript + `mkdir -p "$meta_dir"
 ` + remoteSyncAbandonedMetadataCleanup() + `
 if ! IFS= read -r manifest_len; then
   echo "invalid sync manifest length" >&2
@@ -2579,22 +2807,40 @@ fi
 case "$deleted_len" in
   ''|*[!0-9]*|0[0-9]*) echo "invalid sync deleted length" >&2; exit 1 ;;
 esac
-# Keep this to POSIX dd operands: minimal guests commonly provide BusyBox dd,
-# which rejects GNU's progress-suppression extension. Check the output size too:
-# portable dd can exit successfully after reading fewer records than requested.
-dd bs=1 count="$manifest_len" of="$meta_dir/` + manifestName + `" 2>/dev/null
+# Full blocks plus one exact remainder preserve framing across short pipe reads.
+# Older/minimal dd keeps byte-sized input records but still buffers disk writes.
+fullblock=
+if dd iflag=fullblock count=0 </dev/null >/dev/null 2>&1; then fullblock=1; fi
+write_frame() {
+  frame_len=$1
+  if [ "$fullblock" = 1 ]; then
+    {
+      dd iflag=fullblock bs=65536 count="$((frame_len / 65536))" 2>/dev/null
+      remainder=$((frame_len % 65536))
+      if [ "$remainder" -ne 0 ]; then
+        dd iflag=fullblock bs="$remainder" count=1 2>/dev/null
+      fi
+    } > "$2"
+  else
+    dd ibs=1 obs=65536 count="$frame_len" of="$2" 2>/dev/null
+  fi
+}
+write_frame "$manifest_len" "$meta_dir/` + manifestName + `"
 manifest_size=$(wc -c < "$meta_dir/` + manifestName + `" | tr -d '[:space:]')
 if [ "$manifest_size" != "$manifest_len" ]; then
   echo "short sync manifest: got $manifest_size want $manifest_len" >&2
   exit 1
 fi
-dd bs=1 count="$deleted_len" of="$meta_dir/` + deletedName + `" 2>/dev/null
+write_frame "$deleted_len" "$meta_dir/` + deletedName + `"
 deleted_size=$(wc -c < "$meta_dir/` + deletedName + `" | tr -d '[:space:]')
 if [ "$deleted_size" != "$deleted_len" ]; then
   echo "short sync deleted manifest: got $deleted_size want $deleted_len" >&2
   exit 1
 fi
 `
+	if probe != "" {
+		script += "\nif [ \"$cold_sync\" = 1 ]; then printf '" + coldSyncReady + "'; fi\n"
+	}
 	if hermetic {
 		return remoteHermeticPOSIXControlCommand(script)
 	}
@@ -2889,10 +3135,11 @@ fi
 	if !opts.GitOverlay && !opts.PlainManifest && opts.HydrateGit && opts.BaseRef != "" {
 		refspec := "+refs/heads/" + opts.BaseRef + ":refs/remotes/origin/" + opts.BaseRef
 		script += `if exact_git_root && git remote get-url origin >/dev/null 2>&1; then
+  hydrate_fetch() { git fetch --quiet --filter=blob:none origin "$@"; }
   if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
-    git fetch --quiet --unshallow origin ` + shellQuote(refspec) + ` || git fetch --quiet --depth=1000 origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(opts.BaseRef) + ` || true
+    hydrate_fetch --unshallow ` + shellQuote(refspec) + ` || hydrate_fetch --depth=1000 ` + shellQuote(refspec) + ` || hydrate_fetch ` + shellQuote(refspec) + ` || hydrate_fetch ` + shellQuote(opts.BaseRef) + ` || true
   else
-    git fetch --quiet origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(opts.BaseRef) + ` || true
+    hydrate_fetch ` + shellQuote(refspec) + ` || hydrate_fetch ` + shellQuote(opts.BaseRef) + ` || true
   fi
 fi
 `
@@ -2925,14 +3172,14 @@ coherence_committed=1
 }
 
 func runRemoteFinalizeSync(ctx context.Context, target SSHTarget, workdir string, opts remoteSyncFinalizeOptions) (string, error, string, bool) {
-	out, err := runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
 	reason, fallback := gitOriginRuntimeFallbackResult(opts.Coherence.RemoteURL, out, err)
 	if !fallback {
 		return out, err, "", false
 	}
 	opts.HydrateGit, opts.GitOverlay, opts.PlainManifest = false, false, true
 	opts.Fingerprint, opts.Coherence = "", gitCoherencePlan{}
-	out, err = runIdempotentSSHSyncScriptGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	out, err = runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
 	return out, err, reason, true
 }
 
@@ -2992,7 +3239,7 @@ coherence_committed=; coherence_mutated=; head_changed=; index_changed=
 tmp_ref="refs/crabbox/sync-$expected_token"; advertised_branch=` + shellQuote(plan.Branch) + `; expected_origin=` + shellQuote(plan.RemoteURL) + `
 ` + remoteGitOriginTransportFunctions() + `
 coherence_fetch() {
-  set -- --quiet --no-tags
+  set -- --quiet --filter=blob:none --no-tags
   # An existing shallow boundary can hide ancestors of the advertised branch.
   if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
     set -- "$@" --unshallow

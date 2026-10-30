@@ -15,6 +15,13 @@
   "version_metadata": {
     "binding": "CF_VERSION_METADATA",
   },
+  // Workers Logs: keep every invocation, including Durable Object alarms, for incident attribution.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    // OAuth callbacks carry authorization codes in the query string; keep them out of retained logs.
+    "redact_query_string": true,
+  },
   "triggers": {
     "crons": ["*/15 * * * *"],
   },
@@ -55,22 +62,23 @@
     "CRABBOX_AZURE_ORPHAN_SWEEP_GRACE_SECONDS": "900",
     "CRABBOX_CAPACITY_HINTS": "1",
     "CRABBOX_CAPACITY_LARGE_CLASSES": "beast",
-    "CRABBOX_MAX_ACTIVE_LEASES": "20",
+    "CRABBOX_MAX_ACTIVE_LEASES": "50",
     "CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER": "10",
-    "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG": "20",
+    "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG": "50",
     "CRABBOX_MAX_CHECKPOINTS": "100",
     "CRABBOX_MAX_CHECKPOINTS_PER_OWNER": "100",
     "CRABBOX_MAX_CHECKPOINTS_PER_ORG": "100",
     "CRABBOX_MAX_CHECKPOINT_USE_CLAIMS": "16",
     "CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER": "64",
     "CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL": "256",
-    "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN": "20",
-    "CRABBOX_MAX_MONTHLY_USD": "50000",
-    "CRABBOX_MAX_MONTHLY_USD_PER_OWNER": "25000",
-    "CRABBOX_MAX_MONTHLY_USD_PER_ORG": "50000",
+    "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN": "50",
+    "CRABBOX_MAX_MONTHLY_USD": "100000",
+    "CRABBOX_MAX_MONTHLY_USD_PER_OWNER": "50000",
+    "CRABBOX_MAX_MONTHLY_USD_PER_ORG": "100000",
   },
   "durable_objects": {
     "bindings": [
+      { "name": "SERVE_RELAY", "class_name": "ServeRelayDurableObject" },
       {
         "name": "FLEET",
         "class_name": "FleetDurableObject",
@@ -97,22 +105,23 @@
       "CRABBOX_DAYTONA_SSH_ACCESS_MINUTES": "120",
       "CRABBOX_CAPACITY_HINTS": "1",
       "CRABBOX_CAPACITY_LARGE_CLASSES": "beast",
-      "CRABBOX_MAX_ACTIVE_LEASES": "20",
+      "CRABBOX_MAX_ACTIVE_LEASES": "50",
       "CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER": "10",
-      "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG": "20",
+      "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG": "50",
       "CRABBOX_MAX_CHECKPOINTS": "20",
       "CRABBOX_MAX_CHECKPOINTS_PER_OWNER": "10",
       "CRABBOX_MAX_CHECKPOINTS_PER_ORG": "20",
       "CRABBOX_MAX_CHECKPOINT_USE_CLAIMS": "16",
       "CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER": "64",
       "CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL": "256",
-      "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN": "20",
-      "CRABBOX_MAX_MONTHLY_USD": "50000",
-      "CRABBOX_MAX_MONTHLY_USD_PER_OWNER": "25000",
-      "CRABBOX_MAX_MONTHLY_USD_PER_ORG": "50000",
+      "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN": "50",
+      "CRABBOX_MAX_MONTHLY_USD": "100000",
+      "CRABBOX_MAX_MONTHLY_USD_PER_OWNER": "50000",
+      "CRABBOX_MAX_MONTHLY_USD_PER_ORG": "100000",
     },
     "durable_objects": {
       "bindings": [
+        { "name": "SERVE_RELAY", "class_name": "ServeRelayDurableObject" },
         {
           "name": "FLEET",
           "class_name": "FleetDurableObject",
@@ -125,5 +134,6 @@
       "tag": "v1",
       "new_sqlite_classes": ["FleetDurableObject"],
     },
+    { "tag": "serve-relay-v1", "new_sqlite_classes": ["ServeRelayDurableObject"] },
   ],
 }

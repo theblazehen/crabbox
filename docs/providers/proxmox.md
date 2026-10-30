@@ -16,9 +16,12 @@ then drives the normal SSH sync/run/release path.
 The provider is direct-only: it talks to the Proxmox API straight from the CLI.
 The Crabbox coordinator (broker) does not provision or broker Proxmox capacity,
 so brokered shared-team leases are not available here. Proxmox supports the
-`ssh`, `crabbox-sync`, and `cleanup` features on `target=linux` only. Direct
+`ssh`, `crabbox-sync`, and `cleanup` features on `target=linux` only, plus
+[opt-in prepared desktop and browser templates](#prepared-desktop-and-browser-templates). Direct
 Proxmox also supports caller-supplied fixed lease IDs with
-`warmup --lease-id cbx_<12 lowercase hex>`.
+`warmup --lease-id cbx_<12 lowercase hex>`, and can run behind
+[`crabbox adapter serve`](../commands/adapter.md) as described in
+[Runtime adapter](#runtime-adapter).
 
 ## When to use
 
@@ -384,6 +387,14 @@ For an ordinary acquire, step 2 remains a per-create `/cluster/nextid` lookup.
 For `warmup --lease-id`, Crabbox instead persists the normalized create intent,
 selected VMID, source node, and cluster scope in the fixed lease claim before
 submitting the clone, then passes that exact VMID as the clone API's `newid`.
+Starting at Proxmox's `nextid`, fixed-ID reservation skips VMIDs bound by any
+live local Proxmox claim and verifies the next free VMID against complete cluster
+inventory, including unlabelled VMs, templates, and containers. Released fixed-ID
+receipts no longer reserve a VMID. Other claims are never dropped or adopted.
+Local fixed acquisitions serialize VMID selection through durable claim
+publication, so concurrent callers cannot reserve the same free ID. The fence
+ends before cloning or waiting for the guest; other hosts still rely on Proxmox
+to reject a conflicting clone request.
 An identical replay inspects the persisted VMID and adopts only the VM whose
 lease labels, intent fingerprint, cluster scope, VMID, and native `vmgenid`
 match. Slugs are never replay authority. A changed intent, copied labels,
@@ -399,7 +410,9 @@ can be stopped safely; replay does not declare it ready merely because SSH works
 
 Successful fixed-ID release, including authoritative absence of a previously
 acquired VM, retains a terminal local tombstone. Absence while a clone is still
-uncertain does not prove completion and retains the attempt. Checked deletion
+uncertain does not prove completion and retains the attempt on ordinary stop.
+Explicit prepared-claim recovery checks both cluster absence and active clone
+tasks as described below. Checked deletion
 records its phase before stopping/purging, so a retry can reconcile a lost delete
 response without reopening acquisition. The fixed lease ID is single-use and
 cannot allocate another VM after release.
@@ -433,7 +446,89 @@ against an operator copying or rewriting the entire VM configuration. Proxmox's
 VMID-based purge has no atomic identity precondition; do not concurrently replace
 VMs through raw Proxmox operations while cleanup runs.
 
+## Runtime adapter
+
+`crabbox adapter serve --provider proxmox` uses the same direct provider and
+fixed lease IDs. At startup the adapter reads the provider's controller identity
+and refuses to listen unless the configuration is complete: API URL, node,
+token ID, token secret, a positive `templateId` and `target=linux`. The API URL
+must be an absolute HTTP(S) URL without userinfo, a query or a fragment.
+
+The identity includes a versioned, opaque scope (`proxmox-v1:sha256:...`). It is a SHA-256 digest of the
+normalized API endpoint, node, token ID, template, storage, pool, bridge, clone
+mode, guest user and work root. The token secret must be present, but it is
+never part of the scope.
+The adapter stores the scope with each workspace before its first lifecycle
+operation. Later `inspect`, `list`, `stop` and WebVNC subprocesses for that
+workspace refuse to run when the current configuration produces another scope.
+
+This means:
+
+- You can replace the token secret for the same token ID without affecting
+  existing workspaces.
+- Changing the token ID, API endpoint, node or clone settings changes the scope.
+  Drain the adapter's workspaces to confirmed cleanup under the old configuration
+  before changing these settings. If settings have already changed, restore the
+  original configuration to drain them. Crabbox does not migrate workspaces between
+  Proxmox principals or clone profiles.
+- TLS verification, TTL and idle timeout do not change the scope.
+
+The scope is routing protection, not ownership proof: fixed-ID replay and exact
+cleanup still verify the exact claim, VMID and native `vmgenid` under the rules in [Lifecycle](#lifecycle),
+including the checks that need propagated `VM.Audit` on `/vms`. Proxmox can
+reuse a VMID after a VM is deleted. If another workspace receives the same VMID
+before the adapter confirms absence of the old one, the adapter keeps the old
+workspace's local cleanup pending until that VMID is gone. It never treats the
+new VM as the old workspace.
+
+When the adapter confirms that a released VM is absent, it finishes cleanup and
+keeps the released claim as the lease ID's receipt, as direct `stop` does. If an
+acquisition failed before Crabbox wrote that claim, confirmed-absence cleanup
+fails closed and the workspace stays `stopping` until an operator inspects it.
+
 ## Troubleshooting
+
+`http 403: Permission check failed (..., SDN.Use)` during a fixed-ID clone
+
+Grant the API token the named permission on the indicated resource (for example,
+`SDN.Use` on the selected bridge), then retry the same `warmup --lease-id` request.
+A definite HTTP 401/403 rejection from the clone endpoint, or an authorization
+failure during inventory/planning before submission, removes the pending intent
+and generated lease key. It does not reserve the VMID or consume the fixed ID.
+The original API error preserves the missing permission and path.
+
+Clone rejection requires a native Proxmox JSON error envelope with null data
+and the Proxmox server header. Proxy-generated, malformed, or rewritten 401/403
+responses retain the claim because the upstream clone may already have started.
+Replies carrying task data also retain custody, regardless of HTTP status.
+
+A 401/403 from task polling or VM identity reads after clone acceptance is
+ambiguous: the VM may already exist. Crabbox retains the prepared claim and
+refuses another clone. Restore read permissions and inspect the clone task and
+VM before recovery. A bound generation can be released with ordinary `stop`;
+an existing VM without a bound generation requires manual inspection and cannot
+be adopted or deleted by name.
+
+After a 403 on an older version, restore permissions and inspect the clone task,
+then clear each retained prepared claim whose VM is absent with its own lease ID:
+
+```sh
+crabbox stop --provider proxmox --id cbx_123456abcdef --force
+```
+
+Recovery requires the original cluster/node scope, a canonical fixed lease ID,
+and a prepared claim with no bound generation. Under the claim lock it verifies
+there are no active `qmclone` tasks on the source node, then checks complete
+cluster inventory for the reserved VMID, exact requested VM name, lease label,
+and provider key. This requires `Sys.Audit` on `/nodes/<source-node>` and
+propagated `VM.Audit` on `/vms`; missing permissions, unreadable inventory,
+active clones, or any matching VM retain the claim. Recovery never deletes a
+VM. Success removes the stored lease key and leaves a terminal receipt, freeing
+the VMID for a new lease ID while keeping the recovered fixed ID single-use.
+This checked recovery also applies to older claims without rejection evidence.
+Fixed IDs no longer collide with locally bound VMIDs: new requests skip those
+VMIDs. If no alternative can be reserved, the error names the conflicting claim
+and its exact recovery command; unreadable inventory always prevents allocation.
 
 `proxmox apiUrl is required` / `proxmox tokenId/tokenSecret are required` /
 `proxmox node is required` / `proxmox templateId is required`
@@ -484,3 +579,140 @@ unchanged.
 
 - [Provider reference](README.md)
 - [Provider backends](../provider-backends.md)
+
+## Prepared desktop and browser templates
+
+Desktop and browser leases are opt-in, template-backed Linux features. Crabbox
+never installs a desktop or browser during acquisition. Prepare and review the
+image first, then authorize its exact VMID in **user configuration**, environment
+variables, or explicit flags. Repository configuration cannot grant these
+capabilities. For example, with a prepared template at VMID 9401:
+
+```yaml
+provider: proxmox
+target: linux
+proxmox:
+  node: pve1
+  templateId: 9401
+  desktopTemplateId: 9401
+  browserTemplateId: 9401
+  user: crabbox
+```
+
+Both authorization fields default to `0` (disabled). `desktopTemplateId` enables
+`--desktop` only when it equals the selected `templateId`; `browserTemplateId`
+independently enables `--browser`, including headless browser leases. Environment
+names are `CRABBOX_PROXMOX_DESKTOP_TEMPLATE_ID` and
+`CRABBOX_PROXMOX_BROWSER_TEMPLATE_ID`; explicit flags are
+`--proxmox-desktop-template-id` and `--proxmox-browser-template-id`.
+`crabbox providers --configured --json` reports the features enabled by this configuration.
+Changing either authorization changes the immutable adapter scope: drain old
+workspaces before reconfiguring an adapter. Existing headless configuration and
+scope remain unchanged when both fields are zero.
+
+### Template preparation recipe
+
+Start with a Debian 12 Linux QEMU guest satisfying the cloud-init, guest-agent,
+SSH and passwordless-sudo requirements above. Inside that guest, from a reviewed
+Crabbox checkout, install the existing X11 desktop setup **before** converting the
+VM to a template:
+
+```sh
+sudo env CRABBOX_DESKTOP_USER=crabbox \
+  CRABBOX_DESKTOP_DISPLAY=:99 CRABBOX_DESKTOP_GEOMETRY=1920x1080x24 \
+  bash scripts/install-linux-desktop.sh
+sudo apt-get update
+sudo apt-get install -y chromium x11-utils
+sudo install -d -m 0755 /usr/local/bin
+sudo tee /usr/local/bin/crabbox-browser >/dev/null <<'BROWSER'
+#!/bin/sh
+set -eu
+profile="$HOME/.cache/crabbox/browser-profile"
+umask 077
+mkdir -p "$profile"
+chmod 0700 "$profile"
+exec /usr/bin/chromium --no-first-run --no-default-browser-check \
+  --disable-default-apps --hide-crash-restore-bubble \
+  --user-data-dir="$profile" "$@"
+BROWSER
+sudo chmod 0755 /usr/local/bin/crabbox-browser
+sudo tee /var/lib/crabbox/browser.env >/dev/null <<'ENV'
+BROWSER=/usr/local/bin/crabbox-browser
+CHROME_BIN=/usr/local/bin/crabbox-browser
+ENV
+sudo chmod 0644 /var/lib/crabbox/browser.env
+sudo -H -u crabbox /usr/local/bin/crabbox-browser --version
+```
+
+A reviewed Chrome-based template can use its installed Chrome executable in the
+wrapper instead. Do not bake logged-in browser profiles, SSH keys, or reusable
+credentials into the image. Before sealing it, stop and disable the desktop
+services and remove their temporary VNC credentials, so the clone cannot start
+with the template's password:
+
+```sh
+sudo systemctl disable --now crabbox-desktop.service crabbox-xvfb.service
+sudo rm -f /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
+```
+
+Shut down the guest and convert it to a Proxmox template with your normal image
+preparation process. Authorize the resulting template VMID, not the build VM's
+previous identity. The template must retain `crabbox-xvfb.service` (TigerVNC) and
+`crabbox-desktop.service` (XFCE), running as the configured `proxmox.user`.
+
+### Readiness and limits
+
+At clone creation Crabbox generates fresh private VNC credentials, enables and starts the
+prepared services, and verifies XFCE, TigerVNC, an accessible X11 display at
+`:99`, VncAuth using the per-clone password file, and a VNC listener exclusively
+on loopback port 5900. Both password files must belong to the configured guest
+user with mode `0600`. A browser request also checks `browser.env`, the executable
+`/usr/local/bin/crabbox-browser` wrapper, and its `--version` result as the guest
+user. These checks are installed in `crabbox-ready` for subsequent readiness
+probes. Failures name the missing or invalid component and require repairing the
+template; acquisition does not download a replacement desktop stack. The existing
+headless SSH toolchain bootstrap is unchanged.
+
+Only Linux XFCE/X11 with TigerVNC is supported here. Wayland, GNOME, Windows,
+macOS, arbitrary display numbers, and the 8-bit Xvfb/x11vnc alternative are not
+part of this template contract. A failed initial bootstrap follows the existing
+owned-clone cleanup/recovery path. Fixed-ID replay preserves capability labels
+and rejects a changed desktop/browser request instead of silently reusing an
+incompatible VM. Read-only inspect never installs packages or rotates passwords.
+
+Use the existing [VNC](../features/vnc-linux.md) SSH tunnel or
+[WebVNC](../commands/webvnc.md); do not expose port 5900 on the Proxmox bridge.
+For coordinator inventory and WebVNC, use `broker.mode: registered` with the
+existing [runtime adapter](#runtime-adapter). Proxmox still owns clone creation
+and cleanup; the coordinator does not gain Proxmox API credentials.
+
+### Live desktop proof
+
+This feature's automated tests use fake Proxmox, SSH, service, process and socket
+boundaries. A real proof requires a Proxmox host, API permissions and a prepared
+VMID as described above. On that host, using the trusted configuration:
+
+```sh
+crabbox doctor --provider proxmox --json
+crabbox warmup --provider proxmox --keep --desktop --browser \
+  --lease-id cbx_0123456789ab --slug desktop-proof --ttl 20m --idle-timeout 10m
+crabbox inspect --provider proxmox --id cbx_0123456789ab --json
+crabbox run --provider proxmox --id cbx_0123456789ab --browser --no-sync -- \
+  bash -lc 'crabbox-ready && "$BROWSER" --version'
+crabbox desktop launch --provider proxmox --id cbx_0123456789ab \
+  --browser --url https://example.com
+crabbox webvnc --provider proxmox --id cbx_0123456789ab --open
+crabbox stop --provider proxmox --id cbx_0123456789ab
+crabbox list --provider proxmox --json --refresh --all
+```
+
+Success means the lease reports `desktop=true`, `desktop_env=xfce`, and
+`browser=true`; the browser appears in WebVNC; VNC listens only on guest loopback;
+and stop removes the exact cloned VM, its local claim/key and registration while
+leaving the template intact. Repeat warmup with the same ID and capabilities
+before stop and confirm that there is still only one VM; omit `--browser` on a
+retry and expect `lease_id_conflict`. Repeat through `crabbox adapter serve
+--provider proxmox` with registered mode to validate the controller path.
+Finally, remove a required component in a separate test template and confirm the
+named readiness error and owned-clone cleanup. Preserve any unresolved claim
+until Proxmox inventory proves absence.

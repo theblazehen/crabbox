@@ -25,6 +25,36 @@ crabbox warmup --provider ssh --target macos --static-host mac-studio.example.co
 crabbox warmup --provider ssh --target windows --static-host win-dev.example.com --static-work-root 'C:\crabbox' --browser
 ```
 
+## Lifetime rollout canary
+
+Administrators can explicitly enroll a new coordinator-managed AWS on-demand
+lease in enforced maximum-age cleanup, even while the coordinator's default
+lifetime mode is off or report-only:
+
+```sh
+CRABBOX_AWS_REGION=eu-west-1 crabbox warmup --provider aws --class tiny --type t3.small --market on-demand --keep --ttl 45m --idle-timeout 10m --lifetime-canary 6m --lifetime-retention 5m
+```
+
+Set the AWS Region with `CRABBOX_AWS_REGION`; warmup accepts neither `--region`
+nor `--aws-region`.
+
+Supply both `--lifetime-canary <duration>` (compute lifetime from creation) and
+`--lifetime-retention <duration>` (root-disk retention after confirmed stop).
+Each must be a whole number of seconds between `1m` and `744h` (31 days).
+These are explicit rollout flags, not configuration defaults. They require a
+new managed AWS on-demand lease without a dedicated Mac host; direct and
+registered leases are rejected. Existing fixed-ID requests must match their
+original policy. The coordinator enforces administrator authorization and
+records `lifetimePolicy.source: "admin-canary"`.
+
+An explicit configured admin credential takes precedence for this canary;
+otherwise the configured broker credential must already have admin access.
+Inspect the resulting policy and warnings with `status`, `inspect`, `list`, or
+`admin leases`. Neither activity nor `--keep` extends the compute deadline.
+The retained root disk is permanently deleted after its retention period.
+Use [`admin extend-lifetime`](admin.md#extend-lifetime) before stopping starts
+to request an audited extension.
+
 ## Output
 
 On success warmup prints two lines on stdout — the lease summary and the ready
@@ -37,11 +67,59 @@ warmup complete total=42.1s
 ```
 
 The canonical lease ID is `cbx_...`; the friendly `slug` is an auto-generated
-`<adjective>-<noun>` handle (or a normalized `--slug` you requested). Reuse
+`<adjective>-<noun>-<eight-hex-fingerprint>` handle (or a normalized `--slug`
+you requested). Fixed-ID replay preserves its original naming contract. Reuse
 either with later `run`, `status`, `ssh`, `inspect`, and `stop` commands.
-Scripts should prefer the canonical ID. Add `--timing-json` to emit a final
+Scripts should prefer the canonical ID. On success, add `--timing-json` to emit a final
 JSON timing record (provider, lease ID, slug, total duration, exit code) on
 stderr.
+
+Azure Sandbox warmup also reports client-side provisioning steps in the existing
+`runnerPhases` and `creationEvents` fields: credential acquisition, create/inspect/
+list/resume requests, and polling waits grouped by observed lifecycle state.
+Creation events contain each step's cumulative duration and call count. Steps
+partition the client's time; request durations exclude credential acquisition,
+and `unattributed` retains local bookkeeping time. Failed or cancelled Sandbox
+warmup emits the same observational timing record on stderr with a nonzero exit
+code; it is not allocation rejection, readiness, or cleanup evidence. Timing
+output never authorizes another create or retry.
+
+The service does not expose separate disk-attachment or boot timestamps. Create
+and lifecycle waits therefore remain explicitly opaque server work; these client
+observations must not be presented as exact server disk/boot measurements.
+
+For a fixed-ID coordinator request rejected by a quota before lease admission,
+`--timing-json` emits a failure record on **stdout**, separately from diagnostic
+text on stderr. Its optional `creationRejected`
+object has this shape (shown with the relevant existing timing fields):
+
+```json
+{"provider":"aws","exitCode":1,"creationRejected":{"version":1,"requestedLeaseId":"cbx_0123456789ab","code":"cost_limit_exceeded"}}
+```
+
+The top-level provider is the canonical requested provider. `requestedLeaseId`
+identifies the request; `leaseId` and `slug` are absent because no allocated
+identity is reported. The original error diagnostic and nonzero exit remain.
+This applies to ordinary and minimum-resource fixed-create requests through the
+coordinator. It does not change successful output or commands without
+`--timing-json`.
+
+Version 1 qualifies only the original typed HTTP 429 `cost_limit_exceeded`
+response for that exact create request. Cancellation, deadlines, an earlier
+uncertain response followed by replay, errors after acceptance, other error
+codes, direct-provider creation, and checkpoint forks do not produce this
+result. A nonzero exit alone never proves rejection or completed cleanup.
+
+Consumers must require one complete newline-terminated stdout result, the
+supported version and code, the matching requested provider and ID, no lease
+receipt, and a failed invocation without interruption. Keep stdout and stderr
+separate: JSON in stderr diagnostics is never creation-rejection evidence.
+Successful timing output remains on stderr. Missing,
+malformed, duplicate, unknown, or mismatched results remain inconclusive,
+including partial output or a signal before complete evidence. Older clients
+without this result retain the existing recovery path. The result describes
+creation rejection; it does not confirm removal of local request state or
+authorize cleanup of another request.
 
 For Blacksmith Testbox with a configured coordinator, the lease summary appears
 as soon as the ready Testbox is retained. Final completion and timing follow the
@@ -75,9 +153,38 @@ attempt so an interrupted operation can be safely replayed.
 
 ## Lifetime: TTL and idle timeout
 
-- `--ttl <duration>` is the maximum wall-clock lifetime. Default `90m`.
+- `--ttl <duration>` is the maximum wall-clock lifetime. Default `30m`.
 - `--idle-timeout <duration>` releases the lease after no touch for that long.
   Default `30m`.
+
+`--keep=true` remains the default so the lease can be reused across runs. Set
+`warmup.keep: false` in user or repository config to change this default;
+`CRABBOX_WARMUP_KEEP` overrides config, and an explicit `--keep` wins over both.
+This setting applies only to `warmup`; it does not change `run --keep`.
+`lease.idleTimeout` (or top-level `idleTimeout`) configures the idle window;
+`CRABBOX_IDLE_TIMEOUT` overrides config and `--idle-timeout` overrides both.
+
+For managed coordinator leases, TTL counts from admission and remains a hard
+wall-clock cap. Provisioning does not consume idle time: `lastTouchedAt` and the
+idle deadline start when the coordinator publishes the active lease. Expiry is
+then the earlier of admission plus TTL and activation plus idle timeout; later
+plain heartbeats extend only the idle deadline. Choose a TTL that covers provisioning
+and intended use. A TTL exhausted during provisioning still triggers cleanup.
+The CLI's lease labels reflect these authoritative coordinator timestamps.
+
+Managed coordinator leases expire automatically regardless of keep. New direct
+GCP VMs also honor recorded expiry through their guest-side expiry guard when
+the attached service account can delete the VM. The expiry is the earlier of
+TTL and idle timeout; GCP guests still marked running or provisioning retain
+the 12-hour stale-state grace period. Kept guests without valid expiry metadata
+are left alone.
+
+Manual `crabbox cleanup` always skips `keep=true` machines, including expired
+ones. It is separate from automatic expiry. For direct providers without an
+automatic idle reaper, use `warmup.keep: false` and schedule cleanup, or stop the
+lease explicitly. Existing GCP guests retain their installed guard; recreate
+them to receive the updated idle reaper. See [cleanup](cleanup.md) and the
+provider documentation for supported lifecycle behavior.
 
 Tenki is an exception: kept leases are sticky and ignore TTL, and native idle
 expiry is unsupported. Use `--keep=false` to pass TTL as Tenki's maximum duration,
@@ -90,12 +197,13 @@ it and may append a short suffix if an active lease already uses that slug.
 
 `--lease-id cbx_<12 lowercase hex>` is the automation idempotency contract for
 providers that explicitly support fixed identities. Direct AWS, Azure, DigitalOcean,
-Machine0, Daytona, Incus, Tenki, Parallels, Proxmox, Boat, and local-container leases,
+Machine0, Daytona, Incus, Tenki, RunPod, Parallels, Proxmox, Boat, Apple Container, and local-container leases,
 Agent Sandbox delegated leases, managed coordinator leases, and explicitly capable
 external providers accept it. Replaying the same normalized create intent
 returns or joins the same live lease, including after the creating process loses
 its response. A managed coordinator reports `fixed_lease_terminal` when that
-same intent has already ended. Reusing the ID with a different provider, slug
+same intent has already ended, or `422 provisioning_failed` with the original
+diagnostics when it failed with no possible provider machine. Reusing the ID with a different provider, slug
 request, SSH key, machine or container shape, capabilities, lifetime, or other
 immutable create input fails with `lease_id_conflict` before another provider
 create. Slugs remain display aliases and are never used as the idempotency key.
@@ -129,7 +237,7 @@ honors caller cancellation. Fixed-ID leases remain available for explicit recove
 or stop; ordinary creates keep their token-bound cancellation cleanup.
 
 A fixed lease ID is single-use. Direct AWS, Azure, DigitalOcean, Machine0, Daytona,
-Incus, Tenki, Parallels, Proxmox, Boat, and local-container
+Incus, Tenki, RunPod, Parallels, Proxmox, Boat, Apple Container, and local-container
 acquisitions fail closed if their bound resource later disappears. Successful
 stop and missing-resource cleanup replace the live local claim with a compact
 terminal tombstone, so the ID remains rejected after release. Use a new
@@ -179,7 +287,13 @@ Reusing a lease later requires matching capability labels.
 
 ## OS image
 
-`--os` selects a portable Linux OS image; `ubuntu:26.04` is the default.
+`--os` selects an OS image. Linux supports `ubuntu:26.04` (the default) and
+`ubuntu:24.04`. AWS Windows supports `windows-server:2022` and
+`windows-server:2025` with `--target windows`, including WSL2 mode. Without a
+Windows selector, brokered promoted Windows images still win and stock Windows
+Server 2022 remains the fallback. A Windows selector requests the stock image
+for that release instead of an unversioned promoted image; see
+[AWS Windows images](../providers/aws.md#windows-images).
 Explicit provider image flags and config values still win for exact AMIs, URNs,
 image families, or provider image names.
 
@@ -284,9 +398,11 @@ sync/run/actions contract. Azure Windows does not provision browser/code.
 Azure leases use managed `StandardSSD_LRS` OS disks by default so native
 disk-snapshot checkpoints can be created and forked. Use
 `--azure-os-disk ephemeral` only for stateless leases that don't need native
-Azure checkpoint/fork support. Use `--azure-os-disk ephemeral-preview` for
-Azure's public-preview full-caching ephemeral OS disk mode; `--azure-os-disk
-auto` resolves to managed.
+Azure checkpoint/fork support. This mode enables GA full caching and requires
+at least eight vCPUs plus sufficient local storage on a supported VM family.
+See [Azure disk requirements](../features/azure.md#os-disk-mode).
+`ephemeral-preview` is removed; use `ephemeral`. `--azure-os-disk auto` resolves
+to managed.
 
 `--azure-backend dynamic-sessions` keeps `--provider azure` as the family
 selector while routing to the `azure-dynamic-sessions` delegated backend.
@@ -353,15 +469,17 @@ bootstrap, key migration, or failure cleanup.
 --profile <name>                   configuration profile
 --class <name>                     machine class; default beast
 --arch amd64|arm64                 CPU architecture; arm64 supports Linux on AWS/Azure/Apple Container and native Windows on Azure
---os ubuntu:26.04|ubuntu:24.04     portable Linux OS image selector
+--os <selector>                   Ubuntu or AWS Windows Server OS image selector
 --type <provider-type>             provider server/instance type
 --market spot|on-demand            capacity market (AWS)
+--min-vcpus <count>                minimum vCPUs for new AWS Linux leases; 0 disables
+--min-memory-mib <MiB>             minimum memory for new AWS Linux leases; 0 disables
 --slug <slug>                      request a friendly slug for a new lease
 --lease-id cbx_<12 lowercase hex> fixed lease ID for idempotent automation
 --pond <name>                      tag this lease into a pond
 --expose <port>                    declare a TCP port reachable over the SSH-mesh plane; repeatable
 --cache-volume [name=]key:path     require a provider-backed cache volume; repeatable
---ttl <duration>                   maximum lease lifetime; default 90m
+--ttl <duration>                   maximum lease lifetime; default 30m
 --idle-timeout <duration>          release after idle; default 30m
 --desktop                          provision/require a visible desktop + VNC
 --desktop-env xfce|wayland|gnome   Linux desktop environment
@@ -379,6 +497,8 @@ bootstrap, key migration, or failure cleanup.
 --static-user <user>               static SSH user
 --static-port <port>               static SSH port
 --static-work-root <path>          static target work root
+--static-start-command <json-argv>  local argv run before the SSH readiness wait
+--static-stop-command <json-argv>   local argv run after the last local lease on the host
 --network auto|tailscale|public    network mode for the printed SSH endpoint
 --tailscale                        join new managed Linux leases to the tailnet
 --tailscale-tags <a,b,c>           Tailscale tags for new managed leases
@@ -386,12 +506,12 @@ bootstrap, key migration, or failure cleanup.
 --tailscale-auth-key-env <env>     env var holding a direct-provider Tailscale auth key
 --tailscale-exit-node <name|100.x> Tailscale exit node
 --tailscale-exit-node-allow-lan-access
---keep                             keep the box after warmup; default true
+--keep                             retain across runs; recorded expiry still applies; default warmup.keep (true)
 --actions-runner                   register the box as an ephemeral GitHub Actions runner
 --reclaim                          overwrite an existing local claim for this lease
 --timing-json                      print a final JSON timing record on stderr
 --azure-backend vm|dynamic-sessions
---azure-os-disk managed|ephemeral|ephemeral-preview|auto
+--azure-os-disk managed|ephemeral|auto
 ```
 
 Provider-specific flags (for example `--azure-backend`, `--e2b-template`,
@@ -410,6 +530,18 @@ entries do not record or prove image capabilities.
 
 ## SSH keys
 
+SSH readiness is checked immediately, then retried after 250 ms, 500 ms, 1 s,
+2 s, 4 s, and at most 5 s between later attempts. Each attempt must still pass
+SSH host trust, authentication, and the provider's readiness command. The delay
+is in addition to connection/probe time; cancellation and the overall readiness
+deadline also interrupt pending probes and retry waits.
+
+Once a direct Linux target authenticates, an unready guest is checked inside a
+single SSH session every 250 ms for up to 30 seconds. The session uses the same
+`crabbox-ready` or custom readiness command, reports progress every five seconds,
+and returns to ordinary probing on failure or timeout. Windows, WSL2, macOS,
+and provider proxy routes retain their existing probes.
+
 New leases use per-lease SSH keys under the user config directory (RSA for
 AWS/Azure Windows, ed25519 otherwise):
 
@@ -419,3 +551,18 @@ AWS/Azure Windows, ed25519 otherwise):
 
 On macOS and Linux this is typically `~/Library/Application Support/crabbox/...`
 or `~/.config/crabbox/...` respectively.
+
+Static power hooks require a trusted `static.power.dedicated: true` contract.
+Use a distinct `static.id` for concurrent acquisitions; same-ID acquisition and
+prepared reuse are refused while custody remains. See [Power hooks](../providers/ssh.md#power-hooks).
+
+Optional resource minimums and supported creation/reuse combinations are documented
+in [capacity fallback](../features/capacity-fallback.md#optional-aws-resource-minimums).
+
+Ordinary lease lifetime defaults to 30m with a 4h maximum. The coordinator may
+clamp requested TTL/idle values and prints a policy notice through the CLI.
+Use [extend](extend.md) for an explicit extension. `run` requests auto-extension
+only while executing the user command, when fewer than 10 minutes remain, adding
+30 minutes up to the effective maximum. Policy or a creation-fixed provider
+deadline can disable this; setup and sync-only phases do not auto-extend.
+See [lifetime policy](../features/lifecycle-cleanup.md#ordinary-lifetime-policy).

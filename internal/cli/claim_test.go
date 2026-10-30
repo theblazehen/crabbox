@@ -51,6 +51,77 @@ func TestLeaseClaimImageEvidenceIdentity(t *testing.T) {
 	}
 }
 
+func TestLeaseClaimActionsWorkspaceAuthority(t *testing.T) {
+	binding := &ActionsWorkspaceBinding{Origin: "https://github.com/example-org/workflow", MarkerFingerprint: "fixture-marker"}
+	for _, kind := range []string{"metadata", "same-resource", "cloud", "numeric", "immutable", "replace-endpoint", "reclaim", "root", "scope", "replacement-root", "replacement-static"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			original := leaseClaim{
+				LeaseID: "cbx_binding", RepoRoot: "/source", Provider: "aws", ProviderScope: "scope-a",
+				CloudID: "resource-a", CloudNumericID: 1, CloudImmutableID: "immutable-a",
+				ActionsWorkspace: binding,
+			}
+			claim := cloneLeaseClaim(original)
+			if claim.ActionsWorkspace == original.ActionsWorkspace {
+				t.Fatal("claim clone aliases hydration authority")
+			}
+			switch kind {
+			case "metadata":
+				applyLeaseClaimEndpoint(&claim, Server{Labels: map[string]string{"state": "ready"}}, SSHTarget{}, claimEndpointUpdate)
+			case "same-resource":
+				SetLeaseClaimResourceIdentity(&claim, "resource-a", 1, "immutable-a", nil)
+			case "cloud":
+				SetLeaseClaimResourceIdentity(&claim, "resource-b", 1, "immutable-a", nil)
+			case "numeric":
+				SetLeaseClaimResourceIdentity(&claim, "resource-a", 2, "immutable-a", nil)
+			case "immutable":
+				SetLeaseClaimResourceIdentity(&claim, "resource-a", 1, "immutable-b", nil)
+			case "replace-endpoint":
+				applyLeaseClaimEndpoint(&claim, Server{}, SSHTarget{}, claimEndpointReplace)
+			case "reclaim", "root", "scope":
+				root, scope := original.RepoRoot, original.ProviderScope
+				if kind == "root" {
+					root = "/replacement"
+				}
+				if kind == "scope" {
+					scope = "scope-b"
+				}
+				err := transformLeaseClaimForRepo(&claim, original.LeaseID, "", original.Provider, scope, "", staticClaimDetails{}, root, time.Minute, kind != "scope", claimMetadata{}, LeaseLabelTime(time.Now()))
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "replacement-root", "replacement-static":
+				path, err := leaseClaimPath(original.LeaseID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeLeaseClaimAtomic(path, original); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "replacement-root" {
+					claim.RepoRoot = "/replacement"
+				} else {
+					claim.StaticHost = "replacement.example.test"
+				}
+				claim, err = ReplaceLeaseClaimIfUnchangedDurableReturning(original.LeaseID, original, claim)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			preserve := kind == "metadata" || kind == "same-resource"
+			if (claim.ActionsWorkspace != nil) != preserve {
+				t.Fatalf("authority retained=%t, want %t", claim.ActionsWorkspace != nil, preserve)
+			}
+			if !reflect.DeepEqual(original.ActionsWorkspace, binding) {
+				t.Fatal("claim mutation changed the prior snapshot")
+			}
+		})
+	}
+}
+
 func TestFixedAWSClaimProviderCanonicalizesWithoutOverwritingMarker(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	const leaseID = "cbx_abcdef123464"
@@ -1454,6 +1525,37 @@ func TestUpdateLeaseClaimTouchIfUnchangedActionCommitsAtomically(t *testing.T) {
 	})
 	if err != nil || endpoint.LastUsedAt != replaced.LastUsedAt || endpoint.IdleTimeoutSeconds != replaced.IdleTimeoutSeconds {
 		t.Fatalf("endpoint compatibility claim=%#v err=%v", endpoint, err)
+	}
+}
+
+func TestLeaseClaimTouchPersistsEffectiveIdleTimeout(t *testing.T) {
+	for _, atomicAction := range []bool{false, true} {
+		t.Run(fmt.Sprint(atomicAction), func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			const id = "cbx_clamped_idle"
+			server := Server{Provider: "aws", CloudID: "i-test", Labels: map[string]string{"provider": "aws"}}
+			if err := ClaimLeaseTargetForRepoConfig(id, "test", Config{Provider: "aws"}, server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := ReadLeaseClaim(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requested := 90 * time.Minute
+			server.Labels = map[string]string{"provider": "aws", "idle_timeout_secs": "1800", "ttl_secs": "1800"}
+			if atomicAction {
+				claim, _, _, err = UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), id, claim, time.Now(), &requested, func() (Server, SSHTarget, bool, error) { return server, SSHTarget{}, true, nil })
+			} else {
+				claim, err = UpdateLeaseClaimTouchIfUnchanged(t.Context(), id, claim, server.Labels, time.Now(), &requested)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := ReadLeaseClaim(id)
+			if err != nil || claim.IdleTimeoutSeconds != 1800 || persisted.IdleTimeoutSeconds != 1800 {
+				t.Fatalf("effective idle timeout lost: claim=%d persisted=%d err=%v", claim.IdleTimeoutSeconds, persisted.IdleTimeoutSeconds, err)
+			}
+		})
 	}
 }
 

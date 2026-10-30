@@ -23,10 +23,18 @@ type sshTransportSession struct {
 	dir         string
 	configPath  string
 	destination string
+	serveRelay  bool
 	cleanup     func() error
 }
 
 func newSSHTransportSession(ctx context.Context, target SSHTarget, localForward bool) (*sshTransportSession, error) {
+	if !localForward {
+		var err error
+		target, err = prepareServeRelayControl(ctx, target)
+		if err != nil {
+			return nil, err
+		}
+	}
 	dir, err := os.MkdirTemp("", "crabbox-ssh-transport-*")
 	if err != nil {
 		return nil, fmt.Errorf("create private SSH transport directory: %w", err)
@@ -84,7 +92,7 @@ func newSSHTransportSession(ctx context.Context, target SSHTarget, localForward 
 	if err := secureSSHTransportPath(path, false); err != nil {
 		return fail(fmt.Errorf("secure private SSH transport config: %w", err))
 	}
-	return &sshTransportSession{dir: dir, configPath: path, destination: sshTransportDestination(target)}, nil
+	return &sshTransportSession{dir: dir, configPath: path, destination: sshTransportDestination(target), serveRelay: usesServeRelay(target)}, nil
 }
 
 func (s *sshTransportSession) Close() error {
@@ -194,7 +202,7 @@ func newWSLSSHTransportSession(ctx context.Context, target SSHTarget, wslExe, mo
 	if err := writeWSLSSHTransportFile(ctx, wslExe, configPath, []byte(config), target); err != nil {
 		return fail(err)
 	}
-	return &sshTransportSession{dir: dir, configPath: configPath, destination: sshTransportDestination(wslTarget), cleanup: cleanup}, nil
+	return &sshTransportSession{dir: dir, configPath: configPath, destination: sshTransportDestination(wslTarget), serveRelay: usesServeRelay(wslTarget), cleanup: cleanup}, nil
 }
 
 func validWSLSSHTransportDirectory(value string) bool {
@@ -288,6 +296,7 @@ func (s *sshTransportSession) commandPrefix() []string {
 }
 
 func (s *sshTransportSession) commandPrefixWithOptions(connectTimeout, connectionAttempts string) []string {
+	connectTimeout = relaySSHConnectTimeout(connectTimeout, s.serveRelay)
 	return append(s.commandPrefix(), "-o", "ConnectTimeout="+connectTimeout, "-o", "ConnectionAttempts="+connectionAttempts)
 }
 
@@ -652,7 +661,7 @@ func startOwnedSSHTransportSubsystem(ctx context.Context, target SSHTarget, conn
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	args := append(session.commandPrefix(), "-o", "ConnectTimeout="+connectTimeout, "-o", "ConnectionAttempts="+connectionAttempts, "-s", session.host(), subsystem)
+	args := append(session.commandPrefixWithOptions(connectTimeout, connectionAttempts), "-s", session.host(), subsystem)
 	handle := newOwnedSSHTransportCommand(ctx, target, args)
 	handle.cmd.Stderr = stderr
 	input, err := handle.cmd.StdinPipe()
@@ -970,7 +979,7 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 	b.WriteString("  ForwardX11 no\n")
 	b.WriteString("  ForwardX11Trusted no\n")
 	b.WriteString("  RequestTTY no\n")
-	b.WriteString("  ConnectTimeout 10\n")
+	b.WriteString("  ConnectTimeout " + relaySSHConnectTimeout("10", usesServeRelay(target)) + "\n")
 	b.WriteString("  ConnectionAttempts 1\n")
 	b.WriteString("  ServerAliveInterval 15\n")
 	b.WriteString("  ServerAliveCountMax 2\n")
@@ -993,10 +1002,14 @@ func renderSSHTransportConfigWithRoute(target SSHTarget, localForward bool, rout
 			b.WriteString("  CheckHostIP no\n")
 		}
 	}
-	// A transport command owns one process tree. Never let a multiplexed master
-	// retain a copy or forward after that process exits.
+	// Only an explicitly owned foreground master may outlive a copy. Exported
+	// forwards keep their own transport and cannot borrow invocation state.
 	b.WriteString("  ControlMaster no\n")
-	b.WriteString("  ControlPath none\n")
+	if target.ownerControlPath != "" && !localForward {
+		writeSSHTransportLiteralConfigValue(&b, "ControlPath", target.ownerControlPath)
+	} else {
+		b.WriteString("  ControlPath none\n")
+	}
 	b.WriteString("  ControlPersist no\n")
 	for _, identityFile := range identityFiles {
 		writeSSHTransportLiteralConfigValue(&b, "IdentityFile", identityFile)
@@ -1135,7 +1148,13 @@ func (a App) probeSSHTransportLeaseAfterClaim(ctx context.Context, cfg Config, l
 		return nil
 	}
 	configuredPort := lease.SSH.Port
-	_ = probePrivateSSHTransport(ctx, &lease.SSH, 4*time.Second)
+	if err := probePrivateSSHTransport(ctx, &lease.SSH, 4*time.Second); err != nil {
+		// Not fatal: the operation still tries the configured port with its own
+		// deadlines. But the reason the endpoint was not re-resolved is reported, so a
+		// later "connection refused" on the configured port is explained.
+		writeSSHTransportDiagnostic(a.Stderr, lease.SSH, fmt.Sprintf("warning: ssh endpoint probe for %s kept the configured port %s: %v", lease.LeaseID, configuredPort, err))
+		return nil
+	}
 	if lease.SSH.Port == configuredPort {
 		return nil
 	}
@@ -1152,34 +1171,44 @@ func (a App) probeSSHTransportLeaseAfterClaim(ctx context.Context, cfg Config, l
 	return nil
 }
 
-func probePrivateSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Duration) bool {
+// probePrivateSSHTransport selects the first candidate port that answers. A candidate
+// whose private session cannot be created, or that does not answer within timeout, is
+// skipped rather than ending the probe; when none answers, the error names every
+// candidate and why it failed.
+func probePrivateSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Duration) error {
 	if target == nil || target.Host == "" {
-		return false
+		return errors.New("no SSH host to probe")
 	}
+	var failures []error
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		if context.Cause(ctx) != nil {
-			return false
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, timeout)
-		probe := *target
-		probe.Port = port
-		probe.FallbackPorts = nil
-		session, err := newSSHTransportSession(probeCtx, probe, false)
-		if err != nil {
-			cancel()
-			return false
+		if err := probeSSHTransportPort(ctx, *target, port, timeout); err != nil {
+			failures = append(failures, fmt.Errorf("port %q: %w", port, err))
+			continue
 		}
-		args := append(session.commandPrefix(), "-n", session.host(), wrapRemoteForTarget(probe, sshTransportProbeCommand(probe)))
-		runErr := runOwnedSSHTransportCommand(probeCtx, probe, args, io.Discard, io.Discard)
-		closeErr := session.Close()
-		cancel()
-		if runErr == nil && closeErr == nil {
-			target.Port = port
-			return true
-		}
-		if context.Cause(ctx) != nil {
-			return false
-		}
+		target.Port = port
+		return nil
 	}
-	return false
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return fmt.Errorf("no candidate answered: %w", errors.Join(failures...))
+}
+
+// probeSSHTransportPort runs the transport probe command against one candidate port.
+func probeSSHTransportPort(ctx context.Context, target SSHTarget, port string, timeout time.Duration) error {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	probe := target
+	probe.Port = port
+	probe.FallbackPorts = nil
+	session, err := newSSHTransportSession(probeCtx, probe, false)
+	if err != nil {
+		return err
+	}
+	args := append(session.commandPrefix(), "-n", session.host(), wrapRemoteForTarget(probe, sshTransportProbeCommand(probe)))
+	runErr := runOwnedSSHTransportCommand(probeCtx, probe, args, io.Discard, io.Discard)
+	return errors.Join(runErr, session.Close())
 }

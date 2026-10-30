@@ -1,7 +1,6 @@
 package scaleway
 
 import (
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -16,10 +15,9 @@ const (
 	ownershipTagConflictLabel = "_scaleway_ownership_tag_conflict"
 )
 
-var tagSafeRe = regexp.MustCompile(`[^A-Za-z0-9_:\-]`)
-
-// Share field definitions while retaining Scaleway's own decoding precedence.
 var tagSchema = shared.LeaseTagSchema(append(shared.TailscaleTagFields(),
+	shared.TagLabelField{Key: "fixed_attempt"},
+	shared.TagLabelField{Key: "fixed_intent_sha256"},
 	shared.TagLabelField{Key: "recovery"},
 	shared.TagLabelField{Key: "scaleway_project"},
 	shared.TagLabelField{Key: "scaleway_organization"},
@@ -49,25 +47,12 @@ func tagsFromLabels(labels map[string]string) []string {
 }
 
 func encodeTagKV(key, value string) string {
-	key = sanitizeTagPart(key)
+	key = shared.SanitizeTagPart(key, 64)
 	if tagSchema.Exact(key) {
 		key += "_v1"
 		return tagPrefix + key + ":" + shared.EncodeExactTagValue(value, 255-len(tagPrefix)-len(key)-1)
 	}
-	return tagPrefix + key + ":" + sanitizeTagPart(value)
-}
-
-func sanitizeTagPart(value string) string {
-	value = strings.TrimSpace(value)
-	value = tagSafeRe.ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-")
-	if value == "" {
-		return "unknown"
-	}
-	if len(value) > 64 {
-		return value[:64]
-	}
-	return value
+	return tagPrefix + key + ":" + shared.SanitizeTagPart(value, 64)
 }
 
 func versionedExactTagValueKey(key string) (string, bool) {
@@ -99,7 +84,7 @@ func labelsFromTags(tags []string) map[string]string {
 				continue
 			}
 			switch key {
-			case "provider", "lease", "slug", "target", volumeContractLabel, rootVolumeLabel:
+			case "provider", "lease", "slug", "target", volumeContractLabel, rootVolumeLabel, "fixed_attempt", "fixed_intent_sha256":
 				if prior := labels[key]; prior != "" && prior != value {
 					ownershipConflicts[key] = true
 				}

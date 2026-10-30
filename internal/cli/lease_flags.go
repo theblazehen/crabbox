@@ -11,33 +11,37 @@ import (
 )
 
 type leaseCreateFlagValues struct {
-	Provider      *string
-	Profile       *string
-	Class         *string
-	Architecture  *string
-	OSImage       *string
-	ServerType    *string
-	SSHPort       *string
-	Market        *string
-	Slug          *string
-	Pond          *string
-	Expose        *stringListFlag
-	CacheVolumes  *stringListFlag
-	TTL           *time.Duration
-	Idle          *time.Duration
-	Desktop       *bool
-	DesktopEnv    *string
-	Browser       *bool
-	ImageMinOS    *string
-	ImageSDK      *stringListFlag
-	ImageRuntime  *stringListFlag
-	ImageBrowser  *bool
-	ImageWebView2 *bool
-	ImageDesktop  *bool
-	Code          *bool
-	ProviderFlags providerFlagValues
-	Target        targetFlagValues
-	Network       networkFlagValues
+	Provider          *string
+	Profile           *string
+	Class             *string
+	Architecture      *string
+	OSImage           *string
+	ServerType        *string
+	SSHPort           *string
+	Market            *string
+	MinVCPUs          *int
+	MinMemoryMiB      *int
+	Slug              *string
+	Pond              *string
+	Expose            *stringListFlag
+	CacheVolumes      *stringListFlag
+	TTL               *time.Duration
+	Idle              *time.Duration
+	LifetimeCanary    *time.Duration
+	LifetimeRetention *time.Duration
+	Desktop           *bool
+	DesktopEnv        *string
+	Browser           *bool
+	ImageMinOS        *string
+	ImageSDK          *stringListFlag
+	ImageRuntime      *stringListFlag
+	ImageBrowser      *bool
+	ImageWebView2     *bool
+	ImageDesktop      *bool
+	Code              *bool
+	ProviderFlags     providerFlagValues
+	Target            targetFlagValues
+	Network           networkFlagValues
 }
 
 type leaseCreateFlagRegistrationOptions struct {
@@ -65,33 +69,37 @@ func registerLeaseCreateFlagsWithOptions(fs *flag.FlagSet, defaults Config, opti
 	fs.Var(&imageSDK, "image-sdk", "minimum SDK in name=version form; repeatable")
 	fs.Var(&imageRuntime, "image-runtime", "minimum runtime in name=version form; repeatable")
 	return leaseCreateFlagValues{
-		Provider:      registerProviderSelectionFlag(fs, defaults, providerHelpAll()),
-		Profile:       fs.String("profile", defaults.Profile, "profile"),
-		Class:         fs.String("class", defaults.Class, "machine class"),
-		Architecture:  fs.String("arch", defaults.Architecture, "CPU architecture: amd64 or arm64"),
-		OSImage:       fs.String("os", defaults.OSImage, "portable Linux OS image selector, for example ubuntu:26.04"),
-		ServerType:    fs.String("type", options.serverTypeDefault, "provider server/instance type"),
-		SSHPort:       fs.String("ssh-port", defaults.SSHPort, "SSH port for the leased target"),
-		Market:        fs.String("market", defaults.Capacity.Market, "capacity market: spot or on-demand"),
-		Slug:          fs.String("slug", "", "request a friendly slug for a new lease"),
-		Pond:          fs.String("pond", defaults.Pond, "tag this lease with a pond name so peers can be selected with --pond"),
-		Expose:        &expose,
-		CacheVolumes:  &cacheVolumes,
-		TTL:           fs.Duration("ttl", defaults.TTL, "maximum lease lifetime"),
-		Idle:          fs.Duration("idle-timeout", defaults.IdleTimeout, "idle timeout"),
-		Desktop:       fs.Bool("desktop", defaults.Desktop, "provision or require a visible desktop/VNC session"),
-		DesktopEnv:    fs.String("desktop-env", defaults.DesktopEnv, "Linux desktop environment: xfce, wayland, or gnome"),
-		Browser:       fs.Bool("browser", defaults.Browser, "provision or require a browser binary"),
-		ImageMinOS:    fs.String("image-min-os", "", "minimum promoted-image OS version"),
-		ImageSDK:      &imageSDK,
-		ImageRuntime:  &imageRuntime,
-		ImageBrowser:  fs.Bool("image-require-browser", false, "require browser support in the promoted image"),
-		ImageWebView2: fs.Bool("image-require-webview2", false, "require WebView2 support in the promoted image"),
-		ImageDesktop:  fs.Bool("image-require-desktop", false, "require desktop support in the promoted image"),
-		Code:          fs.Bool("code", defaults.Code, "provision or require web code-server capability"),
-		ProviderFlags: registerProviderFlagsObserved(fs, defaults, options.observe),
-		Target:        registerTargetFlags(fs, defaults),
-		Network:       registerNetworkFlags(fs, defaults),
+		Provider:          registerProviderSelectionFlag(fs, defaults, providerHelpAll()),
+		Profile:           fs.String("profile", defaults.Profile, "profile"),
+		Class:             fs.String("class", defaults.Class, "machine class"),
+		Architecture:      fs.String("arch", defaults.Architecture, "CPU architecture: amd64 or arm64"),
+		OSImage:           fs.String("os", defaults.OSImage, "OS image selector, for example ubuntu:26.04 or windows-server:2025 (AWS Windows)"),
+		ServerType:        fs.String("type", options.serverTypeDefault, "provider server/instance type"),
+		SSHPort:           fs.String("ssh-port", defaults.SSHPort, "SSH port for the leased target"),
+		Market:            fs.String("market", defaults.Capacity.Market, "capacity market: spot or on-demand"),
+		MinVCPUs:          fs.Int("min-vcpus", defaults.Capacity.MinVCPUs, "minimum provisioned vCPUs (AWS Linux; 0 = unconstrained)"),
+		MinMemoryMiB:      fs.Int("min-memory-mib", defaults.Capacity.MinMemoryMiB, "minimum provisioned memory in MiB (AWS Linux; 0 = unconstrained)"),
+		Slug:              fs.String("slug", "", "request a friendly slug for a new lease"),
+		Pond:              fs.String("pond", defaults.Pond, "tag this lease with a pond name so peers can be selected with --pond"),
+		Expose:            &expose,
+		CacheVolumes:      &cacheVolumes,
+		TTL:               fs.Duration("ttl", defaults.TTL, "maximum lease lifetime"),
+		Idle:              fs.Duration("idle-timeout", defaults.IdleTimeout, "idle timeout"),
+		LifetimeCanary:    fs.Duration("lifetime-canary", 0, "admin-only rollout canary: enforce a maximum compute age (1m..744h) on a new coordinator AWS on-demand lease"),
+		LifetimeRetention: fs.Duration("lifetime-retention", 0, "admin-only rollout canary: retain the stopped root disk for this duration (1m..744h); requires --lifetime-canary"),
+		Desktop:           fs.Bool("desktop", defaults.Desktop, "provision or require a visible desktop/VNC session"),
+		DesktopEnv:        fs.String("desktop-env", defaults.DesktopEnv, "Linux desktop environment: xfce, wayland, or gnome"),
+		Browser:           fs.Bool("browser", defaults.Browser, "provision or require a browser binary"),
+		ImageMinOS:        fs.String("image-min-os", "", "minimum promoted-image OS version"),
+		ImageSDK:          &imageSDK,
+		ImageRuntime:      &imageRuntime,
+		ImageBrowser:      fs.Bool("image-require-browser", false, "require browser support in the promoted image"),
+		ImageWebView2:     fs.Bool("image-require-webview2", false, "require WebView2 support in the promoted image"),
+		ImageDesktop:      fs.Bool("image-require-desktop", false, "require desktop support in the promoted image"),
+		Code:              fs.Bool("code", defaults.Code, "provision or require web code-server capability"),
+		ProviderFlags:     registerProviderFlagsObserved(fs, defaults, options.observe),
+		Target:            registerTargetFlags(fs, defaults),
+		Network:           registerNetworkFlags(fs, defaults),
 	}
 }
 
@@ -104,17 +112,25 @@ func applyLeaseCreateFlagsForLease(cfg *Config, fs *flag.FlagSet, values leaseCr
 }
 
 func autoRouteClaimLeaseProvider(cfg *Config, fs *flag.FlagSet, identifier string) error {
+	return autoRouteClaimLeaseProviderContext(context.Background(), cfg, fs, identifier)
+}
+
+func autoRouteClaimLeaseProviderContext(ctx context.Context, cfg *Config, fs *flag.FlagSet, identifier string) error {
 	if flagWasSet(fs, "provider") {
 		return nil
 	}
-	return autoRouteClaimLeaseProviderForIdentifier(cfg, identifier)
+	return autoRouteClaimLeaseProviderForIdentifierContext(ctx, cfg, identifier)
 }
 
 func autoRouteClaimLeaseProviderForIdentifier(cfg *Config, identifier string) error {
+	return autoRouteClaimLeaseProviderForIdentifierContext(context.Background(), cfg, identifier)
+}
+
+func autoRouteClaimLeaseProviderForIdentifierContext(ctx context.Context, cfg *Config, identifier string) error {
 	if ProviderSelectionIsAuthoritativeRoute(*cfg) {
 		return nil
 	}
-	provider, ok, err := claimProviderForIdentifier(identifier)
+	provider, ok, err := claimProviderForIdentifierContext(ctx, identifier)
 	if err != nil {
 		return err
 	}
@@ -125,13 +141,17 @@ func autoRouteClaimLeaseProviderForIdentifier(cfg *Config, identifier string) er
 }
 
 func autoRouteLeaseProviderForIdentifier(cfg *Config, fs *flag.FlagSet, identifier string) error {
-	if err := autoRouteClaimLeaseProvider(cfg, fs, identifier); err != nil {
+	return autoRouteLeaseProviderForIdentifierContext(context.Background(), cfg, fs, identifier)
+}
+
+func autoRouteLeaseProviderForIdentifierContext(ctx context.Context, cfg *Config, fs *flag.FlagSet, identifier string) error {
+	if err := autoRouteClaimLeaseProviderContext(ctx, cfg, fs, identifier); err != nil {
 		return err
 	}
-	if err := autoRouteStaticLease(cfg, fs, identifier); err != nil {
+	if err := autoRouteStaticLeaseContext(ctx, cfg, fs, identifier); err != nil {
 		return err
 	}
-	return autoRouteExternalLease(cfg, fs, identifier)
+	return autoRouteExternalLeaseContext(ctx, cfg, fs, identifier)
 }
 
 func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values leaseCreateFlagValues, existingLeaseID string, mutateExternal bool) error {
@@ -151,6 +171,31 @@ func applyLeaseCreateFlagsForTarget(cfg *Config, fs *flag.FlagSet, values leaseC
 	prepareProviderDefaults(cfg)
 	cfg.Profile = *values.Profile
 	recordConfigInput(cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "profile"))
+	if flagWasSet(fs, "min-vcpus") {
+		cfg.Capacity.MinVCPUs = *values.MinVCPUs
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
+	}
+	if flagWasSet(fs, "min-memory-mib") {
+		cfg.Capacity.MinMemoryMiB = *values.MinMemoryMiB
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
+	}
+	if err := validateCapacityMinimumValues(cfg.Capacity); err != nil {
+		return err
+	}
+	if hasCapacityMinimums(*cfg) {
+		if target.Reuse {
+			return Exit(2, "resource requirements are unsupported with existing lease reuse (--id)")
+		}
+		if fs.Name() == "prewarm" {
+			return Exit(2, "resource requirements are unsupported for composite prewarm; use warmup")
+		}
+		if fs.Name() == "checkpoint fork" {
+			return Exit(2, "resource requirements are unsupported for checkpoint forks")
+		}
+		if pool := fs.Lookup("pool"); pool != nil && strings.TrimSpace(pool.Value.String()) != "" {
+			return Exit(2, "resource requirements are unsupported with ready pools")
+		}
+	}
 	cfg.Class = *values.Class
 	recordConfigInput(cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "class"))
 	if flagWasSet(fs, "ssh-port") {
@@ -284,6 +329,9 @@ func applyLeaseCreateFlagsForTarget(cfg *Config, fs *flag.FlagSet, values leaseC
 	if err := validateProviderTarget(*cfg); err != nil {
 		return err
 	}
+	if err := validateResourceRequirements(*cfg); err != nil {
+		return err
+	}
 	if err := validateImageRequirementsForLease(*cfg, target.Reuse); err != nil {
 		return err
 	}
@@ -308,6 +356,9 @@ func applyLeaseCreateFlagsForTarget(cfg *Config, fs *flag.FlagSet, values leaseC
 		}
 	}
 	if err := validateLeaseDurations(*cfg); err != nil {
+		return err
+	}
+	if err := applyLifetimeCanaryFlags(cfg, fs, values, target); err != nil {
 		return err
 	}
 	if cfg.Pond != "" {
@@ -479,8 +530,21 @@ type leaseTargetConfigOptions struct {
 	ProviderResourceID bool
 }
 
+func applyTargetAndProviderFlags(cfg *Config, fs *flag.FlagSet, target targetFlagValues, provider providerFlagValues) error {
+	// Provider flag handlers may validate the target, so resolve explicit target
+	// overrides before they see inherited configuration.
+	if err := applyTargetFlagOverrides(cfg, fs, target); err != nil {
+		return err
+	}
+	return applyProviderFlags(cfg, fs, provider)
+}
+
 func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags targetFlagValues, networkFlags networkModeFlagValues, opts leaseTargetConfigOptions) (Config, error) {
-	cfg, err := loadConfig()
+	return loadLeaseTargetConfigContext(context.Background(), fs, provider, targetFlags, networkFlags, opts)
+}
+
+func loadLeaseTargetConfigContext(ctx context.Context, fs *flag.FlagSet, provider string, targetFlags targetFlagValues, networkFlags networkModeFlagValues, opts leaseTargetConfigOptions) (Config, error) {
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return Config{}, err
 	}
@@ -498,7 +562,7 @@ func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags target
 		return Config{}, err
 	}
 	if !opts.ProviderResourceID {
-		if err := autoRouteLeaseProviderForIdentifier(&cfg, fs, opts.LeaseID); err != nil {
+		if err := autoRouteLeaseProviderForIdentifierContext(ctx, &cfg, fs, opts.LeaseID); err != nil {
 			return Config{}, err
 		}
 	}

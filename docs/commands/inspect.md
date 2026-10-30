@@ -26,6 +26,10 @@ slug selects its recorded provider before provider initialization. An explicit
 lease ID or `--provider`, while missing claims keep the configured-provider
 fallback.
 
+SSH readiness follows the lease's recorded target OS and Windows mode, as in
+[`status`](status.md#waiting-for-readiness); allocation-time platform flags do
+not need to be repeated.
+
 For an acquired fixed Daytona lease removed by native TTL or external deletion,
 inspection can persist its terminal tombstone after verifying the original
 organization and complete provider database absence. It reports `released` and
@@ -368,6 +372,15 @@ the association state.
 --json                       print the structured JSON record
 ```
 
+For enrolled coordinator leases, both text and JSON preserve the
+`lifetimePolicy`, including the `admin-canary` marker, effective stop deadline,
+confirmed-stop deletion deadline, retention duration, current status,
+readiness, and warnings. `DELETION:` warns of permanent root-disk removal.
+Before compute has been confirmed stopped, no exact disk deletion deadline is
+recorded. These are coordinator observations; an administrator can obtain a
+fresh read-only instance and volume observation with
+[`admin lifetime-readback`](admin.md#lifetime-readback).
+
 ## inspect vs status vs list
 
 - `inspect` is the long-form record for one lease, including provider labels
@@ -388,3 +401,7 @@ Related docs:
 - [ssh](ssh.md)
 - [Identifiers](../features/identifiers.md)
 - [Network and reachability](../features/network.md)
+
+Blacksmith `inspect --json` returns the same bounded, read-only
+[remote settlement metadata](../providers/blacksmith-testbox.md#read-only-remote-settlement)
+as `status --json`, including when the exact native ID has no local claim.

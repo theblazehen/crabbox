@@ -38,6 +38,16 @@ crabbox run --pool example/app/main/linux --pool-compatibility-key linux-16-vcpu
 crabbox run --pool example/app/main/linux --pool-identity-file pool-identity.json -- pnpm test
 ```
 
+Administrators creating a new coordinator-managed AWS on-demand lease may use
+`--lifetime-canary <duration> --lifetime-retention <duration>` to enroll it in
+the explicit [lifetime rollout canary](warmup.md#lifetime-rollout-canary).
+Both values must be whole seconds between `1m` and `744h`. This is enforced
+even with the coordinator default lifetime mode off; use `--keep` if the box
+should remain after the command completes. These flags reject reuse via `--id`,
+ready pools, direct or registered providers, spot capacity, and dedicated Mac
+hosts. The coordinator checks administrator authorization. Activity and kept
+runs do not extend the compute-stop or permanent root-disk deletion deadline.
+
 The trailing command after `--` is sent to the box verbatim as argv. Use
 `--shell` to run it through the remote shell instead, for multi-statement
 snippets, pipes, or shell expansion.
@@ -133,6 +143,14 @@ lease may remain for recovery; Crabbox does not allocate another lease while tha
 ownership is uncertain. Check it with `crabbox inspect --provider <provider> --id <lease>`
 and use the matching `stop` command for a disposable lease. Static SSH hosts are
 not destroyed by `stop`.
+
+With `--no-sync` on POSIX SSH targets, workspace creation, sync-fingerprint
+invalidation, and script upload share one SSH session when no preflight or
+profile probe must run before the upload. The script is still
+retained at its content-addressed path for execution and failure capture.
+Baseline telemetry is collected concurrently with preparation and joined before
+execution; terminal telemetry and run-event delivery complete before the run
+record is finalized.
 
 ## Remote workspace root
 
@@ -248,6 +266,9 @@ replayed, including after a multiplexing failure.
 
 Crabbox records a local repo claim for each reused lease. If a lease is already
 claimed by another repo, pass `--reclaim` to move the claim intentionally.
+For SSH leases, `run --id` uses the recorded target OS and Windows mode for
+readiness and execution. Allocation-time platform flags do not need to be
+repeated; explicit flags that contradict the recorded platform are rejected.
 For already-bound canonical IDs on native AWS, Machine0, and Daytona, run
 admission holds that claim through provider preparation and endpoint publication.
 A concurrent heartbeat cannot invalidate the command between those steps.
@@ -255,7 +276,7 @@ Aliases, explicit reclaim, and coordinator-managed leases retain their existing
 resolution paths; stale heartbeat snapshots still fail the exact-claim check.
 
 `--idle-timeout` controls inactivity expiry (default `30m`); `--ttl` is the
-maximum wall-clock lifetime (default `90m`). Reusing a claimed direct lease keeps
+maximum wall-clock lifetime (default `30m`). Reusing a claimed direct lease keeps
 its recorded idle timeout unless `--idle-timeout` is explicitly supplied; reader
 defaults and transferring the repository claim with `--reclaim` do not replace
 that policy. This applies to direct allocation even in registered broker mode;
@@ -264,9 +285,17 @@ on an existing direct lease is stored in whole seconds, rounded to the nearest
 second with a minimum of one second for a positive value. Use `--stop-after
 success|always|failure|never` to make lease cleanup explicit. Without it, a
 newly acquired one-shot lease is released after the command and an existing
-`--id` lease is left alone. The run details always print the exact `crabbox
-stop ...` command. Use `--keep-on-failure` to keep a newly acquired lease alive
-for debugging when the remote command exits non-zero; Crabbox then prints
+`--id` lease is left alone. The run details print the exact `crabbox stop ...`
+command. If a resolved SSH lease remains after an early failure, ownership
+refusal, interrupted cleanup, or retention policy, a final `lease recovery`
+line prints the same provider-scoped `stop_command` and a one-line reason.
+With `--timing-json`, the final JSON record includes `stopCommand` and
+`leaseRetainedReason` too. Ambiguous ownership still refuses automatic cleanup;
+the recovery command does not bypass the ownership checks in `stop`.
+Use `--keep-on-failure` to keep a newly acquired lease alive
+for debugging when the remote command exits non-zero; it does not retain a
+failed acquisition (for example, a Parallels clone that fails guest preparation).
+Crabbox then prints
 inspect/SSH/stop commands for the exact failed box. Add `--lease-output <file>`
 with `--keep` to write a small JSON lease handle for orchestrators on providers
 that advertise `run-session`. Delegated providers return their own handle.
@@ -354,13 +383,11 @@ common caches stay out. Default excludes also cover common generated churn such
 as `.ignored`, `.vite`, `playwright-report`, `test-results`, and local
 `.crabbox` log/capture directories.
 
-Jujutsu workspaces are supported for sync only when `.jj` is colocated with
-same-root `.git` metadata. Native Jujutsu revision mapping is not supported yet;
-`run` fails before lease acquisition or ready-pool borrowing instead of risking
-sync of an outer Git checkout's revision. Use a colocated Git workspace or pass
-`--no-sync` with a provider that supports it to run without transferring local
-files. See
-[sync](../features/sync.md#jujutsu-workspaces) for safe initialization guidance.
+Native Git-backed Jujutsu workspaces use installed `jj` to snapshot and sync the
+exact `@` tree, including octopus merges and working-copy edits. Use an ordinary
+SSH provider with `--no-hydrate`; ambiguous or conflicted revisions fail before
+leasing. Colocated `.jj` + `.git` workspaces retain the Git path. See
+[sync](../features/sync.md#jujutsu-workspaces) for bookmark mapping and limitations.
 
 Before the first rsync into a Git checkout, Crabbox seeds the remote worktree
 from your `origin` remote so the first sync is a dirty-tree overlay instead of a
@@ -381,7 +408,7 @@ redirected file stream before upload, sync, or user commands read it.
 
 Ownership is fenced with a random token and renewed while the lifecycle is
 active. If the local client disappears, Crabbox recovers an expired owner only
-after verifying that its witnessed remote child is no longer alive. Ambiguous
+after verifying that its witnessed remote child is no longer alive. Unconfirmed
 renewal, release, token, or child state fails closed instead of risking a
 concurrent checkout. POSIX, WSL2, and native Windows targets implement the same
 protocol; the small sync-finalization lock remains nested inside it.
@@ -394,18 +421,29 @@ caller-provided cancellation causes; the original transport error is preserved.
 Workspace-owner protocol calls reuse an admitted SSH control master; before one
 exists, they use an independent connection. Sync and command transport keep
 their existing connection policy.
+A renewal transport failure with no protocol response or exactly `RENEWED` is
+retried at most twice, after 250 ms and 500 ms backoffs, while a complete retry
+call still fits before the last acknowledged ownership expires. The window is
+measured from when that acknowledged acquire or renewal was sent, with a safety margin for the remote
+clock's whole-second expiry. Only an error-free `RENEWED` confirms ownership;
+`RENEWED` with a transport error does not extend the confirmed deadline. Any
+other nonempty response remains terminal, including recognized denials and
+unknown output.
+The owner TTL includes two additional transport-call budgets, so reclaiming a
+crashed client's workspace can take longer. Calls use the same fencing token;
+retries never acquire ownership or revive an expired owner.
 WSL2 renewal uses a compact marker-only helper with a 60-second execution
 allowance for CPU and disk contention. It retries confirmed lock contention at
 most twice within the original bounded call deadline; that deadline is included
-in the owner expiry window. A transport failure or rejected/ambiguous owner
-state is never retried. Collection and cleanup remain blocked after ownership
-fails closed. Owner authority checks and renewal deadlines are unchanged.
+in the owner expiry window. The outer renewal loop applies the same bounded
+transport retry policy as on other SSH targets. Collection and cleanup remain
+blocked after ownership fails closed. Owner authority checks are unchanged.
 
 Native Windows stages owner scripts and witnessed command input with exact byte
 counts and asynchronous pipe reads. Empty frames complete without initializing
 stdin; nonempty frames leave any following bytes available. Incomplete input
-fails before the staged script or command runs. A transport failure during
-renewal still fails closed.
+fails before the staged script or command runs. Unconfirmed renewal after the
+bounded transport retries still fails closed.
 
 Use `--full-resync` (alias `--fresh-sync`) when a warm lease smells stale:
 Crabbox deletes the remote workdir, skips the fingerprint fast path, reseeds Git
@@ -431,7 +469,9 @@ Large syncs warn or fail according to `sync.warnFiles`, `sync.warnBytes`,
 list the top source directories by file count plus a hint to update
 `.crabboxignore` or `sync.exclude`. Quiet rsync runs print a heartbeat; after
 several minutes without visible progress the heartbeat includes a concrete retry
-hint, and `sync.timeout` kills stalled syncs.
+hint. For rsync, `sync.timeout` limits I/O inactivity rather than total transfer
+time; a quiet transfer that continues exchanging protocol data may exceed it.
+Manifest staging and archive transfers retain their wall-clock limits.
 
 ### Sync alternatives
 
@@ -522,9 +562,36 @@ writes uploaded Windows scripts as UTF-8 with a BOM when the input has none, so
 Windows PowerShell 5.1 does not treat non-ASCII source as the system ANSI code
 page.
 
+Native executables receive a Windows command line quoted with the standard
+`CommandLineToArgvW`/C-runtime rules, preserving empty arguments, embedded double
+quotes, backslashes, whitespace, and Unicode. Literal `%VAR%`, `^`, `&`, `|`,
+and `$` are not expanded by Crabbox. The PowerShell transport starts the process
+directly with inherited input/output streams, the remote working directory, and
+its actual exit status. Arguments to `--script` use the same transport to
+Windows PowerShell's `-File` entrypoint.
+
+Windows command arguments, forwarded environment values, and paths preserve
+typographic quotes (`‘ ’ ‚ ‛ “ ” „`) as literal data. The same quoting applies
+to Windows Sandbox, Hyper-V, and generated Windows bootstrap scripts. PowerShell
+recognizes smart quotes as delimiters, so Crabbox escapes all single-quote
+variants when generating literals; see Microsoft's
+[about_Quoting_Rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_quoting_rules)
+and [language specification §2.3.5.2](https://learn.microsoft.com/en-us/powershell/scripting/lang-spec/chapter-02#2352-string-literals).
+
+An explicitly selected interpreter still owns its syntax: `cmd /c` and `.cmd`/
+`.bat` launchers use cmd's expansion and quoting rules, and `powershell -Command`
+parses its command as PowerShell source. PowerShell scripts and cmdlets retain
+PowerShell parameter binding. Windows utilities with nonstandard parsers
+(`cscript.exe`, `find.exe`, `sqlcmd.exe`, and `wscript.exe`) also retain
+PowerShell's legacy argument binding. Inside `--shell` or a `.ps1` script, Windows
+PowerShell 5.1's own native-command binding can still discard empty strings and
+embedded quotes when the script calls another executable. Use plain argv for
+that executable; use `--shell '...PowerShell source...'` or `--script file.ps1`
+for PowerShell expressions rather than nesting another `powershell -Command`.
+
 ### Native Windows background processes
 
-Managed native Windows leases install Node 24.19.0 and npm when either runtime
+Managed native Windows leases install Node 24.22.1 and npm when either runtime
 is missing or broken. The checksum-pinned x64 or ARM64 runtime lives in
 `C:\Program Files\nodejs` on the machine PATH; working existing installations
 are retained. Readiness requires both version commands to succeed.
@@ -1085,6 +1152,9 @@ cleanup error: it can accompany `leaseStopped=true` when the remote resource is
 gone but local finalization failed. An existing workload failure keeps its exit
 code. Accepted pending or retained cleanup does not itself turn a successful
 workload into a command failure.
+The `lease.released` event carries the same outcome in its message: phase `cleanup`
+means the lease is retained or cleanup is unconfirmed; phase `released` means
+lease recovery has ended. The event type alone does not prove deletion.
 Commands can emit
 phase markers on stdout or stderr as
 `CRABBOX_PHASE:<name>`; Crabbox records those as `commandPhases` without removing
@@ -1152,10 +1222,11 @@ config rather than argv.
 
 Azure one-shot leases use managed `StandardSSD_LRS` OS disks by default so they
 can become native checkpoint sources. Use `--azure-os-disk ephemeral` only for
-stateless leases that do not need native Azure checkpoint/fork support;
-`--azure-os-disk ephemeral-preview` opts into Azure's public-preview
-full-caching ephemeral OS disk mode. `--azure-os-disk auto` is accepted for
-compatibility and resolves to managed.
+stateless leases that do not need native Azure checkpoint/fork support. This
+mode enables GA full caching and requires at least eight vCPUs, a supported VM
+family, and sufficient local storage. See [Azure disk requirements](../features/azure.md#os-disk-mode).
+`ephemeral-preview` is removed; use `ephemeral`. `--azure-os-disk auto` resolves
+to managed.
 
 ## Flags
 
@@ -1167,15 +1238,17 @@ lease-acting commands):
 --profile <name>
 --class <name>
 --arch amd64|arm64           CPU architecture; cloud/Apple select capacity, while local-container asserts selected-daemon native architecture.
---os <selector>              Portable Linux OS image, e.g. ubuntu:26.04
+--os <selector>              OS image, e.g. ubuntu:26.04 or windows-server:2025 (AWS Windows)
 --type <provider-type>
 --market spot|on-demand
+--min-vcpus <count>                minimum vCPUs for new AWS Linux leases; 0 disables
+--min-memory-mib <MiB>             minimum memory for new AWS Linux leases; 0 disables
 --slug <slug>                Only when creating a fresh lease.
 --pond <name>
 --expose <port>              Repeatable; SSH-mesh TCP port; creation-only for managed leases.
 --cache-volume [name=]key:path
                              Require a provider cache volume.
---ttl <duration>             Default 90m.
+--ttl <duration>             Default 30m.
 --idle-timeout <duration>    Default 30m.
 --desktop
 --desktop-env xfce|wayland|gnome
@@ -1193,6 +1266,8 @@ lease-acting commands):
 --static-user <user>
 --static-port <port>
 --static-work-root <path>
+--static-start-command <json-argv>
+--static-stop-command <json-argv>
 --network auto|tailscale|public
 --tailscale
 --tailscale-tags <comma-separated tags>
@@ -1282,3 +1357,18 @@ succeeds, a fencing or return failure fails the run. Failed cleanup retains the
 receipt for `pool return --receipt-file <path> --result drain`. AWS v1 removes the
 grant key and observes a reboot before returning a scrubbed machine to ready.
 A longer job must return and borrow again; uninterrupted renewal is deferred.
+
+Static power hooks require a trusted `static.power.dedicated: true` contract.
+Use a distinct `static.id` for concurrent acquisitions; same-ID acquisition and
+prepared reuse are refused while custody remains. See [Power hooks](../providers/ssh.md#power-hooks).
+
+Optional resource minimums and supported creation/reuse combinations are documented
+in [capacity fallback](../features/capacity-fallback.md#optional-aws-resource-minimums).
+
+Ordinary lease lifetime defaults to 30m with a 4h maximum. The coordinator may
+clamp requested TTL/idle values and prints a policy notice through the CLI.
+Use [extend](extend.md) for an explicit extension. `run` requests auto-extension
+only while executing the user command, when fewer than 10 minutes remain, adding
+30 minutes up to the effective maximum. Policy or a creation-fixed provider
+deadline can disable this; setup and sync-only phases do not auto-extend.
+See [lifetime policy](../features/lifecycle-cleanup.md#ordinary-lifetime-policy).

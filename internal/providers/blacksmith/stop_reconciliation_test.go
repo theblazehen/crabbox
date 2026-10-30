@@ -147,7 +147,16 @@ func TestBlacksmithStopReconcilesCompletedClaim(t *testing.T) {
 				}
 			}))
 			backend.rt.Stdout, backend.rt.Stderr = &stdout, &stderr
-			if err := backend.Stop(t.Context(), core.StopRequest{ID: claim.Slug}); err != nil {
+			err := backend.Stop(t.Context(), core.StopRequest{ID: claim.Slug})
+			if strings.HasPrefix(mode, "never-assigned-") {
+				if err == nil || !strings.Contains(err.Error(), "GitHub settlement unresolved") {
+					t.Fatalf("native completion without association accepted: %v", err)
+				}
+				assertStopState(t, claim, true)
+				assertStopState(t, unrelated, true)
+				return
+			}
+			if err != nil {
 				t.Fatal(err)
 			}
 			wantOperations := []string{"status", "stop", "status", "status"}
@@ -319,7 +328,7 @@ func TestBlacksmithStopReconciliationFailsClosed(t *testing.T) {
 					t.Fatalf("verification elapsed=%s, want the caller deadline", time.Since(started))
 				}
 				var exitErr core.ExitError
-				if !core.AsExitError(err, &exitErr) || exitErr.Code != 1 || !strings.Contains(exitErr.Message, "blacksmith failed: exit status 1") || !strings.Contains(exitErr.Message, "verification") {
+				if !core.AsExitError(err, &exitErr) || exitErr.Code != 1 || !strings.Contains(exitErr.Message, "blacksmith testbox stop exit=1 cause=other") || !strings.Contains(exitErr.Message, "verification") {
 					t.Fatalf("original stop error lost: %v", err)
 				}
 				want := []string{"status", "stop", "status"}
@@ -359,9 +368,8 @@ func TestBlacksmithStopRejectsForeignProviderClaim(t *testing.T) {
 }
 
 func TestBlacksmithReconciliationRetainsOriginalErrorUntilFinalized(t *testing.T) {
-	for _, mode := range []string{"status-error", "cancelled", "changed-identity", "not-completed", "status-error-never-assigned", "cancelled-never-assigned", "changed-identity-never-assigned", "not-completed-never-assigned"} {
+	for _, mode := range []string{"status-error", "cancelled", "changed-identity", "not-completed"} {
 		t.Run(mode, func(t *testing.T) {
-			mode, neverAssigned := strings.CutSuffix(mode, "-never-assigned")
 			isolateBlacksmithOwnership(t)
 			claim := seedStopClaim(t, "tbx_finalization123")
 			var stdout, stderr bytes.Buffer
@@ -380,12 +388,6 @@ func TestBlacksmithReconciliationRetainsOriginalErrorUntilFinalized(t *testing.T
 					state = "ready"
 				}
 				output := nativeStopStatus(claim.LeaseID, state, "")
-				if neverAssigned {
-					if inspections == 1 {
-						state = "queued"
-					}
-					output = nativeNeverAssignedStatus(claim.LeaseID, state)
-				}
 				if inspections == 3 {
 					switch mode {
 					case "status-error":
@@ -403,7 +405,7 @@ func TestBlacksmithReconciliationRetainsOriginalErrorUntilFinalized(t *testing.T
 			backend.rt.Stdout, backend.rt.Stderr = &stdout, &stderr
 			err := backend.Stop(ctx, core.StopRequest{ID: claim.LeaseID})
 			var nativeErr core.ExitError
-			if !core.AsExitError(err, &nativeErr) || nativeErr.Code != 1 || !strings.Contains(nativeErr.Message, "blacksmith failed: exit status 1") || nativeErr.Message != err.Error() || inspections != 3 {
+			if !core.AsExitError(err, &nativeErr) || nativeErr.Code != 1 || !strings.Contains(nativeErr.Message, "blacksmith testbox stop exit=1 cause=other") || nativeErr.Message != err.Error() || inspections != 3 {
 				t.Fatalf("original failure lost after finalization: err=%v inspections=%d", err, inspections)
 			}
 			assertStopState(t, claim, true)
@@ -556,7 +558,7 @@ func TestBlacksmithOneShotReconciliationPreservesCommandResult(t *testing.T) {
 		{"test failure 7", 7, "FAIL: assertion mismatch\n"},
 		{"not found", 127, "sh: test-runner: command not found\n"},
 	} {
-		for _, state := range []string{"completed", "ready", "artifact-failure"} {
+		for _, state := range []string{"completed", "ready", "artifact-failure", "github-unresolved"} {
 			t.Run(command.name+"/"+state, func(t *testing.T) {
 				testutil.IsolateUserDirs(t)
 				repo := t.TempDir()
@@ -565,6 +567,10 @@ func TestBlacksmithOneShotReconciliationPreservesCommandResult(t *testing.T) {
 				var stderr bytes.Buffer
 				stopped := false
 				keyMoved := false
+				var commandErr error
+				if command.code != 0 {
+					commandErr = fmt.Errorf("exit status %d", command.code)
+				}
 				runner := reconciliationRunner(t, func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 					switch req.Args[1] {
 					case "warmup":
@@ -572,7 +578,7 @@ func TestBlacksmithOneShotReconciliationPreservesCommandResult(t *testing.T) {
 					case "run":
 						fmt.Fprint(req.Stderr, command.output)
 						if command.code != 0 {
-							return core.LocalCommandResult{ExitCode: command.code}, fmt.Errorf("exit status %d", command.code)
+							return core.LocalCommandResult{ExitCode: command.code}, commandErr
 						}
 						return core.LocalCommandResult{}, nil
 					case "stop":
@@ -587,6 +593,9 @@ func TestBlacksmithOneShotReconciliationPreservesCommandResult(t *testing.T) {
 							t.Error("unbounded cleanup context")
 						}
 						observed := state
+						if state == "github-unresolved" {
+							observed = "completed"
+						}
 						if state == "artifact-failure" {
 							observed = "completed"
 							if !keyMoved {
@@ -614,6 +623,14 @@ func TestBlacksmithOneShotReconciliationPreservesCommandResult(t *testing.T) {
 				cfg.Blacksmith.Org = "example-org"
 				cfg.Blacksmith.Workflow = ".github/workflows/testbox.yml"
 				backend := newTestBlacksmithBackend(cfg, runner)
+				if state == "github-unresolved" {
+					backend.rt.Exec = settlementRunner(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+						if req.Name == "gh" {
+							return core.LocalCommandResult{ExitCode: 4}, errors.New("GitHub access unavailable")
+						}
+						return runner.Run(ctx, req)
+					})
+				}
 				backend.rt.Stderr = &stderr
 				result, err := backend.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: repo}, Command: []string{"test-runner"}, TimingJSON: true})
 				wantCode := command.code
@@ -625,8 +642,18 @@ func TestBlacksmithOneShotReconciliationPreservesCommandResult(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-				} else if !errors.As(err, &exitErr) || exitErr.Code != wantCode || exitErr.Message != fmt.Sprintf("blacksmith testbox run exited %d", wantCode) {
+				} else if !errors.As(err, &exitErr) || exitErr.Code != wantCode {
 					t.Fatalf("command error changed: %v", err)
+				}
+				if commandErr != nil && !errors.Is(err, commandErr) {
+					t.Errorf("native command cause lost: %v", err)
+				}
+				// Native stderr is not a workload receipt, even when it says a test failed.
+				if command.code == 255 && !strings.Contains(err.Error(), "native exit 255; workload exit unconfirmed") {
+					t.Errorf("native exit uncertainty lost: %v", err)
+				}
+				if wantCode != 0 && result.ErrorKind != core.RunErrorProvider {
+					t.Errorf("native or cleanup failure misclassified: %+v", result)
 				}
 				if result.ExitCode != wantCode || result.LeaseID != id {
 					t.Fatalf("result=%#v", result)
@@ -730,9 +757,8 @@ func reconciliationRunner(t *testing.T, fn func(context.Context, core.LocalComma
 }
 
 func TestBlacksmithStopArtifactFinalization(t *testing.T) {
-	for _, mode := range []string{"unsafe", "missing", "reconciled-unsafe", "unsafe-never-assigned", "missing-never-assigned", "reconciled-unsafe-never-assigned"} {
+	for _, mode := range []string{"unsafe", "missing", "reconciled-unsafe"} {
 		t.Run(mode, func(t *testing.T) {
-			mode, neverAssigned := strings.CutSuffix(mode, "-never-assigned")
 			isolateBlacksmithOwnership(t)
 			const id = "tbx_artifact123"
 			claim := testOwnedBlacksmithClaim(t, id, "artifact-krill", t.TempDir())
@@ -788,12 +814,6 @@ func TestBlacksmithStopArtifactFinalization(t *testing.T) {
 				state := "completed"
 				if mode == "reconciled-unsafe" && inspections == 1 {
 					state = "ready"
-					if neverAssigned {
-						state = "queued"
-					}
-				}
-				if neverAssigned {
-					return core.LocalCommandResult{Stdout: nativeNeverAssignedStatus(id, state)}, nil
 				}
 				return core.LocalCommandResult{Stdout: nativeStopStatus(id, state, "")}, nil
 			}))
@@ -870,7 +890,7 @@ func TestBlacksmithStopVerificationDiagnostics(t *testing.T) {
 			}))
 			err := backend.Stop(ctx, core.StopRequest{ID: claim.LeaseID})
 			var exitErr core.ExitError
-			if !core.AsExitError(err, &exitErr) || exitErr.Code != 9 || exitErr.Message != err.Error() || strings.Count(exitErr.Message, nativeCause.Error()) != 1 || !errors.Is(err, nativeCause) {
+			if !core.AsExitError(err, &exitErr) || exitErr.Code != 9 || exitErr.Message != err.Error() || strings.Count(exitErr.Message, "blacksmith testbox stop exit=9 cause=other") != 1 || strings.Contains(exitErr.Message, nativeCause.Error()) || !errors.Is(err, nativeCause) {
 				t.Errorf("native diagnostic/cause lost: %v", err)
 			}
 			switch mode {
@@ -883,7 +903,7 @@ func TestBlacksmithStopVerificationDiagnostics(t *testing.T) {
 					t.Errorf("cancellation cause hidden: %v", err)
 				}
 			default:
-				if !errors.Is(err, queryCause) || strings.Count(exitErr.Message, queryCause.Error()) != 1 || strings.Count(exitErr.Message, "authentication unavailable") != 1 {
+				if !errors.Is(err, queryCause) || strings.Count(exitErr.Message, "blacksmith testbox status exit=7 cause=other") != 1 || strings.Contains(exitErr.Message, queryCause.Error()) || strings.Contains(exitErr.Message, "authentication unavailable") {
 					t.Errorf("independent lookup diagnostic/cause lost: %v", err)
 				}
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"runtime"
 	"strings"
 	"time"
 
@@ -151,7 +152,7 @@ func validateParallelsFixedVM(claim core.LeaseClaim, intent *core.FixedCreateInt
 	return nil
 }
 
-func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest, warnClone func(string)) (core.LeaseTarget, error) {
 	leaseID := req.RequestedLeaseID
 	source := shared.FirstNonBlankTrimmed(b.Cfg.Parallels.SourceID, b.Cfg.Parallels.Source)
 	if source == "" {
@@ -191,6 +192,14 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 			}
 			if err != nil {
 				return core.FixedLeaseBinding{}, err
+			}
+			// Resolve defaults before fingerprinting. Explicit replay needs no
+			// architecture probe; warnings belong only to clone submission.
+			if !exists || strings.TrimSpace(cfg.Parallels.CloneMode) == "" {
+				if err := client.ResolveCloneMode(ctx); err != nil {
+					return core.FixedLeaseBinding{}, err
+				}
+				cfg.Parallels.CloneMode = client.Cfg.Parallels.CloneMode
 			}
 			identity, err := client.ServerIdentity(ctx)
 			if err != nil {
@@ -330,7 +339,9 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 			// resulting bundle inside this attempt's directory.
 			cloneCfg := cfg
 			cloneCfg.Parallels.VMRoot = createDir
-			cloneErr := core.NewParallelsClient(cloneCfg, b.RT.Exec).SubmitClone(ctx, sourceID, snapshotID, leaseID, intent.Slug, req.Keep, tx.Admit)
+			cloneClient := core.NewParallelsClient(cloneCfg, b.RT.Exec)
+			cloneClient.WarnClone = warnClone
+			cloneErr := cloneClient.SubmitClone(ctx, sourceID, snapshotID, leaseID, intent.Slug, req.Keep, tx.Admit)
 			// Whatever the reply said, a submitted clone may already count
 			// against maxVMs, and the reservation has done its job either way:
 			// the rest of bring-up need not keep other forks waiting.
@@ -370,7 +381,9 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 				}
 			}
 			// Fixed acquisitions retain failed VMs, so use existing-lease guidance.
-			ready, err := client.WaitForIP(ctx, vm.ID, cfg.Parallels.StartupTimeout, core.ParallelsIPWaitExisting)
+			startupCtx, cancelStartup := core.ParallelsStartupContext(ctx, cfg)
+			defer cancelStartup()
+			ready, err := client.WaitForIP(startupCtx, vm.ID, cfg.Parallels.StartupTimeout, core.ParallelsIPWaitExisting)
 			if err != nil {
 				return core.LeaseTarget{}, err
 			}
@@ -381,10 +394,11 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 			// that need not be available just because the lease is still valid.
 			// SSH readiness below still re-proves the lease is usable.
 			if intent.State != "acquired" {
-				if err := b.prepareGuest(ctx, client, vm.ID, ready, cfg, publicKey); err != nil {
+				if err := b.prepareGuest(startupCtx, client, vm.ID, ready, cfg, publicKey); err != nil {
 					return core.LeaseTarget{}, err
 				}
 			}
+			cancelStartup()
 			server := core.Server{CloudID: vm.ID, Provider: parallelsProviderName, Name: vm.Name, Status: "ready", Labels: maps.Clone(claim.Labels)}
 			server.ImmutableID = vm.ID
 			server.ServerType.Name = core.ServerTypeForProviderClass(parallelsProviderName, cfg.Class)
@@ -397,7 +411,7 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 				target.ReadyCheck = core.PowershellCommand(`$PSVersionTable.PSVersion | Out-Null`)
 			}
 			if err := waitForSSHReady(ctx, &target, b.RT.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
-				return core.LeaseTarget{}, err
+				return core.LeaseTarget{}, parallelsBootstrapWaitError(err, runtime.GOOS)
 			}
 			server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, "ready", time.Now().UTC())
 			client.SetLeaseLabels(leaseID, server.Labels)
@@ -465,6 +479,7 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, claim core.LeaseClaim, 
 		return &vm, nil
 	}
 	err = core.DeleteFixedResource(ctx, parallelsFixedLeaseKind, claim, core.FixedLeaseOperations[core.ParallelsVM]{
+		Release: &core.FixedReleasePolicy{Outcome: outcome},
 		ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[core.ParallelsVM], error) {
 			claim = *tx.Claim
 			vm, err := lookup()
@@ -478,20 +493,15 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, claim core.LeaseClaim, 
 			claim = *tx.Claim
 			current, err := lookup()
 			if err != nil || current == nil {
-				outcome.Terminal = err == nil
 				return err
 			}
 			err = client.Delete(ctx, current.ID)
-			outcome.Terminal = err == nil
 			if err == nil {
 				client.RemoveHostDirIfEmpty(ctx, parallelsFixedCreationDir(claim.FixedCreateIntent))
 			}
 			return err
 		},
 	})
-	if err == nil {
-		outcome.Terminal = true
-	}
 	if err != nil {
 		return err
 	}

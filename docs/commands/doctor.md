@@ -9,6 +9,13 @@ empty, and skips provider credential readiness with a warning. Run it before
 your first `crabbox run`, after rotating tokens or
 editing config, and as a sanity check in agent boot sequences or CI smoke jobs.
 
+Use `--provider <name>` to check a specific provider instead of the configured
+selection. Doctor validates the name and reports `source=flag selected=true`;
+unknown names fail with exit `2`. A valid selection can still exit `1` when
+readiness checks fail, such as missing AWS credentials or running Firecracker
+on a non-Linux host. For static provider metadata, use
+[`crabbox providers describe <name>`](providers.md#providers-describe).
+
 ```sh
 crabbox doctor
 crabbox doctor --provider aws
@@ -144,6 +151,9 @@ remediation `hint`:
 failed  provider provider=gcp class=auth hint=check_gcp_project_credentials_and_compute_instances_list ...
 ```
 
+An absent Unix daemon socket is a `network` failure: check the configured
+endpoint and start the daemon. A missing provider executable is a `tool` failure.
+
 ### SSH key
 
 When `CRABBOX_SSH_KEY` is set, doctor validates the private key and its matching
@@ -229,6 +239,18 @@ policy includes `ec2:DescribeInstanceTypes` and `servicequotas:GetServiceQuota`.
 Types outside the supported Standard-instance quota bucket report
 `capacity=unknown` with `hint=unsupported_instance_quota`.
 
+When the applied quota covers the requested type, the check reports `ok` with
+`capacity=unknown quota_limit=sufficient usage=unchecked`. This confirms only
+that the VM fits the quota ceiling. Doctor does not measure account-wide usage
+or Capacity Reservations, so it cannot establish remaining regional headroom.
+A launch can still fail with `VcpuLimitExceeded`; check usage for the reported
+region and quota before retrying or requesting a quota increase.
+
+For automation, `ok` still means this advisory check succeeded, not that a
+launch is guaranteed. The former `capacity=ready` / `quota_satisfies_default_class`
+result is now `capacity=unknown` / `check_regional_quota_usage`; the JSON
+`details` include the same `capacity`, `quota_limit`, and `usage` fields.
+
 `--json` prints the same checks as a structured object with `ok`, `provider`,
 and `checks` fields. Each check includes `status`, `check`, `message`, and
 parsed `details` when available; the `provider-selection` details include
@@ -245,8 +267,8 @@ Exit codes:
 
 - `0` — no failures (skips and warnings do not change this).
 - `1` — at least one check failed.
-- `2` — `--from-run` without a coordinator, or profile doctor on a native
-  Windows target.
+- `2` — invalid flags or provider names, `--from-run` without a coordinator,
+  or profile doctor on a native Windows target.
 - `7` — the remote SSH probe failed.
 
 ## Flags

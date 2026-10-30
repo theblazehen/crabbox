@@ -409,7 +409,7 @@ exit 99
 }
 
 func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
-	for _, name := range []string{"bash", "python3"} {
+	for _, name := range []string{"bash", "python3", "tar"} {
 		if _, err := exec.LookPath(name); err != nil {
 			t.Skip(name + " is required")
 		}
@@ -419,11 +419,18 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 		env              map[string]string
 		dotEnv           string
 		workFolder       string
+		registration     string
+		fresh            bool
 		change           string
 		managerEnv       string
 		wantNode, wantGo bool
 	}{
-		{name: "default", wantNode: true, wantGo: true},
+		{name: "default", fresh: true, wantNode: true, wantGo: true},
+		{name: "BOM registration", registration: "bom", fresh: true, wantNode: true, wantGo: true},
+		{name: "existing registration", change: "registered", wantNode: true, wantGo: true},
+		{name: "writable existing dotenv", change: "dotenv-writable", dotEnv: "LANG=C\n"},
+		{name: "malformed registration", registration: "malformed"},
+		{name: "malformed BOM registration", registration: "malformed-bom"},
 		{name: "custom work folder", workFolder: "custom"},
 		{name: "inherited root", env: map[string]string{"RUNNER_TOOL_CACHE": "/custom"}},
 		{name: "legacy runner root", env: map[string]string{"RUNNER_TOOLSDIRECTORY": "/custom"}},
@@ -465,9 +472,6 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Every case owns its tree and child environment; no parent process
-			// state changes while the installer fixtures run concurrently.
-			t.Parallel()
 			root, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
@@ -525,6 +529,12 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 					t.Fatal(err)
 				}
 				write(filepath.Join(slot, "bin", tool), body, 0o755)
+				// Archive fixture modes must not depend on the caller's umask.
+				for _, path := range []string{slot, filepath.Join(slot, "bin"), filepath.Join(slot, "bin", tool)} {
+					if err := os.Chmod(path, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
 				if tool == "node" {
 					for _, name := range []string{"pnpm", "pnpx", "yarn", "yarnpkg"} {
 						link("../lib/node_modules/corepack/dist/"+name+".js", filepath.Join(slot, "bin", name))
@@ -534,26 +544,72 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 				write(filepath.Join(archives, archiveName), buf.String(), 0o644)
 				return fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
 			}
-			nodeDigest := pack("node", "24.19.0", "node-v24.19.0-linux-x64.tar.xz")
-			goDigest := pack("go", "1.27.0", "go1.27.0.linux-amd64.tar.gz")
-			nodeSlot := filepath.Join(image, "node", "24.19.0", "x64")
-			goSlot := filepath.Join(image, "go", "1.27.0", "x64")
-			destGo := filepath.Join(cache, "go", "1.27.0", "x64")
-			write(filepath.Join(runner, ".crabbox-runner-version-2.337.0-x64-sha256-"+strings.Repeat("a", 64)), "", 0o644)
+			nodeDigest := pack("node", "24.22.1", "node-v24.22.1-linux-x64.tar.xz")
+			goDigest := pack("go", "1.27.3", "go1.27.3.linux-amd64.tar.gz")
+			nodeSlot := filepath.Join(image, "node", "24.22.1", "x64")
+			goSlot := filepath.Join(image, "go", "1.27.3", "x64")
+			destGo := filepath.Join(cache, "go", "1.27.3", "x64")
 			workFolder := tc.workFolder
 			if workFolder == "" {
 				workFolder = "_work"
 			}
-			write(filepath.Join(runner, "config.sh"), "#!/bin/sh\nif [ \"${1:-}\" = remove ]; then rm -f .runner; exit 0; fi\nprintf '{\"workFolder\":\""+workFolder+"\"}\\n' >.runner\nprintf 'configured\\n' >>\"$HOME/order\"\n", 0o755)
-			write(filepath.Join(runner, ".env"), tc.dotEnv, 0o600)
-			write(filepath.Join(bin, "curl"), "#!/bin/sh\nprintf '{}'\n", 0o755)
-			write(filepath.Join(bin, "jq"), "#!/bin/sh\ncase \"$*\" in *tag_name*) printf 2.337.0;; *digest*) printf '"+strings.Repeat("a", 64)+"';; *) exit 2;; esac\n", 0o755)
+			configuration := "{\"workFolder\":\"" + workFolder + "\"}\n"
+			if strings.HasPrefix(tc.registration, "malformed") {
+				configuration = "{invalid\n"
+			}
+			// Runner's IOUtil.SaveObject emits UTF-8 with a BOM.
+			if strings.HasSuffix(tc.registration, "bom") {
+				configuration = "\ufeff" + configuration
+			}
+			// Like Runner's env.sh and IOUtil.SaveObject, creation inherits the installer's mask.
+			configScript := "#!/bin/sh\n[ -f .env ] || touch .env\nprintf '%s\\n' \"$PATH\" >.path\n" +
+				"if [ \"${1:-}\" = remove ]; then rm -f .runner .credentials .credentials_rsaparams; printf 'removed\\n' >>\"$HOME/order\"; exit 0; fi\n" +
+				"printf '%s' " + shellQuote(configuration) + " >.runner\nprintf '{}' >.credentials\nprintf '{}' >.credentials_rsaparams\nprintf 'configured\\n' >>\"$HOME/order\"\n"
+			write(filepath.Join(runner, "config.sh"), configScript, 0o755)
+			if tc.dotEnv != "" {
+				write(filepath.Join(runner, ".env"), tc.dotEnv, 0o600)
+			}
+			runnerDigest := strings.Repeat("a", 64)
+			if tc.fresh {
+				// A real tiny archive exercises extraction and the installer's marker creation.
+				var buf bytes.Buffer
+				gz := gzip.NewWriter(&buf)
+				tw := tar.NewWriter(gz)
+				if err := tw.WriteHeader(&tar.Header{Name: "config.sh", Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(configScript))}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tw.Write([]byte(configScript)); err != nil {
+					t.Fatal(err)
+				}
+				if err := tw.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatal(err)
+				}
+				write(filepath.Join(root, "runner.tar.gz"), buf.String(), 0o600)
+				runnerDigest = fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
+			}
+			runnerArch := map[bool]string{true: "arm64", false: "x64"}[tc.change == "arm"]
+			versionMarker := ".crabbox-runner-version-2.337.0-" + runnerArch + "-sha256-" + runnerDigest
+			if !tc.fresh {
+				write(filepath.Join(runner, versionMarker), "", 0o644)
+			}
+			write(filepath.Join(bin, "curl"), "#!/bin/sh\nif [ \"${2:-}\" = -o ]; then cp \"$HOME/runner.tar.gz\" \"$3\"; else printf '{}'; fi\n", 0o755)
+			write(filepath.Join(bin, "sha256sum"), "#!/usr/bin/env python3\nimport hashlib\nimport sys\nwith open(sys.argv[1], 'rb') as archive:\n    print(hashlib.sha256(archive.read()).hexdigest() + '  ' + sys.argv[1])\n", 0o755)
+			write(filepath.Join(bin, "jq"), "#!/bin/sh\ncase \"$*\" in *tag_name*) printf 2.337.0;; *digest*) printf '"+runnerDigest+"';; *) exit 2;; esac\n", 0o755)
 			write(filepath.Join(bin, "uname"), "#!/bin/sh\nprintf '"+map[bool]string{true: "aarch64", false: "x86_64"}[tc.change == "arm"]+"\\n'\n", 0o755)
 			// Nothing privileged or networked runs: only the generated owner's filesystem logic.
 			write(filepath.Join(bin, "sudo"), "#!/bin/sh\nif [ \"$1\" = tee ]; then cat >/dev/null; elif [ \"$1\" = systemctl ]; then shift; exec systemctl \"$@\"; fi\n", 0o755)
 			write(filepath.Join(bin, "pgrep"), "#!/bin/sh\nexit "+map[bool]string{true: "0", false: "1"}[tc.change == "busy"]+"\n", 0o755)
 			unitState := "LoadState=not-found\\nActiveState=inactive\\nEnvironment=\\nEnvironmentFiles=\\nDropInPaths=\\n"
 			switch tc.change {
+			case "registered":
+				write(filepath.Join(runner, ".runner"), "old registration", 0o600)
+			case "dotenv-writable":
+				if err := os.Chmod(filepath.Join(runner, ".env"), 0o664); err != nil {
+					t.Fatal(err)
+				}
 			case "active":
 				unitState = "LoadState=loaded\\nActiveState=active\\n"
 			case "service-env":
@@ -584,7 +640,7 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "archive":
-				write(filepath.Join(archives, "go1.27.0.linux-amd64.tar.gz"), "tampered", 0o644)
+				write(filepath.Join(archives, "go1.27.3.linux-amd64.tar.gz"), "tampered", 0o644)
 			case "tree":
 				write(filepath.Join(goSlot, "bin", "go"), "tampered", 0o755)
 			case "extra":
@@ -638,14 +694,11 @@ esac
 			script := strings.NewReplacer(
 				"/opt/hostedtoolcache", image,
 				"/opt/crabbox/toolchain-archives", archives,
-				"14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647", nodeDigest,
-				"675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685", goDigest,
+				"6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6", nodeDigest,
+				"65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40", goDigest,
 			).Replace(githubActionsRunnerInstallScript("2.337.0", true))
-			// The ARM case must not trigger the unrelated Runner download path.
-			if tc.change == "arm" {
-				write(filepath.Join(runner, ".crabbox-runner-version-2.337.0-arm64-sha256-"+strings.Repeat("a", 64)), "", 0o644)
-			}
-			cmd := exec.Command("bash", "-c", script)
+			// The installer runs in its own shell and must not alter the caller's umask.
+			cmd := exec.Command("bash", "-c", "umask 002; bash -c \"$1\"; result=$?; [ \"$(umask)\" = 0002 ] || exit 99; exit \"$result\"", "fixture", script)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + root,
 				"RUNNER_REPO=example-org/my-app", "RUNNER_NAME=fixture", "RUNNER_TOKEN=fixture",
 				"RUNNER_LABELS=fixture"}
@@ -659,11 +712,41 @@ esac
 			if err != nil {
 				t.Fatalf("installer failed: %v\n%s", err, output)
 			}
+			gotConfiguration, err := os.ReadFile(filepath.Join(runner, ".runner"))
+			if err != nil || string(gotConfiguration) != configuration {
+				t.Fatalf("registration changed: %v", err)
+			}
+			modes := map[string]os.FileMode{
+				".runner": 0o600, ".env": 0o600, ".path": 0o600,
+				".credentials": 0o600, ".credentials_rsaparams": 0o600, "run-crabbox.sh": 0o700,
+			}
+			if tc.fresh {
+				modes[versionMarker] = 0o600
+			}
+			if tc.change == "dotenv-writable" {
+				modes[".env"] = 0o664
+				if !strings.Contains(string(output), "runner-toolcache: skipped nonowned runner environment") {
+					t.Fatalf("unsafe environment was not rejected: %s", output)
+				}
+			}
+			for name, want := range modes {
+				info, err := os.Stat(filepath.Join(runner, name))
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				if info.Mode().Perm() != want {
+					t.Fatalf("%s mode=%#o want %#o", name, info.Mode().Perm(), want)
+				}
+			}
+			gotEnv, err := os.ReadFile(filepath.Join(runner, ".env"))
+			if err != nil || string(gotEnv) != tc.dotEnv {
+				t.Fatalf("existing environment changed: %v", err)
+			}
 			for _, expected := range []struct {
 				tool, version string
 				present       bool
 			}{
-				{"node", "24.19.0", tc.wantNode}, {"go", "1.27.0", tc.wantGo},
+				{"node", "24.22.1", tc.wantNode}, {"go", "1.27.3", tc.wantGo},
 			} {
 				slot := filepath.Join(cache, expected.tool, expected.version, "x64")
 				_, err := os.Stat(slot + ".complete")
@@ -715,7 +798,11 @@ esac
 				t.Fatalf("missing copy cost: %s", output)
 			}
 			order, _ := os.ReadFile(filepath.Join(root, "order"))
-			if string(order) != "configured\nstarted\n" {
+			wantOrder := "configured\nstarted\n"
+			if tc.change == "registered" {
+				wantOrder = "removed\n" + wantOrder
+			}
+			if string(order) != wantOrder {
 				t.Fatalf("lifecycle order %q", order)
 			}
 		})
@@ -1877,6 +1964,9 @@ exit 0
 	if !strings.Contains(logText, "timeout --signal=TERM") || strings.Contains(logText, "nohup") {
 		t.Fatalf("config-derived WSL2 target used the wrong hydration path:\n%s", logText)
 	}
+	if strings.Contains(logText, "CRABBOX_LOCAL_ACTIONS_NODE_PATH") {
+		t.Fatal("hydration producer sourced the environment before consumer verification")
+	}
 	if probes, err := os.ReadFile(probeLog); err != nil || len(probes) == 0 {
 		t.Fatalf("WSL2 fixture did not observe the Bash prerequisite: %q %v", probes, err)
 	}
@@ -2205,6 +2295,7 @@ func TestHydrateActionsWithGitHubRunnerInvalidatesPrivateOriginHermetically(t *t
 		t.Skip("shell ssh fixture")
 	}
 	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
 	tools := filepath.Join(dir, "tools")
 	if err := os.MkdirAll(tools, 0o755); err != nil {
 		t.Fatal(err)
@@ -2216,6 +2307,9 @@ remote=""
 for arg do remote="$arg"; done
 printf '%s\n---\n' "$remote" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$remote" in
+  *"exact_git_root || exit 2"*"git remote get-url origin"*)
+    printf '%s\n' 'https://github.com/example/repo.git'
+    ;;
   *"cat"*".crabbox/actions/cbx_gh.env"*)
     if [ -e "$CRABBOX_FAKE_DISPATCHED" ]; then
       printf '%s\n' 'WORKSPACE=/work/cbx_gh/repo'
@@ -2245,10 +2339,39 @@ esac
 	cfg.Actions.Workflow = "hydrate.yml"
 	repo := Repo{Root: dir, Name: "repo", RemoteURL: "ssh://git@example.test/repo.git"}
 	target := SSHTarget{User: "crabbox", Host: "example.test", Port: "22", TargetOS: targetLinux}
+	if err := ClaimLeaseForRepoProvider("cbx_gh", "", "aws", repo.Root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	inspections := 0
+	owner := &workspaceOwner{
+		key: workspaceOwnerKey("cbx_gh"), token: strings.Repeat("a", 64),
+		transport: workspaceOwnerTransportFunc(func(_ context.Context, req workspaceOwnerRemoteRequest) (string, error) {
+			if req.Action != workspaceOwnerInspect {
+				t.Fatalf("unexpected owner action %s", req.Action)
+			}
+			claim, err := ReadLeaseClaim("cbx_gh")
+			if err != nil || claim.ActionsWorkspace != nil {
+				t.Fatalf("hydration consent published before child join: %v", err)
+			}
+			log, err := os.ReadFile(logPath)
+			if err != nil || strings.Contains(string(log), "exact_git_root || exit 2") {
+				t.Fatalf("origin probed before child join: %v", err)
+			}
+			inspections++
+			if inspections == 1 {
+				return "CHILD", nil
+			}
+			return "OWNED", nil
+		}),
+	}
 	app := App{Stdout: io.Discard, Stderr: io.Discard}
-	if _, err := app.hydrateActionsWithGitHubRunner(context.Background(), cfg, repo, target, "cbx_gh", "", GitHubRepo{Owner: "example", Name: "repo"}, "crabbox-cbx-gh", "main", nil, time.Minute, nil); err != nil {
+	if _, err := app.hydrateActionsWithGitHubRunner(context.Background(), cfg, repo, target, "cbx_gh", "", GitHubRepo{Owner: "example", Name: "repo"}, "crabbox-cbx-gh", "main", nil, time.Minute, owner); err != nil {
 		logData, _ := os.ReadFile(logPath)
 		t.Fatalf("%v\n%s", err, logData)
+	}
+	bound, err := ReadLeaseClaim("cbx_gh")
+	if err != nil || inspections != 2 || bound.ActionsWorkspace == nil || bound.ActionsWorkspace.Origin != "https://github.com/example/repo" {
+		t.Fatalf("verified producer did not bind after child join: inspections=%d err=%v", inspections, err)
 	}
 	logData, err := os.ReadFile(logPath)
 	if err != nil {

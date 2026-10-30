@@ -23,6 +23,7 @@ import {
   pairingRequestBodyBytes,
 } from "./pairing";
 import { runtimeAdapterProxyPath, runtimeAdapterRelayMethodAllowed } from "./runtime-adapter-relay";
+import { serveDisabledResponse, serveBodyLimit } from "./serve";
 import { timingSafeEqual } from "./timing-safe";
 import type { Env } from "./types";
 
@@ -51,7 +52,19 @@ export async function prepareCoordinatorRequest(
 ): Promise<PreparedCoordinatorRequest> {
   const url = new URL(request.url);
   if (request.method === "GET" && url.pathname === "/v1/health") {
-    return { response: json({ ok: true, service: "crabbox-coordinator" }), authenticated: false };
+    return {
+      response: json(
+        {
+          ok: true,
+          service: "crabbox-coordinator",
+          ...(env.CF_VERSION_METADATA
+            ? { version: { id: env.CF_VERSION_METADATA.id, tag: env.CF_VERSION_METADATA.tag } }
+            : {}),
+        },
+        { headers: { "cache-control": "no-store" } },
+      ),
+      authenticated: false,
+    };
   }
   if (request.method === "GET" && url.pathname === "/") {
     return {
@@ -120,10 +133,12 @@ export async function prepareCoordinatorRequest(
     };
   }
   if (
-    isWebVNCAgentUpgrade(request, url) ||
-    isCodeAgentUpgrade(request, url) ||
-    isEgressAgentUpgrade(request, url) ||
-    isRuntimeAdapterAgentUpgrade(request, url)
+    request.method === "GET" &&
+    request.headers.get("upgrade")?.toLowerCase() === "websocket" &&
+    (/^\/v1\/leases\/[^/]+\/webvnc\/agent$/.test(url.pathname) ||
+      /^\/v1\/leases\/[^/]+\/code\/agent$/.test(url.pathname) ||
+      /^\/v1\/leases\/[^/]+\/egress\/(?:host|client)$/.test(url.pathname) ||
+      /^\/v1\/adapters\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\/agent$/.test(url.pathname))
   ) {
     return { request: requestWithoutTrustedHeaders(request), authenticated: false };
   }
@@ -226,9 +241,23 @@ async function authenticatedCoordinatorRequest(
       authenticated: false,
     };
   }
+  const serveRoute = new URL(request.url).pathname.startsWith("/v1/serve/");
+  const relayRoute = /^\/v1\/serve\/(?:relay\/[^/]+\/(?:agent|client)|leases\/[^/]+\/relay)$/.test(
+    new URL(request.url).pathname,
+  );
+  // Relay admission is bound to its provider and current principals in Fleet.
+  const disabled = serveRoute && !relayRoute ? serveDisabledResponse(env, auth.owner) : undefined;
+  if (disabled)
+    return {
+      response: /\/v1\/serve\/(?:relay\/|leases\/[^/]+\/relay$)/.test(new URL(request.url).pathname)
+        ? json({ error: "serve_relay_not_allowed" }, { status: 403 })
+        : disabled,
+      authenticated: false,
+    };
   return {
     request: await requestWithAdminGrantVersion(requestWithAuthContext(request, auth), env),
     authenticated: true,
+    ...(serveRoute ? { bodyLimit: serveBodyLimit } : {}),
   };
 }
 
@@ -291,38 +320,6 @@ function requestWithoutCoordinatorAuthContext(request: Request): Request {
     headers.delete(name);
   }
   return new Request(clean, { headers });
-}
-
-function isWebVNCAgentUpgrade(request: Request, url: URL): boolean {
-  return (
-    request.method === "GET" &&
-    request.headers.get("upgrade")?.toLowerCase() === "websocket" &&
-    /^\/v1\/leases\/[^/]+\/webvnc\/agent$/.test(url.pathname)
-  );
-}
-
-function isCodeAgentUpgrade(request: Request, url: URL): boolean {
-  return (
-    request.method === "GET" &&
-    request.headers.get("upgrade")?.toLowerCase() === "websocket" &&
-    /^\/v1\/leases\/[^/]+\/code\/agent$/.test(url.pathname)
-  );
-}
-
-function isEgressAgentUpgrade(request: Request, url: URL): boolean {
-  return (
-    request.method === "GET" &&
-    request.headers.get("upgrade")?.toLowerCase() === "websocket" &&
-    /^\/v1\/leases\/[^/]+\/egress\/(?:host|client)$/.test(url.pathname)
-  );
-}
-
-function isRuntimeAdapterAgentUpgrade(request: Request, url: URL): boolean {
-  return (
-    request.method === "GET" &&
-    request.headers.get("upgrade")?.toLowerCase() === "websocket" &&
-    /^\/v1\/adapters\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\/agent$/.test(url.pathname)
-  );
 }
 
 function runtimeAdapterServiceAuth(

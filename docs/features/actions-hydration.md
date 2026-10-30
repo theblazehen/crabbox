@@ -27,6 +27,21 @@ There are two hydration paths:
 Both paths converge on the same readiness marker, so later `crabbox run`
 commands attach to the hydrated workspace identically.
 
+Before adopting a marker, `run`, `cache warm`, and editor handoffs verify that
+`WORKSPACE` is the exact Git root and its actual `origin` matches the invoking
+repository or the explicitly configured `actions.repo`. Custom workspace paths
+are supported. Missing, unreadable, or mismatched identity fails before sync,
+marker replacement, environment sourcing, or command execution.
+
+For `actions hydrate --github-runner --repo owner/name`, Crabbox records the
+verified target origin and marker identity in the existing local lease claim.
+Later commands from that same checkout can attach without repeating `--repo`.
+Replacement hydration, reclaim, or a changed lease resource clears that consent.
+An older cross-repository marker without this binding is left untouched: rerun
+the explicit GitHub-runner hydration command with `--repo`, or configure the
+intended `actions.repo`. `--reclaim` alone does not authorize a foreign workspace.
+Automatic local hydration still must produce the invoking repository.
+
 ## Supported targets
 
 | Path | Targets |
@@ -55,6 +70,15 @@ its own workspace.
 You can also hydrate explicitly: `crabbox actions hydrate --id <id>` syncs the
 current checkout and then runs the hydrate workflow. Automatic hydration during
 `crabbox run` reuses the run's own sync rather than syncing twice.
+
+For an unpublished detached source, cold local hydration can use a verified
+published ancestor from the same origin as its Git baseline, then apply the full
+selected file manifest. This matches a previously hydrated workspace: working
+files are the selected source, while Git HEAD may be the published ancestor.
+The log reports both identities. Workloads that require the exact unpublished Git
+commit must establish and verify it separately before treating their results as
+proof of that commit. No private Git history is implicitly copied. See
+[Git seeding](sync.md#fingerprints-and-git-seeding) for eligibility and limits.
 
 When `--full-resync` starts from an existing readiness marker, Crabbox
 invalidates that marker before resetting the workspace. Runs with a command must

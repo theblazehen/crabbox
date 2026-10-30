@@ -90,6 +90,10 @@ func runScriptForTarget(spec *RunScriptSpec, target SSHTarget) *RunScriptSpec {
 }
 
 func uploadRunScript(ctx context.Context, target SSHTarget, workdir string, spec *RunScriptSpec) error {
+	return uploadRunScriptAfter(ctx, target, workdir, spec, "")
+}
+
+func uploadRunScriptAfter(ctx context.Context, target SSHTarget, workdir string, spec *RunScriptSpec, prepare string) error {
 	if spec == nil {
 		return nil
 	}
@@ -97,8 +101,25 @@ func uploadRunScript(ctx context.Context, target SSHTarget, workdir string, spec
 	if isWindowsNativeTarget(target) {
 		remote = windowsRemoteUploadRunScriptCommand(workdir, spec.RemotePath)
 	}
+	if prepare != "" {
+		// Preparation previously had no stdin; login hooks must not consume script bytes.
+		remote = "( " + prepare + " ) </dev/null && " + remote
+	}
 	var stdout, stderr bytes.Buffer
-	if err := runSSHInput(ctx, target, remote, bytes.NewReader(spec.Data), &stdout, &stderr); err != nil {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		stdout.Reset()
+		stderr.Reset()
+		err = runSSHInput(ctx, target, remote, bytes.NewReader(spec.Data), &stdout, &stderr)
+		if err == nil || !shouldRetrySSHPort(err) || attempt == 1 {
+			break
+		}
+		// Preparation and overwriting the same script are safe to repeat.
+		if err = sleepContext(ctx, idempotentSSHRetryDelay); err != nil {
+			break
+		}
+	}
+	if err != nil {
 		detail := trimFailureDetail(strings.TrimSpace(stdout.String() + "\n" + stderr.String()))
 		if detail != "" {
 			return Exit(7, "upload script %s: %v: %s", spec.RemotePath, err, detail)
@@ -174,17 +195,8 @@ func remoteRunScriptCommandWithEnvFiles(workdir string, env map[string]string, e
 func windowsRemoteRunScriptCommandWithEnvFiles(workdir string, env map[string]string, envFiles []string, script *RunScriptSpec, args []string) string {
 	var b bytes.Buffer
 	writeWindowsRemotePrefix(&b, workdir, env, envFiles)
-	b.WriteString("$__crabboxScript = " + psQuote(script.RemotePath) + "\n")
-	b.WriteString("$__crabboxArgs = @(")
-	for i, arg := range args {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(psQuote(arg))
-	}
-	b.WriteString(")\n")
-	b.WriteString("& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $__crabboxScript @__crabboxArgs\n")
-	b.WriteString("exit $LASTEXITCODE\n")
+	command := []string{"powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script.RemotePath}
+	writeWindowsCommandInvocation(&b, append(command, args...))
 	return PowershellCommand(b.String())
 }
 

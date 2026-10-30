@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -25,9 +26,18 @@ const parallelsDHCPLeasesPath = "/Library/Preferences/Parallels/parallels_dhcp_l
 const parallelsPasswordEnvName = "CRABBOX_PARALLELS_PASSWORD"
 const parallelsCapacityLockRetryDelay = 100 * time.Millisecond
 
+const (
+	parallelsIPBootGrace        = 2 * time.Minute
+	parallelsIPProbeInterval    = 15 * time.Second
+	parallelsIPProbeTimeout     = 10 * time.Second
+	parallelsIPUnavailableLimit = 3
+)
+
 var errParallelsDHCPLeaseAmbiguous = errors.New("ambiguous Parallels DHCP lease")
 
 var errParallelsDHCPLeaseMissing = errors.New("no Parallels DHCP lease for VM MACs")
+
+var errParallelsGuestToolsUnavailable = errors.New("Parallels guest tools unavailable")
 
 // Acquisition owns clone mode and rollback; resolving an existing VM does not.
 type ParallelsIPWaitPurpose uint8
@@ -40,6 +50,10 @@ const (
 type ParallelsClient struct {
 	Cfg    Config
 	Runner CommandRunner
+	// WarnClone receives advisory output immediately before clone submission.
+	WarnClone func(string)
+
+	linkedMacOSOnAppleSilicon bool
 }
 
 type ParallelsVM struct {
@@ -376,6 +390,48 @@ func (c *ParallelsClient) GetVM(ctx context.Context, id string) (ParallelsVM, er
 	return vms[0], nil
 }
 
+// ResolveCloneMode defers the default until the execution host is selected.
+// Query hardware on that host, including when its shell runs under Rosetta.
+func (c *ParallelsClient) ResolveCloneMode(ctx context.Context) error {
+	c.linkedMacOSOnAppleSilicon = false
+	mode := strings.ToLower(strings.TrimSpace(c.Cfg.Parallels.CloneMode))
+	switch mode {
+	case "full", "unlink":
+		c.Cfg.Parallels.CloneMode = mode
+		return nil
+	case "", "linked":
+	default:
+		return Exit(2, "parallels.cloneMode must be linked, full, or unlink")
+	}
+	if c.Cfg.TargetOS == targetMacOS {
+		// Optional feature OIDs may be absent on Intel. -i accepts only that
+		// absence; transport and other command failures still fail closed.
+		result, err := c.hostCommand(ctx, nil, "/usr/sbin/sysctl", "-n", "-i", "hw.optional.arm64")
+		if err != nil {
+			return commandOutputError("detect Parallels host architecture", result, err)
+		}
+		switch strings.TrimSpace(result.Stdout) {
+		case "1":
+			if mode == "" && (strings.TrimSpace(c.Cfg.Parallels.SourceSnapshot) != "" || strings.TrimSpace(c.Cfg.Parallels.SourceSnapshotID) != "") {
+				mode = "linked"
+			}
+			if mode == "linked" {
+				c.linkedMacOSOnAppleSilicon = true
+			} else {
+				mode = "full"
+			}
+		case "", "0":
+		default:
+			return Exit(4, "detect Parallels host architecture: expected hw.optional.arm64 to be absent, 0, or 1")
+		}
+	}
+	if mode == "" {
+		mode = "linked"
+	}
+	c.Cfg.Parallels.CloneMode = mode
+	return nil
+}
+
 // SubmitClone validates the request, calls beforeSubmit immediately before
 // `prlctl clone`, and leaves resource discovery to the caller. A mutable-name
 // lookup cannot attest which incarnation the clone produced.
@@ -402,6 +458,12 @@ func (c *ParallelsClient) submitClone(ctx context.Context, source, snapshotID, l
 	if strings.TrimSpace(source) == "" {
 		return nil, Exit(2, "parallels.source or parallels.sourceId is required")
 	}
+	if strings.TrimSpace(c.Cfg.Parallels.CloneMode) == "" && strings.TrimSpace(snapshotID) != "" {
+		c.Cfg.Parallels.CloneMode = "linked"
+	}
+	if err := c.ResolveCloneMode(ctx); err != nil {
+		return nil, err
+	}
 	name := parallelsLeaseVMName(leaseID, slug)
 	args := []string{"clone", source, "--name", name}
 	if dst := strings.TrimSpace(c.Cfg.Parallels.VMRoot); dst != "" {
@@ -427,7 +489,7 @@ func (c *ParallelsClient) submitClone(ctx context.Context, source, snapshotID, l
 		args = append(args, "--linked")
 	case "full":
 		if snapshotID != "" {
-			return nil, Exit(2, "Parallels snapshot forks require cloneMode=linked; prlctl selects snapshots only for linked clones")
+			return nil, Exit(2, "Parallels clone_mode=full cannot select a snapshot; prlctl selects snapshots only for linked clones; to clone the source VM's current state, clear snapshot selectors with --parallels-source-snapshot= --parallels-source-snapshot-id=")
 		}
 	case "unlink":
 		if snapshotID != "" {
@@ -444,6 +506,13 @@ func (c *ParallelsClient) submitClone(ctx context.Context, source, snapshotID, l
 		if err := beforeSubmit(); err != nil {
 			return nil, err
 		}
+	}
+	if c.linkedMacOSOnAppleSilicon && c.WarnClone != nil {
+		warning := "warning: linked clones of macOS guests on Apple silicon have been observed to start without guest IP or Parallels Tools; if IP discovery times out, use --parallels-clone-mode full"
+		if snapshotID != "" {
+			warning += " and clear snapshot selectors with --parallels-source-snapshot= --parallels-source-snapshot-id="
+		}
+		c.WarnClone(warning)
 	}
 	result, err := c.prlctl(ctx, nil, args...)
 	if err != nil {
@@ -618,13 +687,14 @@ func (c *ParallelsClient) BootstrapMacOSOverSSH(ctx context.Context, ip string, 
 }
 
 func (c *ParallelsClient) runWindowsPowerShellFile(ctx context.Context, vmID, name, script string) error {
+	ctx, cancel := ParallelsStartupContext(ctx, c.Cfg)
+	defer cancel()
 	base := `C:\ProgramData\crabbox`
 	ps1 := base + `\` + name + `.ps1`
 	b64 := ps1 + `.b64`
-	if err := c.runWindowsPowerShell(ctx, vmID, fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
-foreach ($path in @(%s, %s)) {
-  if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-}`, psQuote(base), psQuote(ps1), psQuote(b64))); err != nil {
+	if err := c.runWindowsPowerShellStaging(ctx, vmID, fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path %s | Out-Null
+[IO.File]::Open(%s, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite).Dispose()`, psQuote(base), psQuote(b64))); err != nil {
 		return err
 	}
 	encoded := base64.StdEncoding.EncodeToString([]byte(script))
@@ -635,25 +705,109 @@ foreach ($path in @(%s, %s)) {
 			end = len(encoded)
 		}
 		chunk := encoded[start:end]
-		if err := c.runWindowsPowerShell(ctx, vmID, fmt.Sprintf(`Add-Content -Encoding ASCII -LiteralPath %s -Value %s`, psQuote(b64), psQuote(chunk))); err != nil {
+		// Tools can lose the result after a write. Replaying an offset overwrite
+		// preserves bytes even if the previous invocation already completed.
+		write := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+$bytes = [Text.Encoding]::ASCII.GetBytes(%s)
+$file = [IO.File]::Open(%s, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+try {
+  $file.Position = %d
+  $file.Write($bytes, 0, $bytes.Length)
+} finally { $file.Dispose() }`, psQuote(chunk), psQuote(b64), start)
+		if err := c.runWindowsPowerShellStaging(ctx, vmID, write); err != nil {
 			return err
 		}
 	}
-	run := fmt.Sprintf(`$raw = (Get-Content -Raw -LiteralPath %s) -replace '\s',''
+	// A fresh receipt distinguishes this dispatch from an older successful run.
+	receipt := ps1 + ".result"
+	token := rand.Text()
+	// Ignore a longer previous upload's tail, but verify the entire decoded
+	// payload before executing it. Never replay this invocation after result loss.
+	run := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+$raw = [IO.File]::ReadAllText(%s).Substring(0, %d)
 $bytes = [Convert]::FromBase64String($raw)
-$text = [Text.Encoding]::UTF8.GetString($bytes)
-[IO.File]::WriteAllText(%s, $text, [Text.UTF8Encoding]::new($false))
-& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File %s`, psQuote(b64), psQuote(ps1), psQuote(ps1))
-	return c.runWindowsPowerShell(ctx, vmID, run)
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+if ($hash -ne %s) { throw 'Windows bootstrap upload SHA-256 mismatch' }
+[IO.File]::WriteAllBytes(%s, $bytes)
+& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File %s
+$code = $LASTEXITCODE
+[IO.File]::WriteAllText(%s, %s + ':' + $code, [Text.Encoding]::ASCII)
+exit $code`, psQuote(b64), len(encoded), psQuote(fmt.Sprintf("%x", sha256.Sum256([]byte(script)))), psQuote(ps1), psQuote(ps1), psQuote(receipt), psQuote(token))
+	result, err := c.runWindowsPowerShell(ctx, vmID, run)
+	if !parallelsWindowsToolsResultLost(result, err) {
+		return err
+	}
+	return c.waitWindowsPowerShellReceipt(ctx, vmID, receipt, token, err)
 }
 
-func (c *ParallelsClient) runWindowsPowerShell(ctx context.Context, vmID, script string) error {
+func (c *ParallelsClient) runWindowsPowerShellStaging(ctx context.Context, vmID, script string) error {
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		result, err := c.runWindowsPowerShell(ctx, vmID, script)
+		if !parallelsWindowsToolsResultLost(result, err) || attempt == attempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-time.After(time.Duration(attempt) * ParallelsGuestExecProbeInterval):
+		}
+		if err := c.WaitForGuestExec(ctx, vmID, c.Cfg, c.Cfg.Parallels.StartupTimeout); err != nil {
+			return err
+		}
+	}
+}
+
+// The retained result-loss signatures are exit 255 with one of these Tools
+// messages. Exit 255 alone (also used by SSH) is not retryable.
+func parallelsWindowsToolsResultLost(result LocalCommandResult, err error) bool {
+	if err == nil || result.ExitCode != 255 {
+		return false
+	}
+	message := strings.ToLower(result.Stderr + "\n" + result.Stdout)
+	return strings.Contains(message, "prljob_getresult: invalid argument") ||
+		strings.Contains(message, "prljob_getretcode: invalid argument")
+}
+
+func (c *ParallelsClient) waitWindowsPowerShellReceipt(ctx context.Context, vmID, path, token string, original error) error {
+	probe := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+try {
+  if (Test-Path -LiteralPath %s) { [IO.File]::ReadAllText(%s) }
+} catch [IO.IOException] { }`, psQuote(path), psQuote(path))
+	for ctx.Err() == nil {
+		probeCtx, cancel := context.WithTimeout(ctx, parallelsIPProbeTimeout)
+		result, err := c.runWindowsPowerShell(probeCtx, vmID, probe)
+		probeExpired := probeCtx.Err() != nil
+		cancel()
+		if err == nil && !probeExpired {
+			if value, found := strings.CutPrefix(strings.TrimSpace(result.Stdout), token+":"); found {
+				code, parseErr := strconv.Atoi(value)
+				if parseErr == nil && code == 0 {
+					return nil
+				}
+				if parseErr == nil {
+					return fmt.Errorf("Windows bootstrap completed with exit code %d after result loss: %w", code, original)
+				}
+			}
+		} else if !probeExpired && !parallelsWindowsToolsResultLost(result, err) {
+			return fmt.Errorf("Windows bootstrap outcome unknown: %w; receipt check: %w", original, err)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(ParallelsGuestExecProbeInterval):
+		}
+	}
+	return fmt.Errorf("Windows bootstrap outcome unknown: %w; receipt check: %w", original, context.Cause(ctx))
+}
+
+func (c *ParallelsClient) runWindowsPowerShell(ctx context.Context, vmID, script string) (LocalCommandResult, error) {
 	args := strings.Fields(PowershellCommand(script))
 	result, err := c.prlctl(ctx, nil, append([]string{"exec", vmID}, args...)...)
-	if err != nil {
-		return commandOutputError("parallels windows powershell", result, err)
-	}
-	return nil
+	return result, commandOutputError("parallels windows powershell", result, err)
 }
 
 func (c *ParallelsClient) EnsureGuestReady(ctx context.Context, vmID string, cfg Config) error {
@@ -681,20 +835,71 @@ func (c *ParallelsClient) WaitForIP(ctx context.Context, id string, timeout time
 	if timeout <= 0 {
 		timeout = 15 * time.Minute
 	}
-	deadline := time.Now().Add(timeout)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	deadline, _ := waitCtx.Deadline()
+	nextProbe := time.Now().Add(parallelsIPBootGrace)
+	unavailableProbes := 0
+	dhcpAddressObserved := false
 	var last ParallelsVM
+	var vmObserved bool
 	var lastDHCPError error
+	var lastQueryError error
 	useDHCPFallback := c.Cfg.TargetOS == targetMacOS && strings.TrimSpace(c.Cfg.Parallels.BootstrapKey) != ""
+	waitError := func(reason string) error {
+		if parentDeadline, ok := ctx.Deadline(); ok && !time.Now().Before(parentDeadline) {
+			<-ctx.Done()
+		}
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		hint := parallelsIPTimeoutHint(c.Cfg, last, vmObserved, useDHCPFallback, lastDHCPError, purpose)
+		if lastQueryError != nil {
+			return Exit(5, "%s Parallels VM %s IP; last_state=%s; VM query: %v; %s", reason, id, blank(last.State, "-"), lastQueryError, hint)
+		}
+		if lastDHCPError != nil {
+			return Exit(5, "%s Parallels VM %s IP; last_state=%s; DHCP fallback: %v; %s", reason, id, blank(last.State, "-"), lastDHCPError, hint)
+		}
+		return Exit(5, "%s Parallels VM %s IP; last_state=%s; %s", reason, id, blank(last.State, "-"), hint)
+	}
+	waitExpired := func() bool {
+		// The poll can wake before the deadline's cancellation callback runs.
+		// Join that notification before admitting work, preserving the parent cause.
+		if !time.Now().Before(deadline) {
+			<-waitCtx.Done()
+		}
+		return waitCtx.Err() != nil
+	}
 	for {
-		vm, err := c.GetVM(ctx, id)
+		if ctx.Err() != nil {
+			return ParallelsVM{}, context.Cause(ctx)
+		}
+		if waitExpired() {
+			return ParallelsVM{}, waitError("timed out waiting for")
+		}
+		vm, err := c.GetVM(waitCtx, id)
+		vmObserved = err == nil
+		lastQueryError = err
+		if ctx.Err() != nil {
+			return ParallelsVM{}, context.Cause(ctx)
+		}
 		if err == nil {
 			last = vm
 			if vm.IP != "" {
+				if waitExpired() {
+					return ParallelsVM{}, waitError("timed out waiting for")
+				}
 				vm.IPSource = "tools"
 				return vm, nil
 			}
 			if useDHCPFallback {
-				data, readErr := c.readDHCPLeases(ctx)
+				if waitExpired() {
+					return ParallelsVM{}, waitError("timed out waiting for")
+				}
+				data, readErr := c.readDHCPLeases(waitCtx)
+				if ctx.Err() != nil {
+					return ParallelsVM{}, context.Cause(ctx)
+				}
 				if readErr != nil {
 					lastDHCPError = readErr
 				} else if ip, resolveErr := resolveParallelsDHCPLeaseIP(data, vm.MACs, time.Now()); resolveErr != nil {
@@ -702,25 +907,65 @@ func (c *ParallelsClient) WaitForIP(ctx context.Context, id string, timeout time
 					if errors.Is(resolveErr, errParallelsDHCPLeaseAmbiguous) {
 						return ParallelsVM{}, resolveErr
 					}
-				} else if probeErr := c.probeHostTCP(ctx, ip, c.Cfg.SSHPort); probeErr != nil {
-					lastDHCPError = probeErr
 				} else {
-					vm.IP = ip
-					vm.IPSource = "dhcp-mac"
-					return vm, nil
+					// A valid address makes SSH, rather than Tools, the remaining
+					// readiness dependency. Keep its full startup budget.
+					dhcpAddressObserved = true
+					if waitExpired() {
+						return ParallelsVM{}, waitError("timed out waiting for")
+					}
+					probeErr := c.probeHostTCP(waitCtx, ip, c.Cfg.SSHPort)
+					if ctx.Err() != nil {
+						return ParallelsVM{}, context.Cause(ctx)
+					}
+					if probeErr != nil {
+						lastDHCPError = probeErr
+					} else {
+						if waitExpired() {
+							return ParallelsVM{}, waitError("timed out waiting for")
+						}
+						vm.IP = ip
+						vm.IPSource = "dhcp-mac"
+						return vm, nil
+					}
 				}
 			}
 		}
-		if time.Now().After(deadline) {
-			hint := parallelsIPTimeoutHint(c.Cfg, last, err == nil, useDHCPFallback, lastDHCPError, purpose)
-			if lastDHCPError != nil {
-				return ParallelsVM{}, Exit(5, "timed out waiting for Parallels VM %s IP; last_state=%s; DHCP fallback: %v; %s", id, blank(last.State, "-"), lastDHCPError, hint)
+		if waitExpired() {
+			return ParallelsVM{}, waitError("timed out waiting for")
+		}
+		if err != nil || !strings.EqualFold(strings.TrimSpace(vm.State), "running") || dhcpAddressObserved {
+			unavailableProbes = 0
+		} else if !time.Now().Before(nextProbe) {
+			probeCtx, cancelProbe := context.WithTimeout(waitCtx, parallelsIPProbeTimeout)
+			probeErr := c.probeGuestExec(probeCtx, id, c.Cfg)
+			probeContextErr := probeCtx.Err()
+			cancelProbe()
+			nextProbe = time.Now().Add(parallelsIPProbeInterval)
+			if ctx.Err() != nil {
+				return ParallelsVM{}, context.Cause(ctx)
 			}
-			return ParallelsVM{}, Exit(5, "timed out waiting for Parallels VM %s IP; last_state=%s; %s", id, blank(last.State, "-"), hint)
+			if waitExpired() {
+				return ParallelsVM{}, waitError("timed out waiting for")
+			}
+			// Early boot metadata, timeouts and unrelated execution errors do
+			// not prove that Tools remain unavailable.
+			if probeContextErr == nil && ParallelsGuestToolsUnavailable(probeErr) {
+				unavailableProbes++
+			} else {
+				unavailableProbes = 0
+			}
+			if unavailableProbes >= parallelsIPUnavailableLimit {
+				return ParallelsVM{}, fmt.Errorf("%w: %w", errParallelsGuestToolsUnavailable,
+					waitError(fmt.Sprintf("failed after %d consecutive Tools-unavailable probes waiting for", unavailableProbes)))
+			}
 		}
 		select {
-		case <-ctx.Done():
-			return ParallelsVM{}, ctx.Err()
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return ParallelsVM{}, context.Cause(ctx)
+			}
+			return ParallelsVM{}, waitError("timed out waiting for")
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -745,6 +990,10 @@ func parallelsIPTimeoutHint(cfg Config, last ParallelsVM, vmObserved, dhcpFallba
 		toolsIP = "none"
 	}
 	parts := []string{"clone_mode=" + mode + " macs=" + macs + " tools_ip=" + toolsIP}
+	parts = append(parts, "--parallels-startup-timeout bounds the overall IP wait; increasing it does not disable Tools fail-fast")
+	if !vmObserved {
+		return "hint: " + strings.Join(parts, "; ") + "; last_state and macs reflect the last successful VM observation, if any; verify Parallels host inventory access before diagnosing guest boot or networking"
+	}
 	if !dhcpFallback && cfg.TargetOS == targetMacOS {
 		parts = append(parts, "for macOS guests without working Parallels Tools, set parallels.bootstrapKey to enable DHCP/SSH discovery")
 	}
@@ -758,41 +1007,81 @@ func parallelsIPTimeoutHint(cfg Config, last ParallelsVM, vmObserved, dhcpFallba
 		}
 	}
 	if running && purpose == ParallelsIPWaitAcquisition && mode == "linked" {
-		parts = append(parts, "if the console stays blank, the template may not boot as a linked clone; retry with parallels.cloneMode=full and clear parallels.sourceSnapshot and parallels.sourceSnapshotId (full clones use the source VM's current state and cannot select a source snapshot)")
+		parts = append(parts, "the template snapshot may not boot as a linked clone; retry with parallels.cloneMode=full (--parallels-clone-mode full) and clear parallels.sourceSnapshot and parallels.sourceSnapshotId with --parallels-source-snapshot= --parallels-source-snapshot-id= (full clones use the source VM's current state and cannot select a source snapshot)")
 	}
 	return "hint: " + strings.Join(parts, "; ")
 }
+
+// ParallelsStartupContext shares one startup budget across IP discovery and preparation.
+func ParallelsStartupContext(ctx context.Context, cfg Config) (context.Context, context.CancelFunc) {
+	timeout := cfg.Parallels.StartupTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Minute
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+const ParallelsGuestExecProbeInterval = 5 * time.Second
 
 func (c *ParallelsClient) WaitForGuestExec(ctx context.Context, id string, cfg Config, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 15 * time.Minute
 	}
-	deadline := time.Now().Add(timeout)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	var lastErr error
-	for {
-		var args []string
-		if cfg.TargetOS == targetWindows {
-			args = strings.Fields(PowershellCommand(`"ok" | Out-Null`))
-		} else {
-			args = []string{"/bin/sh", "-lc", "true"}
+	waitError := func() error {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
 		}
-		result, err := c.prlctl(ctx, nil, append([]string{"exec", id}, args...)...)
-		if err == nil {
+		return Exit(5, "timed out waiting for Parallels guest exec in %s: %v", id, lastErr)
+	}
+	for {
+		if waitCtx.Err() != nil {
+			return waitError()
+		}
+		probeCtx, cancelProbe := context.WithTimeout(waitCtx, parallelsIPProbeTimeout)
+		err := c.probeGuestExec(probeCtx, id, cfg)
+		probeErr := probeCtx.Err()
+		cancelProbe()
+		if err != nil {
+			lastErr = err
+		}
+		if waitCtx.Err() != nil {
+			return waitError()
+		}
+		if err == nil && probeErr == nil {
 			return nil
 		}
-		lastErr = commandOutputError("parallels guest exec", result, err)
-		if c.Cfg.TargetOS == targetMacOS && strings.TrimSpace(c.Cfg.Parallels.BootstrapKey) != "" && ParallelsGuestToolsUnavailable(lastErr) {
-			return lastErr
+		if err == nil {
+			err = probeErr
 		}
-		if time.Now().After(deadline) {
-			return Exit(5, "timed out waiting for Parallels guest exec in %s: %v", id, lastErr)
+		lastErr = err
+		unavailable := ParallelsGuestToolsUnavailable(err)
+		if unavailable && cfg.TargetOS == targetMacOS && strings.TrimSpace(cfg.Parallels.BootstrapKey) != "" {
+			return err
+		}
+		// A timed-out probe proves neither readiness nor a terminal guest failure.
+		if !unavailable && probeErr == nil {
+			return err
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-waitCtx.Done():
+			return waitError()
+		case <-time.After(ParallelsGuestExecProbeInterval):
 		}
 	}
+}
+
+func (c *ParallelsClient) probeGuestExec(ctx context.Context, id string, cfg Config) error {
+	var args []string
+	if cfg.TargetOS == targetWindows {
+		args = strings.Fields(PowershellCommand(`"ok" | Out-Null`))
+	} else {
+		args = []string{"/bin/sh", "-lc", "true"}
+	}
+	result, err := c.prlctl(ctx, nil, append([]string{"exec", id}, args...)...)
+	return commandOutputError("parallels guest exec", result, err)
 }
 
 func ParallelsGuestToolsUnavailable(err error) bool {
@@ -800,9 +1089,14 @@ func ParallelsGuestToolsUnavailable(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "prl_err_vm_exec_guest_tool_not_available") ||
+	return errors.Is(err, errParallelsGuestToolsUnavailable) ||
+		strings.Contains(message, "prl_err_vm_exec_guest_tool_not_available") ||
+		strings.Contains(message, "prljob_getresult: invalid argument") ||
+		strings.Contains(message, "prljob_getretcode: invalid argument") ||
 		strings.Contains(message, "guest tools are not available") ||
-		strings.Contains(message, "guest tools not available")
+		strings.Contains(message, "guest tools not available") ||
+		(strings.Contains(message, "unable to open new session in this virtual machine.") &&
+			strings.Contains(message, "runs the latest version of parallels tools, and is not isolated from the host os"))
 }
 
 func (c *ParallelsClient) WindowsGuestText(ctx context.Context, id, path string) (string, error) {

@@ -87,13 +87,35 @@ gcp:
   tags:
     - crabbox-ssh
   sshCIDRs: []
-  rootGB: 400
+  rootGB: 0 # automatic: class default, at least the image minimum
   serviceAccount: ""
 ```
 
 Defaults applied when a field is unset: `zone` `europe-west2-a`, `network`
-`default`, `tags` `[crabbox-ssh]`, `rootGB` `400`, and the Ubuntu 26.04 LTS image
+`default`, `tags` `[crabbox-ssh]`, automatic root sizing, and the Ubuntu 26.04 LTS image
 above. `project` and `zone` are required for a direct lease.
+
+Automatic boot disks are 40 GB for `tiny`, 80 GB for `small`, 150 GB for
+`standard` and `fast`, 250 GB for `large`, and 400 GB for `beast`. Unset or zero
+`gcp.rootGB` selects this policy. Direct and brokered creates read the source
+image's disk size and raise the automatic default when necessary. Family aliases
+are resolved to the exact inspected image. Project-relative references such as
+`global/images/my-image` resolve in the selected project. Brokered disk-snapshot restores use
+the same policy with the snapshot's size as the minimum. Provider credentials
+need image read access (and snapshot read access for snapshot restores).
+
+Set `gcp.rootGB: 400` or `CRABBOX_GCP_ROOT_GB=400` to
+retain 400 GB. Positive explicit sizes are forwarded unchanged, including sizes
+that GCP rejects as smaller than the source. The coordinator's
+`CRABBOX_GCP_ROOT_GB` remains an explicit operator override when the request
+leaves sizing unset. Config output reports `rootGB: 0` for automatic sizing;
+the source minimum is resolved only during create. Upgrade the coordinator as
+well as the client for class sizing in brokered mode.
+
+Ready-pool borrows retain their existing disk; new members follow this policy.
+Machine-image restores preserve their inherited disk sizes and types: GCP
+[does not allow attached-disk property overrides during restore](https://cloud.google.com/compute/docs/machine-images/create-instance-from-machine-image#create-instance-from-image-override).
+Use disk-snapshot checkpoints when a fork needs a different root size.
 
 Project resolution order is `CRABBOX_GCP_PROJECT`, then `gcp.project`, then
 `GOOGLE_CLOUD_PROJECT`, then `GCP_PROJECT_ID`. Brokered requests forward only the
@@ -292,6 +314,13 @@ large     c4-standard-96, c3-standard-88, n2-standard-80, n2d-standard-96, c4-st
 beast     c4-standard-192, c4-standard-96, c3-standard-176, c3-standard-88, n2d-standard-224, n2-standard-128
 ```
 
+Boot disks use Hyperdisk Balanced (`hyperdisk-balanced`) for the Hyperdisk-only
+families A4, A4X, C4, C4A, C4D, C4N, G4, H4D, M4, M4N, N4, N4A, N4D, X4,
+X5, and Z4D, plus the A3 Ultra (`a3-ultragpu`) variant.
+Other families use Balanced Persistent Disk (`pd-balanced`), including C3, N2,
+and N2D. N2 and N2D cannot use Hyperdisk Balanced, so the disk type follows each
+candidate rather than the initially selected class type.
+
 `capacity.market: spot` maps to GCP Spot VMs. If `capacity.fallback` starts with
 `on-demand`, Crabbox retries the same zone and type candidates as on-demand after
 retryable Spot capacity or quota failures.
@@ -304,6 +333,13 @@ returns a quota, capacity, rate-limit, or unavailable-type error. See
 The coordinator classifies retry eligibility from complete API error evidence;
 displayed diagnostics remain bounded and redacted. Shortening a diagnostic does
 not change which configured zone or market candidates may be attempted.
+
+Disk-type/machine-type incompatibility also permits candidate fallback. For any
+provider, a create the coordinator records as failed with no possible provider
+resource returns HTTP 422 `provisioning_failed` with the diagnostic message.
+Uncertain outcomes and failures requiring resource cleanup retain their existing
+responses. An identical fixed-ID replay returns the same `422 provisioning_failed`
+diagnostics without provider work or client cancellation.
 
 ## Networking
 
@@ -430,10 +466,14 @@ Three independent safety nets enforce expiry:
 
 - Direct GCP VMs set Compute Engine `maxRunDuration` with termination action
   `DELETE`, so the TTL hard cap is enforced by the platform.
-- Each VM installs a guest-side `crabbox-gcp-expiry-guard` systemd timer that
-  reads live instance labels through the metadata service and Compute API, then
-  self-deletes expired non-kept leases when the attached service account can
-  delete the VM.
+- New direct Linux VMs install the shared `crabbox-expiry-guard` systemd timer.
+  It reads live instance labels through the metadata service and Compute API,
+  then self-deletes expired leases, including kept warmups, when the attached
+  service account can delete the VM. The timer runs every two minutes; running
+  and provisioning states have a one-hour expiry grace. Existing VMs retain
+  their installed guard and must be recreated to receive this version.
+  Manual `crabbox cleanup` also expires kept leases. Brokered leases do not
+  install this guard; their coordinator owns expiry.
 - Cleanup removes stale local GCP claim files whose lease IDs no longer appear in
   provider inventory.
 
@@ -453,8 +493,8 @@ drift before persisting evidence.
 
 This observation runs only for typed `identity` and `register-identity`
 requests after lease access, state, expiry, and request metadata validation.
-Ordinary launches, legacy ready pools, borrow/return/heartbeat, and reconciliation
-do not read image or snapshot metadata. The coordinator credentials need
+Ordinary launches with automatic root sizing read image or snapshot size metadata.
+Borrow/return/heartbeat and reconciliation do not read source metadata. The coordinator credentials need
 `compute.instances.get` and `compute.disks.get` for typed GCP identity
 operations.
 
@@ -476,12 +516,21 @@ remain valid checkpoint sources but cannot join typed ready-pool cohorts.
 
 Brokered Linux GCP leases support native [checkpoints](../features/checkpoints.md):
 
-- `--strategy image` captures a GCP machine image (`gcp-machine-image`).
+- `--strategy image` captures a GCP machine image (`gcp-machine-image`). GCP
+  [refuses machine images](https://docs.cloud.google.com/compute/docs/machine-images/create-machine-images)
+  for instances with any Hyperdisk attached (Crabbox rejects Hyperdisk-booted
+  leases before calling GCP) and for C3D, H3, A3, and most Z3 machine types even
+  with a Persistent Disk boot; use the default disk-snapshot strategy for those.
 - The default strategy captures a disk snapshot (`gcp-disk-snapshot`).
 
 `checkpoint fork` and `checkpoint restore` rehydrate from either kind in the
 recorded project and zone. Native checkpoints require a coordinator and a known
 cloud instance ID; they are not available for direct-only leases.
+
+Machine-image restore preserves the image's disk type without overriding its
+disks. An incompatible candidate (such as C4 with a `pd-balanced` machine image)
+falls through to the next configured candidate. Disk-snapshot restore selects
+the boot disk type for the destination machine family and supports Hyperdisk.
 
 New brokered GCP checkpoints are owned by the coordinator and manually retained
 unless creation or `checkpoint policy` explicitly sets
@@ -559,3 +608,78 @@ temporary `CRABBOX_CONFIG` without broker settings for direct cleanup.
 - [Tailscale](../features/tailscale.md)
 - [Checkpoints](../features/checkpoints.md)
 - [Lifecycle and cleanup](../features/lifecycle-cleanup.md)
+
+## Brokered address readiness
+
+The coordinator checks the instance address immediately, then waits 250 ms,
+500 ms, 1 s, 2 s, 4 s, and at most 5 s between reads. The existing two-minute
+address deadline is unchanged; the last wait is clipped and no new read starts
+at the deadline. A response arriving after the deadline is not accepted as ready.
+In-flight calls retain the provider client's existing transport/retry behavior.
+Provider errors, including exhausted throttling responses, propagate unchanged;
+the polling loop does not add rapid retries or override provider backoff.
+This reduces the observation delay for an early address, not the VM's boot time.
+
+## Coordinator preparation reuse
+
+For automatic root sizing, the coordinator caches the resolved image or snapshot
+path and minimum disk size for up to 30 minutes from lookup start. The cache is
+memory-only, bounded to 128 references, and isolated by coordinator environment,
+credential generation, execution project, and source project/reference. Zones and
+machine classes share source metadata, but each create still applies its class
+default. Family aliases stay pinned to the inspected image during that window;
+new family members appear on the next uncached lookup. Cache hits do not extend
+the window. Cold coordinators and credential rotation require fresh metadata.
+
+Image, snapshot, disk, and not-found provider errors discard these hints, including
+asynchronous operation errors; failed lookups are never cached. In-flight reads
+cannot refill invalidated entries. Explicit request or operator root sizes skip
+the lookup entirely, as do machine-image restores. Ownership and cleanup never
+use this cache. `gcp.image_minimum` measures an uncached lookup, including source
+metadata validation and any token acquisition; warm cache hits emit no lookup step.
+
+The coordinator caches an exact firewall verification in memory for up to five
+minutes, scoped to its environment, credential generation, project, firewall
+name, network, and desired policy. Creates with the same policy during that
+window skip the firewall GET. Cache hits do not extend the window, and cold
+coordinator instances always fetch. The cache is bounded to 128 policies and
+contains no credentials or durable ownership claims.
+
+Only a successful GET of a Crabbox-managed firewall can populate the cache. It
+must exactly match the desired network, ingress direction, priority, enabled
+state, source CIDRs, target tags, and TCP ports, with no additional selectors or
+deny rules. Updates and inserts require a subsequent exact GET before reuse.
+Changed policies and credentials require fresh verification. GCP request errors
+(including authentication, missing resources, transport, and malformed responses),
+operation errors, root-image or snapshot metadata request failures (including
+cross-project lookups), and address-readiness timeouts discard cached verifications;
+an in-flight older read cannot refill an invalidated entry.
+
+This introduces a bounded drift window: external firewall edits or deletion can
+remain undetected for up to five minutes after verification starts. A cache hit
+does not change or widen access; it proves only that the exact desired policy
+recently existed, not that it is still unchanged. External widening can therefore
+persist until the next uncached create reconciles it; external narrowing or
+deletion can interrupt SSH. After expiry, the next create reads the firewall and
+reconciles drift as before. Cleanup and instance ownership checks never use this
+cache.
+
+On a cache miss, an exact match still skips the update and global-operation
+wait. Drift follows the existing update-and-wait path; unmanaged rules remain an
+error.
+
+OAuth tokens are reused in memory across provider instances belonging to the
+same coordinator environment and credential generation. Service-account tokens
+refresh one minute before expiry; metadata tokens refresh five minutes before
+expiry. Credential changes discard the shared cache, concurrent misses share
+one exchange, and failed exchanges are never cached. Tokens are not persisted.
+Previously, each new provider instance started with an empty client cache, so
+`gcp.token_mint` could recur on successive creates. Cold coordinator instances
+and token expiry still incur that step.
+
+`gcp.firewall_get`, `gcp.firewall_put`, `gcp.firewall_insert`, and
+`gcp.disk_instance_insert` timings measure the Compute HTTP request and response
+processing after token acquisition. Older coordinator versions included token
+acquisition in these steps as well as in `gcp.token_mint`, so those durations
+overlapped; they were not independent network-latency measurements. A firewall
+cache hit emits no `gcp.firewall_get` step because no GET was sent.

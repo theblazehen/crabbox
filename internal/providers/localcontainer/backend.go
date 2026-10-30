@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -202,6 +203,9 @@ func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID st
 
 func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	cfg := b.configForRun()
+	if _, err := localContainerOCIRuntime(cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	architecture, err := b.assertRequestedArchitecture(ctx, cfg)
 	if err != nil {
 		return core.LeaseTarget{}, err
@@ -236,6 +240,10 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 		b.cfg.LocalContainer.CheckpointMetadata = shared.CloneLabels(metadata)
 	}
 	if strings.TrimSpace(req.RequestedLeaseID) != "" {
+		// Reject unavailable runtimes before reserving a durable fixed-ID intent.
+		if _, err := b.checkOCIRuntime(ctx, cfg); err != nil {
+			return core.LeaseTarget{}, err
+		}
 		return b.acquireFixed(ctx, req, cfg)
 	}
 	leaseID := core.NewLeaseID()
@@ -410,6 +418,9 @@ func createdPendingLease(cfg core.Config, containerID, leaseID, slug, bootstrapD
 		containerWorkRoot = resolvedWorkRoot
 	}
 	labels["work_root"] = containerWorkRoot
+	if ociRuntime := strings.TrimSpace(cfg.LocalContainer.OCIRuntime); ociRuntime != "" {
+		labels["oci_runtime"] = ociRuntime
+	}
 	for _, key := range checkpointScopeMetadataKeys {
 		if value := strings.TrimSpace(cfg.LocalContainer.CheckpointMetadata[key]); value != "" {
 			labels[key] = value
@@ -978,6 +989,11 @@ func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseVie
 }
 
 func (b *backend) Doctor(ctx context.Context, req core.DoctorRequest) (core.DoctorResult, error) {
+	cfg := b.configForRun()
+	ociRuntime, err := b.checkOCIRuntime(ctx, cfg)
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
 	runtime, contextName := b.runtimeInfo(ctx)
 	containers, err := b.listContainers(ctx)
 	if err != nil {
@@ -987,8 +1003,7 @@ func (b *backend) Doctor(ctx context.Context, req core.DoctorRequest) (core.Doct
 	if req.ProbeSSH {
 		probe = "requires_running_lease"
 	}
-	cfg := b.configForRun()
-	msg := fmt.Sprintf("cli=ready control_plane=local inventory=ready api=list mutation=false leases=%d runtime=%s context=%s ssh_probe=%s image=%s docker_socket=%v", len(containers), runtime, blank(contextName, "-"), probe, cfg.LocalContainer.Image, cfg.LocalContainer.DockerSocket)
+	msg := fmt.Sprintf("cli=ready control_plane=local inventory=ready api=list mutation=false leases=%d runtime=%s context=%s ssh_probe=%s image=%s docker_socket=%v oci_runtime=%s", len(containers), runtime, blank(contextName, "-"), probe, cfg.LocalContainer.Image, cfg.LocalContainer.DockerSocket, blank(ociRuntime, "-"))
 	return core.DoctorResult{Provider: providerName, Message: msg}, nil
 }
 
@@ -1800,13 +1815,59 @@ func localContainerDisplayImage(cfg core.Config) string {
 	return cfg.LocalContainer.Image
 }
 
+var ociRuntimeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+// Empty keeps the engine default; paths and shell syntax are never runtime names.
+func localContainerOCIRuntime(cfg core.Config) (string, error) {
+	value := cfg.LocalContainer.OCIRuntime
+	if value == "" {
+		return "", nil
+	}
+	// Podman takes the OCI runtime as a global option, which this setting
+	// does not pass yet.
+	if isPodmanRuntime(cfg.LocalContainer.Runtime) {
+		return "", core.Exit(2, "localContainer.ociRuntime is not supported with Podman yet; Crabbox passes it only as docker run --runtime, while Podman selects the runtime with its global --runtime option")
+	}
+	if !ociRuntimeNamePattern.MatchString(value) {
+		return "", core.Exit(2, "localContainer.ociRuntime %q must be a runtime name matching [A-Za-z0-9][A-Za-z0-9_.-]*; paths and shell syntax are not allowed", value)
+	}
+	return value, nil
+}
+
+func (b *backend) checkOCIRuntime(ctx context.Context, cfg core.Config) (string, error) {
+	value, err := localContainerOCIRuntime(cfg)
+	if err != nil || value == "" {
+		return value, err
+	}
+	result, err := b.containerRuntime(ctx, cfg, []string{"info", "--format", "{{json .Runtimes}}"}, nil, nil)
+	if err != nil {
+		return "", core.Exit(2, "query Docker configured OCI runtimes: %v: %s", err, trimCheckpointFailure(result.Stderr))
+	}
+	var runtimes map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(result.Stdout), &runtimes); err != nil {
+		return "", core.Exit(2, "decode Docker configured OCI runtimes: %v", err)
+	}
+	if _, ok := runtimes[value]; !ok {
+		return "", core.Exit(2, "localContainer.ociRuntime %q is not configured in the selected Docker daemon; register it in Docker's runtimes configuration, then check docker info --format '{{json .Runtimes}}'", value)
+	}
+	return value, nil
+}
+
 func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey string, keep bool) (string, string, error) {
 	return b.createContainerWithFixedIntent(ctx, cfg, name, leaseID, slug, publicKey, "", keep)
 }
 
 func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey, fixedFingerprint string, keep bool) (string, string, error) {
+	return b.createContainerWithOptions(ctx, cfg, name, leaseID, slug, publicKey, fixedFingerprint, keep, nil)
+}
+
+func (b *backend) createContainerWithOptions(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey, fixedFingerprint string, keep bool, served *ServedContainerOptions) (string, string, error) {
 	if digest, known := core.DefaultContainerImageDigest(cfg.LocalContainer.Image); known && digest == "" {
 		return "", "", core.Exit(2, "compiled container image is missing its reviewed digest")
+	}
+	ociRuntime, err := b.checkOCIRuntime(ctx, cfg)
+	if err != nil {
+		return "", "", err
 	}
 	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, time.Now().UTC())
 	// Checkpoint images may carry an older allocation's fixed-ID authority.
@@ -1849,6 +1910,9 @@ func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.C
 		}
 	}()
 	labels["work_root"] = containerWorkRoot
+	if ociRuntime != "" {
+		labels["oci_runtime"] = ociRuntime
+	}
 	cacheVolumeMounts, err := localContainerCacheVolumeMounts(cfg.Cache.Volumes)
 	if err != nil {
 		return "", "", err
@@ -1882,8 +1946,17 @@ func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.C
 	for i, destination := range hostVolumeDestinations {
 		args = append(args, "-e", fmt.Sprintf("CRABBOX_HOST_VOLUME_PATH_%d=%s", i, destination))
 	}
+	if served != nil {
+		for key, value := range served.Labels {
+			labels[key] = value
+		}
+		args = append(args, "--rm", "--cpu-shares", "2", "-e", "CRABBOX_MANAGED_HOME=1")
+	}
 	for key, value := range labels {
 		args = append(args, "--label", key+"="+value)
+	}
+	if ociRuntime != "" {
+		args = append(args, "--runtime="+ociRuntime)
 	}
 	if cfg.LocalContainer.CPUs > 0 {
 		args = append(args, "--cpus", strconv.Itoa(cfg.LocalContainer.CPUs))
@@ -1931,6 +2004,19 @@ func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.C
 	}
 	for _, vol := range cfg.LocalContainer.Volumes {
 		args = append(args, "-v", vol)
+	}
+	if served != nil {
+		script := servedWatchdog + "\n" + bootstrapScript
+		runtimeImage := cfg.LocalContainer.Image
+		if served.runtimeImage != "" {
+			runtimeImage = served.runtimeImage
+		}
+		args = append(args, "-e", "CRABBOX_SERVE_DEADLINE="+strconv.FormatInt(served.Deadline, 10), runtimeImage, "/bin/sh", "-c", script)
+		result, err := b.docker(ctx, args, nil, b.rt.Stderr)
+		if err != nil {
+			return "", "", shared.LocalCommandError("served container run (loopback SSH binding)", result, err)
+		}
+		return strings.TrimSpace(result.Stdout), "", nil
 	}
 	bootstrapRoot := localContainerBootstrapRoot()
 	if err := os.MkdirAll(bootstrapRoot, 0o700); err != nil {
@@ -2176,7 +2262,10 @@ func (b *backend) prepareLease(ctx context.Context, cfg core.Config, container i
 }
 
 func (b *backend) listContainers(ctx context.Context) ([]inspectContainer, error) {
-	result, err := b.docker(ctx, []string{"ps", "-a", "--filter", "label=crabbox=true", "--filter", "label=provider=" + providerName, "--format", "{{.ID}}"}, nil, nil)
+	return b.listContainersForProvider(ctx, providerName)
+}
+func (b *backend) listContainersForProvider(ctx context.Context, provider string) ([]inspectContainer, error) {
+	result, err := b.docker(ctx, []string{"ps", "-a", "--filter", "label=crabbox=true", "--filter", "label=provider=" + provider, "--format", "{{.ID}}"}, nil, nil)
 	if err != nil {
 		return nil, shared.LocalCommandError("container list", result, err)
 	}
@@ -3179,6 +3268,9 @@ MOZILLA
 fi
 `
 
+const bootstrapTools = "/usr/sbin/sshd git rsync curl sudo python3"
+const bootstrapPackages = "openssh-server ca-certificates git rsync curl sudo python3"
+
 var bootstrapScript = `
 set -eu
 image_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
@@ -3260,12 +3352,12 @@ env | sed -n 's/^CRABBOX_HOST_VOLUME_PATH_[0-9][0-9]*=//p' | while IFS= read -r 
   check_host_volume_path "$host_path"
 done
 need_install=0
-	for tool in /usr/sbin/sshd git rsync curl sudo python3; do
+	for tool in ` + bootstrapTools + `; do
 	  command -v "$tool" >/dev/null 2>&1 || need_install=1
 	done
 	if [ "$need_install" = "1" ] && command -v apt-get >/dev/null 2>&1; then
 	  apt-get update
-	  apt-get install -y --no-install-recommends openssh-server ca-certificates git rsync curl sudo python3
+	  apt-get install -y --no-install-recommends ` + bootstrapPackages + `
 	fi
 if [ "${CRABBOX_DESKTOP:-0}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
   apt-get update
@@ -3347,6 +3439,10 @@ passwd -d "$user" >/dev/null 2>&1 || true
 home_dir="$(getent passwd "$user" | cut -d: -f6)"
 if [ -z "$home_dir" ]; then
   home_dir="/home/$user"
+fi
+# Named cache mounts can create the home before useradd runs.
+if [ "${CRABBOX_MANAGED_HOME:-0}" = "1" ]; then
+  chown -R "$user" "$home_dir"
 fi
 if [ "${CRABBOX_DOCKER_SOCKET:-0}" = "1" ] && [ -S /var/run/docker.sock ]; then
   socket_gid="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"

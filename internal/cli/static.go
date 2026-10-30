@@ -12,6 +12,7 @@ type targetFlagValues struct {
 	Target      *string
 	WindowsMode *string
 	Static      StaticConfigFlagValues
+	Commands    staticCommandFlagValues
 }
 
 func registerTargetFlags(fs *flag.FlagSet, defaults Config) targetFlagValues {
@@ -19,36 +20,35 @@ func registerTargetFlags(fs *flag.FlagSet, defaults Config) targetFlagValues {
 		Target:      fs.String("target", defaults.TargetOS, "target OS: linux, macos, or windows"),
 		WindowsMode: fs.String("windows-mode", defaults.WindowsMode, "Windows mode: normal or wsl2"),
 		Static:      RegisterStaticConfigFlags(fs, defaults.Static),
+		Commands:    registerStaticCommandFlags(fs),
 	}
 }
 
 func applyTargetFlagOverrides(cfg *Config, fs *flag.FlagSet, values targetFlagValues) error {
-	if flagWasSet(fs, "target") {
-		cfg.TargetOS = *values.Target
-		cfg.targetExplicit = true
-		cfg.targetFlagExplicit = true
-		cfg.credentialProvenance.externalDesktopTarget = credentialSourceFlag
-		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
-		if normalizeTargetOS(cfg.TargetOS) != targetWindows && !flagWasSet(fs, "windows-mode") {
-			cfg.WindowsMode = windowsModeNormal
-			cfg.explicitWindowsMode = ""
-			cfg.credentialProvenance.externalDesktopMode = credentialSourceFlag
-		}
+	var target, mode string
+	if values.Target != nil {
+		target = *values.Target
 	}
-	if flagWasSet(fs, "windows-mode") {
-		cfg.WindowsMode = *values.WindowsMode
-		cfg.explicitWindowsMode = *values.WindowsMode
-		cfg.windowsModeFlagExplicit = true
-		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
-		cfg.credentialProvenance.externalDesktopMode = credentialSourceFlag
+	if values.WindowsMode != nil {
+		mode = *values.WindowsMode
 	}
+	applyTargetSelectorFlags(cfg, fs, target, mode)
 	applied, err := values.Static.Apply(&cfg.Static, fs)
 	recordConfigInput(cfg, "ssh", configInputFlag, applied.InputAccepted)
 	// Target validation can fail after this explicit host approval has applied.
 	if applied.Host {
 		cfg.credentialProvenance.staticHost = credentialSourceFlag
 	}
+	if flagWasSet(fs, "static-user") {
+		cfg.credentialProvenance.staticUser = credentialSourceFlag
+	}
+	if flagWasSet(fs, "static-port") {
+		cfg.credentialProvenance.staticPort = credentialSourceFlag
+	}
 	if err != nil {
+		return err
+	}
+	if err := applyStaticCommandFlags(cfg, fs, values.Commands); err != nil {
 		return err
 	}
 	normalizeTargetConfig(cfg)
@@ -89,13 +89,21 @@ func staticLease(cfg Config) (Server, SSHTarget, string, error) {
 	}
 	server.PublicNet.IPv4.IP = cfg.Static.Host
 	server.ServerType.Name = staticServerType(cfg)
-	target := sshTargetForLease(cfg, cfg.Static.Host, firstNonEmpty(cfg.Static.User, cfg.SSHUser), firstNonEmpty(cfg.Static.Port, cfg.SSHPort))
+	target := sshTargetForLease(cfg, cfg.Static.Host, staticLoginUser(cfg), firstNonEmpty(cfg.Static.Port, cfg.SSHPort))
+	target.FallbackPorts = staticSSHFallbackPorts(cfg, target.FallbackPorts)
 	target.ReadyCheck = staticReadyCommand(target)
+	target.NoControlMaster = cfg.Static.NoControlMaster
 	return server, target, leaseID, nil
 }
 
 func StaticLease(cfg Config) (Server, SSHTarget, string, error) {
 	return staticLease(cfg)
+}
+
+// staticLoginUser is the user Static SSH connects as; the implicit macOS
+// work root is derived from it.
+func staticLoginUser(cfg Config) string {
+	return firstNonEmpty(cfg.Static.User, cfg.SSHUser)
 }
 
 func staticReadyCommand(target SSHTarget) string {
@@ -125,4 +133,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// staticSSHFallbackPorts keeps an explicitly selected endpoint exclusive.
+// Another port on the same host can reach a different machine through a forward.
+func staticSSHFallbackPorts(cfg Config, fallback []string) []string {
+	if strings.TrimSpace(cfg.Static.Port) != "" || IsSSHPortExplicit(&cfg) {
+		return []string{}
+	}
+	return fallback
 }

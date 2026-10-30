@@ -2135,6 +2135,9 @@ func TestGitOverlayOriginAcceptsOnlyAnonymousSupportedTransports(t *testing.T) {
 		{origin: "file://localhost/srv/git/project.git", disposition: gitOriginRemoteAttemptSafe},
 		{origin: "http://example.test/project.git", disposition: gitOriginRemoteAttemptSafe},
 		{origin: "https://example.test/project.git", disposition: gitOriginRemoteAttemptSafe},
+		{origin: "git@github.com:example-org/project.git", disposition: gitOriginRemoteAttemptSafe},
+		{origin: "git@github.com:example-org/project.git?token=private", disposition: gitOriginNonForwardable},
+		{origin: "git@github.com:example-org/project.git#fragment", disposition: gitOriginNonForwardable},
 		{origin: fmt.Sprintf("https://%s:%s@example.test/project.git", "user", "test-password"), disposition: gitOriginNonForwardable},
 		{origin: "https://example.test/project.git?", disposition: gitOriginNonForwardable},
 		{origin: "https://example.test/project.git?token=private", disposition: gitOriginNonForwardable},
@@ -4145,7 +4148,36 @@ exit 99
 			case "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "linked-worktree", "checkout-file-obstruction", "post-reset-cache",
 				"ordinary-private-fresh", "ordinary-private-reused", "ordinary-unavailable-fresh", "ordinary-unavailable-reused", "ordinary-disconnected-reused":
 				transfer, err := os.ReadFile(rsyncLog)
-				if err != nil || !bytes.Contains(transfer, []byte("clean.txt\x00")) {
+				seededReuse := ordinary && reused && (privateOrigin || unavailableOrigin)
+				if seededReuse {
+					// The cached exact tree is verified before the later origin fetch
+					// fails. Clean bytes need no transfer; metadata still falls back.
+					if !os.IsNotExist(err) || len(transfer) != 0 || !strings.Contains(stderr.String(), "seeded sync delta: 0 files") {
+						t.Fatalf("verified clean seed did not skip transfer: data=%q err=%v stderr=%s", transfer, err, stderr.String())
+					}
+					manifest, _ := fixture.manifest(t)
+					for _, rel := range manifest.Files {
+						local, remote := filepath.Join(repo.Root, rel), filepath.Join(workdir, rel)
+						wantInfo, localErr := os.Lstat(local)
+						gotInfo, remoteErr := os.Lstat(remote)
+						if localErr != nil || remoteErr != nil || wantInfo.Mode() != gotInfo.Mode() {
+							t.Fatalf("seeded path %q modes: %v %v", rel, localErr, remoteErr)
+						}
+						if wantInfo.Mode()&os.ModeSymlink != 0 {
+							want, _ := os.Readlink(local)
+							got, _ := os.Readlink(remote)
+							if got != want {
+								t.Fatalf("seeded symlink %q differs", rel)
+							}
+						} else {
+							want, localErr := os.ReadFile(local)
+							got, remoteErr := os.ReadFile(remote)
+							if localErr != nil || remoteErr != nil || !bytes.Equal(got, want) {
+								t.Fatalf("seeded path %q bytes differ: %v %v", rel, localErr, remoteErr)
+							}
+						}
+					}
+				} else if err != nil || !bytes.Contains(transfer, []byte("clean.txt\x00")) {
 					t.Fatalf("fallback omitted full manifest: data=%q err=%v", transfer, err)
 				}
 				wantReason := "checkout_failed"
@@ -4168,7 +4200,7 @@ exit 99
 				if ordinary {
 					warningPrefix = "git origin fallback reason="
 					manifest, _ := fixture.manifest(t)
-					if !bytes.Equal(transfer, manifest.NUL()) {
+					if !seededReuse && !bytes.Equal(transfer, manifest.NUL()) {
 						t.Fatalf("ordinary fallback transferred an incomplete manifest: got=%q want=%q", transfer, manifest.NUL())
 					}
 				}
@@ -4350,6 +4382,7 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	remoteRoot := filepath.Join(testRoot, "remote")
+	replacementReady := filepath.Join(testRoot, "replacement-ready")
 	var leaseIDs [2]string
 	providerName := runReadyPoolPreflightTestProvider{}.Spec().Name
 	// Coordinator leases use direct TCP readiness, unlike the provider-local
@@ -4434,6 +4467,12 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 				http.Error(w, "unexpected acquisition", http.StatusInternalServerError)
 				return
 			}
+			if index == 1 {
+				if err := os.WriteFile(replacementReady, nil, 0o600); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
 			mu.Lock()
 			leaseIDs[index] = body.ID
 			mu.Unlock()
@@ -4467,14 +4506,12 @@ func TestRunMissingOriginReplacementLeaseStaysPlainManifest(t *testing.T) {
 	}
 	sshLog := filepath.Join(testRoot, "ssh.log")
 	transferred := filepath.Join(testRoot, "transferred")
-	failedReady := filepath.Join(testRoot, "failed-ready")
 	installWorkspaceOwnerAwareSSH(t, filepath.Join(binDir, "ssh"), `#!/bin/sh
 cmd="$1"
 printf '%s\n---\n' "$cmd" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$cmd" in
   *crabbox-ready*)
-    if [ -e "$CRABBOX_FAKE_TRANSFERRED" ] && [ ! -e "$CRABBOX_FAKE_FAILED_READY" ]; then
-      : > "$CRABBOX_FAKE_FAILED_READY"
+    if [ -e "$CRABBOX_FAKE_TRANSFERRED" ] && [ ! -e "$CRABBOX_FAKE_REPLACEMENT_READY" ]; then
       exit 1
     fi
     exit 0
@@ -4499,8 +4536,8 @@ done <"$tmp"
 		t.Fatal(err)
 	}
 	previousTimeout := runBeforeCommandSSHReadyTimeout
-	// Stay below the ten-second readiness retry interval so the first forced
-	// failure still replaces the lease, while healthy probes have time to start.
+	// Keep the first lease unready after sync until replacement, independently
+	// of retry cadence, while allowing healthy probes time to start.
 	runBeforeCommandSSHReadyTimeout = 5 * time.Second
 	t.Cleanup(func() { runBeforeCommandSSHReadyTimeout = previousTimeout })
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -4508,8 +4545,9 @@ done <"$tmp"
 	t.Setenv("CRABBOX_FAKE_SSH_LOG", sshLog)
 	t.Setenv("CRABBOX_FAKE_REPO_ROOT", fixture.root)
 	t.Setenv("CRABBOX_FAKE_TRANSFERRED", transferred)
-	t.Setenv("CRABBOX_FAKE_FAILED_READY", failedReady)
-	t.Setenv("CRABBOX_FAKE_SSH_PORT", sshPort)
+	t.Setenv("CRABBOX_FAKE_REPLACEMENT_READY", replacementReady)
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
 
 	var stdout, stderr bytes.Buffer
 	if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{

@@ -149,7 +149,7 @@ Historical final provenance verifies its producer configuration against the
 `.goreleaser.yaml` and literal toolchain versions in `scripts/release-config.sh`
 at the originally pinned verifier commit, not the newer tooling checkout. The
 policy reader never executes historical shell code. New candidate production
-uses the current protected configuration, including Go 1.26.5. Missing historical Git objects fail verification; this lookup
+uses the current protected configuration, including Go 1.27.3. Missing historical Git objects fail verification; this lookup
 does not lazily fetch them or consult replacement objects.
 
 The protected `scripts/runtime-artifacts` tool stages exact archive inventories
@@ -611,8 +611,11 @@ scripts/verify-homebrew-release.sh \
 ```
 
 The six-argument verifier first fetches the immutable public release by numeric
-ID without authentication and compares its exact notes, inventory, asset IDs,
-sizes, and digests with the supplied bytes. Protected static `verify-release.sh`
+ID without authentication, or reads the JSON file supplied through
+`CRABBOX_HOMEBREW_RELEASE_METADATA`, and compares its exact notes, inventory,
+asset IDs, sizes, and digests with the supplied bytes. Supplied metadata must
+still describe the requested immutable public release; it does not bypass any
+validation. Protected static `verify-release.sh`
 validation precedes Homebrew. There is no public verifier run ID, proof ZIP,
 witness, or post-candidate API comparison.
 
@@ -635,7 +638,11 @@ verifier, before and after installation.
 The hosted `Verify Homebrew Release` workflow (`verify-homebrew.yml`) accepts
 `tag`, `tag_object`, `source_commit`, `verifier_commit`, and `release_id`. It uses
 protected-default tooling and anonymous fixed-repository downloads on both
-native architectures, then runs the same six-argument verifier. It never writes
+native architectures. A separate metadata step uses the workflow's read-only
+`GITHUB_TOKEN` to avoid shared-runner anonymous GitHub API rate limits, then
+passes only the response JSON to the same six-argument verifier. The token is
+scoped to that step; Homebrew and candidate execution remain credential-free.
+The workflow keeps `contents: read` permissions and never writes
 to the tap or supplies candidate-accessible credentials. Rerun this installation
 smoke independently after a smoke failure; do not re-enter publication.
 
@@ -668,6 +675,26 @@ follows symlinks or changes file permissions, and an earlier verification failur
 keeps its original exit status even if cleanup also fails.
 
 ### 2. Verify the draft natively
+
+Online notarization runs only when the binary architecture matches the native
+host; foreign binaries still receive every static signature, requirement,
+identity, and entitlement check. Both native hosts are required for complete
+draft, public-release, and Homebrew verification, including the arm64 helper,
+embedded VMD, and both companion runtimes from the amd64 archive. A local script
+invocation or draft-creation precheck covers only its host's online checks; the
+dual-host workflow supplies the complete gate. For local/manual diagnostics,
+set `CRABBOX_VERIFY_FOREIGN_ONLINE_NOTARIZATION=1` when invoking
+`scripts/verify-macos-binary.sh` to force the foreign online check (default `0`).
+
+A fresh macOS host can transiently fail its first online notarization lookup.
+The verifier runs the identical strict check at most four times, with retry
+delays of 5, 15, and 45 seconds, only for exit 3 with complete diagnostics and
+zero omitted events. At least one classified event must be attributed to the
+codesign PID, and every classified event must be a notarization-daemon error;
+any daemon code within that category is eligible. Each failed attempt and the
+final verdict remain visible. Signature, identity, designated requirement,
+revoked-hash, missing-ticket, unknown failures, and interrupted checks are never
+retried; rejected binaries are never executed.
 
 Dispatch the protected-default verifier with the tag, tag-object ID, source
 commit, numeric draft ID, and protected workflow commit. Both native static and
@@ -733,8 +760,10 @@ Publication establishes eligibility. Dispatch the ordinary tap update using the
 TAG-only four-target handoff above, without waiting for either public native
 or Go smoke. The updater maintains all four URL/hash routes; retry only this
 step after an update failure. An already-current update succeeds. After the tap
-finishes, run the independent installed-Homebrew smoke on both native macOS
-architectures. Neither smoke failure requires rebuilding or republishing.
+finishes, run the independent installed-Homebrew smoke for both macOS
+architectures. Hosted verification uses `xcode-27` Apple Silicon runners; the
+Intel row runs through Rosetta with the Intel Homebrew prefix at `/usr/local`.
+Neither smoke failure requires rebuilding or republishing.
 
 ### 5. Independent public channel smokes
 
@@ -744,6 +773,13 @@ using the same opaque `release-input` transport; public mode emits no
 `verified-assets-*` approval artifacts. Draft mode still freezes exactly
 `release-input`, `verified-assets-arm64`, and `verified-assets-x86_64` for the
 publisher, with unchanged proof schemas.
+
+For a release-pipeline dry run on merged `main`, dispatch the same verifier with
+`dry_run=true` and `draft=false`, supplying the current published release's
+existing identity inputs. The guard rejects dry runs against drafts. This
+repeats static verification and isolated execution for ARM and Intel on macOS
+27 without creating, modifying, or publishing a release. The macOS 13 deployment
+gates remain enforced; Intel execution uses an explicit Rosetta shell.
 
 Run the public Go installation procedure independently with fresh proxy-only
 state. It proves the actual published tag is remotely resolvable, unlike the

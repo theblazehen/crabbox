@@ -139,6 +139,7 @@ Provider flags (override config):
 --blacksmith-workflow
 --blacksmith-job
 --blacksmith-ref
+--blacksmith-wait-timeout
 ```
 
 Environment variables supply the same defaults:
@@ -150,6 +151,7 @@ CRABBOX_BLACKSMITH_JOB
 CRABBOX_BLACKSMITH_REF
 CRABBOX_BLACKSMITH_IDLE_TIMEOUT
 CRABBOX_BLACKSMITH_DEBUG
+CRABBOX_BLACKSMITH_WAIT_TIMEOUT
 ```
 
 `blacksmith.workflow` (or `actions.workflow`, when it is not a generic
@@ -157,6 +159,19 @@ CRABBOX_BLACKSMITH_DEBUG
 Reusing an existing ID or slug does not need it. `idleTimeout` falls back to the
 global `idleTimeout` when unset, and `debug` passes `--debug` through to the
 Blacksmith CLI.
+
+Set `blacksmith.waitTimeout: 5m`, `CRABBOX_BLACKSMITH_WAIT_TIMEOUT=5m`, or
+`--blacksmith-wait-timeout 5m` to override the native `testbox run --wait-timeout`.
+This positive duration bounds the total wait for command readiness, including
+both queueing and workflow hydration. When unset, Blacksmith keeps its native
+15-minute default. It applies to ordinary and artifact runs, including reused
+leases; it does not shorten workload execution, sync, artifact collection, idle
+retention, or `status --wait`.
+
+A readiness timeout keeps the existing run cleanup policy: a newly acquired
+one-shot lease is stopped unless retention was requested; a reused lease is not
+automatically stopped. Unconfirmed stop retains local ownership and reports a
+cleanup failure. No local execution or alternate provider is started.
 
 ### Environment forwarding is unsupported
 
@@ -191,14 +206,26 @@ Stop, reuse, delegated artifact commands, and one-shot cleanup require the
 unchanged claim. Each operation pins the selected organization and API endpoint
 with explicit native CLI flags and checks the exact Testbox status under the
 claim fence. A stop can cancel an active command without allowing claim writers
-to change its authority. After terminal confirmation, stop takes an exclusive
-fence and rechecks the original claim and native status before removing the claim
-and key. A changed claim or a command that fails to exit within the cleanup
+to change its authority. After native and exact GitHub terminal confirmation, stop takes an exclusive
+fence and rechecks the original claim, native status, run association, and GitHub
+result before removing the key and claim. A changed claim or a command that fails to exit within the cleanup
 deadline leaves local ownership intact. `hydration_failed` prevents reuse but
 still requires confirmed termination for cleanup. Missing, malformed, duplicate or mismatched status is not proof of
 termination. Uncertain cleanup retains ownership; a successful workload with
 failed cleanup returns a failure and reports the session as kept. An earlier
 workload failure keeps its own exit code.
+
+Ordinary runs and artifact runs join their local Blacksmith command process
+group before releasing that fence, including when synchronization is canceled.
+This requires a macOS or Linux caller with compatible `ps`; unsupported process
+ownership fails before acquisition. Local cleanup does not establish that a
+remote command completed, and a sync timeout remains a failed run.
+
+Run-scoped SSH launchers disable native `ControlMaster` and `ControlPersist`
+before Blacksmith's SSH options are applied, so sync connections cannot detach
+and outlive a successful, failed, or canceled run. Artifact SCP transfers use
+the same policy. Existing native control sockets and unrelated sessions remain
+untouched; a kept Testbox opens fresh connections on its next run.
 
 Local connection artifacts must be removed successfully before the exact claim
 is deleted; an unsafe or undeletable lease key directory reports cleanup failure
@@ -208,12 +235,23 @@ finalization failure, preserving the native exit code. Failed-query stderr is
 diagnostic only and never proves completion.
 
 A never-assigned Testbox can move directly from `queued` to `completed`, with
-empty IP and `RUN URL` cells. This permits cleanup only after a successful,
-uncanceled native status query returns the exact owned identity in a complete
-native table, with nonempty `CREATED`, aligned columns, trailing padding through
-the empty `RUN URL` cell, and the final newline. Present run URLs remain
-validated. Missing or failed status is still not completion evidence; the
-exclusive claim/status recheck and key-before-claim finalization remain required.
+empty IP and `RUN URL` cells. This is a valid native snapshot, but it does not
+prove that its dispatched GitHub work settled. Stop returns nonzero and retains
+the claim/key when the exact association or GitHub terminal result is unavailable.
+Retry the same stop after the association appears. An associated run is checked
+with the existing optional `gh` integration using existing access only; missing
+tools or access remain unresolved without automatic installation or login.
+Claim-fenced stop may cancel only the exact associated GitHub run, after a fresh
+native identity and association check. Acquisition rollback cannot cancel it;
+Crabbox never infers run identity from timing. Reconciliation has a 30-second
+budget, followed by up to 10 seconds for exclusive claim admission and a fresh
+native/GitHub terminal verification. Both phases honor an earlier caller deadline
+or cancellation. If the reconciliation budget interrupts the GitHub read after
+authenticated native completion, final verification can still establish settlement;
+expiry alone never releases the claim/key. A terminal GitHub conclusion of success or
+failure establishes settlement as well as cancellation, without claiming that
+Crabbox caused that conclusion. See [stop settlement](../features/blacksmith-testbox.md#forwarded-commands)
+for the verification and retry contract.
 
 Use the same organization/API route when reusing or stopping a lease. Workflow
 flags are still unnecessary for reuse; the provider checks stored native
@@ -235,7 +273,7 @@ blacksmith --org example-org testbox status --id tbx_EXACT_ID
 ```
 
 Verify the final status is terminal, then create a new Crabbox lease. Native stop
-also cancels the backing GitHub Actions run. Do not reconstruct claims from IDs,
+requests native termination; verify the exact associated GitHub work separately before treating recovery as settled. Do not reconstruct claims from IDs,
 inventory or copied metadata.
 
 One-shot runs stop the Testbox and remove the local claim and key after the
@@ -367,3 +405,52 @@ Related docs:
 
 - [Feature: Blacksmith Testbox](../features/blacksmith-testbox.md)
 - [Provider backends](../provider-backends.md)
+
+## Read-only remote settlement
+
+`status --json` and `inspect --json` expose native state and command readiness
+unchanged. Their `providerMetadata` adds these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `runURL` | Exact native GitHub workflow run URL, present only when its supported github.com format is valid. |
+| `remoteSettlement` | `complete` only after native `completed`, a supported terminal conclusion from the exact GitHub run, and a matching second native identity snapshot; `pending` for a valid association whose native state or GitHub run is not complete; `unknown` when evidence is missing, invalid, changed, inaccessible or unsupported. |
+| `runConclusion` | GitHub terminal conclusion, present only with verified `complete`; failure or cancellation also establishes settlement. |
+
+For example, a verified terminal snapshot includes:
+
+```json
+{
+  "state": "completed",
+  "ready": false,
+  "providerMetadata": {
+    "runURL": "https://github.com/example-org/my-app/actions/runs/123",
+    "remoteSettlement": "complete",
+    "runConclusion": "cancelled"
+  }
+}
+```
+
+This evidence describes remote settlement at observation time, not local claim
+or key finalization; it does not set `cleanupStatus`. A successful JSON command
+exits zero even for `unknown` or `pending`: callers must check the metadata.
+An initial native read/parse failure or any cancellation/deadline failure exits
+nonzero and provides no successful snapshot. A failed or mismatched confirmation
+read returns zero with `unknown`. Missing or denied existing `gh` access also
+leaves settlement `unknown` without exposing GitHub diagnostics.
+
+A non-waiting snapshot has a ten-second total provider-read budget. Ordinary
+active/ready polling makes no GitHub request. Only native `completed` with a valid
+association performs at most one exact GitHub GET, followed by at most one native
+confirmation read. There is no run search, background polling, credential
+acquisition, persisted verification, or provider/local-state mutation. Readiness
+waits retain their existing meaning and fail with code 5 on native `completed`
+or `hydration_failed`; they do not wait for settlement.
+
+After a stop succeeds but its acknowledgment is lost and the local claim is
+already finalized, read the retained exact native ID with an explicit provider
+and the original organization/API route. Compare `runURL` with any association
+you previously retained and require `remoteSettlement == "complete"`. An
+association change during verification remains `unknown`; changes between
+separate calls must be checked by the caller against its retained identity.
+The observation cannot authorize another stop or reconstruct local ownership.

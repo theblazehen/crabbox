@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -152,23 +153,29 @@ func TestParallelsDHCPFallbackRunsOnRemoteHost(t *testing.T) {
 }
 
 func TestParallelsWaitForIPDoesNotFallbackWithoutBootstrapIdentity(t *testing.T) {
-	runner := &parallelsDHCPRunner{vmJSON: `[{"ID":"vm1","Name":"macOS","State":"running","Hardware":{"net0":{"enabled":true,"mac":"001C4233EEDD"}}}]`}
-	_, err := NewParallelsClient(Config{TargetOS: targetMacOS}, runner).WaitForIP(context.Background(), "vm1", time.Nanosecond, ParallelsIPWaitExisting)
-	if err == nil || len(runner.requests) != 1 {
-		t.Fatalf("err=%v requests=%#v", err, runner.requests)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		runner := &parallelsDHCPRunner{vmJSON: `[{"ID":"vm1","Name":"macOS","State":"running","Hardware":{"net0":{"enabled":true,"mac":"001C4233EEDD"}}}]`}
+		_, err := NewParallelsClient(Config{TargetOS: targetMacOS}, runner).WaitForIP(context.Background(), "vm1", time.Nanosecond, ParallelsIPWaitExisting)
+		if err == nil || len(runner.requests) != 1 {
+			t.Fatalf("err=%v requests=%#v", err, runner.requests)
+		}
+	})
 }
 
 func TestParallelsWaitForIPTimeoutExplainsDiscovery(t *testing.T) {
 	running := `[{"ID":"vm1","Name":"macOS","State":"running","Hardware":{"net0":{"enabled":true,"mac":"001C425AA8E6"}}}]`
 	stopped := `[{"ID":"vm1","Name":"macOS","State":"stopped","Hardware":{"net0":{"enabled":true,"mac":"001C425AA8E6"}}}]`
-	otherLease := "[vnic0]\n10.211.55.79=\"" + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + ",1800,001c426ad157,01001c426ad157\"\n"
-	staleLease := "[vnic0]\n10.211.55.79=\"" + strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10) + ",1800,001c425aa8e6,01001c425aa8e6\"\n"
+	otherLease := func() string {
+		return "[vnic0]\n10.211.55.79=\"" + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + ",1800,001c426ad157,01001c426ad157\"\n"
+	}
+	staleLease := func() string {
+		return "[vnic0]\n10.211.55.79=\"" + strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10) + ",1800,001c425aa8e6,01001c425aa8e6\"\n"
+	}
 	bootstrap := "/Users/build/.ssh/bootstrap"
 	for _, test := range []struct {
 		name      string
 		vmJSON    string
-		leases    string
+		leases    func() string
 		target    string
 		cloneMode string
 		bootstrap string
@@ -212,7 +219,7 @@ func TestParallelsWaitForIPTimeoutExplainsDiscovery(t *testing.T) {
 			reject: []string{"no matching DHCP lease was found", "check guest boot"},
 		},
 		{
-			name: "malformed lease file is not missing", vmJSON: running, target: targetMacOS, bootstrap: bootstrap, leases: "10.211.55.79=bad\n",
+			name: "malformed lease file is not missing", vmJSON: running, target: targetMacOS, bootstrap: bootstrap, leases: func() string { return "10.211.55.79=bad\n" },
 			want:   []string{"DHCP fallback: parse Parallels DHCP leases"},
 			reject: []string{"no matching DHCP lease was found", "check guest boot"},
 		},
@@ -233,26 +240,73 @@ func TestParallelsWaitForIPTimeoutExplainsDiscovery(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			runner := &parallelsDHCPRunner{vmJSON: test.vmJSON, leases: test.leases}
-			cfg := Config{TargetOS: test.target, SSHPort: "22", Parallels: ParallelsConfig{CloneMode: test.cloneMode, BootstrapKey: test.bootstrap}}
-			purpose := ParallelsIPWaitAcquisition
-			if test.existing {
-				purpose = ParallelsIPWaitExisting
-			}
-			_, err := NewParallelsClient(cfg, runner).WaitForIP(context.Background(), "vm1", time.Nanosecond, purpose)
-			if err == nil || ExitCodeForError(err, 1) != 5 {
-				t.Fatalf("expected timeout with exit code 5, got %v", err)
-			}
-			for _, want := range test.want {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error missing %q: %v", want, err)
+			synctest.Test(t, func(t *testing.T) {
+				leases := ""
+				if test.leases != nil {
+					leases = test.leases()
 				}
-			}
-			for _, reject := range test.reject {
-				if strings.Contains(err.Error(), reject) {
-					t.Errorf("error unexpectedly contains %q: %v", reject, err)
+				runner := &parallelsDHCPRunner{vmJSON: test.vmJSON, leases: leases}
+				cfg := Config{TargetOS: test.target, SSHPort: "22", Parallels: ParallelsConfig{CloneMode: test.cloneMode, BootstrapKey: test.bootstrap}}
+				purpose := ParallelsIPWaitAcquisition
+				if test.existing {
+					purpose = ParallelsIPWaitExisting
 				}
-			}
+				_, err := NewParallelsClient(cfg, runner).WaitForIP(context.Background(), "vm1", time.Nanosecond, purpose)
+				if err == nil || ExitCodeForError(err, 1) != 5 {
+					t.Fatalf("expected timeout with exit code 5, got %v", err)
+				}
+				for _, want := range test.want {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error missing %q: %v", want, err)
+					}
+				}
+				for _, reject := range test.reject {
+					if strings.Contains(err.Error(), reject) {
+						t.Errorf("error unexpectedly contains %q: %v", reject, err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestParallelsWaitForIPRetainsFinalQueryFailure(t *testing.T) {
+	running := `[{"ID":"vm1","State":"running","Hardware":{"net0":{"enabled":true,"mac":"001C425AA8E6"}}}]`
+	commandFailure := parallelsVMQueryResult{stderr: "synthetic inventory unavailable", err: errors.New("exit status 1")}
+	for _, test := range []struct {
+		name    string
+		queries []parallelsVMQueryResult
+		want    []string
+		reject  []string
+	}{
+		{"native query failure", []parallelsVMQueryResult{commandFailure, commandFailure}, []string{"VM query: parallels get vm: exit status 1: synthetic inventory unavailable", "tools_ip=unknown"}, []string{"DHCP fallback:", "retry with parallels.cloneMode=full"}},
+		{"malformed inventory", []parallelsVMQueryResult{{stdout: "invalid JSON"}, {stdout: "invalid JSON"}}, []string{"VM query: parse parallels VM JSON:", "tools_ip=unknown"}, []string{"DHCP fallback:"}},
+		{"missing VM", []parallelsVMQueryResult{{stdout: "[]"}, {stdout: "[]"}}, []string{"VM query: parallels VM not found: vm1", "tools_ip=unknown"}, []string{"DHCP fallback:"}},
+		{"failed query supersedes old DHCP diagnosis", []parallelsVMQueryResult{{stdout: running}, commandFailure}, []string{"last_state=running", "macs=001c425aa8e6", "VM query: parallels get vm:", "last successful VM observation"}, []string{"DHCP fallback:", "no matching DHCP lease", "retry with parallels.cloneMode=full", "prlctl capture"}},
+		{"successful query clears earlier failure", []parallelsVMQueryResult{commandFailure, {stdout: running}}, []string{"last_state=running", "tools_ip=none", "DHCP fallback:", "retry with parallels.cloneMode=full"}, []string{"VM query:", "synthetic inventory unavailable", "last successful VM observation"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				runner := &parallelsDHCPRunner{vmQueries: append([]parallelsVMQueryResult(nil), test.queries...)}
+				cfg := Config{TargetOS: targetMacOS, SSHPort: "22", Parallels: ParallelsConfig{BootstrapKey: "/Users/build/.ssh/bootstrap"}}
+				_, err := NewParallelsClient(cfg, runner).WaitForIP(context.Background(), "vm1", 6*time.Second, ParallelsIPWaitAcquisition)
+				if err == nil || ExitCodeForError(err, 1) != 5 {
+					t.Fatalf("expected existing timeout exit 5, got %v", err)
+				}
+				for _, want := range test.want {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error missing %q: %v", want, err)
+					}
+				}
+				for _, reject := range test.reject {
+					if strings.Contains(err.Error(), reject) {
+						t.Errorf("error contains stale or misleading %q: %v", reject, err)
+					}
+				}
+				if len(runner.vmQueries) != 0 {
+					t.Fatal("final inventory result was not observed")
+				}
+			})
 		})
 	}
 }
@@ -271,7 +325,12 @@ func TestParallelsWaitForGuestExecShortCircuitsOnlyForConfiguredMacOSFallback(t 
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
-			runner := &parallelsGuestExecUnavailableRunner{cancel: cancel}
+			defer cancel()
+			runner := &parallelsGuestExecUnavailableRunner{cancel: func() {
+				if !test.wantTools {
+					cancel()
+				}
+			}}
 			cfg := Config{TargetOS: test.target, Parallels: ParallelsConfig{BootstrapKey: test.bootstrap}}
 			err := NewParallelsClient(cfg, runner).WaitForGuestExec(ctx, "vm1", cfg, time.Minute)
 			if test.wantTools {
@@ -1092,10 +1151,16 @@ func TestParallelsBootstrapMacOSOverSSHExecutesNestedSSHOnRemoteHost(t *testing.
 }
 
 type parallelsDHCPRunner struct {
-	vmJSON   string
-	leases   string
-	requests []LocalCommandRequest
-	stdin    string
+	vmJSON    string
+	vmQueries []parallelsVMQueryResult
+	leases    string
+	requests  []LocalCommandRequest
+	stdin     string
+}
+
+type parallelsVMQueryResult struct {
+	stdout, stderr string
+	err            error
 }
 
 type parallelsGuestExecUnavailableRunner struct {
@@ -1116,6 +1181,11 @@ func (r *parallelsDHCPRunner) Run(_ context.Context, req LocalCommandRequest) (L
 	rendered := req.Name + " " + strings.Join(req.Args, " ")
 	switch {
 	case strings.Contains(rendered, "prlctl") && strings.Contains(rendered, "list"):
+		if len(r.vmQueries) > 0 {
+			query := r.vmQueries[0]
+			r.vmQueries = r.vmQueries[1:]
+			return LocalCommandResult{Stdout: query.stdout, Stderr: query.stderr}, query.err
+		}
 		return LocalCommandResult{Stdout: r.vmJSON}, nil
 	case strings.Contains(rendered, parallelsDHCPLeasesPath):
 		return LocalCommandResult{Stdout: r.leases}, nil

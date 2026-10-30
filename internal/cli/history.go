@@ -36,7 +36,7 @@ func (a App) history(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(runs)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(runs))
 	}
 	for _, run := range runs {
 		telemetry := runTelemetryStatusSummary(run.Telemetry)
@@ -129,6 +129,32 @@ func (a App) events(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if strings.HasPrefix(*runID, "cbx_") {
+		if *after != 0 || *limit != 500 || *eventType != "" || *phase != "" {
+			return Exit(2, "lease creation events do not support run filters or pagination")
+		}
+		var response struct {
+			Events []CreationEvent `json:"events"`
+		}
+		if err := coord.do(ctx, "GET", "/v1/leases/"+*runID+"/events", nil, &response); err != nil {
+			return err
+		}
+		if *jsonOut {
+			return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(response.Events))
+		}
+		for _, event := range response.Events {
+			fmt.Fprintf(a.Stdout, "%s %s source=%s", event.At, event.Phase, event.Source)
+			if event.Step != "" && event.DurationMs != nil {
+				var errors int64
+				if event.Errors != nil {
+					errors = *event.Errors
+				}
+				fmt.Fprintf(a.Stdout, " step=%s durationMs=%g count=%d errors=%d", event.Step, *event.DurationMs, event.Count, errors)
+			}
+			fmt.Fprintln(a.Stdout)
+		}
+		return nil
+	}
 	eventTypeFilter := strings.TrimSpace(*eventType)
 	phaseFilter := strings.TrimSpace(*phase)
 	events, err := fetchFilteredRunEvents(ctx, coord, *runID, *after, *limit, eventTypeFilter, phaseFilter)
@@ -136,7 +162,7 @@ func (a App) events(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(events)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(events))
 	}
 	for _, event := range events {
 		text := event.Message

@@ -77,7 +77,7 @@ describe("NodeCoordinatorRuntime", () => {
     );
   });
 
-  it("accepts a control handshake during unrelated lifecycle work and still queues messages", async () => {
+  it("accepts control traffic during unrelated lifecycle work without holding its grant checks", async () => {
     const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
     const mutex = new AsyncMutex();
     runtime.setOperationRunner((callback) => mutex.run(callback));
@@ -135,10 +135,15 @@ describe("NodeCoordinatorRuntime", () => {
       const transportPong = new Promise<void>((resolve) => client.once("pong", resolve));
       client.ping();
       await transportPong;
-      expect(messages).toHaveLength(1);
+      await vi.waitFor(() => expect(messages.at(-1)).toEqual({ type: "pong" }));
       release.resolve();
       await lifecycle;
       await vi.waitFor(() => expect(messages.at(-1)).toEqual({ type: "pong" }));
+      const closed = new Promise<number>((resolve) => client.once("close", resolve));
+      env.CRABBOX_SHARED_TOKEN = "synthetic-rotated-token";
+      client.send(JSON.stringify({ type: "heartbeat", leaseID: "cbx_abcdef012345" }));
+      expect(await closed).toBe(1008);
+      expect(messages).not.toContainEqual(expect.objectContaining({ type: "heartbeat" }));
     } finally {
       release.resolve();
       await lifecycle;
@@ -330,30 +335,33 @@ describe("NodeCoordinatorRuntime", () => {
     expect(terminal).not.toContain("!workspace.sshHostKeySha256");
   });
 
-  it("lets code-agent replies bypass the lifecycle queue", async () => {
-    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
-    const socket = Object.assign(new EventEmitter(), {
-      close: vi.fn<(code?: number, reason?: string) => void>(),
-      terminate: vi.fn<() => void>(),
-    });
-    const operationRunner = vi.fn<OperationRunner>(
-      async <T>(_callback: () => Promise<T>): Promise<T> => await new Promise<T>(() => {}),
-    );
-    const message = vi.fn<() => Promise<void>>(async () => {});
-    runtime.setOperationRunner(operationRunner);
+  it.each(["code-agent", "serve-relay"])(
+    "lets %s replies bypass the lifecycle queue",
+    async (kind) => {
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      const socket = Object.assign(new EventEmitter(), {
+        close: vi.fn<(code?: number, reason?: string) => void>(),
+        terminate: vi.fn<() => void>(),
+      });
+      const operationRunner = vi.fn<OperationRunner>(
+        async <T>(_callback: () => Promise<T>): Promise<T> => await new Promise<T>(() => {}),
+      );
+      const message = vi.fn<() => Promise<void>>(async () => {});
+      runtime.setOperationRunner(operationRunner);
 
-    runtime.acceptWebSocket(socket as unknown as WebSocket, { kind: "code-agent" }, [], {
-      message,
-      close: vi.fn<(code: number, reason: string) => void>(),
-      error: vi.fn<() => void>(),
-    });
-    socket.emit("message", Buffer.from("{}"), false);
+      runtime.acceptWebSocket(socket as unknown as WebSocket, { kind }, [], {
+        message,
+        close: vi.fn<(code: number, reason: string) => void>(),
+        error: vi.fn<() => void>(),
+      });
+      socket.emit("message", Buffer.from("{}"), false);
 
-    await vi.waitFor(() => {
-      expect(message).toHaveBeenCalledOnce();
-    });
-    expect(operationRunner).not.toHaveBeenCalled();
-  });
+      await vi.waitFor(() => {
+        expect(message).toHaveBeenCalledOnce();
+      });
+      expect(operationRunner).not.toHaveBeenCalled();
+    },
+  );
 
   it("lets runtime-adapter replies bypass the lifecycle queue", async () => {
     const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
@@ -387,7 +395,7 @@ describe("NodeCoordinatorRuntime", () => {
     { kind: "control", payload: '{"type":"heartbeat"}', isBinary: true },
     { kind: "unknown", payload: '{"type":"heartbeat"}', isBinary: false },
   ])(
-    "serializes $kind messages ($payload, binary=$isBinary) with lifecycle operations",
+    "dispatches $kind messages ($payload, binary=$isBinary) with the proper lifecycle boundary",
     async ({ kind, payload, isBinary }) => {
       const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
       const socket = Object.assign(new EventEmitter(), {
@@ -409,7 +417,7 @@ describe("NodeCoordinatorRuntime", () => {
       socket.emit("message", Buffer.from(payload), isBinary);
 
       await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(message).not.toHaveBeenCalled();
+      expect(message.mock.calls).toHaveLength(kind === "control" ? 1 : 0);
       lifecycleDone.resolve();
       await lifecycle;
 
@@ -418,11 +426,11 @@ describe("NodeCoordinatorRuntime", () => {
           isBinary ? Uint8Array.from(Buffer.from(payload)).buffer : payload,
         );
       });
-      expect(operationRunner).toHaveBeenCalledTimes(2);
+      expect(operationRunner).toHaveBeenCalledTimes(kind === "control" ? 1 : 2);
     },
   );
 
-  it.each(["code-agent", "runtime-adapter-agent"])(
+  it.each(["code-agent", "runtime-adapter-agent", "serve-relay"])(
     "keeps %s data-plane close callbacks behind earlier messages",
     async (kind) => {
       const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");

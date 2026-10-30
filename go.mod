@@ -2,7 +2,7 @@ module github.com/openclaw/crabbox
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.27.3
 
 require (
 	cloud.google.com/go/compute v1.69.0
@@ -19,8 +19,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.0
 	github.com/aws/smithy-go v1.28.2
 	github.com/containernetworking/cni v1.3.1
-	github.com/daytonaio/daytona/libs/api-client-go v0.190.0
-	github.com/daytonaio/daytona/libs/sdk-go v0.190.0
+	github.com/creack/pty v1.1.24
+	github.com/daytona/clients/api-client-go v0.216.1
+	github.com/daytona/clients/sdk-go v0.216.1
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0
 	github.com/gofrs/flock v0.13.1
@@ -29,7 +30,7 @@ require (
 	github.com/hashicorp/nomad/api v0.0.0-20260921134951-9e1409fc523a
 	github.com/islo-labs/go-sdk v0.0.0-20260902083704-1464faf8f1fd
 	github.com/lima-vm/go-qcow2reader v0.8.0
-	github.com/lxc/incus/v7 v7.1.0
+	github.com/lxc/incus/v7 v7.2.0
 	github.com/pkg/sftp v1.13.11
 	github.com/scaleway/scaleway-sdk-go v1.0.0-beta.36
 	github.com/sirupsen/logrus v1.10.2
@@ -56,6 +57,8 @@ require (
 )
 
 require (
+	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.4.7 // indirect
+	github.com/daytona/clients/analytics-api-client-go v0.0.0-20260722121532-3d2223c79fe5 // indirect
 	github.com/go-openapi/runtime/server-middleware v0.33.2 // indirect
 	github.com/go-openapi/swag/cmdutils v0.29.2 // indirect
 	github.com/go-openapi/swag/conv v0.29.2 // indirect
@@ -103,7 +106,7 @@ require (
 	github.com/containernetworking/plugins v1.9.1 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/cyphar/filepath-securejoin v0.7.0 // indirect
-	github.com/daytonaio/daytona/libs/toolbox-api-client-go v0.190.0
+	github.com/daytona/clients/toolbox-api-client-go v0.216.1
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.10.1
@@ -168,11 +171,11 @@ require (
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
+	golang.org/x/net v0.60.0
 	golang.org/x/term v0.46.0
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto v0.0.0-20260921155816-b14227669459 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260921155816-b14227669459 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260921155816-b14227669459
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
