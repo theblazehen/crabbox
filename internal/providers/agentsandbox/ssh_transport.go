@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	claimLabelSSHPort       = "ssh_port"
-	sshProxyReadyTimeout    = 30 * time.Second
-	sshProxyOutputLineLimit = 4096
+	claimLabelSSHPort            = "ssh_port"
+	sshProxyReadyTimeout         = 30 * time.Second
+	sshProxyOutputLineLimit      = 4096
+	sshForwardRevalidateInterval = time.Minute
 )
 
 func validSSHBootstrapPort(port string) bool {
@@ -197,34 +198,71 @@ func (b *sshLeaseBackend) ProxySSH(ctx context.Context, identifier string, input
 	}
 	checkIdentity := func() error {
 		if claimTTLExpired(claim, core.ClockNow(lifecycle.rt.Clock)) {
-			return fmt.Errorf("agent-sandbox-ssh lease %s has expired", claim.LeaseID)
+			return sshLeaseExpiredError{leaseID: claim.LeaseID}
 		}
 		return revalidateSandboxReadiness(ctx, client, lifecycle.cfg.AgentSandbox.Namespace, ready)
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	ticker := time.NewTicker(sshForwardRevalidateInterval)
+	defer ticker.Stop()
 	monitorDone := make(chan struct{})
 	go func() {
 		defer close(monitorDone)
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := checkIdentity(); err != nil {
-					cancel(err)
-					return
-				}
-			}
-		}
+		monitorSSHForwardIdentity(ctx, cancel, ticker.C, checkIdentity, stderr)
 	}()
 	err = lifecycle.forwardSSH(ctx, ready.PodName, port, input, output, stderr, checkIdentity)
 	cause := context.Cause(ctx)
 	cancel(nil)
 	<-monitorDone
 	return errors.Join(err, cause)
+}
+
+type sshLeaseExpiredError struct{ leaseID string }
+
+func (e sshLeaseExpiredError) Error() string {
+	return fmt.Sprintf("agent-sandbox-ssh lease %s has expired", e.leaseID)
+}
+
+// sshForwardRevalidationFatal reports whether a periodic check proves the
+// forwarded runtime is no longer the admitted one. Kubernetes API errors,
+// timeouts and transient readiness gaps are not proof: the established stream
+// still reaches the pinned host key, so they must not tear down the forward.
+func sshForwardRevalidationFatal(err error) bool {
+	var runtimeChanged containerRuntimeChangedError
+	var expired sshLeaseExpiredError
+	return isResourceIdentityError(err) || errors.As(err, &runtimeChanged) || errors.As(err, &expired)
+}
+
+// monitorSSHForwardIdentity cancels the forward only on a proven identity
+// change; any other failure is retried on the next tick.
+func monitorSSHForwardIdentity(ctx context.Context, cancel context.CancelCauseFunc, ticks <-chan time.Time, check func() error, stderr io.Writer) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			err := check()
+			if err == nil || ctx.Err() != nil {
+				continue
+			}
+			if sshForwardRevalidationFatal(err) {
+				cancel(err)
+				return
+			}
+			if stderr != nil && debugEnabled() {
+				fmt.Fprintf(stderr, "debug: agent-sandbox-ssh revalidation failed, retrying next tick: %v\n", err)
+			}
+		}
+	}
+}
+
+func debugEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CRABBOX_DEBUG"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // Probe the actual authenticated SSH endpoint, without running a remote command,

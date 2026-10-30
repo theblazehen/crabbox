@@ -544,3 +544,75 @@ func TestSSHProxyRejectsIdentityChangesBeforeAndAfterForwarding(t *testing.T) {
 		})
 	}
 }
+
+func TestSSHForwardMonitorCancelsOnlyOnIdentityChange(t *testing.T) {
+	identityErr := resourceIdentityError{err: core.Exit(4, "agent-sandbox pod identity changed from a UID 1 to b UID 2")}
+	tests := []struct {
+		name      string
+		errs      []error
+		wantCause error
+	}{
+		{name: "transient API errors retry", errs: []error{
+			errors.New("etcdserver: request timed out"),
+			fmt.Errorf("get SandboxClaim: %w", context.DeadlineExceeded),
+			fmt.Errorf("%w: pod p phase=Running conditions=Ready=False", errNotReady),
+			&net.OpError{Op: "dial", Err: errors.New("connection reset by peer")},
+			nil,
+		}},
+		{name: "identity mismatch cancels after transient errors", errs: []error{
+			errors.New("the server is currently unable to handle the request"),
+			identityErr,
+		}, wantCause: identityErr},
+		{name: "container runtime replacement cancels", errs: []error{
+			containerRuntimeChangedError{err: core.Exit(4, "runtime changed")},
+		}, wantCause: containerRuntimeChangedError{err: core.Exit(4, "runtime changed")}},
+		{name: "expiry cancels", errs: []error{sshLeaseExpiredError{leaseID: "cbx_1"}}, wantCause: sshLeaseExpiredError{leaseID: "cbx_1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CRABBOX_DEBUG", "1")
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			ticks := make(chan time.Time)
+			checked := make(chan struct{})
+			calls := 0
+			check := func() error {
+				err := tt.errs[calls]
+				calls++
+				checked <- struct{}{}
+				return err
+			}
+			var stderr bytes.Buffer
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				monitorSSHForwardIdentity(ctx, cancel, ticks, check, &stderr)
+			}()
+			for range tt.errs {
+				ticks <- time.Now()
+				<-checked
+			}
+			if tt.wantCause == nil {
+				// The monitor must still be serving ticks after every transient failure.
+				select {
+				case <-done:
+					t.Fatalf("monitor stopped on transient errors: cause=%v", context.Cause(ctx))
+				case <-time.After(20 * time.Millisecond):
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("transient errors canceled the forward: %v", context.Cause(ctx))
+				}
+				cancel(nil)
+				<-done
+				if got := strings.Count(stderr.String(), "retrying next tick"); got != len(tt.errs)-1 {
+					t.Fatalf("debug retry lines=%d want %d:\n%s", got, len(tt.errs)-1, stderr.String())
+				}
+				return
+			}
+			<-done
+			if cause := context.Cause(ctx); !reflect.DeepEqual(cause, tt.wantCause) {
+				t.Fatalf("cause=%v want %v", cause, tt.wantCause)
+			}
+		})
+	}
+}

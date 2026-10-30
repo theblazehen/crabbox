@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep `agent-sandbox-ssh` forwards alive through transient Kubernetes API errors and timeouts during periodic revalidation; only a proven claim, pod or container replacement (or lease expiry) cancels the forward, and retried failures log under `CRABBOX_DEBUG=1`.
 - Reuse an existing immutable Agent Sandbox SSH payload after full content verification when an initializer update changes its extraction path, preserving image helper aliases and live daemon identity instead of rejecting retained workers.
 - Restore generated SSH sync output capture and include remote diagnostics in failed sync errors while preserving exit-code and retry classification.
 - Keep ordinary failure retries non-destructive: preserve `--no-sync` when requested and never suggest a workspace reset by default.
