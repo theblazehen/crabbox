@@ -39,6 +39,18 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
+	if cfg.AsciiBox.Visibility != "" && asciiBoxOrg() == "personal" {
+		return core.LeaseTarget{}, core.Exit(2, "ascii-box visibility requires an organization selected with BOX_ORG; omit visibility for personal sandboxes, which are already private")
+	}
+	if err := validateBoxType(cfg.ServerType); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if core.IsArchitectureExplicit(cfg) {
+		architecture, err := core.NormalizeArchitecture(cfg.Architecture)
+		if err != nil || architecture != core.ArchitectureAMD64 {
+			return core.LeaseTarget{}, core.Exit(2, "provider=ascii-box supports only amd64 machines")
+		}
+	}
 	client, err := newAPI(cfg, b.rt)
 	if err != nil {
 		return core.LeaseTarget{}, err
@@ -57,7 +69,7 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	}
 	cfg.TTL = ttl
 	fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s ttl=%s\n", providerName, leaseID, slug, core.Blank(ttl.String(), "-"))
-	box, createErr := client.CreateBox(ctx, createRequest{TTL: ttl})
+	box, createErr := client.CreateBox(ctx, createRequest{TTL: ttl, Type: cfg.ServerType, NoEnv: cfg.AsciiBox.NoEnv, NoSnapshots: cfg.AsciiBox.NoSnapshots, Visibility: cfg.AsciiBox.Visibility})
 	if !concreteBoxID(box.createdID) || box.ID != box.createdID {
 		if createErr != nil {
 			return core.LeaseTarget{}, fmt.Errorf("ascii-box creation did not establish an original Box ID; retaining any resource: %w", createErr)
@@ -74,6 +86,9 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	if fresh.ID != box.ID || boxCreationTime(fresh) == "" || boxCreationTime(box) != "" && !boxCreationTimeMatches(fresh, boxCreationTime(box)) {
 		return core.LeaseTarget{}, core.Exit(2, "ascii-box created %s but its creation identity is missing or changed; resource retained", box.ID)
 	}
+	if err := validateBoxPrivacy(cfg, fresh); err != nil {
+		return core.LeaseTarget{}, errors.Join(err, b.rollbackBox(ctx, client, leaseID, box, core.LeaseClaim{}, false))
+	}
 	box = mergeBox(box, fresh)
 	claim, err := publishBoxClaim(cfg, leaseID, slug, req.Repo.Root, box, req.Keep)
 	if err != nil {
@@ -86,6 +101,9 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 			return err
 		}
 		if err := validateBoxIdentity(current, box); err != nil {
+			return err
+		}
+		if err := validateBoxPrivacy(cfg, current); err != nil {
 			return err
 		}
 		if err := client.PrepareSSH(ctx, box.ID); err != nil {
@@ -183,7 +201,7 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 	var lease core.LeaseTarget
 	err = core.WithLeaseClaimUnchanged(claim.LeaseID, claim, func() error {
 		if !req.ReleaseOnly && req.Repo.Root != "" {
-			if err := core.CheckLeaseClaimRepositoryOwner(claim.LeaseID, claim, req.Repo.Root, req.Reclaim); err != nil {
+			if err := core.CheckLeaseClaimRepositoryOwner(claim.LeaseID, claim, req.Repo.Root, req.Reclaim, req.Repo.LegacyRoot); err != nil {
 				return err
 			}
 		}
@@ -214,6 +232,14 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 		lease = core.LeaseTarget{Server: recordedBoxServer(cfg, box, claim), LeaseID: claim.LeaseID}
 		if req.ReleaseOnly {
 			return nil
+		}
+		if !req.StatusOnly && !req.ReleaseOnly {
+			if err := validateBoxCreationPolicy(cfg, claim); err != nil {
+				return err
+			}
+			if err := validateBoxPrivacy(cfg, box); err != nil {
+				return err
+			}
 		}
 		if err := client.PrepareSSH(ctx, box.ID); err != nil {
 			return err
@@ -527,6 +553,10 @@ func (b *backend) configForRun() (core.Config, error) {
 		return core.Config{}, err
 	}
 	cfg.WorkRoot = cleaned
+	if err := validateBoxVisibility(cfg.AsciiBox.Visibility); err != nil {
+		return core.Config{}, err
+	}
+	cfg.ServerType = (Provider{}).ServerTypeForConfig(cfg)
 	return cfg, nil
 }
 
@@ -561,6 +591,8 @@ func recordedBoxServer(cfg core.Config, box boxData, claim core.LeaseClaim) core
 
 func seedBoxLeaseServer(cfg core.Config, box boxData, leaseID, slug string, keep bool, at time.Time) core.Server {
 	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, at)
+	labels[boxNoEnvLabel] = fmt.Sprint(cfg.AsciiBox.NoEnv)
+	recordBoxPrivacyRequest(labels, cfg)
 	return boxServerWithLabels(cfg, box, leaseID, slug, labels)
 }
 
@@ -569,6 +601,11 @@ func boxServerWithLabels(cfg core.Config, box boxData, leaseID, slug string, lab
 	labels["ascii_box_scope"] = (Provider{}).ClaimScope(cfg)
 	labels[boxCreationLabel] = boxCreationTime(box)
 	labels["box_name"] = box.Name
+	if box.Type != "" {
+		labels["box_type"] = box.Type
+	} else {
+		delete(labels, "box_type")
+	}
 	labels["box_state"] = boxState(box)
 	labels["state"] = boxState(box)
 	labels["ssh_user"] = boxSSHUser(box)
@@ -580,7 +617,7 @@ func boxServerWithLabels(cfg core.Config, box boxData, leaseID, slug string, lab
 		Status:   boxState(box),
 		Labels:   labels,
 	}
-	server.ServerType.Name = "ascii-box"
+	server.ServerType.Name = box.Type
 	server.PublicNet.IPv4.IP = boxHost(box)
 	return server
 }
@@ -711,7 +748,11 @@ func boxExpiresAt(box boxData) string {
 }
 
 func boxReadyForSSH(box boxData) bool {
-	return statusReady(boxState(box)) && boxHost(box) != "" && boxSSHUser(box) != ""
+	if !statusReady(boxState(box)) || boxSSHUser(box) == "" {
+		return false
+	}
+	_, _, err := boxSSHConnection(box)
+	return err == nil
 }
 
 func boxStateFailed(status string) bool {

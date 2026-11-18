@@ -32,8 +32,20 @@
       "parameters": {}
     },
     {
+      "name": "linuxAptWait",
+      "file": "linuxAptWait.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
       "name": "linuxBootstrapPrelude",
       "file": "linuxBootstrapPrelude.sh",
+      "parameters": {}
+    },
+    {
+      "name": "linuxAptQuiesce",
+      "file": "linuxAptQuiesce.sh",
+      "literal": true,
       "parameters": {}
     },
     {
@@ -48,8 +60,22 @@
       "parameters": {}
     },
     {
+      "name": "linuxOwnershipRepair",
+      "file": "linuxOwnershipRepair.sh",
+      "parameters": {
+        "user": "sh-string",
+        "roots": "sh-strings"
+      }
+    },
+    {
       "name": "linuxOptionalPackages",
       "file": "linuxOptionalPackages.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
+      "name": "windowsUtilities",
+      "file": "windowsUtilities.ps1",
       "literal": true,
       "parameters": {}
     },

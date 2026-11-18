@@ -15,6 +15,9 @@ import (
 )
 
 const boxCreationLabel = "ascii_box_created_at"
+const boxNoEnvLabel = "ascii_box_no_env"
+const boxNoSnapshotsRequestLabel = "ascii_box_requested_no_snapshots"
+const boxVisibilityRequestLabel = "ascii_box_requested_visibility"
 const boxDeletionLabel = "ascii_box_deletion_completed"
 const boxDeletionBindingDomain = "completed-native-operation/v1\x00"
 const boxDeletionOperationLabel = "ascii_box_deletion_operation"
@@ -31,6 +34,65 @@ func (Provider) ClaimScope(cfg core.Config) string {
 	}
 	encoded, _ := json.Marshal([]string{endpoint, asciiBoxOrg()})
 	return string(encoded)
+}
+
+// This is a creation receipt, not a claim that the current disk has no secrets.
+func validateBoxNoEnv(cfg core.Config, claim core.LeaseClaim) error {
+	switch claim.Labels[boxNoEnvLabel] {
+	case "", "false":
+		if !cfg.AsciiBox.NoEnv {
+			return nil
+		}
+	case "true":
+		if cfg.AsciiBox.NoEnv {
+			return nil
+		}
+	}
+	return core.Exit(2, "ascii-box lease %s has incompatible or unknown no-env creation policy; create a new lease (status and stop remain available)", claim.LeaseID)
+}
+
+// Requested policy receipts bind reuse. Fresh provider metadata, not these
+// labels, confirms explicitly selected privacy settings before SSH access.
+func recordBoxPrivacyRequest(labels map[string]string, cfg core.Config) {
+	if cfg.AsciiBox.NoSnapshots {
+		labels[boxNoSnapshotsRequestLabel] = "true"
+	}
+	if cfg.AsciiBox.Visibility != "" {
+		labels[boxVisibilityRequestLabel] = cfg.AsciiBox.Visibility
+	}
+}
+
+func validateBoxCreationPolicy(cfg core.Config, claim core.LeaseClaim) error {
+	if err := validateBoxNoEnv(cfg, claim); err != nil {
+		return err
+	}
+	noSnapshots := ""
+	if cfg.AsciiBox.NoSnapshots {
+		noSnapshots = "true"
+	}
+	if claim.Labels[boxNoSnapshotsRequestLabel] != noSnapshots || claim.Labels[boxVisibilityRequestLabel] != cfg.AsciiBox.Visibility {
+		return core.Exit(2, "ascii-box lease %s has incompatible or unknown privacy creation policy; create a new lease (status and stop remain available)", claim.LeaseID)
+	}
+	return nil
+}
+
+func validateBoxVisibility(visibility string) error {
+	switch visibility {
+	case "", "private", "shared":
+		return nil
+	default:
+		return core.Exit(2, "ascii-box visibility must be private or shared, or empty for the organization default")
+	}
+}
+
+func validateBoxPrivacy(cfg core.Config, box boxData) error {
+	if cfg.AsciiBox.NoSnapshots && (box.Snapshots == nil || *box.Snapshots) {
+		return core.Exit(2, "ascii-box %s did not confirm snapshots disabled; refusing SSH access", box.ID)
+	}
+	if cfg.AsciiBox.Visibility != "" && box.Visibility != cfg.AsciiBox.Visibility {
+		return core.Exit(2, "ascii-box %s did not confirm requested visibility %s; refusing SSH access", box.ID, cfg.AsciiBox.Visibility)
+	}
+	return nil
 }
 
 func boxCreationTime(box boxData) string {
@@ -203,7 +265,7 @@ func (Provider) PrepareLeaseClaimEndpoint(existing core.LeaseClaim, provider, sl
 		return core.Server{}, core.Exit(2, "refusing to retarget ascii-box lease %s", existing.LeaseID)
 	}
 	labels := shared.CloneLabels(server.Labels)
-	for _, key := range []string{"provider", "box_id", "ascii_box_scope", boxCreationLabel, boxDeletionLabel, boxDeletionOperationLabel, boxDeletionOperationBindingLabel} {
+	for _, key := range []string{"provider", "box_id", "ascii_box_scope", boxCreationLabel, boxNoEnvLabel, boxNoSnapshotsRequestLabel, boxVisibilityRequestLabel, boxDeletionLabel, boxDeletionOperationLabel, boxDeletionOperationBindingLabel} {
 		original := existing.Labels[key]
 		if original != "" && labels[key] != "" && labels[key] != original {
 			return core.Server{}, core.Exit(2, "ascii-box lease %s changed %s", existing.LeaseID, key)
@@ -297,6 +359,17 @@ func releaseExactBox(ctx context.Context, client api, expected boxData, beforeRe
 		onDeletionObserved(operation)
 	}
 	if err != nil {
+		var missing *boxNotFoundError
+		if errors.As(err, &missing) && missing.id == expected.ID {
+			// A snapshot-disabled sandbox can disappear during native stop.
+			absent, absenceErr := boxAbsentAfterDeletion(ctx, client, expected)
+			if absenceErr != nil {
+				return errors.Join(err, fmt.Errorf("ascii-box cleanup confirmation: %w", absenceErr))
+			}
+			if absent {
+				return nil
+			}
+		}
 		return err
 	}
 	// Re-attest both absence witnesses inside the release fence.

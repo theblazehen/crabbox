@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +33,7 @@ type sshScriptTestBackend struct {
 	lease                             LeaseTarget
 	activityPath                      string
 	activityErr                       error
+	activityLease                     LeaseTarget
 	requests                          []RunRequest
 	warmups, acquired, starts, joined int
 }
@@ -52,6 +55,7 @@ func (b *sshScriptTestBackend) Status(context.Context, StatusRequest) (StatusVie
 }
 func (b *sshScriptTestBackend) Stop(context.Context, StopRequest) error { return nil }
 func (b *sshScriptTestBackend) BeginSSHRunActivity(ctx context.Context, lease LeaseTarget) (func(), error) {
+	b.activityLease = lease
 	if claim, err := ReadLeaseClaim(lease.LeaseID); err != nil || claim.Provider != b.spec.Name {
 		return nil, fmt.Errorf("activity started before admission: %v", err)
 	}
@@ -167,6 +171,97 @@ exit "$code"
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return p, b, dir
+}
+
+type sshOnlyScriptTestBackend struct {
+	SSHLeaseBackend
+	SSHRunActivityBackend
+}
+
+func TestNoSyncOwnedCommandKeepsExitAndAvoidsSecondReadiness(t *testing.T) {
+	p, b, dir := setupSSHScriptRun(t)
+	p.backend = sshOnlyScriptTestBackend{b, b}
+	t.Setenv("CI", "")
+	t.Setenv("NODE_OPTIONS", "")
+	for _, name := range []string{"CI", "NODE_OPTIONS"} {
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), []string{
+		"--provider", p.Spec().Name, "--id", b.lease.LeaseID, "--no-sync", "--timing-json",
+		"--shell", "printf 'ordered-output'; exit 23",
+	})
+	if ExitCodeForError(err, 1) != 23 || stdout.String() != "ordered-output" {
+		t.Fatalf("exit=%v stdout=%q stderr=%s", err, &stdout, &stderr)
+	}
+	data, readErr := os.ReadFile(filepath.Join(dir, "ssh.log"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	count := 0
+	for _, call := range strings.Split(string(data), "\n") {
+		if strings.Contains(call, "/usr/local/bin/crabbox-ready") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("readiness calls=%d, want one", count)
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	var report TimingReport
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, phase := range report.RunnerPhases {
+		if phase.Name == "unattributed" {
+			t.Fatalf("unattributed phase: %+v", report)
+		}
+		total += phase.Ms
+	}
+	if report.ExitCode != 23 || total != report.RunnerTotalMs {
+		t.Fatalf("invalid final timing: %+v", report)
+	}
+}
+
+func TestNoSyncOwnedPreparationFailureDoesNotStartCommand(t *testing.T) {
+	for _, reused := range []bool{true, false} {
+		t.Run(fmt.Sprint("reused=", reused), func(t *testing.T) {
+			p, b, dir := setupSSHScriptRun(t)
+			p.backend = sshOnlyScriptTestBackend{b, b}
+			releases := 0
+			previous := runEnvProfileTestReleaseHook
+			runEnvProfileTestReleaseHook = func() error { releases++; return nil }
+			t.Cleanup(func() { runEnvProfileTestReleaseHook = previous })
+			blocked := filepath.Join(dir, "blocked-work-root")
+			if err := os.WriteFile(blocked, []byte("not a directory"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_WORK_ROOT", blocked)
+			marker := filepath.Join(dir, "workload-started")
+			args := []string{"--provider", p.Spec().Name, "--no-sync", "--timing-json", "--keep-on-failure", "--allow-env", "CRABBOX_UNUSED_FIXTURE"}
+			if reused {
+				args = append(args, "--id", b.lease.LeaseID)
+			}
+			args = append(args, "--", "touch", marker)
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), args)
+			if ExitCodeForError(err, 1) != 7 || !strings.Contains(err.Error(), "prepare remote workdir") || strings.Contains(err.Error(), "remote command exited") {
+				t.Fatalf("error=%v stdout=%q stderr=%s", err, &stdout, &stderr)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("workload ran after preparation failure: %v", err)
+			}
+			if reused && (releases != 0 || !strings.Contains(stderr.String(), "workspace owner released")) {
+				t.Fatalf("reused lease cleanup changed: releases=%d stderr=%s", releases, &stderr)
+			}
+			if !reused && releases != 1 {
+				t.Fatalf("setup failure retained a new lease with --keep-on-failure: releases=%d stderr=%s", releases, &stderr)
+			}
+		})
+	}
 }
 
 func TestHybridSSHScriptRun(t *testing.T) {
@@ -370,5 +465,67 @@ func TestHybridSSHScriptActivityFailureStopsBeforeSetup(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "ssh.log")); !os.IsNotExist(err) {
 		t.Fatal("setup ran after activity admission failed")
+	}
+}
+
+func TestRunCanonicalizesLeaseTargetBeforeActivity(t *testing.T) {
+	for _, platform := range []struct {
+		name, targetOS, windowsMode, rawTargetOS string
+		emptyEnvironment                         bool
+	}{
+		{name: "default Linux", targetOS: targetLinux, windowsMode: windowsModeNormal},
+		{name: "native Linux", targetOS: targetLinux, windowsMode: windowsModeNormal, rawTargetOS: targetLinux, emptyEnvironment: true},
+		{name: "recorded macOS", targetOS: targetMacOS, windowsMode: windowsModeNormal},
+		{name: "recorded Windows", targetOS: targetWindows, windowsMode: windowsModeNormal},
+		{name: "recorded WSL2", targetOS: targetWindows, windowsMode: windowsModeWSL2},
+	} {
+		for _, reused := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reused=%t", platform.name, reused), func(t *testing.T) {
+				p, b, dir := setupSSHScriptRun(t)
+				p.spec.Targets = append(p.spec.Targets, TargetSpec{OS: platform.targetOS, WindowsMode: platform.windowsMode})
+				workRoot := filepath.Join(dir, "recorded-root")
+				b.lease.Server.ServerType.Name = "fixture-large"
+				b.lease.Server.Labels = map[string]string{"work_root": workRoot}
+				if platform.targetOS != targetLinux {
+					b.lease.Server.Labels["target"] = platform.targetOS
+					b.lease.Server.Labels["windows_mode"] = platform.windowsMode
+				}
+				b.lease.SSH.TargetOS = platform.rawTargetOS
+				if !platform.emptyEnvironment {
+					b.lease.SSH.ChildEnv = map[string]string{"FIXTURE_TRANSPORT": "synthetic-context"}
+					b.lease.SSH.ChildEnvDenylist = []string{"FIXTURE_PRIVATE"}
+				}
+				stopped := errors.New("stop after lease admission")
+				b.activityErr = stopped
+				args := []string{"--provider", p.Spec().Name, "--no-sync", "--keep", "--script-stdin"}
+				if reused {
+					args = append(args, "--id", b.lease.LeaseID)
+				}
+				err := (App{Stdout: io.Discard, Stderr: io.Discard, Stdin: strings.NewReader("exit 0\n")}).runCommand(t.Context(), args)
+				if !errors.Is(err, stopped) || b.starts != 1 {
+					t.Fatalf("admission error=%v activity starts=%d", err, b.starts)
+				}
+				target := b.activityLease.SSH
+				claim, err := ReadLeaseClaim(b.lease.LeaseID)
+				if err != nil || claim.Provider != p.Spec().Name || b.activityLease.Server.ServerType.Name != "fixture-large" || claim.Labels["work_root"] != workRoot {
+					t.Fatalf("recorded lease=%+v error=%v", claim, err)
+				}
+				cfg := defaultConfig()
+				cfg.Provider, cfg.TargetOS, cfg.WindowsMode = claim.Provider, platform.targetOS, platform.windowsMode
+				hydrationTarget := targetWithConfigDefaults(target, cfg)
+				if nativeRuntimeRouteKey(target) != nativeRuntimeRouteKey(hydrationTarget) {
+					t.Fatal("Actions hydration changed the admitted runtime route")
+				}
+				if target.TargetOS != platform.targetOS || target.WindowsMode != platform.windowsMode || target.User != b.lease.SSH.User {
+					t.Fatalf("activity target=%+v, want platform=%s/%s and provider user", target, platform.targetOS, platform.windowsMode)
+				}
+				if !reflect.DeepEqual(target.ChildEnv, b.lease.SSH.ChildEnv) || !slices.Equal(target.ChildEnvDenylist, b.lease.SSH.ChildEnvDenylist) {
+					t.Fatal("lease admission changed the provider environment boundary")
+				}
+				if _, err := os.Stat(filepath.Join(dir, "ssh.log")); !os.IsNotExist(err) {
+					t.Fatal("SSH ran after the activity refusal")
+				}
+			})
+		}
 	}
 }

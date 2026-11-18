@@ -1592,6 +1592,7 @@ func allBuiltInProviderNames() []string {
 		"vercel-sandbox",
 		"vultr",
 		"wandb",
+		"warpbuild",
 		"windows-sandbox",
 		"xcp-ng",
 	}

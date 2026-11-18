@@ -1,7 +1,10 @@
 import {
   psQuote,
   sharedLinuxSSHRestart,
+  sharedLinuxOwnershipRepair,
   sharedLinuxBootstrapStart,
+  sharedLinuxAptQuiesce,
+  sharedLinuxAptWait,
   sharedLinuxBootstrapActivate,
   sharedLinuxBootstrapPrelude,
   sharedLinuxOptionalPackages,
@@ -96,9 +99,8 @@ export function cloudInit(
   let core = `    #!/bin/bash
     exec > >(tee -a /var/log/cloud-init-output.log) 2>&1
 ${indentRuncmdScript(sharedLinuxBootstrapPrelude())}${sshRestart}${indentRuncmdScript(linuxMinimalReadinessBootstrap)}
-    mkdir -p ${config.workRoot} /var/cache/crabbox/pnpm /var/cache/crabbox/npm
-    chown -R ${config.sshUser}:${config.sshUser} ${config.workRoot} /var/cache/crabbox
-    install -d /var/lib/crabbox
+    mkdir -p ${shellQuote(config.workRoot)} /var/cache/crabbox/pnpm /var/cache/crabbox/npm
+${indentRuncmdScript(sharedLinuxOwnershipRepair(config.sshUser, [config.workRoot, "/var/cache/crabbox"]))}    install -d /var/lib/crabbox
 ${sshRestart}`;
   let final = "    systemctl start crabbox-bootstrap.service\n";
   let workspaceAfter = "crabbox-bootstrap.service cloud-config.service";
@@ -186,6 +188,9 @@ function privateAWSCloudInit(config: LeaseConfig): string {
   return `#cloud-config
 package_update: false
 package_upgrade: false
+bootcmd:
+  - |
+${indentRuncmdScript(sharedLinuxAptQuiesce())}
 ssh_pwauth: false
 disable_root: true
 users:
@@ -214,6 +219,7 @@ runcmd:
   - |
     bash -euxo pipefail <<'BOOT'
     export DEBIAN_FRONTEND=noninteractive
+${indentRuncmdScript(sharedLinuxAptWait())}
     if grep -RIl 'http://' /etc/apt 2>/dev/null | grep -q .; then
       grep -RIl 'http://' /etc/apt | xargs -r sed -i 's|http://|https://|g'
     fi

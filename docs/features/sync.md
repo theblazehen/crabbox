@@ -106,10 +106,10 @@ are forwarded. Other SSH origins remain ineligible for remote origin seeding.
 
 Use `sync.source: directory` to sync an include-only working set from a directory
 without creating a repository. There is no automatic fallback when Git discovery
-fails. The source root is the effective current working directory, including when
-that directory is inside an outer Git checkout; `run --workdir` selects that
-current directory before loading configuration. A nonempty `sync.include`
-allowlist is required:
+fails. The source root is the directory you run `crabbox` from, including when
+that directory is inside an outer Git checkout. To sync a different directory,
+change into it before `crabbox run` or `crabbox sync-plan`; `run` has no
+`--workdir` flag. A nonempty `sync.include` allowlist is required:
 
 ```yaml
 sync:
@@ -163,6 +163,14 @@ With `--no-sync`, a valid directory selection is inactive: no include requiremen
 enumeration, or temporary Git metadata is needed. Existing provider-specific
 `--no-sync` restrictions still apply. Unrelated sync settings do not prevent
 `stop` from cleaning up an existing lease.
+
+Directory-source claims use the canonical current directory, so retained leases
+can be reused through equivalent path aliases, including with `run --no-sync`
+and `exec`. Older claims containing a logical path also remain usable when that
+path exactly matches the invoking command's original repository lookup. Crabbox
+never resolves a stored claim path to its current target to establish ownership;
+an older claim reached through another alias can still receive the usual
+claim-owner refusal. Missing or unresolvable invocation paths fail closed.
 
 ### Jujutsu workspaces
 

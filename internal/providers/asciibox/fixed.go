@@ -29,17 +29,28 @@ func (b *backend) acquireFixed(ctx context.Context, cfg core.Config, client api,
 	ttl = ttl.Round(time.Second)
 	cfg.TTL = ttl
 	lease, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind: fixedBoxKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Kind:           fixedBoxKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
 		TargetOS: targetLinux, TTL: ttl, IdleTimeout: cfg.IdleTimeout, Now: b.now,
 	}, core.FixedLeaseOperations[boxData]{
 		Admission: &core.FixedAdmission{FreshOnly: true, KeyedRetry: &core.FixedKeyedRetry{AttemptKey: "idempotency_key", Window: asciiBoxIdempotencyWindow}},
 		DescribeIntent: func(_ context.Context, _ *core.LeaseClaim, _ bool) (core.FixedLeaseBinding, error) {
 			scope := (Provider{}).ClaimScope(cfg)
+			// Omitted sizing in existing claims meant the native default. Preserve
+			// that fingerprint while binding every nondefault type to its intent.
+			kind := cfg.ServerType
+			if kind == "default" {
+				kind = ""
+			}
 			fingerprint, err := core.FixedIntentFingerprint("ascii-box/v1\x00", struct {
 				Scope, Workdir, Slug, Pond string
 				TTL, Idle                  time.Duration
 				Keep                       bool
-			}{scope, cfg.WorkRoot, core.NormalizeLeaseSlug(req.RequestedSlug), core.NormalizePondName(cfg.Pond), ttl, cfg.IdleTimeout, req.Keep})
+				Type                       string `json:",omitempty"`
+				NoEnv                      bool   `json:",omitempty"`
+				NoSnapshots                bool   `json:",omitempty"`
+				Visibility                 string `json:",omitempty"`
+			}{scope, cfg.WorkRoot, core.NormalizeLeaseSlug(req.RequestedSlug), core.NormalizePondName(cfg.Pond), ttl, cfg.IdleTimeout, req.Keep, kind, cfg.AsciiBox.NoEnv, cfg.AsciiBox.NoSnapshots, cfg.AsciiBox.Visibility})
 			return core.FixedLeaseBinding{ProviderScope: scope, Fingerprint: fingerprint, AllocateSlug: true, RequestedSlug: req.RequestedSlug}, err
 		},
 		Plan: func(_ context.Context, claim core.LeaseClaim) (core.FixedAttemptPlan, error) {
@@ -50,9 +61,11 @@ func (b *backend) acquireFixed(ctx context.Context, cfg core.Config, client api,
 		},
 		ObserveExact: fixedBoxObserver(cfg, client),
 		Submit: func(ctx context.Context, tx *core.FixedTransaction) (boxData, error) {
-			box, createErr := client.CreateBox(ctx, createRequest{TTL: ttl, IdempotencyKey: tx.Claim.FixedCreateIntent.Attempt["idempotency_key"]})
+			box, createErr := client.CreateBox(ctx, createRequest{TTL: ttl, Type: cfg.ServerType, NoEnv: cfg.AsciiBox.NoEnv, NoSnapshots: cfg.AsciiBox.NoSnapshots, Visibility: cfg.AsciiBox.Visibility, IdempotencyKey: tx.Claim.FixedCreateIntent.Attempt["idempotency_key"]})
 			if concreteBoxID(box.createdID) && box.ID == box.createdID {
 				server := fixedBoxServer(cfg, box, *tx.Claim)
+				server.Labels[boxNoEnvLabel] = fmt.Sprint(cfg.AsciiBox.NoEnv)
+				recordBoxPrivacyRequest(server.Labels, cfg)
 				if err := tx.Observe(core.FixedResourceBinding{CloudID: box.ID, ImmutableID: server.ImmutableID, Labels: server.Labels}); err != nil {
 					return boxData{}, err
 				}
@@ -188,11 +201,17 @@ func fixedBoxServer(cfg core.Config, box boxData, claim core.LeaseClaim) core.Se
 }
 
 func (b *backend) prepareFixedBox(ctx context.Context, cfg core.Config, client api, claim core.LeaseClaim, box boxData) (core.LeaseTarget, error) {
+	if err := validateBoxCreationPolicy(cfg, claim); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	ready, err := client.waitForBoxReady(ctx, box)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
 	if err := validateBoxIdentity(ready, box); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if err := validateBoxPrivacy(cfg, ready); err != nil {
 		return core.LeaseTarget{}, err
 	}
 	if err := client.PrepareSSH(ctx, box.ID); err != nil {
@@ -224,6 +243,35 @@ func (b *backend) resolveFixed(ctx context.Context, cfg core.Config, client api,
 			return boxData{}, core.FixedUncertainCustody(claim.LeaseID)
 		}
 		return result.Candidates[0], nil
+	}
+	if req.Reclaim && req.Repo.Root != "" && req.Repo.Root != claim.RepoRoot && !req.StatusOnly && !req.ReleaseOnly && !req.NoLocalStateMutations {
+		if err := core.CheckFixedAttemptActive(claim, "idempotency_key", "deletion_operation_id", "deletion_completed"); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		intent := claim.FixedCreateIntent
+		if intent.State == fixedBoxKind.DeletionState || (intent.Journal != nil && intent.Journal.Phase == "deleting") {
+			return core.LeaseTarget{}, core.Exit(4, "lease_id_conflict: fixed lease has entered cleanup; retry stop")
+		}
+		// Deletion receipts bind the original repository and cannot be relocated.
+		for _, key := range []string{boxDeletionLabel, boxDeletionOperationLabel, boxDeletionOperationBindingLabel} {
+			if _, exists := claim.Labels[key]; exists {
+				return core.LeaseTarget{}, core.Exit(4, "lease_id_conflict: fixed lease has entered cleanup; retry stop")
+			}
+		}
+		if err := validateBoxCreationPolicy(cfg, claim); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		var err error
+		claim, err = core.ReclaimFixedLease(ctx, claim, cfg, req.Repo.Root, true, func(ctx context.Context, claim core.LeaseClaim) (core.Server, error) {
+			box, err := observe(ctx, claim)
+			if err != nil {
+				return core.Server{}, err
+			}
+			return fixedBoxServer(cfg, box, claim), nil
+		})
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
 	}
 	return core.ResolveFixedLeaseTarget(ctx, core.FixedResolveOptions{Kind: fixedBoxKind, Request: req, Expected: claim, Provider: providerName, ResourceName: claim.CloudID, TerminalState: "released", Now: b.now},
 		func(ctx context.Context, claim *core.LeaseClaim, persist func() error) (core.LeaseTarget, error) {

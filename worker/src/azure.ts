@@ -1344,7 +1344,9 @@ export class AzureClient {
       const preparedClaim = this.ownedDeleteClaim(
         lease,
         inspection.diskResource,
-        transport ? inspection.resourceIdentity : context?.resourceIdentity,
+        transport && inspection.stableResourceIdentity !== "[]"
+          ? inspection.resourceIdentity
+          : context?.resourceIdentity,
         observedStableResourceIdentity ?? inspection.stableResourceIdentity,
       );
       claim = await this.persistOwnedDeleteClaimTransition(claimKey, lease, claim, preparedClaim);
@@ -1392,6 +1394,47 @@ export class AzureClient {
         throw new Error("Azure deletion operation failed; fresh ownership verification required");
       }
       return false;
+    }
+    if (
+      !context &&
+      !transport &&
+      claim.version === 2 &&
+      claim.stableResourceIdentity !== undefined &&
+      !azureStableResourceIdentityEntries(claim.stableResourceIdentity).some(
+        (entry) => entry.kind === "virtualMachines" || entry.kind === "disks",
+      ) &&
+      !claim.resourceIdentity &&
+      !claim.partialStableResourceIdentity &&
+      !claim.deletedStableResourceIdentity &&
+      !claim.completed
+    ) {
+      // An interrupted create can finish its companions after cleanup first observes it.
+      // Extend only an untouched claim; replacements and frozen candidates stay strict.
+      const inspection = await this.ownedDeleteResources(lease, {
+        request,
+        claim,
+        prepareClaim: true,
+        expectedStableResourceIdentity: claim.stableResourceIdentity,
+        allowResourceSetExpansion: true,
+      });
+      if (
+        azureStableResourceIdentityCanExpand(
+          claim.stableResourceIdentity,
+          inspection.stableResourceIdentity,
+        )
+      ) {
+        claim = await this.persistOwnedDeleteClaimTransition(
+          claimKey,
+          lease,
+          claim,
+          this.ownedDeleteClaim(
+            lease,
+            inspection.diskResource,
+            undefined,
+            inspection.stableResourceIdentity,
+          ),
+        );
+      }
     }
     const canonicalVMID = this.resourceID(vmPath(this.resourceGroup, lease.cloudID));
     const canonicalNICID = this.resourceID(
@@ -1568,11 +1611,26 @@ export class AzureClient {
   ): Promise<true> {
     if (retainEvidence) {
       // Completion survives a lost provisioning-result commit; it is not inferred from intent.
-      if (!claim.completed)
+      if (!claim.completed) {
+        const deleted = azureStableResourceIdentityEntries(
+          claim.deletedStableResourceIdentity ?? "[]",
+        );
+        const deletedKinds = new Set(deleted.map((entry) => entry.kind));
         await this.persistOwnedDeleteClaimTransition(claimKey, lease, claim, {
           ...claim,
+          ...(claim.stableResourceIdentity
+            ? {
+                deletedStableResourceIdentity: JSON.stringify([
+                  ...deleted,
+                  ...azureStableResourceIdentityEntries(claim.stableResourceIdentity).filter(
+                    (entry) => !deletedKinds.has(entry.kind),
+                  ),
+                ]),
+              }
+            : {}),
           completed: true,
         });
+      }
     } else await this.clearOwnedDeleteClaim(claimKey, lease, claim);
     return true;
   }
@@ -1775,6 +1833,7 @@ export class AzureClient {
       prepareClaim?: boolean;
       expectedResourceIdentity?: string;
       expectedStableResourceIdentity?: string;
+      allowResourceSetExpansion?: boolean;
     } = {},
   ): Promise<AzureOwnedDeleteInspection> {
     const request = options.request ?? this.arm.bind(this);
@@ -1814,6 +1873,19 @@ export class AzureClient {
       ),
     ]);
 
+    if (!vm && !nic && !pip && !initialDisk) {
+      // Only exact not-found responses become absent resources; no deletion remains to authorize.
+      return {
+        vm: false,
+        nic: false,
+        pip: false,
+        disk: false,
+        stableResourceIdentity: "[]",
+        resourceIdentity: "[]",
+        ephemeralOSDisk: false,
+      };
+    }
+
     if (vm) this.requireOwnedResource("VM", vm, vmResourcePath, lease);
     if (nic) this.requireOwnedResource("NIC", nic, nicResourcePath, lease);
     if (pip) this.requireOwnedResource("public IP", pip, pipResourcePath, lease);
@@ -1845,6 +1917,13 @@ export class AzureClient {
         options.expectedStableResourceIdentity,
         currentStableResourceIdentity,
         azureEffectiveCleanupProgress(options.claim),
+      ) &&
+      !(
+        options.allowResourceSetExpansion &&
+        azureStableResourceIdentityCanExpand(
+          options.expectedStableResourceIdentity,
+          currentStableResourceIdentity,
+        )
       )
     ) {
       throw new Error(
@@ -2261,7 +2340,9 @@ export class AzureClient {
     request: AzureResourceRequest = this.arm.bind(this),
   ): Promise<T | undefined> {
     try {
-      return await request<T>("GET", path, apiVersion);
+      const resource = await request<T>("GET", path, apiVersion);
+      if (!resource) throw new Error(`Azure GET ${path}: resource response is empty`);
+      return resource;
     } catch (error) {
       if (azureResourceNotFound(error, kind, name)) return undefined;
       throw error;
@@ -4450,6 +4531,21 @@ function azureStableResourceIdentityMatches(
   } catch {
     return false;
   }
+}
+
+function azureStableResourceIdentityCanExpand(expected: string, current: string): boolean {
+  const expectedEntries = azureStableResourceIdentityEntries(expected);
+  if (expectedEntries.some((entry) => entry.kind === "virtualMachines" || entry.kind === "disks"))
+    return false;
+  const expectedKinds = new Set(expectedEntries.map((entry) => entry.kind));
+  const added = azureStableResourceIdentityEntries(current).filter(
+    (entry) => !expectedKinds.has(entry.kind),
+  );
+  // Project the larger set back onto the original: only attachments to new members may differ.
+  // This is a comparison, never deletion evidence persisted to the claim.
+  return (
+    added.length > 0 && azureStableResourceIdentityMatches(current, expected, JSON.stringify(added))
+  );
 }
 
 function azureResourceIdentityMatches(

@@ -41,10 +41,14 @@ func (r *remoteNativeRuntime) command(args ...string) string {
 	return remotePOSIXControlCommand("exec " + strings.Join(words, " "))
 }
 
-func (r *remoteNativeRuntime) runCommand(nonce string, commandBytes int, budget time.Duration) string {
-	return r.command("run", remoteruntime.Protocol, nonce, strconv.Itoa(commandBytes), "0",
+func (r *remoteNativeRuntime) runCommand(nonce string, commandBytes int, inputBytes int64, budget time.Duration, purpose, lifetime string) string {
+	milliseconds := budget / time.Millisecond
+	if budget%time.Millisecond != 0 {
+		milliseconds++
+	}
+	return r.command("run", remoteruntime.Protocol, nonce, strconv.Itoa(commandBytes), strconv.FormatInt(inputBytes, 10),
 		strconv.FormatInt(wslStageIdleTimeout.Milliseconds(), 10), strconv.FormatInt(wsl2SignalGrace.Milliseconds(), 10),
-		strconv.FormatInt(budget.Milliseconds(), 10), "preflight", "finite")
+		strconv.FormatInt(int64(milliseconds), 10), purpose, lifetime)
 }
 
 func (r *remoteNativeRuntime) close(ctx context.Context) error {
@@ -185,6 +189,25 @@ func preparePOSIXRuntime(ctx context.Context, target SSHTarget, artifacts runtim
 		return nil, errors.New("runtime source does not fulfill the requested capability identity")
 	}
 	runtime.identity = identity
+	nonce, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
+	runtime.nonce, runtime.path = nonce, "/tmp/crabbox-runtime-"+nonce+"/crabbox"
+	cache := target.TargetOS == targetLinux && required.Capability == runtimeartifact.Supervisor
+	if cache {
+		remote = runtime // A failed probe may still have created a private pin.
+		hello := newSynchronizedBuffer(4097)
+		if err := runtime.runPOSIX(probeCtx, nativeRuntimeCacheProbeScript(runtime), &hello); err != nil {
+			return nil, fmt.Errorf("probe native runtime cache: %w", err)
+		}
+		if hello.String() != "CBX-CACHE-MISS\n" {
+			if err := validateNativeRuntimeIdentity(hello.Bytes(), arch); err != nil {
+				return nil, err
+			}
+			return runtime, nil
+		}
+	}
 	var payload io.ReadSeeker = artifact
 	transportSize, compressed := identity.Size, false
 	if capabilities[1] == "gzip" {
@@ -199,11 +222,6 @@ func preparePOSIXRuntime(ctx context.Context, target SSHTarget, artifacts runtim
 			payload, transportSize, compressed = packed, packed.Size(), true
 		}
 	}
-	nonce, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-	runtime.nonce, runtime.path = nonce, "/tmp/crabbox-runtime-"+nonce+"/crabbox"
 	// Artifact installation has its own size-dependent allowance. It does not
 	// consume the worker's execution clock or its separate cleanup reserve.
 	transferBudget := wslStageBudget(wslStageTimeout, wslStageIdleTimeout, transportSize)
@@ -237,7 +255,13 @@ func preparePOSIXRuntime(ctx context.Context, target SSHTarget, artifacts runtim
 		return runtime, nil
 	}
 	hello := newSynchronizedBuffer(4097)
-	if err := runtime.runMetadata(installCtx, []string{"identity"}, &hello); err != nil {
+	if cache {
+		handshake := runtime.command("identity") + " && " + remotePOSIXControlCommand(nativeRuntimeCachePublishScript(runtime))
+		err = runtime.runPOSIX(installCtx, handshake, &hello)
+	} else {
+		err = runtime.runMetadata(installCtx, []string{"identity"}, &hello)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("native runtime handshake: %w", err)
 	}
 	if err := validateNativeRuntimeIdentity(hello.Bytes(), arch); err != nil {

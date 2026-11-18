@@ -133,6 +133,66 @@ password retrieval, remote setup/cleanup, and sync need their own transport
 boundary. Native VNC handoff stdout still intentionally contains the viewer
 credentials documented by that command.
 
+## Linux command lifetime
+
+With a complete release installation, ordinary Linux foreground commands use
+the verified native runtime shipped beside the CLI. Keep the `crabbox-runtime`
+directory with its matching controller; a CLI-only installation does not provide
+this native command path. Command input remains finite, while a separate watched
+connection lifetime prevents an already-disconnected invocation from starting
+its workload. Output and command exit status keep their existing meanings.
+
+Cancellation preserves the normal TERM grace, then joins owned process-group
+cleanup. Crabbox requires a completion record for that exact invocation and
+explicit retirement before reporting cleanup confirmed. Local SSH exit or an
+absent remote stage is not sufficient: a delayed accepted wrapper can still be
+pending. Unconfirmed retirement is reported with its retained stage locator; the
+runtime is preserved and the dispatched command is not automatically replayed.
+Owner metadata and intentionally detached helpers retain their existing owners.
+
+Linux keeps one cached supervisor artifact per remote user in a private
+`/tmp/crabbox-runtime-cache-<uid>` directory. Later invocations pin the cached
+inode, check its ownership and SHA-256 against the local manifest, and complete
+the identity handshake before executing workloads. Cache hits skip compression,
+upload, and full readback. Missing, partial, or mismatched artifacts are reinstalled;
+an unsafe cache directory fails closed. Each invocation has its own private
+hard-link pin, so replacing the cached version cannot change an active run's
+cleanup executable. Successful finalization removes that pin, while the single
+cache slot remains until replacement or host/lease teardown. Retained and shared
+hosts therefore keep at most one cached artifact, plus pins for active or
+unconfirmed invocations. Hosts without a SHA-256 utility retain verified upload
+and readback on each invocation.
+
+Successful readiness checks are reused within one invocation for the same lease
+and transport identity. Readiness is checked
+again when the workspace owner changes; a new route or lease requires its own
+preparation. Metadata and workloads can use normal SSH multiplexing, while each
+supervised workload keeps its own watched input channel. Only the controller
+holds that channel's pipe writer, so its exit still delivers EOF through a
+surviving SSH master. Completion observation
+and retirement share one metadata round trip; both must succeed before cleanup
+is reported as confirmed. WSL2 retains its existing transport behavior.
+
+For a local Darwin arm64 controller with both Linux supervisor companions, run
+these commands from the source checkout. They do not contact a lease:
+
+```sh
+out="$PWD/bin/local-darwin-arm64"
+mkdir -p "$out/crabbox-runtime"
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o "$out/crabbox" ./cmd/crabbox
+for arch in amd64 arm64; do
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$out/crabbox-runtime/linux-$arch" ./cmd/crabbox-runtime
+done
+go run ./scripts/runtime-artifacts prepare --directory "$out/crabbox-runtime" --controller "$out/crabbox" > "$out/crabbox-runtime/manifest.json"
+go run ./scripts/runtime-artifacts verify --directory "$out/crabbox-runtime" --controller "$out/crabbox"
+```
+
+Run `"$out/crabbox"` and keep its companion directory beside it. Regenerate the
+manifest after rebuilding either the controller or a companion. This minimal
+pack supplies the Linux supervisor; optional filesystem and egress capability
+packs have additional requirements in
+[`scripts/runtime-artifacts/README.md`](../../scripts/runtime-artifacts/README.md).
+
 ## Native Windows command input
 
 Native Windows SSH carries workspace-owner requests, witness scripts, and

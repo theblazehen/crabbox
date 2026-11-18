@@ -18,12 +18,13 @@ Subcommands: `create`, `abandon`, `list`, `inspect`, `policy`, `restore`, `fork`
 ## Two checkpoint kinds
 
 **Native (provider snapshot or image)** — captures the whole machine: packages,
-tools, caches, services. Stored in the provider account, so it incurs provider
-storage costs. Recorded as one of `aws-ami`, `aws-ebs-snapshot`,
+tools, caches, services. Stored in provider-managed or provider-specific
+artifact storage; cloud backends may incur storage costs. Recorded as one of
+`aws-ami`, `aws-ebs-snapshot`,
 `azure-managed-image`, `azure-os-disk-snapshot`, `gcp-machine-image`,
 `gcp-disk-snapshot`, `hetzner-snapshot`, `machine0-image`,
 `parallels-snapshot`, `daytona-snapshot`, `incus-image`, or
-`cloudflare-container-snapshot`.
+`cloudflare-container-snapshot`; Hyper-V uses `hyperv-vhdx`.
 
 **Archive (workspace tarball)** — captures only the contents of the remote
 workdir as `workspace.tar.gz`. Portable across any POSIX SSH lease, but it does
@@ -538,14 +539,19 @@ checkpoints; their lifecycle belongs exclusively to coordinator retention.
 
 ## restore
 
-Restore brings a checkpoint back onto a lease in place. This is for **archive
-checkpoints** (and Parallels VM snapshots) — a native image checkpoint cannot be
-restored in place; fork it instead.
+Restore brings a checkpoint back onto a lease in place. Archive checkpoints and
+Parallels VM snapshots support restore. Hyper-V production checkpoints also
+support provider-native restore, but only onto the original source lease with
+its exact local claim. Other native image or disk-snapshot checkpoints cannot
+be restored in place; fork them instead.
 
 ```sh
 # Archive checkpoint -> existing lease
 crabbox checkpoint restore chk_abc123 --id target-lease
 crabbox checkpoint restore chk_abc123 --id target-lease --clear=false
+
+# Hyper-V production checkpoint -> original source lease
+crabbox checkpoint restore chk_hyperv123 --provider hyperv --id source-lease
 
 # Parallels VM snapshot, in place
 crabbox checkpoint restore --provider parallels --id "macOS Tahoe" --snapshot "macOS 26.3.1 LATEST"
@@ -620,6 +626,7 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
                   and commands after --.
 --json            Print one fork as a JSON object or multiple forks as a JSON
                   array; incompatible with --dry-run.
+--wait-timeout <duration>  Fixed native Linux readiness wait (default 60m, maximum 4h).
 --id <vm>         Parallels source VM when forking from --snapshot.
 --snapshot <name> Parallels snapshot name or id for a direct fork.
 --clear           Clear the workdir before restoring an archive (default true).
@@ -840,6 +847,7 @@ See [Checkpoints](../features/checkpoints.md#lifecycle-and-expiry).
 | Daytona Linux (direct only) | Filesystem snapshot (`--no-reboot=false` for a running source) | Same filesystem snapshot |
 | Incus Linux containers (direct only, `--mode native`) | Private root-disk image | Same snapshot-to-image capture |
 | Parallels | VM snapshot | — |
+| Hyper-V Windows (direct only) | Production checkpoint, exported locally (`hyperv-vhdx`); also the `--mode auto` choice; create needs the guest password ([details](../providers/hyperv.md#checkpoints)) | not supported |
 | Cloudflare containers | Container filesystem snapshot | not supported |
 
 Brokered native checkpoints (through a configured coordinator) cover AWS
@@ -883,3 +891,51 @@ for consistency, ownership, and cleanup requirements.
 
 Any POSIX SSH-accessible lease (Linux, macOS, or Windows under WSL2). Portable
 across providers. Windows-native (non-WSL2) leases are not supported.
+
+### Continuing a slow fixed native Linux fork
+
+A native Linux fork with `--lease-id` waits up to **60 minutes** for real
+bootstrap readiness. `--wait-timeout <duration>` overrides this invocation's
+wait (greater than zero, at most `4h`); it requires `--lease-id`. It does not
+change the lease TTL, idle timeout, or enforced lifetime policy. Other fork
+modes retain their existing readiness limits and cleanup behavior.
+
+```sh
+crabbox checkpoint fork chk_example --provider aws \
+  --lease-id cbx_012345abcdef --slug test-fork --ttl 4h --idle-timeout 2h \
+  --wait-timeout 60m --json
+```
+
+Progress stays on stderr. On AWS, observations of the existing systemd boot
+owners identify phases such as `ownership-repair`, `bootstrap`, `cloud-final`,
+and `workspace-ready`. Missing diagnostics report an unknown phase. These
+observations never establish readiness: the current-boot marker and the normal
+readiness command must still pass. Elapsed time measures the current wait;
+`wait_deadline` is its effective local deadline. `observed_lease_deadline`, when
+available, is the expiry/policy stop time observed at acquisition, and can move
+as the existing coordinator heartbeat or an explicit extension updates policy.
+The existing live lease watch checks fresh expiry and enforced stop policy.
+Direct AWS acquisition checks its recorded expiry in its existing provider
+monitor. The readiness wait grants no lifetime extension; existing heartbeat
+behavior is unchanged.
+
+A local timeout exits `5` with `state=pending` when authenticated transport
+still works and readiness is outstanding, or `state=transport_failure` when
+the active transport probe cannot finish. An observed failed boot unit exits
+`5` with `state=bootstrap_failed`; investigate that phase before retrying.
+Lifetime exhaustion reports `state=lifetime_exhausted`. Cancellation preserves
+its original cause. Diagnostics retain the canonical lease identity throughout.
+
+For a pending timeout or interrupted wait, repeat **the same command**, with the
+same checkpoint, lease ID, slug, and lease options. The existing fixed acquisition
+reconciles and waits on that instance, then completes workdir relocation and
+normal checkpoint bookkeeping. Only the wait timeout may change. A changed
+intent, missing acquired resource, released lease, or lost authority fails
+closed. No timeout triggers replacement allocation or marks the guest ready.
+Use `inspect --id cbx_012345abcdef --json` for investigation, or explicit `stop`
+for cleanup. A fresh invocation still requires the checkpoint and its existing
+use admission to remain available.
+
+Success JSON is unchanged. A fork still waiting or failing inside acquisition
+emits no success object on stdout and returns a nonzero exit; its identity and
+recovery guidance are on stderr. This also applies with `--json`.

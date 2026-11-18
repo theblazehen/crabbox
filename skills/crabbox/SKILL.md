@@ -41,6 +41,15 @@ respond to an unsupported history/copy command by setting up another broker or
 managing Kubernetes pods directly. See `docs/providers/agent-sandbox.md` for the
 specific provider contract; other providers have their own files there.
 
+Native Windows guests run on `hyperv`, an `ssh-lease`/`local-vm` provider over a
+Generation 2 VHDX with SSH/sync, pause/resume, guarded checkpoint
+`fork`/`restore`, cleanup and `--desktop` WebVNC proof. It needs DHCP plus a
+known local administrator password from trusted user config or
+`CRABBOX_HYPERV_GUEST_PASSWORD`, never argv, repo config or logs. Run it with
+Hyper-V permissions as the invoking interactive user, never as `LocalSystem`;
+`doctor` is non-mutating inventory/feature proof only, not a boot or credential
+check. See `docs/providers/hyperv.md`.
+
 ## Normal retained-workspace loop
 
 **Default to one retained lease per session and repository.** Use `--keep` on

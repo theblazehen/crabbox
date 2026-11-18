@@ -114,6 +114,12 @@ CRABBOX_STATIC_ID=buildbox-slot-1 crabbox run --provider ssh \
   --static-host buildbox.local -- pnpm test
 ```
 
+Slots on one host share the host-derived slug unless each also sets
+`static.name`, so address a slot by its id: the stop command that `run`
+prints for recovery names the exact lease id. `crabbox list --provider ssh`
+shows only the configured target; `crabbox claims list` shows every slot
+recorded in the local Crabbox state.
+
 Do not use `--reclaim` to share a host. It adopts the other checkout's lease and
 its `<workRoot>/<lease id>` directory; checkouts of the same repository then
 share one remote workdir.
@@ -520,6 +526,14 @@ CRABBOX_SSH_PORT
 
 ## Host Requirements
 
+On Linux (including WSL2), native command supervision gives surviving process
+group members up to five seconds to handle TERM before escalating to KILL.
+Cleanup returns promptly once only its identity guard remains; normal command
+completion does not spend the full grace. Background children still receive the
+grace, and children that ignore TERM are killed at its deadline. If process
+membership cannot be confirmed, cleanup keeps the full grace and still requires
+confirmed group absence before reporting completion.
+
 POSIX hosts (Linux, macOS, WSL2) need:
 
 - SSH access for the configured user;
@@ -531,6 +545,8 @@ Windows native hosts need:
 
 - the OpenSSH server;
 - PowerShell;
+- `git` on the SSH account's `PATH` (the readiness probe runs `git --version`;
+  restart `sshd` after installing Git so new sessions see the updated `PATH`);
 - `tar` for archive sync;
 - VNC/browser tooling only if desktop flows are requested.
 

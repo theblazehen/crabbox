@@ -83,6 +83,38 @@ Keep the same endpoint and organization selector when reusing or stopping a leas
 For fixed-ID API creation, use an organization **ID**, rather than its display
 name, in `BOX_ORG`; omit it or use `personal` for personal billing.
 
+## Machine sizes
+
+`--type` selects a native Boat size: `small` (2 vCPU / 4 GB), `default`
+(4 vCPU / 8 GB), `large` (8 vCPU / 16 GB), or `xlarge` (16 vCPU / 32 GB).
+All sizes run Linux on x86_64. `xlarge` requires Boat's $100 plan or higher;
+Boat enforces account eligibility at creation.
+
+```sh
+crabbox warmup --provider boat --type large
+crabbox run --provider boat --class fast -- pnpm test
+```
+
+Crabbox classes map to the same native sizes:
+
+| Crabbox class | Boat size |
+| --- | --- |
+| `tiny`, `small` | `small` |
+| `standard` | `default` |
+| `fast` | `large` |
+| `large`, `beast` | `xlarge` |
+
+An explicit native type takes precedence over a class. Omitted sizing preserves
+Boat's `default` size. Fixed lease IDs bind the selected size: changing it requires
+a new lease ID. Existing default-sized fixed leases retain their original intent.
+Status reports the observed native size when Boat returns it; an absent size
+remains unknown. See [Boat machine sizes](https://docs.boat.dev/machines).
+
+Earlier versions ignored classes set in configuration or `CRABBOX_DEFAULT_CLASS`
+for this provider. Those settings now select a size. To resume an existing
+default-sized fixed lease, pass `--type default`; use a new lease ID to apply a
+different size. `stop --id <lease-id>` remains available with the configured class.
+
 ## Fixed lease IDs
 
 ```sh
@@ -98,6 +130,13 @@ the immutable Box ID; there is no caller-chosen native ID or create-time name.
 Crabbox stores the returned ID before readiness or SSH preparation. Identical
 replays look up that exact ID and verify its creation timestamp within the
 tolerance described below, plus its recorded scope. Changed intent, scope, or native identity produces `lease_id_conflict`.
+
+To reuse an owned fixed lease from a different checkout, pass `run --id <lease-id>
+--reclaim`. Crabbox verifies the same native Box before transferring local
+repository ownership; it retains the original create intent and lifecycle
+policy. Reclaim cannot move claims that have entered cleanup or whose recorded
+no-env policy is incompatible with the request. Status and stop do not transfer
+repository ownership.
 
 ### Native identity and timestamp tolerance
 
@@ -167,6 +206,9 @@ target: linux
 asciiBox:
   baseUrl: https://ascii.dev
   cliPath: box
+  noEnv: false
+  noSnapshots: false
+  visibility: "" # organization default; or private/shared
   workdir: /home/user/crabbox
 ```
 
@@ -175,6 +217,9 @@ Provider flags (legacy compatibility names):
 ```text
 --ascii-box-base-url
 --ascii-box-cli
+--ascii-box-no-env
+--ascii-box-no-snapshots
+--ascii-box-visibility
 --ascii-box-workdir
 ```
 
@@ -189,10 +234,56 @@ CRABBOX_ASCII_BOX_WORKDIR
 BOX_ORG
 ```
 
+## Account environment isolation
+
+Set `asciiBox.noEnv: true` or pass `--ascii-box-no-env` to request Boat's native
+`--no-env` / API `noEnv` behavior when creating a sandbox. It withholds account
+environment secrets and credentials. The default is `false`; omitted and explicit
+false preserve existing creation requests. `--ascii-box-no-env=false` overrides a
+configured true value. See [Boat environment access](https://docs.boat.dev/environments/access).
+
+The creation policy is bound to fixed IDs and recorded in the existing local
+claim. Reuse for execution requires a matching policy; a no-env request cannot
+reuse a legacy claim with no recorded policy. Existing legacy claims remain
+usable with the default false setting. Use a new lease ID to change the policy.
+Status and owned cleanup remain available after a mismatch.
+
+This option does not remove secrets subsequently copied into the sandbox or
+prove that its current disk or snapshots are secretless. Build reusable snapshots
+from a clean sandbox, control what is synchronized, and do not treat no-env as a
+snapshot sanitization operation.
+
+## Snapshot and visibility controls
+
+Set `asciiBox.noSnapshots: true` or pass `--ascii-box-no-snapshots` to disable
+Boat snapshots at creation. Stopping such a sandbox erases it; it cannot be
+resumed, forked, or saved as a snapshot. `false` leaves the provider default
+unchanged. `--ascii-box-no-snapshots=false` overrides a configured true value.
+
+Set `asciiBox.visibility: private` or `--ascii-box-visibility private` to limit
+an organization sandbox to its creator. `shared` permits organization members;
+an empty value leaves the organization default unchanged. These controls are
+independent of `noEnv`, which only controls account environment attachment.
+Select the organization with `BOX_ORG`. Omit visibility for personal sandboxes,
+which are already private; Crabbox rejects an explicit visibility before
+allocating a personal sandbox.
+See Boat's [creation contract](https://docs.boat.dev/api/reference/sandboxes/create-sandbox.md).
+
+Both ordinary and fixed-ID creation carry the selected controls. Before SSH
+access, Crabbox checks fresh provider metadata for explicitly requested settings;
+missing or mismatched metadata is an error. The local claim records the requested
+policy for reuse, not an attestation that the current sandbox is private.
+Changing that policy requires a new lease. Claims from earlier releases remain
+usable with the new settings omitted. Status and owned cleanup remain available even
+when the requested policy or current metadata does not match.
+
 ## Lifecycle
 
 The following describes ordinary, generated lease IDs. Fixed IDs use the shared
 engine described above and retain terminal records instead of removing claims.
+
+SSH uses the advertised endpoint, including when the sandbox has no public IP.
+Without an endpoint, Crabbox falls back to the reported IP on port 22.
 
 1. `crabbox warmup --provider boat` creates a sandbox through `box new --json`,
    verifies the original Box ID and creation timestamp (within ±5 seconds) through
@@ -358,7 +449,6 @@ existing deletion-operation evidence remain separate from display metadata.
 
 ## Limitations
 
-- `--class`, `--type`, image, size, and keep-alive options are not exposed
-  because the currently integrated CLI lifecycle surface does not document them.
+- Image selection and keep-alive options are not exposed by this adapter.
 - Desktop/VNC/code features are not advertised through Crabbox for this provider.
   Use the official Boat/ASCII tools directly for interactive sessions.

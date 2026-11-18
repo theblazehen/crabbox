@@ -27578,6 +27578,70 @@ describe("fleet lease identity and idle", () => {
     expect(storage.value("lease:cbx_abcdef123456")).toBeUndefined();
   });
 
+  it.each([
+    {
+      name: "omitted",
+      tailscaleTags: undefined,
+      defaults: "tag:ci,tag:staging",
+      tags: ["tag:ci", "tag:staging"],
+    },
+    {
+      name: "omitted with built-in tag allowed",
+      tailscaleTags: undefined,
+      defaults: "tag:crabbox,tag:ci",
+      tags: ["tag:crabbox", "tag:ci"],
+    },
+    { name: "empty", tailscaleTags: [], tags: ["tag:ci", "tag:staging"] },
+    { name: "allowed", tailscaleTags: ["tag:ci"], tags: ["tag:ci"] },
+  ])(
+    "resolves $name brokered Tailscale tags against the coordinator defaults",
+    async ({ tailscaleTags, defaults, tags }) => {
+      const storage = new MemoryStorage();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url === "https://api.tailscale.com/api/v2/oauth/token") {
+            return jsonResponse({ access_token: "oauth-token" });
+          }
+          if (url === "https://api.tailscale.com/api/v2/tailnet/-/keys") {
+            return jsonResponse({ key: "tskey-oneoff" });
+          }
+          return jsonResponse({ message: `unexpected ${url}` }, 500);
+        }),
+      );
+      const fleet = testFleet(
+        storage,
+        { hetzner: fakeProvider() },
+        {
+          CRABBOX_TAILSCALE_CLIENT_ID: "client-id",
+          CRABBOX_TAILSCALE_CLIENT_SECRET: "client-secret",
+          CRABBOX_TAILSCALE_TAGS: defaults ?? "tag:ci,tag:staging",
+        },
+      );
+      const create = await fleet.fetch(
+        request("POST", "/v1/leases", {
+          body: {
+            leaseID: "cbx_abcdef123456",
+            provider: "hetzner",
+            tailscale: true,
+            tailscaleTags,
+            sshPublicKey: "ssh-ed25519 test",
+          },
+        }),
+      );
+      expect(create.status).toBe(201);
+      const { lease } = (await create.json()) as { lease: LeaseRecord };
+      expect(lease.tailscale?.tags).toEqual(tags);
+      const keyCall = vi
+        .mocked(fetch)
+        .mock.calls.find(([input]) => String(input).endsWith("/tailnet/-/keys"));
+      expect(keyCall).toBeDefined();
+      const keyBody = JSON.parse(String(keyCall?.[1]?.body));
+      expect(keyBody.capabilities.devices.create.tags).toEqual(tags);
+    },
+  );
+
   it("returns Tailscale OAuth failures before provisioning and preserves the unbound create attempt", async () => {
     const storage = new MemoryStorage();
     const leaseID = "cbx_abcdef123456";
@@ -62466,6 +62530,80 @@ describe("coordinator lease lifetime policy", () => {
     expect(again.status).toBe(409);
     expect(await again.json()).toMatchObject({ error: "lease_extension_not_advancing" });
   });
+  it("loads an existing AWS record after a policy-only upgrade without rewriting TTL or activity", async () => {
+    const { fleet: before, storage, lease } = fixture({ provider: "aws", ttlSeconds: 14400 });
+    const previous = await before.fetch(request("GET", `/v1/leases/${lease.id}`, { headers }));
+    expect(await previous.json()).toMatchObject({
+      lease: { ttlSeconds: 14400, leasePolicy: { maxTTLSeconds: 14400 } },
+    });
+    const recorded = structuredClone(storage.value<LeaseRecord>(`lease:${lease.id}`));
+    const after = testFleet(
+      storage,
+      {},
+      {
+        CRABBOX_LEASE_POLICY_OVERRIDES: JSON.stringify({
+          owners: {
+            [lease.owner]: { maxTTLSeconds: 43200 },
+          },
+        }),
+      },
+    );
+    const current = await after.fetch(request("GET", `/v1/leases/${lease.id}`, { headers }));
+    expect(current.status).toBe(200);
+    expect(await current.json()).toMatchObject({
+      lease: {
+        ttlSeconds: 14400,
+        idleTimeoutSeconds: lease.idleTimeoutSeconds,
+        createdAt: lease.createdAt,
+        lastTouchedAt: lease.lastTouchedAt,
+        leasePolicy: { maxTTLSeconds: 43200, runtimeExtension: true },
+      },
+    });
+    expect(storage.value<LeaseRecord>(`lease:${lease.id}`)).toEqual(recorded);
+  });
+  it("extends only the scoped owner to twelve hours without changing the idle clock", async () => {
+    const { fleet, lease, storage } = fixture(
+      { provider: "aws", ttlSeconds: 14400 },
+      {
+        CRABBOX_LEASE_POLICY_OVERRIDES: JSON.stringify({
+          owners: {
+            [headers["x-crabbox-owner"]]: { maxTTLSeconds: 43200 },
+          },
+        }),
+      },
+    );
+    const denied = await fleet.fetch(
+      request("POST", `/v1/leases/${lease.id}/extend`, {
+        headers: { ...headers, "x-crabbox-owner": "bob@example.com" },
+        body: { ttlSeconds: 43200 },
+      }),
+    );
+    expect([403, 404]).toContain(denied.status);
+    expect(storage.value<LeaseRecord>(`lease:${lease.id}`)?.ttlSeconds).toBe(14400);
+    const extended = await fleet.fetch(
+      request("POST", `/v1/leases/${lease.id}/extend`, {
+        headers,
+        body: { ttlSeconds: 86400 },
+      }),
+    );
+    expect(extended.status).toBe(200);
+    expect(await extended.json()).toMatchObject({
+      lease: {
+        ttlSeconds: 43200,
+        idleTimeoutSeconds: lease.idleTimeoutSeconds,
+        lastTouchedAt: lease.lastTouchedAt,
+        leasePolicy: { maxTTLSeconds: 43200, runtimeExtension: true },
+      },
+    });
+    const again = await fleet.fetch(
+      request("POST", `/v1/leases/${lease.id}/extend`, {
+        headers,
+        body: { ttlSeconds: 86400 },
+      }),
+    );
+    expect(again.status).toBe(409);
+    expect(await again.json()).toMatchObject({ error: "lease_extension_not_advancing" });
+  });
   it("refuses another owner and allows an authenticated admin", async () => {
     const { fleet, lease } = fixture();
     const denied = await fleet.fetch(
@@ -62888,6 +63026,48 @@ describe("coordinator lease lifetime policy", () => {
 
 describe("lease policy creation", () => {
   const headers = { "x-crabbox-owner": "alice@example.com", "x-crabbox-org": "example-org" };
+  it.each([
+    ["alice@example.com", 43200],
+    ["bob@example.com", 14400],
+  ] as const)(
+    "applies only the scoped maximum before AWS creation for %s",
+    async (owner, maximum) => {
+      let allocated: LeaseConfig | undefined;
+      const fleet = testFleet(
+        new MemoryStorage(),
+        {
+          aws: fakeProvider(
+            (config) => {
+              allocated = config;
+            },
+            { provider: "aws" },
+          ),
+        },
+        {
+          CRABBOX_LEASE_POLICY_OVERRIDES: JSON.stringify({
+            owners: {
+              [headers["x-crabbox-owner"]]: { maxTTLSeconds: 43200 },
+            },
+          }),
+        },
+      );
+      const response = await fleet.fetch(
+        request("POST", "/v1/leases", {
+          headers: { ...headers, "x-crabbox-owner": owner },
+          body: { provider: "aws", sshPublicKey: "ssh-ed25519 test", ttlSeconds: 86400 },
+        }),
+      );
+      expect(response.status).toBe(201);
+      expect(allocated).toMatchObject({ ttlSeconds: maximum, idleTimeoutSeconds: 1800 });
+      expect(await response.json()).toMatchObject({
+        lease: {
+          ttlSeconds: maximum,
+          idleTimeoutSeconds: 1800,
+          leasePolicy: { maxTTLSeconds: maximum, runtimeExtension: true },
+        },
+      });
+    },
+  );
   it.each(["hetzner", "daytona"] as const)(
     "clamps %s create before provider allocation",
     async (provider) => {

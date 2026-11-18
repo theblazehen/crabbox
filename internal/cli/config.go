@@ -18,6 +18,7 @@ import (
 )
 
 type Config struct {
+	claimLegacyRoot               string
 	ManagedHost                   string
 	HostCapabilities              []string
 	DirectLeases                  string
@@ -191,6 +192,7 @@ type Config struct {
 	Freestyle                     FreestyleConfig
 	Tenki                         TenkiConfig
 	Tensorlake                    TensorlakeConfig
+	WarpBuild                     WarpBuildConfig
 	Cua                           CuaConfig
 	OpenComputer                  OpenComputerConfig
 	CodeSandbox                   CodeSandboxConfig
@@ -411,10 +413,13 @@ type ExternalDesktopConfig struct {
 }
 
 type AsciiBoxConfig struct {
-	APIKey  string
-	BaseURL string
-	CLIPath string
-	Workdir string
+	NoSnapshots bool
+	Visibility  string
+	NoEnv       bool
+	APIKey      string
+	BaseURL     string
+	CLIPath     string
+	Workdir     string
 }
 
 const DefaultCloudflareDynamicWorkersCompatibilityDate = "2026-06-12"
@@ -1687,6 +1692,7 @@ func baseConfig() Config {
 		Freestyle:         defaultFreestyleConfig(),
 		Tenki:             defaultTenkiConfig(),
 		Tensorlake:        defaultTensorlakeConfig(),
+		WarpBuild:         defaultWarpBuildConfig(),
 		Cua:               defaultCuaConfig(),
 		OpenComputer:      defaultOpenComputerConfig(),
 		CodeSandbox:       defaultCodeSandboxConfig(),
@@ -1845,6 +1851,7 @@ type fileConfig struct {
 	Freestyle                *fileFreestyleConfig                `yaml:"freestyle,omitempty"`
 	Tenki                    *fileTenkiConfig                    `yaml:"tenki,omitempty"`
 	Tensorlake               *fileTensorlakeConfig               `yaml:"tensorlake,omitempty"`
+	WarpBuild                *fileWarpBuildConfig                `yaml:"warpbuild,omitempty"`
 	Cua                      *fileCuaConfig                      `yaml:"cua,omitempty"`
 	OpenComputer             *fileOpenComputerConfig             `yaml:"openComputer,omitempty"`
 	CodeSandbox              *fileCodeSandboxConfig              `yaml:"codeSandbox,omitempty"`
@@ -2041,9 +2048,12 @@ type fileExternalConfig struct {
 }
 
 type fileAsciiBoxConfig struct {
-	BaseURL string `yaml:"baseUrl,omitempty"`
-	CLIPath string `yaml:"cliPath,omitempty"`
-	Workdir string `yaml:"workdir,omitempty"`
+	NoSnapshots *bool   `yaml:"noSnapshots,omitempty"`
+	Visibility  *string `yaml:"visibility,omitempty"`
+	NoEnv       *bool   `yaml:"noEnv,omitempty"`
+	BaseURL     string  `yaml:"baseUrl,omitempty"`
+	CLIPath     string  `yaml:"cliPath,omitempty"`
+	Workdir     string  `yaml:"workdir,omitempty"`
 }
 
 type fileCloudflareDynamicWorkersConfig struct {
@@ -3414,6 +3424,13 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 	}
 
 	{
+		applied, err := cfg.WarpBuild.applyFile(file.WarpBuild, trusted)
+		recordConfigInput(cfg, "warpbuild", inputSource, applied.InputAccepted)
+		if err != nil {
+			return err
+		}
+	}
+	{
 		applied, err := cfg.Tensorlake.applyFile(file.Tensorlake)
 		recordConfigInput(cfg, "tensorlake", inputSource, applied.InputAccepted)
 		if applied.APIURL {
@@ -3524,6 +3541,18 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 		}
 	}
 	if file.AsciiBox != nil {
+		if file.AsciiBox.NoSnapshots != nil {
+			cfg.AsciiBox.NoSnapshots = *file.AsciiBox.NoSnapshots
+			recordConfigInput(cfg, "ascii-box", inputSource, true)
+		}
+		if file.AsciiBox.Visibility != nil {
+			cfg.AsciiBox.Visibility = *file.AsciiBox.Visibility
+			recordConfigInput(cfg, "ascii-box", inputSource, true)
+		}
+		if file.AsciiBox.NoEnv != nil {
+			cfg.AsciiBox.NoEnv = *file.AsciiBox.NoEnv
+			recordConfigInput(cfg, "ascii-box", inputSource, true)
+		}
 		if file.AsciiBox.BaseURL != "" {
 			cfg.AsciiBox.BaseURL = file.AsciiBox.BaseURL
 			recordConfigInput(cfg, "ascii-box", inputSource, true)
@@ -4706,6 +4735,13 @@ func applyEnv(cfg *Config) error {
 		return err
 	}
 
+	{
+		applied, err := cfg.WarpBuild.applyEnv()
+		recordConfigInput(cfg, "warpbuild", configInputEnvironment, applied.InputAccepted)
+		if err != nil {
+			return err
+		}
+	}
 	{
 		applied, err := cfg.Tensorlake.applyEnv()
 		recordConfigInput(cfg, "tensorlake", configInputEnvironment, applied.InputAccepted)

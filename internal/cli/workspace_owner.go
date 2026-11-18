@@ -210,6 +210,15 @@ const (
 
 type workspaceOwnerCleanupRunner func(context.Context, SSHTarget, string) error
 
+type workspaceCommandSetupKey struct{}
+
+// workspaceCommandSetup returns the no-sync preparation command the caller
+// folded into the workload command, or "" when preparation runs on its own.
+func workspaceCommandSetup(ctx context.Context) string {
+	setup, _ := ctx.Value(workspaceCommandSetupKey{}).(string)
+	return setup
+}
+
 func prepareWorkspaceOwnerRemote(ctx context.Context, target SSHTarget, remote string, inputSize *int64) (workspaceOwnerRemotePreparation, error) {
 	owner := workspaceOwnerFromContext(ctx)
 	if owner == nil {
@@ -229,8 +238,9 @@ func prepareWorkspaceOwnerRemote(ctx context.Context, target SSHTarget, remote s
 		// replay them. Live input (size -1) must remain attached to the user
 		// command: staging it would block on terminal EOF before the command runs.
 		stageInput := inputSize != nil && *inputSize >= 0
+		setup := workspaceCommandSetup(ctx)
 		return workspaceOwnerRemotePreparation{
-			command:     owner.wrapPOSIXCommand(remote, stageInput, marker),
+			command:     remoteWorkspaceOwnerPOSIXLauncher(owner.key, owner.token, remoteWorkspaceOwnerPOSIXWitnessScriptWithSetup(owner.key, owner.token, remote, marker, setup, stageInput), marker),
 			setupMarker: marker,
 		}, nil
 	}
@@ -288,6 +298,11 @@ func stageWorkspaceOwnerWindowsWitness(ctx context.Context, target SSHTarget, ow
 
 func runWorkspaceOwnerBackgroundOutput(ctx context.Context, target SSHTarget, owner *workspaceOwner, remote string) (string, error) {
 	ctx = contextWithoutWorkspaceOwner(ctx)
+	if target.TargetOS == targetLinux {
+		// Intentional background helpers retain their existing owner/witness,
+		// not the foreground native command group.
+		ctx = contextWithoutNativeRuntimeAdmission(ctx)
+	}
 	if owner == nil {
 		return runSSHOutput(ctx, target, remote)
 	}
@@ -1105,10 +1120,17 @@ func remoteWorkspaceOwnerPOSIXSetupDiagnostic(marker string) string {
 }
 
 func remoteWorkspaceOwnerPOSIXWitnessScript(key, token, remote, setupMarker string, preserveInput ...bool) string {
+	return remoteWorkspaceOwnerPOSIXWitnessScriptWithSetup(key, token, remote, setupMarker, "", preserveInput...)
+}
+
+func remoteWorkspaceOwnerPOSIXWitnessScriptWithSetup(key, token, remote, setupMarker, setup string, preserveInput ...bool) string {
 	diagnostic := remoteWorkspaceOwnerPOSIXSetupDiagnostic(setupMarker)
 	started := ""
 	if setupMarker != "" {
 		started = "printf '%s\\n' " + shellQuote(setupMarker+" started") + " >&2 || setup_failed handoff\n"
+	}
+	if setup != "" {
+		started = "/bin/sh -c " + shellQuote(setup) + " || setup_failed workspace\n" + started
 	}
 	inputSetup := ""
 	inputRedirect := ""

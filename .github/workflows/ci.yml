@@ -116,6 +116,9 @@ jobs:
           mapfile -t packages < <(printf '%s\n' "$packages" | sed '\|^github.com/openclaw/crabbox/internal/cli$|d')
           go test -race -count=1 -timeout=10m "${packages[@]}"
 
+      - name: Test Hyper-V restore claim loss between effects
+        run: go test -race -count=1 -timeout=2m -tags=crabbox_claim_fence_probe ./internal/providers/hyperv -run '^TestRestoreNativeCheckpointStopsAtInterFenceClaimChanges$'
+
       - name: Require executed Linux supervision fixtures
         shell: bash
         run: |
@@ -900,6 +903,9 @@ jobs:
         env:
           CRABBOX_TEST_RUST_UV_DOWNLOAD: "1"
         run: node --test --test-name-pattern='^reviewed Linux Rust and uv archives' scripts/linux-rust-uv.test.js
+
+      - name: Install pinned coordinator deployment tooling
+        run: npm ci --prefix worker --ignore-scripts
 
       - name: Test
         run: node --test scripts/*.test.js scripts/*.test.mjs

@@ -6,8 +6,8 @@ Read when:
 - debugging provider-specific provisioning, sync, or command execution;
 - changing provider registration, flags, config, or backend behavior.
 
-Crabbox's catalog contains **81 built-in providers plus the `external` plugin
-contract** (82 entries). The compiled target lists include Linux, macOS, native
+Crabbox's catalog contains **85 built-in providers plus the `external` plugin
+contract** (86 entries). The compiled target lists include Linux, macOS, native
 Windows, WSL2, and a Worker-module runtime. Support varies by provider: a catalog
 entry is not a promise of credentials, capacity, desktop access, or arbitrary
 shell execution. Start with `crabbox providers recommend`, then inspect the
@@ -75,7 +75,7 @@ Remote providers with environment API-key or bearer-token auth include
 `opencomputer`, `e2b`, `blaxel`, `codesandbox`, `cloudflare`,
 `cloudflare-sandbox`, `cloudflare-dynamic-workers`, `cloud-run-sandbox`,
 `crownest`, `freestyle`, `islo`, `morph`, `opensandbox`, `orgo`, `smolvm`,
-`sprites`, `superserve`, `tensorlake`, `upstash-box`, `vercel-sandbox`, `wandb`,
+`sprites`, `superserve`, `tensorlake`, `upstash-box`, `vercel-sandbox`, `wandb`, `warpbuild`,
 and service-control
 providers such as `railway`, `fastapi-cloud`, and `unikraft-cloud`.
 
@@ -94,10 +94,10 @@ coordinator credential boundary.
 
 This table combines the live provider spec compiled into the CLI with curated
 selection metadata. Regenerate it with `node scripts/generate-provider-matrix.mjs`.
-`scripts/check-docs.sh` fails when provider registration, metadata, docs paths, or
-this generated table drift.
+`scripts/check-docs.sh` fails when provider registration, metadata, docs paths,
+stated counts, or this generated table drift.
 
-Current built-in surface: 85 providers (49 SSH lease, 32 delegated run, 4 service control).
+Current catalog: 86 entries, including `external` (49 SSH lease, 33 delegated run, 4 service control).
 
 Access terms:
 
@@ -144,7 +144,7 @@ Access terms:
 | [github-codespaces](github-codespaces.md) (`codespaces`, `gh-codespaces`) | built-in; `ssh-lease` · direct-cloud | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup`, `fixed-lease-id` | `linux`; GitHub Codespace | `provider-managed`; GPU: no | GitHub Codespaces; delete or stop claim-owned Codespace | Repository-backed Linux devcontainer over SSH | Requires gh auth, Codespaces quota, and an SSH-enabled devcontainer |
 | [hetzner](hetzner.md) | built-in; `ssh-lease` · brokerable-cloud | Crabbox-managed SSH; `crabbox-sync` · coordinator optional; features: `ssh`, `crabbox-sync`, `cleanup`, `desktop`, `browser`, `code`, `tailscale`, `workspace-checkpoint`, `workspace-fork`, `provider-snapshot`, `fixed-lease-id` | `linux`; Hetzner Cloud server | `cloud`; GPU: no | Crabbox or coordinator; server delete | Cost-effective high-CPU Linux VM | Linux-only and capacity varies by location |
 | [hostinger](hostinger.md) | built-in; `ssh-lease` · direct-cloud | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup` | `linux`; Hostinger VPS | `cloud`; GPU: no | Hostinger subscription; stop only | Direct Linux VPS with persistent subscription | Purchase needs opt-in and release does not cancel billing |
-| [hyperv](hyperv.md) | built-in; `ssh-lease` · local-vm | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup` | `windows/normal`; Microsoft Hyper-V VM | `local`; GPU: no | Crabbox; VM delete | Local native Windows VM | Windows host with Hyper-V required |
+| [hyperv](hyperv.md) | built-in; `ssh-lease` · local-vm | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `desktop`, `browser`, `cleanup`, `pause-resume`, `workspace-checkpoint`, `workspace-fork`, `workspace-restore` | `windows/normal`; Microsoft Hyper-V VM | `local`; GPU: no | Crabbox; VM delete | Local native Windows Generation 2 VM | Windows Hyper-V host, VM-management permissions, and Windows-ready VHDX required |
 | [incus](incus.md) | built-in; `ssh-lease` · self-hosted-virtualization | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup`, `workspace-checkpoint`, `workspace-fork`, `fixed-lease-id` | `linux`; Incus container or VM | `self-hosted`; GPU: optional | Crabbox; instance delete | Self-hosted Linux containers or VMs | Accessible Incus daemon required; native checkpoints capture container root disks only |
 | [islo](islo.md) | built-in; `delegated-run` · delegated-sandbox | Provider-specific SSH; `provider-owned` · direct only; features: `ssh`, `url-bridge`, `run-session`, `tailscale`, `pause-resume`, `run-downloads`, `lease-heartbeat` | `linux`; Islo sandbox | `provider-managed`; GPU: unknown | Islo; sandbox delete | Hosted delegated execution with keep, pause, and SSH helper | SSH feature is not Crabbox-managed sync/run |
 | [kubevirt](kubevirt.md) (`kubernetes-vm`) | built-in; `ssh-lease` · self-hosted-virtualization | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup`, `desktop`, `browser`, `code` | `linux`; KubeVirt VirtualMachine | `self-hosted`; GPU: optional | Crabbox on Kubernetes; VirtualMachine delete | Kubernetes-hosted Linux VM | Needs KubeVirt, virtctl, and an SSH-ready template |
@@ -190,6 +190,7 @@ Access terms:
 | [vercel-sandbox](vercel-sandbox.md) | built-in; `delegated-run` · delegated-sandbox | No SSH; `archive-sync` · direct only; features: `archive-sync`, `cleanup`, `run-session` | `linux`; Vercel Sandbox microVM | `provider-managed`; GPU: no | Vercel Sandbox; sandbox delete | Hosted delegated Linux microVM execution | Requires SDK bridge support and Vercel Sandbox auth |
 | [vultr](vultr.md) | built-in; `ssh-lease` · direct-cloud | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup` | `linux`; Vultr instance | `cloud`; GPU: optional | Crabbox; instance and key delete | Direct Linux VM on Vultr | Direct-only; firewall groups and VPCs must already exist |
 | [wandb](wandb.md) (`weights-and-biases`) | built-in; `delegated-run` · gpu-cloud | No SSH; `provider-owned` · direct only; features: `run-session` | `linux`; Weights & Biases run sandbox | `provider-managed`; GPU: optional | Weights & Biases; run termination | Delegated ML or GPU run environment | Execution follows the W&B run contract |
+| [warpbuild](warpbuild.md) | built-in; `delegated-run` · delegated-sandbox | No SSH; `archive-sync` · direct only; features: `archive-sync`, `run-session` | `macos`; WarpBuild macOS sandbox | `provider-managed`; GPU: unknown | WarpBuild standalone sandbox; explicit sandbox deletion | Standalone macOS command execution and resumable workspaces | Seven-day native lifetime; no configurable provider TTL or idle timeout; disconnect does not confirm command termination |
 | [windows-sandbox](windows-sandbox.md) (`wsb`, `windows-sandbox-provider`) | built-in; `delegated-run` · local-sandbox | No SSH; `archive-sync` · direct only; features: `archive-sync` | `windows/normal`; Windows Sandbox | `local`; GPU: optional | Windows host; sandbox close | Disposable native Windows command execution | Requires Windows Sandbox and local host automation |
 | [xcp-ng](xcp-ng.md) | built-in; `ssh-lease` · self-hosted-virtualization | Crabbox-managed SSH; `crabbox-sync` · direct only; features: `ssh`, `crabbox-sync`, `cleanup` | `linux`; XCP-ng VM clone | `self-hosted`; GPU: optional | Crabbox; VM delete | Self-hosted Linux VM pool over XAPI | Normal leases require prepared Linux templates |
 
@@ -205,7 +206,7 @@ but also supports coordinator-managed leases.
 | `brokerable-cloud` | 4 | [aws](aws.md), [azure](azure.md), [gcp](gcp.md), [hetzner](hetzner.md) |
 | `byo-ssh` | 2 | [ssh](ssh.md), [ssh-host](ssh-host.md) |
 | `ci-proof-runner` | 2 | [blacksmith-testbox](blacksmith-testbox.md), [semaphore](semaphore.md) |
-| `delegated-sandbox` | 26 | [agent-sandbox](agent-sandbox.md), [agent-sandbox-ssh](agent-sandbox.md), [aws-lambda-microvm](aws-lambda-microvm.md), [azure-dynamic-sessions](azure-dynamic-sessions.md), [azure-sandbox](azure-sandbox.md), [blaxel](blaxel.md), [cloud-run-sandbox](cloud-run-sandbox.md), [cloudflare](cloudflare.md), [cloudflare-dynamic-workers](cloudflare-dynamic-workers.md), [cloudflare-sandbox](cloudflare-sandbox.md), [codesandbox](codesandbox.md), [crownest](crownest.md), [cubesandbox](cubesandbox.md), [e2b](e2b.md), [freestyle](freestyle.md), [islo](islo.md), [modal](modal.md), [nomad](nomad.md), [opencomputer](opencomputer.md), [opensandbox](opensandbox.md), [orgo](orgo.md), [smolvm](smolvm.md), [superserve](superserve.md), [tensorlake](tensorlake.md), [upstash-box](upstash-box.md), [vercel-sandbox](vercel-sandbox.md) |
+| `delegated-sandbox` | 27 | [agent-sandbox](agent-sandbox.md), [agent-sandbox-ssh](agent-sandbox.md), [aws-lambda-microvm](aws-lambda-microvm.md), [azure-dynamic-sessions](azure-dynamic-sessions.md), [azure-sandbox](azure-sandbox.md), [blaxel](blaxel.md), [cloud-run-sandbox](cloud-run-sandbox.md), [cloudflare](cloudflare.md), [cloudflare-dynamic-workers](cloudflare-dynamic-workers.md), [cloudflare-sandbox](cloudflare-sandbox.md), [codesandbox](codesandbox.md), [crownest](crownest.md), [cubesandbox](cubesandbox.md), [e2b](e2b.md), [freestyle](freestyle.md), [islo](islo.md), [modal](modal.md), [nomad](nomad.md), [opencomputer](opencomputer.md), [opensandbox](opensandbox.md), [orgo](orgo.md), [smolvm](smolvm.md), [superserve](superserve.md), [tensorlake](tensorlake.md), [upstash-box](upstash-box.md), [vercel-sandbox](vercel-sandbox.md), [warpbuild](warpbuild.md) |
 | `direct-cloud` | 22 | [ascii-box](ascii-box.md), [boxd](boxd.md), [coder](coder.md), [daytona](daytona.md), [digitalocean](digitalocean.md), [exe-dev](exe-dev.md), [github-codespaces](github-codespaces.md), [hostinger](hostinger.md), [linode](linode.md), [machine0](machine0.md), [morph](morph.md), [namespace-devbox](namespace-devbox.md), [namespace-instance](namespace-instance.md), [nebius](nebius.md), [ovh](ovh.md), [phala](phala.md), [scaleway](scaleway.md), [sealos-devbox](sealos-devbox.md), [sprites](sprites.md), [tencentcloud](tencentcloud.md), [tenki](tenki.md), [vultr](vultr.md) |
 | `external-provider` | 1 | [external](external.md) |
 | `gpu-cloud` | 5 | [lambda](lambda.md), [nvidia-brev](nvidia-brev.md), [runpod](runpod.md), [vast](vast.md), [wandb](wandb.md) |
@@ -217,8 +218,8 @@ but also supports coordinator-managed leases.
 
 <!-- END GENERATED PROVIDER MATRIX -->
 
-At this revision, target declarations cover Linux on 75 entries, macOS on 8,
-native Windows (`windows/normal`) on 9, and WSL2 (`windows/wsl2`) on 5. These
+At this revision, target declarations cover Linux on 79 entries, macOS on 9,
+native Windows (`windows/normal`) on 10, and WSL2 (`windows/wsl2`) on 5. These
 overlap; they are not separate provider totals. Use `--target` filters to see
 the current binary's list. `cloudflare-dynamic-workers` supplies `worker-runtime`
 instead of a Linux shell.
