@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -403,8 +404,13 @@ func downloadRemoteFileWithLimits(ctx context.Context, target SSHTarget, workdir
 	}()
 	diagnostic := newSynchronizedBuffer(remoteDownloadDiagnosticMaxBytes)
 	code, streamErr := runSSHStreamResult(ctx, target, remoteDownloadBase64Command(target, workdir, spec.Remote), nil, writer, &diagnostic)
-	if streamErr != nil {
-		_ = writer.CloseWithError(streamErr)
+	// The transport reports a child it saw exit by its status, mapping a signaled
+	// child to 128+signal (SIGTERM 143, SIGKILL 137) instead of -1. Report that
+	// status rather than the raw wait error the staging reader sees through the
+	// pipe, so a signaled download names the status the run path would report.
+	remoteErr := remoteDownloadStreamError(code, streamErr)
+	if remoteErr != nil {
+		_ = writer.CloseWithError(remoteErr)
 	} else {
 		_ = writer.Close()
 	}
@@ -414,11 +420,16 @@ func downloadRemoteFileWithLimits(ctx context.Context, target SSHTarget, workdir
 		if errors.As(staged.err, &localErr) {
 			return 0, spec.Local, Exit(2, "download %s: write %s: %v", spec.Remote, spec.Local, localErr)
 		}
-		return 0, spec.Local, Exit(7, "download %s: %v", spec.Remote, staged.err)
+		if remoteErr == nil {
+			return 0, spec.Local, Exit(7, "download %s: %v", spec.Remote, staged.err)
+		}
+		if !errors.Is(staged.err, remoteErr) {
+			// The staging failure is independent of the stream failure; keep it.
+			remoteErr = fmt.Errorf("%w: %v", remoteErr, staged.err)
+		}
 	}
-	if streamErr != nil || code != 0 {
+	if remoteErr != nil {
 		staged.stage.remove()
-		remoteErr := firstNonNil(streamErr, fmt.Errorf("remote command exited %d", code))
 		if detail := strings.TrimSpace(diagnostic.String()); detail != "" {
 			return 0, spec.Local, Exit(7, "download %s: %v: %s", spec.Remote, remoteErr, detail)
 		}
@@ -581,6 +592,21 @@ func (reader *contextRunDownloadReader) Read(data []byte) (int, error) {
 		return 0, err
 	}
 	return reader.reader.Read(data)
+}
+
+// remoteDownloadStreamError reports a failed SSH stream. A child the transport
+// saw exit is reported by its status, which the transport maps to 128+signal
+// for a signaled child, matching how the run path reports remote commands. A
+// transport failure keeps its own error, which no status can express.
+func remoteDownloadStreamError(code int, streamErr error) error {
+	if streamErr == nil && code == 0 {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if streamErr != nil && errors.As(streamErr, &exitErr) && code > 0 {
+		return fmt.Errorf("remote command exited %d", code)
+	}
+	return firstNonNil(streamErr, fmt.Errorf("remote command exited %d", code))
 }
 
 func firstNonNil(primary, fallback error) error {

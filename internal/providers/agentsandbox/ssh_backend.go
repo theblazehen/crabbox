@@ -215,7 +215,7 @@ func (b *sshLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 	if err := authorizeClaimScope(lifecycle.cfg, claim); err != nil {
 		return core.LeaseTarget{}, err
 	}
-	if err := authorizeAgentSandboxRepoClaim(claim, req.Repo.Root, req.Reclaim); err != nil {
+	if err := authorizeAgentSandboxRepoClaim(claim, req.Repo.Root, req.Reclaim, req.Repo.LegacyRoot); err != nil {
 		return core.LeaseTarget{}, err
 	}
 	lease := sshLeaseFromClaim(claim)
