@@ -54,14 +54,17 @@ belong in internal artifacts, outside this package and public build outputs.
 
 The private first-walk authority performs fixed EC2 DryRun checks after its
 existing request and ledger validation, before forward launch, capture, copy,
-attachment, mapping and tag effects. Before launch it also tests unchanged,
-missing, changed and removed ownership tags against its already-owned physical
-key. Callers cannot select probes, actions or DryRun parameters.
+attachment and mapping effects. Ownership tags are supplied only at resource
+creation. Before launch it tests standalone restatement, missing, changed and
+removed ownership tags against its already-owned physical key; all thirteen
+standalone mutation/removal probes must return `UnauthorizedOperation`. Callers
+cannot select probes, actions or DryRun parameters, and candidate requests cannot
+proxy standalone `CreateTags` or `DeleteTags`.
 
 Each run permits at most 32 persisted checks, with one DryRun per request
-digest and no retries. The unchanged-tag check first reads the ledger's exact
-key ID, verifies its name and all four ownership tags, then performs its existing
-DryRun. Both requests share one ten-second timeout and the original forward
+digest and no retries. The `tags-immutable` check first reads the ledger's exact
+key ID, verifies its name and all four ownership tags, then performs the fixed
+negative DryRun. Both requests share one ten-second timeout and the original forward
 deadline. Key metadata is capped at 64 KiB and error XML at 16 KiB.
 
 Additive `keyObservation` evidence records a resource digest and fixed-order
@@ -96,7 +99,7 @@ rejects candidate AWS requests and first-walk preparation, while the temporary
 session policy independently denies compute and storage effects. Only trusted
 controller code constructs tagging probes; IAM is not a DryRun-only boundary.
 
-This mode requires the distinct `key-tag-authorization-aws-session/v1` session
+This mode requires the distinct `key-tag-authorization-aws-session/v2` session
 profile with matching handoff and recovery identity. It keeps the existing
 130/150/270-minute lifecycle offsets; the diagnostic itself has a ten-minute
 forward-work bound and does not reopen after an uncertain result. Preserve the
@@ -105,3 +108,100 @@ requires all thirteen checks and authoritative zero-residue finalization. It is
 an authorization diagnostic, not evidence of first-walk performance improvement.
 Installation, namespace-preserving deployment and execution require separate
 operator admission; merging tooling performs none of those actions.
+
+
+## Creation-only ownership contract
+
+Fresh private first-walk and key-authorization identities require
+`taggingContract: "creation-only/v1"`. The field is bound through service props,
+deployment identity, registry, attestation and recovery binding. Missing or
+unknown values cannot enroll or resume forward work. Existing records without
+this field retain their exact identity for finalization and retirement; recovery
+must not rewrite them into the new contract.
+
+The reusable permission policy v2 requires matching run, owner, source and expiry
+request tags on each created resource. Dependent `ec2:CreateTags` is allowed only
+with the documented `ec2:CreateAction` contexts for `ImportKeyPair`, `RunInstances`,
+`CreateImage` and `CreateVolume`; standalone tag writes and removals are denied.
+Creating operations and exact ownership readback remain mandatory. Negative
+DryRuns alone do not establish successful creation, KMS access or lifecycle
+completion for every resource type.
+
+Fresh sessions use `first-walk-aws-session/v2` or the key profile above. The
+compact session policy retains `CreateTags` for dependent creation authorization
+and the forward-work cutoff. Legacy v1 profiles cannot issue forward sessions;
+they are accepted only by the permanently forward-denied cleanup route for an
+original legacy owner. Session and stored tagging contracts must match. The
+existing permissions boundary, fixed resources, trusted issuer, resource limits
+and independent recovery window remain required.
+
+Install permission changes and update the private authority only through a
+separately admitted migration with no active forward or recovery dependency.
+Preserve the original owner and cleanup credentials until complete settlement.
+Historical positive-tag diagnostics remain historical failures; they do not
+satisfy this changed admission contract. Normal production provider tagging is
+unchanged.
+
+
+## Retained installation contract
+
+A separately admitted `operation=install` creates the pinned private candidate,
+authenticated relay/controller and candidate namespace once. The protected
+`CRABBOX_IMAGE_QUALIFICATION_INSTALLATION_JSON` descriptor and matching SHA-256
+bind account, accepted source, names, executable modules and exact namespace.
+They are trusted environment configuration, never candidate or PR inputs.
+Retained installation admission requires `candidate-transport-v2`; empty or unset
+transport remains supported only for disposable legacy operation. Installed
+controllers bind version metadata so authenticated identity readback proves the
+executing physical version after installation and subsequent binding updates.
+Retention supports only the private `first-walk` and `key-authorization` builds,
+whose pinned overlay provides per-run Fleet routing. Ordinary `mint` and
+`retained` builds keep their disposable lifecycle; installation, admission and
+binding updates reject them before effects. Selecting v2 markers alone does not
+make an ordinary Worker compatible with a retained namespace.
+
+Experiments retain these resources. Preparation verifies canonical idle state,
+updates only run bindings on existing names, and verifies the resulting physical
+versions within the immutable session window and existing executor reserve. It performs no exposure
+writes. Installation ownership remains stable across authority credential delivery;
+the exact authority version and admission hash are still resealed and verified.
+Executor credential v2 binds installation, relay, repository, workflow, candidate,
+run, handoff and expiry. Candidate Fleet objects are named by the exact run
+identity within the retained namespace, preventing state reuse between attempts.
+
+Protected deployment and arm share a job; the executor remains a separate
+credential-free boundary. The finalizer and independent reaper use the installed
+controller and fixed recovery credentials. They settle run resources and source
+pins, prove zero residue, then retire the registry without deleting installation
+resources. Missing or unverified infrastructure blocks admission and recovery;
+there is no automatic replacement upload. Failed measurement, registry state and
+physical settlement remain distinct outcomes.
+
+Build, review, installation checks and human readiness precede session issuance.
+The existing issuer still refuses issuance before the frozen start and completes
+all ten fixed authorization DryRuns before credential delivery. Only irreducible
+credential delivery, exact resealing and per-run binding verification remain in
+the active window. Binding preparation is bounded to fifteen minutes and retains
+the existing hundred-minute executor reserve. Forward and recovery cutoffs are
+unchanged; missed preparation cannot move them. An uncertain operation preserves its original private journal
+and cannot be replayed. Installation migration, repair and final removal require
+separate admission with existing recovery dependencies preserved.
+
+
+Interrupted initial installation is reconciled by the protected
+`image-qualification-control.mjs install-recover` command using the original
+private proof directory, pinned descriptor and authority admission. The install
+workflow invokes it in a fresh process after installation failure and retains
+the failure status. Recovery has a separate fifteen-minute reserve after the
+original fifteen-minute installation deadline; a restart never resets that
+clock. It preserves a complete verified installation, or settles only exact
+partial installation custody through the existing deletion implementation. It
+never replays an upload or uncertain deletion. Foreign or missing custody,
+contradictory existence reads, unresolved registry/probe state and expired
+recovery block mutation. Independently restoring a private journal requires
+trusted original workflow/artifact provenance; a public receipt is not an
+authorization capability. The authority and its namespaces remain untouched.
+
+Legacy disposable transport keeps its original `default` Fleet object. Explicit
+v2 profiles require their immutable identity and select separate Fleet objects
+per run; incomplete or unknown profiles never fall back to legacy routing.

@@ -23,11 +23,22 @@ import {
   verifyOwned,
   assertOwnedSettings,
 } from "./image-qualification-isolation.mjs";
+import {
+  readProbeResponse,
+  managementEndpoint,
+  managementFailure,
+  recordManagementFailure,
+} from "./image-qualification-binding-probe.mjs";
 import { withQualificationJournal } from "./image-qualification-journal.mjs";
-import { handoffSession, privateQualificationMode } from "./image-qualification-run-session.mjs";
+import {
+  handoffSession,
+  privateQualificationMode,
+  qualificationTaggingContract,
+} from "./image-qualification-run-session.mjs";
 import {
   ControllerHTTPError,
   requestControllerJSON,
+  observeControllerDiscovery,
 } from "./image-qualification-controller-http.mjs";
 import {
   packageFile,
@@ -41,7 +52,16 @@ import {
   transportBindingShape,
   proveCandidateTransport,
   settleCandidateTransport,
+  assertSettledTransportDiscovery,
 } from "./image-qualification-transport.mjs";
+
+import {
+  readInstallation,
+  verifyInstallation,
+  installedURL,
+  installationModulesMatch,
+  withInstallationJournal,
+} from "./image-qualification-installation.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sha40 = /^[0-9a-f]{40}$/;
@@ -960,10 +980,27 @@ export class Cloudflare {
       responseMetadata = false,
     } = {},
   ) {
-    const response = await fetch(`${this.base}${pathname}`, {
-      ...init,
-      headers: { authorization: `Bearer ${this.token}`, ...(init.headers ?? {}) },
-    });
+    let response;
+    try {
+      response = await fetch(`${this.base}${pathname}`, {
+        ...init,
+        ...(this.discoverySignal
+          ? {
+              signal: init.signal
+                ? AbortSignal.any([init.signal, this.discoverySignal])
+                : this.discoverySignal,
+              redirect: "error",
+            }
+          : {}),
+        headers: { authorization: `Bearer ${this.token}`, ...(init.headers ?? {}) },
+      });
+    } catch (error) {
+      throw recordManagementFailure(
+        error,
+        pathname,
+        init.signal?.aborted ? "cancelled" : "request-failed",
+      );
+    }
     const ray = response.headers.get("cf-ray");
     const responseInfo = {
       status: response.status,
@@ -975,35 +1012,96 @@ export class Cloudflare {
     }
     if ((probeContentIdentity || contentIdentityBytes) && response.ok) {
       const probe = await import("./image-qualification-binding-probe.mjs");
-      return await probe.probeContentIdentity(response, contentIdentityBytes);
+      try {
+        return await probe.probeContentIdentity(response, contentIdentityBytes);
+      } catch (error) {
+        throw recordManagementFailure(
+          error,
+          pathname,
+          init.signal?.aborted ? "cancelled" : "body-read-error",
+          responseInfo,
+          contentIdentityBytes ?? 64 * 1024,
+        );
+      }
     }
-    const text = boundedBytes
-      ? await (
-          await import("./image-qualification-binding-probe.mjs")
-        ).readProbeResponse(response, boundedBytes)
-      : await response.text();
+    // Ordinary Worker deletion can acknowledge with an empty HTTP204. It
+    // still requires the subsequent exact absence checks, never an invented body.
+    let text;
+    try {
+      text =
+        init.method === "DELETE" && response.status === 204 && response.body === null
+          ? ""
+          : boundedBytes
+            ? await readProbeResponse(response, boundedBytes)
+            : await response.text();
+    } catch (error) {
+      throw recordManagementFailure(
+        error,
+        pathname,
+        init.signal?.aborted ? "cancelled" : "body-read-error",
+        responseInfo,
+        boundedBytes,
+      );
+    }
     let parsed;
     try {
       parsed = text ? JSON.parse(text) : {};
+      if (boundedBytes && (!parsed || typeof parsed !== "object" || Array.isArray(parsed)))
+        throw new Error("invalid envelope");
     } catch {
+      if (boundedBytes)
+        throw recordManagementFailure(
+          // Readiness observes only the exact owned deployments HTTP404. Keep
+          // its HTTP classification even when the error page is not JSON;
+          // successful malformed replies and every other status still fail.
+          Object.assign(new Error("Cloudflare management response is not a JSON object"), {
+            status: response.status,
+            pathname,
+            responseInfo,
+          }),
+          pathname,
+          "invalid-json",
+          responseInfo,
+          boundedBytes,
+        );
       parsed = { raw: text.slice(0, 200) };
     }
     if (!response.ok || parsed.success === false) {
-      throw Object.assign(new Error(`Cloudflare API ${pathname} returned ${response.status}`), {
-        status: response.status,
-      });
+      throw recordManagementFailure(
+        Object.assign(new Error(`Cloudflare API ${pathname} returned ${response.status}`), {
+          status: response.status,
+          responseInfo,
+          pathname,
+        }),
+        pathname,
+        response.ok ? "api-error" : "http-error",
+        responseInfo,
+        boundedBytes,
+      );
     }
     if (allow404 && (init.method ?? "GET") === "GET" && parsed.result === undefined) {
-      throw new Error(`Cloudflare API ${pathname} did not confirm existence or absence`);
+      throw recordManagementFailure(
+        new Error(`Cloudflare API ${pathname} did not confirm existence or absence`),
+        pathname,
+        "unconfirmed-existence",
+        responseInfo,
+        boundedBytes,
+      );
     }
-    if (responseMetadata) return { result: parsed.result, response: responseInfo };
+    if (responseMetadata)
+      return { result: envelope ? parsed : parsed.result, response: responseInfo };
     return envelope ? parsed : parsed.result;
   }
 
   async list(pathname) {
     if (pathname === "/workers/scripts") {
       const scripts = await this.request(pathname);
-      if (!Array.isArray(scripts)) throw new Error("Cloudflare script inventory was not an array");
+      if (!Array.isArray(scripts))
+        throw recordManagementFailure(
+          new Error("Cloudflare script inventory was not an array"),
+          pathname,
+          "invalid-inventory",
+        );
       return scripts;
     }
     const items = [];
@@ -1075,18 +1173,16 @@ export class Cloudflare {
     const version = await this.latestVersion(controllerName);
     await verifyOwned(this, controllerName);
     if (this.beforeRecoveryCall) await this.beforeRecoveryCall("controller-content");
-    const response = await fetch(`${this.base}/workers/scripts/${controllerName}/content/v2`, {
-      ...(this.recoverySignal ? { signal: this.recoverySignal(), redirect: "error" } : {}),
-      headers: { authorization: `Bearer ${this.token}` },
-    });
-    if (!response.ok) throw new Error("controller source unavailable");
-    const form = await response.formData();
-    const entries = [...form.entries()];
+    const contentSignals = [this.discoverySignal, this.recoverySignal?.()].filter(Boolean);
+    const identity = await this.request(
+      `/workers/scripts/${controllerName}/content/v2`,
+      contentSignals.length ? { signal: AbortSignal.any(contentSignals), redirect: "error" } : {},
+      { contentIdentityBytes: 64 * 1024 },
+    );
     if (
-      entries.length !== 1 ||
-      entries[0][0] !== "controller.mjs" ||
-      digest(Buffer.from(await entries[0][1].arrayBuffer())) !==
-        digest(fs.readFileSync(controllerSource)) ||
+      identity.count !== 1 ||
+      identity.module !== "controller.mjs" ||
+      identity.sha256 !== digest(fs.readFileSync(controllerSource)) ||
       (await this.latestVersion(controllerName)) !== version
     )
       throw new Error("controller source or version changed");
@@ -1109,6 +1205,7 @@ export class Cloudflare {
   }
 
   async enableSubdomain(name) {
+    if (this.installation) return installedURL(this, name);
     await this.configureSubdomain(name, true);
     const subdomain = await this.request("/workers/subdomain");
     if (!subdomain?.subdomain)
@@ -1158,7 +1255,9 @@ function qualificationConfig() {
         ? 1
         : 3,
     fastSnapshotRestore: false,
-    ...(privateQualificationMode(process.env.QUALIFICATION_MODE) ? { firstWalk: true } : {}),
+    ...(privateQualificationMode(process.env.QUALIFICATION_MODE)
+      ? { firstWalk: true, taggingContract: qualificationTaggingContract }
+      : {}),
     ...(process.env.QUALIFICATION_MODE === "key-authorization"
       ? { keyAuthorizationOnly: true }
       : {}),
@@ -1183,8 +1282,9 @@ function qualificationHandoff(identityCheck, manifestSha256, startsAt) {
     runId,
     attempt: 1,
     owner: `${runId}@example.invalid`,
-    candidateWorker: `crabbox-${runId}`,
-    relayWorker: relayNameForRun(runId),
+    candidateWorker: readInstallation()?.candidate.name ?? `crabbox-${runId}`,
+    relayWorker: readInstallation()?.relay.name ?? relayNameForRun(runId),
+    ...(readInstallation() ? { installationId: readInstallation().id } : {}),
     candidateArtifactId: identityCheck.artifactId,
     candidateArtifactDigest: identityCheck.artifactDigest,
     manifestSha256,
@@ -1197,6 +1297,7 @@ function qualificationHandoff(identityCheck, manifestSha256, startsAt) {
         account: required("CLOUDFLARE_ACCOUNT_ID", /^[0-9a-f]{32}$/),
         config,
         isolation: readAdmission().sha256,
+        ...(readInstallation() ? { installation: digest(canonical(readInstallation())) } : {}),
         ...(session ? { awsSessionScopeSha256: session.sha256 } : {}),
       }),
     ),
@@ -1251,6 +1352,12 @@ function publishHandoff(identityCheck, manifest) {
     ...process.env,
     QUALIFICATION_HANDOFF_SHA256: handoffSha256,
     QUALIFICATION_EXPIRES_AT: handoff.expiresAt,
+    ...(readInstallation()
+      ? {
+          QUALIFICATION_INSTALLATION_ID: readInstallation().id,
+          QUALIFICATION_RELAY_WORKER: handoff.relayWorker,
+        }
+      : {}),
   });
   const directory = path.resolve(required("QUALIFICATION_HANDOFF_DIR"));
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -1288,8 +1395,8 @@ function publishHandoff(identityCheck, manifest) {
       process.env.GITHUB_STEP_SUMMARY,
       `## Qualification handoff\n\nRun: \`${handoff.runId}\`\n\n` +
         `Work cutoff: ${handoff.workExpiresAt}; absolute expiry: ${handoff.expiresAt}.\n\n` +
-        "Preparation, credential delivery, approvals and deployment consume this window. " +
-        "Approve deployment only after the exact binding and cleanup custody are verified. " +
+        "Finish builds, installation and human preparation before session issuance. " +
+        "Admit execution only after exact credential, binding and cleanup custody checks. " +
         "Expired preparation requires a newly authorized run; it cannot be extended.\n\n" +
         (projection ? `\`\`\`json\n${JSON.stringify(projection, null, 2)}\n\`\`\`\n` : ""),
       { mode: 0o600 },
@@ -1340,7 +1447,7 @@ function transportV2Enabled() {
   return profile === "candidate-transport-v2";
 }
 
-function candidateBindings(identity, adminToken, sharedToken, config, stage = false) {
+export function candidateBindings(identity, adminToken, sharedToken, config, stage = false) {
   const vars = {
     CRABBOX_DEFAULT_ORG: "image-qualification",
     CRABBOX_GITHUB_ALLOWED_ORG: "example-org.invalid",
@@ -1399,12 +1506,18 @@ function candidateMetadata(mainModule, bindings, createNamespace = false) {
   };
 }
 
-function controllerMetadata(deploymentHash, token, v2 = transportV2Enabled()) {
+export function controllerMetadata(
+  deploymentHash,
+  token,
+  v2 = transportV2Enabled(),
+  retained = false,
+) {
   return {
     main_module: "controller.mjs",
     compatibility_date: "2026-09-03",
     bindings: [
       ...(v2 ? transportMarkers("controller-v2", { deploymentHash }) : []),
+      ...(retained ? [{ name: "CF_VERSION_METADATA", type: "version_metadata" }] : []),
       { name: "CONTROLLER_TOKEN", type: "secret_text", text: token },
       {
         name: "AUTHORITY",
@@ -1482,6 +1595,7 @@ function executionManifest(identity) {
     expiresAt: identity.expiresAt,
     ...(identity.retainedImage ? { retainedImage: identity.retainedImage } : {}),
     ...(identity.firstWalk ? { firstWalk: true } : {}),
+    ...(identity.taggingContract ? { taggingContract: identity.taggingContract } : {}),
     ...(identity.keyAuthorizationOnly ? { keyAuthorizationOnly: true } : {}),
   };
 }
@@ -1512,7 +1626,9 @@ function qualificationExpectedFromEnv({ optional = false } = {}) {
     expiresAt: required("QUALIFICATION_EXPECTED_EXPIRES_AT"),
     executionManifestDigest: required("QUALIFICATION_EXPECTED_EXECUTION_MANIFEST_DIGEST", sha64),
     ...(retainedImage ? { retainedImage } : {}),
-    ...(privateQualificationMode(process.env.QUALIFICATION_MODE) ? { firstWalk: true } : {}),
+    ...(privateQualificationMode(process.env.QUALIFICATION_MODE)
+      ? { firstWalk: true, taggingContract: qualificationTaggingContract }
+      : {}),
     ...(process.env.QUALIFICATION_MODE === "key-authorization"
       ? { keyAuthorizationOnly: true }
       : {}),
@@ -1531,6 +1647,7 @@ export function verifyAttestationIdentity(attestation, expected, { finalized } =
     "policyHash",
     "enrolledAt",
     "expiresAt",
+    "taggingContract",
   ];
   if (fields.some((field) => attestation?.[field] !== expected[field])) {
     throw new Error("authority attestation identity does not match protected expectations");
@@ -1559,8 +1676,8 @@ export function verifyAttestationIdentity(attestation, expected, { finalized } =
 
 async function verifyExecutionDeployment(cf, expected) {
   if (
-    expected.candidateWorker !== `crabbox-${expected.runId}` ||
-    expected.relayWorker !== relayNameForRun(expected.runId)
+    expected.candidateWorker !== (cf.installation?.candidate.name ?? `crabbox-${expected.runId}`) ||
+    expected.relayWorker !== (cf.installation?.relay.name ?? relayNameForRun(expected.runId))
   ) {
     throw new Error("relay Worker does not match the registered qualification run");
   }
@@ -1620,6 +1737,7 @@ async function verifyExecutionDeployment(cf, expected) {
     transportProps?.candidateWorker !== expected.candidateWorker ||
     transportProps?.deploymentHash !== expected.deploymentHash ||
     transportProps?.expiresAt !== expected.expiresAt ||
+    transportProps?.taggingContract !== expected.taggingContract ||
     Boolean(transportProps?.firstWalk) !== Boolean(expected.firstWalk) ||
     Boolean(transportProps?.keyAuthorizationOnly) !== Boolean(expected.keyAuthorizationOnly) ||
     canonical(transportProps?.retainedImage ?? null) !==
@@ -1643,57 +1761,105 @@ async function verifyExecutionDeployment(cf, expected) {
   };
 }
 
-async function controllerCall(cf, url, token, action, value = {}, authorityCF = cf) {
-  await verifyAuthority(authorityCF);
-  await cf.verifyController();
-  if (cf.beforeRecoveryCall) await cf.beforeRecoveryCall(action);
-  const deadlines = [
-    cf.controllerDeadline,
-    action === "transport-open" ? Date.parse(value.expiresAt) : undefined,
-    action === "claim" ? Date.parse(value.identity?.expiresAt) : undefined,
-  ].filter((value) => value !== undefined);
-  try {
-    return await requestControllerJSON({
-      url,
-      token,
-      action,
-      value,
-      signal: cf.recoverySignal?.(action),
-      ...(deadlines.length ? { deadline: Math.min(...deadlines) } : {}),
-    });
-  } catch (error) {
-    if (error instanceof ControllerHTTPError && process.env.QUALIFICATION_PROOF_DIR) {
+export async function controllerCall(cf, url, token, action, value = {}, authorityCF = cf) {
+  const discovery = ["discover", "transport-discover"].includes(action);
+  if (
+    discovery &&
+    (!value ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      Reflect.ownKeys(value).length !== 0)
+  )
+    throw new Error("discovery requires an empty input");
+  const signal = discovery ? cf.recoverySignal?.(action) : undefined;
+  const request = async (observation = {}) => {
+    const previousSignals = [cf.discoverySignal, authorityCF.discoverySignal];
+    if (observation.signal) {
+      cf.discoverySignal = observation.signal;
+      authorityCF.discoverySignal = observation.signal;
+    }
+    try {
+      observation.signal?.throwIfAborted();
+      await verifyAuthority(authorityCF);
+      await cf.verifyController();
+      if (cf.beforeRecoveryCall) await cf.beforeRecoveryCall(action);
+      observation.signal?.throwIfAborted();
+      const deadlines = [
+        cf.controllerDeadline,
+        observation.deadline,
+        action === "transport-open" ? Date.parse(value.expiresAt) : undefined,
+        action === "claim" ? Date.parse(value.identity?.expiresAt) : undefined,
+      ].filter((value) => value !== undefined);
       try {
-        writeJSON(
-          path.join(
-            path.resolve(process.env.QUALIFICATION_PROOF_DIR),
-            `controller-http-failure-${crypto.randomUUID()}.json`,
-          ),
-          error.receipt,
-        );
-      } catch {
-        // Diagnostics cannot replace the original failure or obstruct recovery.
-        console.error("qualification controller HTTP failure receipt could not be written");
+        return await requestControllerJSON({
+          url,
+          token,
+          action,
+          value,
+          signal: observation.signal ?? cf.recoverySignal?.(action),
+          ...(deadlines.length ? { deadline: Math.min(...deadlines) } : {}),
+        });
+      } catch (error) {
+        if (error instanceof ControllerHTTPError && process.env.QUALIFICATION_PROOF_DIR) {
+          try {
+            writeJSON(
+              path.join(
+                path.resolve(process.env.QUALIFICATION_PROOF_DIR),
+                `controller-http-failure-${crypto.randomUUID()}.json`,
+              ),
+              error.receipt,
+            );
+          } catch {
+            console.error("qualification controller HTTP failure receipt could not be written");
+          }
+        }
+        throw error;
+      }
+    } finally {
+      if (observation.signal) {
+        cf.discoverySignal = previousSignals[0];
+        authorityCF.discoverySignal = previousSignals[1];
       }
     }
-    throw error;
-  }
+  };
+  if (!discovery) return await request();
+  const result = await observeControllerDiscovery(request, {
+    action,
+    deadline: cf.controllerDeadline,
+    signal,
+  });
+  if (action === "discover") discoveredRun(result, cf.installation);
+  else if (Object.keys(result).join(",") !== "probe")
+    throw new Error("invalid transport discovery");
+  return result;
 }
 
-async function cloudflareFromEnv() {
+async function cloudflareFromEnv({ verify = true } = {}) {
   const admission = readAdmission();
   const cf = new Cloudflare(
     required("CLOUDFLARE_ACCOUNT_ID", /^[0-9a-f]{32}$/),
     required("CLOUDFLARE_API_TOKEN"),
   );
   cf.admission = admission;
-  await verifyAuthority(cf);
+  cf.installation = readInstallation();
+  if (verify) await verifyAuthority(cf);
   return cf;
 }
 
 async function deployController(cf, deploymentHash, token) {
-  await requireAbsent(cf, controllerName);
-  await cf.upload(controllerName, controllerSource, controllerMetadata(deploymentHash, token));
+  if (cf.installation) {
+    await cf.verifyController();
+  } else await requireAbsent(cf, controllerName);
+  cf.controllerVersion = undefined; // New acknowledged run binding, same pinned module.
+  const upload = await cf.upload(
+    controllerName,
+    controllerSource,
+    controllerMetadata(deploymentHash, token, transportV2Enabled(), Boolean(cf.installation)),
+  );
+  if (
+    cf.installation &&
+    workerVersion(upload.deployment_id) !== (await cf.latestVersion(controllerName))
+  )
+    throw Error("installed controller upload version mismatch");
   await cf.verifyController();
   return await cf.enableSubdomain(controllerName);
 }
@@ -1899,7 +2065,392 @@ async function readbackRelay(cf, worker, upload, expectedBindings, handoff) {
   );
 }
 
-async function deploy() {
+// This gate belongs only to the initial, acknowledged relay deployment. A
+// stale read may be observed again; an uncertain exposure write is never replayed.
+export async function enableRelaySubdomain(
+  cf,
+  worker,
+  expectedVersion,
+  expectedBindings,
+  handoff,
+  { signal: callerSignal, pause = delay } = {},
+) {
+  if (
+    !runIdPattern.test(handoff.runId ?? "") ||
+    worker !== handoff.relayWorker ||
+    worker !==
+      `crabbox-image-qualification-relay-${handoff.runId.slice("image-qualification-".length)}` ||
+    !Number.isFinite(Date.parse(handoff.workExpiresAt))
+  )
+    throw new Error("qualification relay exposure identity is invalid");
+  workerVersion(expectedVersion);
+  const startedAt = Date.now();
+  const stopsAt = Math.min(startedAt + 60_000, assertRelayReadbackReserve(handoff));
+  const receipt = {
+    version: 1,
+    worker,
+    runId: handoff.runId,
+    expectedVersion,
+    bindingDigest: digest(canonical(expectedBindings)),
+    state: "new",
+    observations: [],
+  };
+  return await withQualificationJournal(
+    path.resolve(required("QUALIFICATION_PROOF_DIR")),
+    {
+      stateName: "relay-exposure.json",
+      lockName: "relay-exposure.lock",
+      create: true,
+      initial: () => receipt,
+    },
+    async (retained, save) => {
+      if (canonical(retained) !== canonical(receipt))
+        throw new Error(
+          "relay exposure receipt already exists; use recovery, never replay deployment",
+        );
+      // Claim local custody before any request, including on a no-write failure.
+      receipt.state = "checking";
+      await save(receipt);
+      const stop = new AbortController();
+      const timer = setTimeout(() => stop.abort(), Math.max(1, stopsAt - Date.now()));
+      const cancel = () => stop.abort();
+      const signal = AbortSignal.any([stop.signal, ...(callerSignal ? [callerSignal] : [])]);
+      process.once("SIGINT", cancel);
+      process.once("SIGTERM", cancel);
+      let requests = 0;
+      const check = () => {
+        if (signal.aborted || Date.now() >= stopsAt)
+          throw new Error("qualification relay exposure cancelled or deadline exhausted");
+        assertRelayReadbackReserve(handoff);
+      };
+      const request = async (pathname, init = {}, options = {}) => {
+        check();
+        if (requests >= 400)
+          throw new Error("qualification relay exposure request budget exhausted");
+        requests++;
+        const result = await cf.request(
+          pathname,
+          { ...init, signal, redirect: "error" },
+          {
+            ...options,
+            boundedBytes: 64 * 1024,
+          },
+        );
+        check();
+        return result;
+      };
+      // Reuse the existing validators with bounded, GET-only management access.
+      // Do not mutate the original client's signals or generic subdomain methods.
+      const reader = Object.create(cf);
+      reader.request = async (pathname, init = {}, options = {}) => {
+        if ((init.method ?? "GET") !== "GET") throw new Error("relay exposure fence is read-only");
+        return await request(pathname, init, options);
+      };
+      const fence = async () => {
+        await verifyAuthority(reader);
+        if ((await reader.latestVersion(worker)) !== expectedVersion)
+          throw new Error("qualification relay exposure version drifted");
+        const settings = await verifyOwned(reader, worker);
+        if (canonical(publicBindingShape(settings.bindings)) !== canonical(expectedBindings))
+          throw new Error("qualification relay exposure bindings drifted");
+        const [routes, schedules, domains] = await Promise.all([
+          reader.request(
+            `/workers/services/${worker}/environments/production/routes?show_zonename=true`,
+          ),
+          reader.request(`/workers/scripts/${worker}/schedules`),
+          reader.list(`/workers/domains?service=${worker}`),
+        ]);
+        if (
+          canonical(routes) !== "[]" ||
+          canonical(schedules?.schedules) !== "[]" ||
+          domains.length !== 0 ||
+          (await reader.latestVersion(worker)) !== expectedVersion
+        )
+          throw new Error("qualification relay exposure isolation or version drifted");
+      };
+      const exposure = (value) => {
+        if (typeof value?.enabled !== "boolean" || typeof value?.previews_enabled !== "boolean")
+          throw new Error("qualification relay exposure readback is malformed");
+        return { enabled: value.enabled, previews_enabled: value.previews_enabled };
+      };
+      const endpoint = `/workers/scripts/${worker}/subdomain`;
+      try {
+        await fence();
+        receipt.initial = exposure(await reader.request(endpoint));
+        receipt.state = "write-intent";
+        await save(receipt);
+        // No catch/retry path can issue another POST, even after an uncertain response.
+        const ack = await request(
+          endpoint,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ enabled: true, previews_enabled: false }),
+          },
+          { envelope: true },
+        );
+        if (ack?.success !== true)
+          throw new Error("qualification relay exposure write is unconfirmed");
+        receipt.state = "acknowledged";
+        await save(receipt);
+        for (let round = 0; round < 12; round++) {
+          await fence();
+          const result = await reader.request(endpoint, {}, { responseMetadata: true });
+          const actual = exposure(result.result);
+          receipt.observations.push({
+            exposure: actual,
+            response: result.response,
+            elapsedMs: Date.now() - startedAt,
+          });
+          await save(receipt);
+          if (actual.enabled === true && actual.previews_enabled === false) {
+            // Bracket the successful exposure read with the same complete fence.
+            await fence();
+            const account = await reader.request("/workers/subdomain");
+            if (
+              typeof account?.subdomain !== "string" ||
+              !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(account.subdomain)
+            )
+              throw new Error("Cloudflare account workers.dev subdomain is invalid");
+            receipt.state = "verified";
+            await save(receipt);
+            check();
+            return `https://${worker}.${account.subdomain}.workers.dev`;
+          }
+          if (canonical(actual) !== canonical(receipt.initial))
+            throw new Error("qualification relay exposure changed to an unexpected state");
+          if (round < 11) {
+            check();
+            await pause(5_000, undefined, { signal });
+            check();
+          }
+        }
+        throw new Error(
+          "qualification relay exposure remains unresolved after twelve observations",
+        );
+      } finally {
+        stop.abort();
+        clearTimeout(timer);
+        process.removeListener("SIGINT", cancel);
+        process.removeListener("SIGTERM", cancel);
+        receipt.requests = requests;
+        await save(receipt);
+      }
+    },
+  );
+}
+
+// One separately authorized migration; never called by run finalization/reaping.
+async function install({ client: cf }) {
+  if (!cf.installation) throw Error("protected installation descriptor required");
+  const identity = await verifyCandidateIdentity({ artifact: true });
+  const directory = path.resolve(required("QUALIFICATION_ARTIFACT_DIR"));
+  const manifest = verifyManifest(directory, identity.candidateSha, identity.workflowSha);
+  installationModulesMatch(cf.installation, directory, manifest, controllerSource, relaySource);
+  for (const worker of [cf.installation.candidate.name, cf.installation.relay.name, controllerName])
+    await requireAbsent(cf, worker);
+  const config = qualificationConfig();
+  const candidateWorker = cf.installation.candidate.name;
+  const placeholder = {
+    runId: candidateWorker.slice("crabbox-".length),
+    owner: "installation@example.invalid",
+    candidateSha: identity.candidateSha,
+    candidateWorker,
+    deploymentHash: cf.installation.id,
+    expiresAt: "2000-01-01T00:00:00.000Z",
+    firstWalk: true,
+    taggingContract: qualificationTaggingContract,
+  };
+  const admin = crypto.randomBytes(32).toString("hex"),
+    shared = crypto.randomBytes(32).toString("hex");
+  const bindings = candidateBindings(placeholder, admin, shared, config, true);
+  await preparePrivateCandidate(cf, candidateWorker, bindings);
+  const settings = await verifyOwned(cf, candidateWorker);
+  const namespaceId = settings.bindings.find((b) => b.name === "FLEET")?.namespace_id;
+  bindings.find((b) => b.name === "FLEET").namespace_id = namespaceId;
+  const upload = await cf.upload(
+    candidateWorker,
+    path.join(directory, manifest.mainModule),
+    candidateMetadata(manifest.mainModule, bindings),
+  );
+  if (workerVersion(upload.deployment_id) !== (await cf.latestVersion(candidateWorker)))
+    throw Error("installation candidate upload version mismatch");
+  const relayUpload = await cf.upload(
+    cf.installation.relay.name,
+    relaySource,
+    relayMetadata(
+      candidateWorker,
+      crypto.randomBytes(32).toString("hex"),
+      admin,
+      shared,
+      config,
+      placeholder.owner,
+      placeholder.expiresAt,
+    ),
+  );
+  if (
+    workerVersion(relayUpload.deployment_id) !==
+    (await cf.latestVersion(cf.installation.relay.name))
+  )
+    throw Error("installation relay upload version mismatch");
+  await cf.configureSubdomain(cf.installation.relay.name, true);
+  const controllerUpload = await cf.upload(
+    controllerName,
+    controllerSource,
+    controllerMetadata(cf.installation.id, required("QUALIFICATION_CONTROLLER_TOKEN"), true, true),
+  );
+  if (workerVersion(controllerUpload.deployment_id) !== (await cf.latestVersion(controllerName)))
+    throw Error("installation controller upload version mismatch");
+  await cf.configureSubdomain(controllerName, true);
+  cf.installation = {
+    ...cf.installation,
+    candidate: { ...cf.installation.candidate, namespaceId },
+  };
+  const versions = await verifyInstallation(cf, { candidateSha: identity.candidateSha });
+  const url = await installedURL(cf, controllerName);
+  assertSettledTransportDiscovery(
+    await controllerCall(cf, url, required("QUALIFICATION_CONTROLLER_TOKEN"), "transport-discover"),
+  );
+  if (
+    discoveredRun(
+      await controllerCall(cf, url, required("QUALIFICATION_CONTROLLER_TOKEN"), "discover"),
+    ) !== null
+  )
+    throw Error("installation registry is not idle");
+  writeJSON(path.join(path.resolve(required("QUALIFICATION_PROOF_DIR")), "installation.json"), {
+    installation: cf.installation,
+    sha256: digest(canonical(cf.installation)),
+    versions,
+    manifestSha256: manifest.manifestSha256,
+    idle: true,
+  });
+}
+
+// Consume only original installation custody. No upload or exposure replay.
+// A missing controller is safe here only because install never claims a run.
+export async function recoverInstallation(cf, state) {
+  const record = cf.installation;
+  const present = {};
+  const roles = ["candidate", "relay", "controller"];
+  for (const role of roles) {
+    const worker = record[role];
+    const settings = await verifyOwned(cf, worker.name, { allowAbsent: true });
+    if (!settings) {
+      if ((await cf.list("/workers/scripts")).some((v) => (v.id ?? v.name) === worker.name))
+        throw Error("installation existence readbacks disagree");
+      continue;
+    }
+    const writes = state.events.filter((v) => v.role === role && v.method === "PUT");
+    const last = writes.at(-1);
+    if (!last || state.events.some((v) => v.role === role && v.method === "DELETE"))
+      throw Error("installation write custody is unresolved; never replay deletion");
+    const version = await cf.latestVersion(worker.name);
+    const module = await cf.request(
+      `/workers/scripts/${worker.name}/content/v2`,
+      {},
+      {
+        contentIdentityBytes: 4 * 1024 * 1024,
+      },
+    );
+    // An uncertain update may have left its exact acknowledged predecessor in
+    // place. Admit either exact intent, never an arbitrary earlier/foreign version.
+    const previous = writes.at(-2);
+    const possible = [
+      last,
+      ...(!last.version && previous?.outcome === "acknowledged" && previous.version
+        ? [previous]
+        : []),
+    ];
+    const matched = possible.find(
+      (intent) =>
+        module.count === 1 &&
+        module.module === intent.requestedModule &&
+        module.sha256 === intent.requestedModuleSha256 &&
+        digest(canonical([...settings.tags].sort())) === intent.requestedTagsSha256 &&
+        (!intent.version || version === intent.version),
+    );
+    if (!matched || (await cf.latestVersion(worker.name)) !== version)
+      throw Error("installation original upload identity differs");
+    state.reconciled ??= {};
+    state.reconciled[role] = {
+      version,
+      moduleSha256: module.sha256,
+      upload: matched === last ? "last-intent" : "preceding-acknowledged",
+    };
+    const own = await ownedNamespaces(cf, worker.name, settings.bindings);
+    if (role === "candidate") {
+      if (
+        own.length > 1 ||
+        (own.length === 1 &&
+          (own[0].class !== "FleetDurableObject" ||
+            (record.candidate.namespaceId !== "0".repeat(32) &&
+              own[0].id !== record.candidate.namespaceId)))
+      )
+        throw Error("installation candidate namespace differs");
+      if (own.length === 1)
+        cf.installation = {
+          ...record,
+          candidate: { ...record.candidate, namespaceId: own[0].id },
+        };
+    }
+    present[role] = { version, settings, module };
+  }
+  if (present.controller) {
+    cf.controllerVersion = present.controller.version;
+    const url = await installedURL(cf, controllerName);
+    const run = discoveredRun(
+      await controllerCall(cf, url, required("QUALIFICATION_CONTROLLER_TOKEN"), "discover"),
+    );
+    const probe = await controllerCall(
+      cf,
+      url,
+      required("QUALIFICATION_CONTROLLER_TOKEN"),
+      "transport-discover",
+    );
+    if (run !== null)
+      throw Error("installation registry or probe unresolved; preserve recovery dependencies");
+    assertSettledTransportDiscovery(probe);
+  }
+  if (roles.every((role) => present[role])) {
+    // Complete installations are never torn down by installation recovery.
+    const versions = await verifyInstallation(cf);
+    writeJSON(path.join(path.resolve(required("QUALIFICATION_PROOF_DIR")), "installation.json"), {
+      installation: cf.installation,
+      sha256: digest(canonical(cf.installation)),
+      versions,
+      idle: true,
+    });
+    return { installation: "retained", registry: "idle", measurement: "not-started" };
+  }
+  // Fence every known member before deleting anything. Preserve source, authority,
+  // and its namespaces; only initial installation custody is admissible here.
+  for (const role of roles)
+    if (present[role]) {
+      const worker = record[role].name;
+      if ((await cf.latestVersion(worker)) !== present[role].version)
+        throw Error("installation version changed before settlement");
+    }
+  if (present.controller) await cf.deleteScript(controllerName);
+  if (present.relay) await deleteRelay(cf, record.relay.name);
+  if (present.candidate) await deleteCandidate(cf, record.candidate.name);
+  for (let round = 0; round < 2; round++) {
+    const inventory = await cf.list("/workers/scripts");
+    for (const role of roles) {
+      const name = record[role].name;
+      await requireAbsent(cf, name);
+      if (inventory.some((v) => (v.id ?? v.name) === name))
+        throw Error("installation physical settlement remains unknown");
+    }
+    await verifyAuthority(cf);
+  }
+  return {
+    installation: "absent",
+    registry: present.controller ? "idle" : "not-observed",
+    measurement: "not-started",
+  };
+}
+
+async function deploy({ client } = {}) {
   const identityCheck = await verifyCandidateIdentity({ artifact: true });
   const artifactDir = path.resolve(required("QUALIFICATION_ARTIFACT_DIR"));
   const manifest = verifyManifest(
@@ -1925,15 +2476,24 @@ async function deploy() {
     candidateWorker,
     expiresAt,
     ...(config.retainedImage ? { retainedImage: config.retainedImage } : {}),
-    ...(config.firstWalk ? { firstWalk: true } : {}),
+    ...(config.firstWalk ? { firstWalk: true, taggingContract: qualificationTaggingContract } : {}),
     ...(config.keyAuthorizationOnly ? { keyAuthorizationOnly: true } : {}),
   };
   const adminToken = crypto.randomBytes(32).toString("hex");
   const sharedToken = crypto.randomBytes(32).toString("hex");
-  const { token: executorToken, tokenSha256: executorTokenSha256 } = readExecutorCredential({
-    ...process.env,
-    QUALIFICATION_EXPIRES_AT: expiresAt,
-  });
+  const { token: executorToken, tokenSha256: executorTokenSha256 } = readExecutorCredential(
+    {
+      ...process.env,
+      QUALIFICATION_EXPIRES_AT: expiresAt,
+      ...(readInstallation()
+        ? {
+            QUALIFICATION_INSTALLATION_ID: readInstallation().id,
+            QUALIFICATION_RELAY_WORKER: relayWorker,
+          }
+        : {}),
+    },
+    { preparationStartsAt: readInstallation() ? handoff.startsAt : undefined },
+  );
   executorTokenForRedaction = executorToken;
   const controllerToken = required("QUALIFICATION_CONTROLLER_TOKEN");
   const placeholderIdentity = { ...baseIdentity, deploymentHash: "0".repeat(64) };
@@ -1957,15 +2517,28 @@ async function deploy() {
       file: path.join(artifactDir, entry.path),
       type: entry.path.endsWith(".wasm") ? "application/wasm" : "application/javascript+module",
     }));
-  const cf = await cloudflareFromEnv();
+  const cf = client ?? (await cloudflareFromEnv());
   cf.controllerDeadline = Date.parse(handoff.workExpiresAt);
-  await Promise.all(
-    [candidateWorker, relayWorker, controllerName].map((name) => requireAbsent(cf, name)),
-  );
+  if (cf.installation) {
+    cf.preparationStopsAt = Date.parse(handoff.workExpiresAt) - 100 * 60_000;
+    if (Date.now() >= cf.preparationStopsAt)
+      throw Error("installation binding preparation lacks the existing executor reserve");
+    installationModulesMatch(cf.installation, artifactDir, manifest, controllerSource, relaySource);
+    await verifyInstallation(cf, { candidateSha: identityCheck.candidateSha });
+    const url = await installedURL(cf, controllerName);
+    await recoverTransportProbe(cf, url, controllerToken);
+    if (discoveredRun(await controllerCall(cf, url, controllerToken, "discover")) !== null)
+      throw Error("installation is active or unknown; recovery required before binding update");
+  } else
+    await Promise.all(
+      [candidateWorker, relayWorker, controllerName].map((name) => requireAbsent(cf, name)),
+    );
   // Only this inert trusted bootstrap can be briefly public on first creation.
   // Candidate bytes are uploaded only after workers.dev is observably disabled.
-  await requireAbsent(cf, candidateWorker);
-  await preparePrivateCandidate(cf, candidateWorker, stagingBindings);
+  if (!cf.installation) {
+    await requireAbsent(cf, candidateWorker);
+    await preparePrivateCandidate(cf, candidateWorker, stagingBindings);
+  }
   const privateSettings = await cf.settings(candidateWorker);
   await ownedNamespaces(cf, candidateWorker, privateSettings.bindings);
   const namespaceId = privateSettings.bindings.find(
@@ -1973,7 +2546,7 @@ async function deploy() {
   )?.namespace_id;
   stagingBindings.find((binding) => binding.name === "FLEET").namespace_id = namespaceId;
   await verifyOwned(cf, candidateWorker);
-  await cf.upload(
+  const stageUpload = await cf.upload(
     candidateWorker,
     mainFile,
     candidateMetadata(manifest.mainModule, stagingBindings),
@@ -1983,6 +2556,8 @@ async function deploy() {
     cf.settings(candidateWorker),
     cf.latestVersion(candidateWorker),
   ]);
+  if (cf.installation && workerVersion(stageUpload.deployment_id) !== stagingVersion)
+    throw Error("installed staging upload version mismatch");
   const stagingShape = {
     bindings: publicBindingShape(stagingSettings.bindings ?? []),
     compatibilityDate: stagingSettings.compatibility_date,
@@ -2059,7 +2634,8 @@ async function deploy() {
     owner,
     expiresAt,
   );
-  await requireAbsent(cf, relayWorker);
+  if (!cf.installation) await requireAbsent(cf, relayWorker);
+  else await verifyOwned(cf, relayWorker);
   // Acknowledgement is required: uncertain PUTs never enter a replay/retry path.
   assertRelayReadbackReserve(handoff);
   const relayUpload = await cf.upload(relayWorker, relaySource, expectedRelayMetadata, [], {
@@ -2073,7 +2649,9 @@ async function deploy() {
     expectedRelayBindings,
     handoff,
   );
-  const relayURL = await cf.enableSubdomain(relayWorker);
+  const relayURL = cf.installation
+    ? await installedURL(cf, relayWorker)
+    : await enableRelaySubdomain(cf, relayWorker, relayVersion, expectedRelayBindings, handoff);
   const relayBindingDigest = digest(canonical(expectedRelayBindings));
   const controllerURL = await deployController(cf, deploymentHash, controllerToken);
   await Promise.all([
@@ -2082,6 +2660,10 @@ async function deploy() {
     assertWorkerIsolation(cf, controllerName, 0, true),
   ]);
   await verifyCandidateIdentity({ artifact: true });
+  if (cf.installation) {
+    if (Date.now() > cf.preparationStopsAt)
+      throw Error("installation binding preparation exceeded its reserve; finalize custody");
+  }
   assertHandoffWindow(handoff);
   if (transportV2Enabled()) {
     const request = {
@@ -2217,6 +2799,7 @@ async function deploy() {
     bindingDigest,
     relayBindingDigest,
   });
+  if (cf.installation) appendOutput("installation_id", cf.installation.id);
   appendOutput("run_id", runId);
   appendOutput("candidate_worker", candidateWorker);
   appendOutput("relay_worker", relayWorker);
@@ -2237,10 +2820,11 @@ async function deploy() {
   appendOutput("expires_at", expiresAt);
   appendOutput("region", config.region);
   appendOutput("base_ami_id", config.baseAmiId);
+  return { ...protectedIdentity, executionManifestDigest: manifestDigest };
 }
 
-async function arm() {
-  const expected = qualificationExpectedFromEnv();
+async function arm({ client, expected: supplied } = {}) {
+  const expected = supplied ?? qualificationExpectedFromEnv();
   const identityCheck = await verifyCandidateIdentity({ artifact: true });
   const handoff = await verifyHandoff(identityCheck, expected.manifestSha256);
   for (const field of [
@@ -2256,8 +2840,9 @@ async function arm() {
     if (expected[field] !== handoff[field])
       throw new Error("deployment differs from prepared handoff");
   }
-  const cf = await cloudflareFromEnv();
+  const cf = client ?? (await cloudflareFromEnv());
   cf.controllerDeadline = Date.parse(handoff.workExpiresAt);
+  if (cf.installation) await verifyInstallation(cf, { candidateSha: expected.candidateSha });
   await verifyExecutionDeployment(cf, expected);
   const token = required("QUALIFICATION_CONTROLLER_TOKEN");
   await cf.verifyController();
@@ -2269,6 +2854,7 @@ async function arm() {
     discovered.run?.candidateWorker !== expected.candidateWorker ||
     discovered.run?.deploymentHash !== expected.deploymentHash ||
     discovered.run?.expiresAt !== expected.expiresAt ||
+    discovered.run?.taggingContract !== expected.taggingContract ||
     Boolean(discovered.run?.keyAuthorizationOnly) !== Boolean(expected.keyAuthorizationOnly) ||
     discovered.run?.cleanupState !== "claimed"
   ) {
@@ -2307,7 +2893,8 @@ async function arm() {
     if (result?.passed !== true || result?.checks !== 13 || Object.keys(result).length !== 2)
       throw new Error("key-only authorization proof is incomplete; finalize original owner");
     writeJSON(path.join(proofDir, "key-authorization.json"), {
-      version: 1,
+      version: 2,
+      taggingContract: qualificationTaggingContract,
       passed: true,
       checks: 13,
     });
@@ -2423,7 +3010,7 @@ async function qualificationRelays(cf) {
   return relays;
 }
 
-function discoveredRun(value) {
+function discoveredRun(value, installation = readInstallation()) {
   const response = objectAt(value, "authority registry discovery");
   if (Object.keys(response).length !== 1 || !Object.hasOwn(response, "run")) {
     throw new Error("authority registry discovery is invalid");
@@ -2433,7 +3020,7 @@ function discoveredRun(value) {
   if (
     !runIdPattern.test(run.runId ?? "") ||
     !workerNamePattern.test(run.candidateWorker ?? "") ||
-    run.candidateWorker !== `crabbox-${run.runId}` ||
+    run.candidateWorker !== (installation?.candidate.name ?? `crabbox-${run.runId}`) ||
     !sha64.test(run.deploymentHash ?? "")
   ) {
     throw new Error("authority registry run identity is invalid");
@@ -2467,63 +3054,329 @@ async function discoveryControllerVersion(cf, metadata, expectedVersion) {
   return version;
 }
 
-async function discoverWithOwnedController(
-  cf,
+function safeControllerResponse(response) {
+  return {
+    status: response.status,
+    ...(/^[a-f0-9]{16}-[A-Z]{3}$/.test(response.ray ?? "") ? { ray: response.ray } : {}),
+  };
+}
+
+// The upload API's deployment_id is the serving version identifier, as in the
+// existing relay readback contract. Missing acknowledgement never permits replay.
+async function observeControllerManagement(cf, metadata, expectedVersion, pause) {
+  const until = Math.min(Date.now() + 60_000, cf.controllerObservationDeadline);
+  const originalSignal = cf.discoverySignal;
+  const observation = new AbortController();
+  const timer = setTimeout(() => observation.abort(), Math.max(1, until - Date.now()));
+  cf.discoverySignal = AbortSignal.any([originalSignal, observation.signal]);
+  try {
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (Date.now() >= until || cf.discoverySignal.aborted)
+        throw new Error("controller management observation cancelled or exhausted");
+      await verifyAuthority(cf);
+      // Validate visible settings even while the deployment view is unavailable.
+      const settings = await cf.request(
+        `/workers/scripts/${controllerName}/settings`,
+        {},
+        { allow404: true },
+      );
+      if (settings !== undefined) {
+        assertOwnedSettings(cf, controllerName, settings);
+        if (
+          canonical(publicBindingShape(settings.bindings ?? [])) !==
+            canonical(publicBindingShape(metadata.bindings)) ||
+          canonical([...(settings.tags ?? [])].sort()) !== canonical([...metadata.tags].sort())
+        )
+          throw new Error("controller upload settings drifted");
+        await ownedNamespaces(cf, controllerName, settings.bindings);
+      }
+      // ONLY this owned first-upload deployment view's HTTP404 is observable again.
+      // Malformed/empty/split/foreign deployments, denial and other endpoints fail.
+      try {
+        const version = await discoveryControllerVersion(cf, metadata, expectedVersion);
+        await verifyAuthority(cf);
+        cf.discoverySignal.throwIfAborted();
+        if (Date.now() >= until) throw new Error("controller management observation exhausted");
+        return version;
+      } catch (error) {
+        if (
+          error.status !== 404 ||
+          error.pathname !== `/workers/scripts/${controllerName}/deployments`
+        )
+          throw error;
+        if (attempt === 11) throw error;
+        await pause(Math.min(5_000, Math.max(1, until - Date.now())), undefined, {
+          signal: cf.discoverySignal,
+        });
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+    cf.discoverySignal = originalSignal;
+  }
+}
+
+export async function discoverWithOwnedController(
+  originalCF,
   deploymentHash,
   token,
-  { idleOnly = false, probeOnly = false, v2 = transportV2Enabled() } = {},
+  { idleOnly = false, probeOnly = false, v2 = transportV2Enabled(), signal, pause = delay } = {},
 ) {
   const metadata = {
     ...controllerMetadata(deploymentHash, token, v2),
-    tags: ownershipTags(cf, controllerName, controllerMetadata(deploymentHash, token, v2).bindings),
+    tags: ownershipTags(
+      originalCF,
+      controllerName,
+      controllerMetadata(deploymentHash, token, v2).bindings,
+    ),
   };
-  await requireControllerAbsent(cf);
-  let version;
-  let failure;
-  let controllerURL;
-  let discovered;
-  let retainForFinalization = false;
-  // Arm cleanup before upload: an API response can be lost after deployment.
-  try {
-    await cf.upload(controllerName, controllerSource, metadata);
-    version = await discoveryControllerVersion(cf, metadata);
-    controllerURL = await cf.enableSubdomain(controllerName);
-    await discoveryControllerVersion(cf, metadata, version);
-    if (probeOnly) {
-      discovered = await controllerCall(cf, controllerURL, token, "transport-discover");
-      if (!discovered || Object.keys(discovered).join(",") !== "probe")
-        throw new Error("invalid probe discovery");
-    } else {
-      if (v2 && !idleOnly) await recoverTransportProbe(cf, controllerURL, token);
-      discovered = await controllerCall(cf, controllerURL, token, "discover");
-    }
-    const run = probeOnly ? null : discoveredRun(discovered);
-    if (idleOnly && run !== null) {
-      throw new Error("idle discovery found an active authority registry run");
-    }
-    retainForFinalization = !idleOnly && !probeOnly;
-  } catch (error) {
-    failure = error instanceof Error ? error.message : String(error);
-  } finally {
-    if (!retainForFinalization) {
-      try {
-        const settings = await cf.request(
-          `/workers/scripts/${controllerName}/settings`,
-          {},
-          { allow404: true },
+  const identity = digest(
+    canonical({
+      authority: originalCF.admission.authority,
+      metadata: {
+        ...metadata,
+        bindings: publicBindingShape(metadata.bindings),
+      },
+    }),
+  );
+  const directory = path.join(
+    path.resolve(required("QUALIFICATION_PROOF_DIR")),
+    `controller-${identity}`,
+  );
+  const started = Date.now();
+  const cycleEnd = Math.min(started + 180_000, originalCF.controllerDeadline ?? Infinity);
+  const forwardEnd = Math.min(started + 120_000, cycleEnd - 60_000);
+  const receipt = { version: 1, identity, stage: "new", settlement: "not-needed", events: [] };
+  return await withQualificationJournal(
+    directory,
+    {
+      stateName: "provisioning.json",
+      lockName: "provisioning.lock",
+      create: true,
+      initial: () => receipt,
+    },
+    async (retained, save) => {
+      if (canonical(retained) !== canonical(receipt))
+        throw new Error(
+          "controller provisioning receipt exists; use recovery, never replay upload",
         );
-        if (settings !== undefined) {
-          await discoveryControllerVersion(cf, metadata, version);
-          await cf.deleteScript(controllerName);
+      const forward = new AbortController(),
+        cleanup = new AbortController();
+      const cancel = () => forward.abort();
+      const timer = setTimeout(cancel, Math.max(1, forwardEnd - Date.now()));
+      const cleanupTimer = setTimeout(() => cleanup.abort(), Math.max(1, cycleEnd - Date.now()));
+      process.once("SIGINT", cancel);
+      process.once("SIGTERM", cancel);
+      const cf = Object.create(originalCF);
+      cf.discoverySignal = AbortSignal.any([
+        forward.signal,
+        ...(signal ? [signal] : []),
+        ...(originalCF.discoverySignal ? [originalCF.discoverySignal] : []),
+      ]);
+      cf.controllerDeadline = forwardEnd;
+      cf.controllerObservationDeadline = forwardEnd;
+      // Canonical discovery temporarily installs its own observation signal.
+      // Keep provisioning cancellation in that signal and in runtime requests.
+      cf.recoverySignal = (action) =>
+        AbortSignal.any([
+          cf.discoverySignal,
+          ...(originalCF.recoverySignal ? [originalCF.recoverySignal(action)] : []),
+        ]);
+      let cleaning = false;
+      const request = originalCF.request;
+      cf.request = async (pathname, init = {}, options = {}) => {
+        const active = cf.discoverySignal;
+        if (
+          active.aborted ||
+          Date.now() >= (cleaning ? cycleEnd : forwardEnd) ||
+          receipt.events.length >= (cleaning ? 800 : 600)
+        )
+          throw new Error("controller provisioning request cancelled or bound exhausted");
+        const own = `/workers/scripts/${controllerName}`;
+        const event = {
+          phase: receipt.stage,
+          method: init.method ?? "GET",
+          endpoint: pathname.startsWith(own)
+            ? pathname.slice(own.length) || "upload"
+            : "isolation-fence",
+          category: managementEndpoint(pathname),
+          elapsedMs: Date.now() - started,
+          outcome: "unconfirmed",
+        };
+        receipt.events.push(event);
+        await save(receipt);
+        try {
+          const content = options.contentIdentityBytes || options.probeContentIdentity;
+          const result = await request.call(
+            cf,
+            pathname,
+            {
+              ...init,
+              redirect: "error",
+              signal: AbortSignal.any([active, ...(init.signal ? [init.signal] : [])]),
+            },
+            {
+              ...options,
+              // The Worker list is unpaginated and includes shared-account metadata.
+              // Keep acknowledgements and all other management reads at 64KiB.
+              boundedBytes:
+                pathname === "/workers/scripts" && (init.method ?? "GET") === "GET"
+                  ? 1024 * 1024
+                  : 64 * 1024,
+              ...(!content ? { responseMetadata: true } : {}),
+            },
+          );
+          event.outcome = "acknowledged";
+          if (!content) event.response = safeControllerResponse(result.response);
+          else event.contentSha256 = result.sha256;
+          await save(receipt);
+          return content || options.responseMetadata ? result : result.result;
+        } catch (error) {
+          event.outcome = "failed";
+          event.failure = managementFailure(error) ?? {
+            endpoint: managementEndpoint(pathname),
+            reason: active.aborted ? "cancelled" : "request-failed",
+          };
+          if (error.responseInfo) event.response = safeControllerResponse(error.responseInfo);
+          await save(receipt);
+          throw error;
         }
+      };
+      let version,
+        failure,
+        controllerURL,
+        discovered,
+        retainForFinalization = false,
+        uploadAttempted = false;
+      try {
+        receipt.stage = "absence";
+        await save(receipt);
+        await verifyAuthority(cf);
+        await requireAbsent(cf, controllerName);
+        // A previous exact caller may have been retired by transport recovery.
+        // This new upload is bound to its own acknowledgement below.
+        cf.controllerVersion = undefined;
+        receipt.stage = "upload";
+        receipt.settlement = "required";
+        await save(receipt);
+        uploadAttempted = true;
+        const ack = await cf.upload(controllerName, controllerSource, metadata, [], {
+          envelope: true,
+          responseMetadata: true,
+        });
+        receipt.upload = {
+          response: safeControllerResponse(ack.response),
+          acknowledged: ack.result?.success === true,
+        };
+        await save(receipt);
+        if (ack.result?.success !== true)
+          throw new Error("controller upload acknowledgement is unconfirmed");
+        receipt.acknowledgedVersion = workerVersion(ack.result?.result?.deployment_id);
+        await save(receipt);
+        receipt.stage = "management-readiness";
+        await save(receipt);
+        version = await observeControllerManagement(
+          cf,
+          metadata,
+          receipt.acknowledgedVersion,
+          pause,
+        );
+        receipt.verifiedVersion = version;
+        receipt.stage = "exposure";
+        await save(receipt);
+        controllerURL = await cf.enableSubdomain(controllerName);
+        await discoveryControllerVersion(cf, metadata, version);
+        receipt.stage = "discovery";
+        await save(receipt);
+        if (probeOnly) {
+          discovered = await controllerCall(cf, controllerURL, token, "transport-discover");
+          if (!discovered || Object.keys(discovered).join(",") !== "probe")
+            throw new Error("invalid probe discovery");
+        } else {
+          if (v2 && !idleOnly) await recoverTransportProbe(cf, controllerURL, token);
+          discovered = await controllerCall(cf, controllerURL, token, "discover");
+        }
+        const run = probeOnly ? null : discoveredRun(discovered);
+        if (idleOnly && run !== null)
+          throw new Error("idle discovery found an active authority registry run");
+        cf.discoverySignal.throwIfAborted();
+        receipt.discovery = probeOnly ? "probe-observed" : run === null ? "idle" : "active";
+        retainForFinalization = !idleOnly && !probeOnly;
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        failure = failure ? `${failure}; probe cleanup: ${message}` : `probe cleanup: ${message}`;
+        failure = error instanceof Error ? error.message : String(error);
+        receipt.failedStage = receipt.stage;
+        receipt.failure = managementFailure(error) ?? { reason: "verification-failed" };
+      } finally {
+        if (uploadAttempted && !retainForFinalization) {
+          cleaning = true;
+          receipt.stage = "cleanup";
+          // User cancellation stops forward work; the original owner retains its
+          // reserved cleanup time. No upload or deletion is ever replayed.
+          cf.discoverySignal = AbortSignal.any([
+            cleanup.signal,
+            ...(originalCF.discoverySignal ? [originalCF.discoverySignal] : []),
+          ]);
+          cf.controllerObservationDeadline = cycleEnd;
+          try {
+            await save(receipt);
+            await verifyAuthority(cf);
+            const settings = await cf.request(
+              `/workers/scripts/${controllerName}/settings`,
+              {},
+              { allow404: true },
+            );
+            if (settings !== undefined || receipt.acknowledgedVersion) {
+              const expected = version ?? receipt.acknowledgedVersion;
+              if (expected) await observeControllerManagement(cf, metadata, expected, pause);
+              else await discoveryControllerVersion(cf, metadata);
+              await cf.deleteScript(controllerName);
+            }
+            await requireAbsent(cf, controllerName);
+            const deployment = await cf.request(
+              `/workers/scripts/${controllerName}/deployments`,
+              {},
+              { allow404: true },
+            );
+            const scripts = await cf.list("/workers/scripts");
+            if (
+              deployment !== undefined ||
+              scripts.some((s) => (s.id ?? s.name) === controllerName)
+            )
+              throw new Error("controller cleanup remains unconfirmed");
+            receipt.settlement =
+              receipt.acknowledgedVersion || settings !== undefined
+                ? "deleted-and-absent"
+                : "absent-without-upload-acknowledgement";
+          } catch (error) {
+            receipt.settlement = "unresolved";
+            receipt.cleanupFailure = managementFailure(error) ?? { reason: "verification-failed" };
+            const message = error instanceof Error ? error.message : String(error);
+            failure = failure
+              ? `${failure}; probe cleanup: ${message}`
+              : `probe cleanup: ${message}`;
+          }
+        } else if (retainForFinalization) {
+          // Transport recovery may have replaced this caller under its exact
+          // canonical owner; controllerCall reverified that replacement.
+          originalCF.controllerVersion = cf.controllerVersion;
+          receipt.retainedVersion = cf.controllerVersion;
+          receipt.settlement = "retained-for-original-finalizer";
+        }
+        receipt.stage = "complete";
+        receipt.outcome = failure ? "failed" : "verified";
+        try {
+          await save(receipt);
+        } finally {
+          clearTimeout(timer);
+          clearTimeout(cleanupTimer);
+          process.removeListener("SIGINT", cancel);
+          process.removeListener("SIGTERM", cancel);
+        }
       }
-    }
-  }
-  if (failure) throw new Error(failure);
-  return { controllerURL, discovered };
+      if (failure) throw new Error(failure);
+      return { controllerURL, discovered };
+    },
+  );
 }
 
 async function recoverTransportProbe(cf, controllerURL, token) {
@@ -2536,10 +3389,15 @@ async function recoverTransportProbe(cf, controllerURL, token) {
     throw new Error("invalid canonical transport probe");
   // A retained tombstone is historical custody, not this controller's mutation
   // target. It must not block cleanup of a later pre-probe partial deployment.
-  if (["verified", "cancelled"].includes(state)) return;
+  if (["verified", "cancelled"].includes(state)) {
+    assertSettledTransportDiscovery(reply);
+    return;
+  }
   const settings = await verifyOwned(cf, controllerName);
   const owner = transportProfile(settings.bindings ?? [])?.identity.deploymentHash;
   if (owner !== request.identity.deploymentHash) {
+    if (cf.installation)
+      throw Error("installed controller differs from unresolved transport owner");
     // No candidate/registry mutation and no force: replace only our exact trusted
     // caller, then let the existing recovery path settle the canonical owner.
     await cf.verifyController();
@@ -2563,8 +3421,9 @@ async function cleanupRun({
   expected,
   initialQualificationFailure,
   recovery,
+  client,
 } = {}) {
-  const cf = recovery?.callerCF ?? (await cloudflareFromEnv());
+  const cf = recovery?.callerCF ?? client ?? (await cloudflareFromEnv());
   const token = recovery?.token ?? required("QUALIFICATION_CONTROLLER_TOKEN");
   const call = (url, action, value = {}) =>
     controllerCall(cf, url, token, action, value, recovery?.authorityCF ?? cf);
@@ -2584,6 +3443,8 @@ async function cleanupRun({
         await recoverTransportProbe(cf, controllerURL, token);
       discovered = await call(controllerURL, "discover");
     } else {
+      if (cf.installation)
+        throw Error("installed recovery controller missing; do not provision replacement");
       if (recovery) {
         if (!recovery.state.retired)
           throw new Error("original controller unavailable before verified retirement");
@@ -2647,7 +3508,7 @@ async function cleanupRun({
         idleProbe = true;
       }
     }
-    discoveredRun(discovered);
+    discoveredRun(discovered, cf.installation);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -2674,15 +3535,18 @@ async function cleanupRun({
       };
     }
     try {
-      for (const relay of await qualificationRelays(cf)) {
-        await deleteRelay(cf, relay.worker);
-      }
-      for (const candidate of await qualificationCandidates(cf)) {
-        await deleteCandidate(cf, candidate.worker);
-      }
-      if (!idleProbe) {
-        await cf.verifyController();
-        await cf.deleteScript(controllerName);
+      if (cf.installation) await verifyInstallation(cf);
+      else {
+        for (const relay of await qualificationRelays(cf)) {
+          await deleteRelay(cf, relay.worker);
+        }
+        for (const candidate of await qualificationCandidates(cf)) {
+          await deleteCandidate(cf, candidate.worker);
+        }
+        if (!idleProbe) {
+          await cf.verifyController();
+          await cf.deleteScript(controllerName);
+        }
       }
     } catch (error) {
       const message = `idle cleanup: ${error instanceof Error ? error.message : String(error)}`;
@@ -2711,7 +3575,13 @@ async function cleanupRun({
     verifyAttestationIdentity(original, expected);
     if (!original.finalizingAt) throw new Error("recovery owner is not already finalizing");
   }
-  const relayWorker = relayNameForRun(run.runId);
+  const relayWorker = cf.installation?.relay.name ?? relayNameForRun(run.runId);
+  if (cf.installation && run.candidateWorker !== cf.installation.candidate.name)
+    return {
+      result: "failed",
+      runId: run.runId,
+      failure: "registry refers to a different installation; preserve recovery custody",
+    };
   let failure;
   let firstAttestation;
   let qualificationFailure = initialQualificationFailure;
@@ -2730,6 +3600,7 @@ async function cleanupRun({
         run.candidateWorker !== expected.candidateWorker ||
         run.deploymentHash !== expected.deploymentHash ||
         run.expiresAt !== expected.expiresAt ||
+        run.taggingContract !== expected.taggingContract ||
         Boolean(run.keyAuthorizationOnly) !== Boolean(expected.keyAuthorizationOnly)
       ) {
         throw new Error("authority registry identity does not match protected expectations");
@@ -2744,7 +3615,7 @@ async function cleanupRun({
     // by the relay can then reach neither the signer nor a reopened run.
     await cf.verifyController();
     await call(controllerURL, "begin-finalization", { runId: run.runId });
-    await deleteRelay(cf, relayWorker);
+    if (!cf.installation) await deleteRelay(cf, relayWorker);
     await call(controllerURL, "finalize", { runId: run.runId });
     firstAttestation = await call(controllerURL, "attest", {
       runId: run.runId,
@@ -2763,7 +3634,7 @@ async function cleanupRun({
         recordQualificationFailure(error);
       }
     }
-    await deleteCandidate(cf, run.candidateWorker);
+    if (!cf.installation) await deleteCandidate(cf, run.candidateWorker);
     await call(controllerURL, "finalize", { runId: run.runId });
     const finalAttestation = await call(controllerURL, "attest", {
       runId: run.runId,
@@ -2796,7 +3667,8 @@ async function cleanupRun({
     if (after.run !== null) throw new Error("authority registry still has an active run");
     if (recovery) await recovery.checkpoint("retired", finalAttestation);
     await cf.verifyController();
-    await cf.deleteScript(controllerName);
+    if (cf.installation) await verifyInstallation(cf);
+    else await cf.deleteScript(controllerName);
     if (recovery) await recovery.verifyAbsentCallers();
     if (qualificationFailure) {
       return {
@@ -2811,7 +3683,7 @@ async function cleanupRun({
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     try {
-      await deleteRelay(cf, relayWorker);
+      if (!cf.installation) await deleteRelay(cf, relayWorker);
     } catch (relayError) {
       const relayFailure = relayError instanceof Error ? relayError.message : String(relayError);
       failure = `${failure}; relay cleanup: ${relayFailure}`;
@@ -2944,7 +3816,7 @@ export function verifyQualificationEvidence(
     const checks = attestation?.authorizationChecks;
     const counts = attestation?.finalReceipt?.finalCounts;
     const expectedProbes = [
-      "tags-restated",
+      "tags-immutable",
       ...Array.from({ length: 4 }, (_, i) => [
         `tag-missing-${i}`,
         `tag-changed-${i}`,
@@ -2955,6 +3827,7 @@ export function verifyQualificationEvidence(
       !counts ||
       Object.keys(counts).sort().join(",") !== "images,instances,keyPairs,snapshots,volumes" ||
       attestation?.keyAuthorizationOnly !== true ||
+      attestation.taggingContract !== qualificationTaggingContract ||
       !attestation.finalized ||
       !Array.isArray(checks) ||
       checks.length !== 13 ||
@@ -2963,7 +3836,7 @@ export function verifyQualificationEvidence(
           c.probe !== expectedProbes[i] ||
           c.outcome !== "passed" ||
           c.action !== (i > 0 && i % 3 === 0 ? "DeleteTags" : "CreateTags") ||
-          c.code !== (i === 0 ? "DryRunOperation" : "UnauthorizedOperation"),
+          c.code !== "UnauthorizedOperation",
       ) ||
       attestation?.operations?.length !== 1 ||
       attestation.operations[0].action !== "ImportKeyPair" ||
@@ -2985,6 +3858,7 @@ export function verifyQualificationEvidence(
           op.signerDispatches?.some((dispatch) => dispatch.outcome === "accepted"),
       );
     if (
+      attestation?.taggingContract !== qualificationTaggingContract ||
       !attestation?.finalized ||
       !receipt?.completedAt ||
       receipt.failureCodes?.length !== 0 ||
@@ -3178,8 +4052,42 @@ function writeEvidence(result) {
   fs.writeFileSync(path.join(proofDir, "checksums.sha256"), `${checksums}\n`, { mode: 0o600 });
 }
 
+async function protectedOperation(operation, work, { recover = false } = {}) {
+  if (!readInstallation()) return work(undefined);
+  const cf = await cloudflareFromEnv({ verify: false });
+  const stop = new AbortController();
+  const cancel = () => stop.abort();
+  process.once("SIGINT", cancel);
+  process.once("SIGTERM", cancel);
+  try {
+    return await withInstallationJournal(
+      cf,
+      path.join(path.resolve(required("QUALIFICATION_PROOF_DIR")), "installation", operation),
+      operation,
+      async (client, state) => {
+        await verifyAuthority(client);
+        return work(client, state);
+      },
+      {
+        signal: stop.signal,
+        recover,
+        deadline: Date.now() + 15 * 60_000,
+      },
+    );
+  } finally {
+    process.removeListener("SIGINT", cancel);
+    process.removeListener("SIGTERM", cancel);
+  }
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
+  if (
+    ["admit", "install", "deploy", "deploy-and-arm", "arm"].includes(command) &&
+    readInstallation() &&
+    !privateQualificationMode(process.env.QUALIFICATION_MODE)
+  )
+    throw Error("retained installation requires a private first-walk or key-authorization build");
   if (["binding-probe-plan", "binding-probe-run", "binding-probe-recover"].includes(command)) {
     const { bindingProbeCommand } = await import("./image-qualification-binding-probe.mjs");
     return await bindingProbeCommand(command, args, Cloudflare);
@@ -3269,8 +4177,24 @@ async function main() {
     writeJSON(path.resolve(args[12]), result);
     return;
   }
-  if (command === "deploy") return await deploy();
-  if (command === "arm") return await arm();
+  if (command === "deploy-and-arm") {
+    const expected = await protectedOperation("prepare-run", (client) => deploy({ client }));
+    return await protectedOperation("arm-run", (client) => arm({ client, expected }));
+  }
+  if (command === "install-recover") {
+    if (!readInstallation()) throw Error("protected installation descriptor required");
+    const result = await protectedOperation("install", recoverInstallation, { recover: true });
+    writeJSON(
+      path.join(path.resolve(required("QUALIFICATION_PROOF_DIR")), "installation-recovery.json"),
+      result,
+    );
+    return;
+  }
+  if (command === "install")
+    return await protectedOperation("install", (client) => install({ client }));
+  if (command === "deploy")
+    return await protectedOperation("prepare-run", (client) => deploy({ client }));
+  if (command === "arm") return await protectedOperation("arm-run", (client) => arm({ client }));
   if (command === "finalize") {
     let identityFailure;
     try {
@@ -3285,18 +4209,23 @@ async function main() {
       const message = error instanceof Error ? error.message : String(error);
       identityFailure = identityFailure ? `${identityFailure}; ${message}` : message;
     }
-    const result = await cleanupRun({
-      reaper: true,
-      requireProof: true,
-      expected,
-      initialQualificationFailure: identityFailure,
-    });
+    const result = await protectedOperation("finalize-run", (client) =>
+      cleanupRun({
+        reaper: true,
+        requireProof: true,
+        expected,
+        initialQualificationFailure: identityFailure,
+        client,
+      }),
+    );
     writeEvidence(result);
     if (result.result === "failed") throw new Error(result.failure);
     return;
   }
   if (command === "reap") {
-    const result = await cleanupRun({ reaper: true });
+    const result = await protectedOperation("recover-run", (client) =>
+      cleanupRun({ reaper: true, client }),
+    );
     writeEvidence(result);
     if (result.result === "failed") throw new Error(result.failure);
     return;
