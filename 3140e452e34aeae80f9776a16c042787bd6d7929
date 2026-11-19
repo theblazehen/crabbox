@@ -1,4 +1,4 @@
-{"run": "crabbox-20261119-003418-a783", "left": "0acae03668e9b2572e7c61d92a1f2608905990b9", "right": "d4e3c91c4df80105f7bc7c242e632665e280d2ea", "commit": "3140e452e34aeae80f9776a16c042787bd6d7929", "at": "2026-11-19T11:33:31Z", "fork": "theblazehen/crabbox", "branch": "main", "upstream": "https://github.com/openclaw/crabbox.git", "upstream_branch": "main"}
+{"run": "crabbox-20261119-003418-a783", "left": "0acae03668e9b2572e7c61d92a1f2608905990b9", "right": "d4e3c91c4df80105f7bc7c242e632665e280d2ea", "commit": "3140e452e34aeae80f9776a16c042787bd6d7929", "at": "2026-11-19T13:36:22Z", "fork": "theblazehen/crabbox", "branch": "main", "upstream": "https://github.com/openclaw/crabbox.git", "upstream_branch": "main"}
 
 # RepoSteward report: main x refs/remotes/upstream/main
 
@@ -11,6 +11,14 @@ Kept: the run is not sure these are the inventory entries named; confirm with `r
 - pod-container-runtime-ids-are-decoded-2 Pod container runtime IDs are decoded per selected container name (+6) (L1, L2, L3, L4, L5, L7, L8) may be pod-container-runtime-ids-are-decoded, runtime-initializer-request-accepts-only
 - retained-agent-sandbox-ssh-resolve-2 Retained agent-sandbox-ssh resolve reuses a healthy identity-fenced endpoint without re-running the initializer (+16) (L6, L9, L11, L13, L15, L17, L18, L28, L29, L30, L31, L32, L33, L34, L35, L36, L27) may be retained-agent-sandbox-ssh-resolve, endpoint-claim-refresh-skips-the-write, agent-sandbox-ssh-is-a-separate-ssh, ssh-bootstrap-reuses-a-byte-identical, ssh-transport-runs-kubectl-port-forward, posix-ssh-sync-scripts-are-uploaded-to-a, sandbox-initializer-reuses-a-verified
 - download-failures-report-the-remote Download failures report the remote child's exit status instead of the raw wait error (L26) may be retained-agent-sandbox-ssh-resolve, posix-ssh-sync-scripts-are-uploaded-to-a
+
+## What the run tried on its failing obligations
+
+- ci:Apple VM: couldn't reproduce CI's failure here: the replay here ends with "(cd "$RS_TREE" && export GOFLAGS='-mod=readonly -trimpath'; export GOTOOLCHAIN=local; bash -e -c 'test "$(uname -m)" = arm64') || { echo "[reposteward] CI's set", not with CI's failure
+- ci:Go: RepoSteward's own check of it cannot pass here, whatever the code does, so that is RepoSteward's to fix, not yours: its replay fails on your fork's own branch too (in 588.7 s), where CI passed the job: the replay is broken, so it can't tell whether the merge broke it; it ends with "Go coverage: success"
+- ci:Go core: CI's failure did not reproduce here: its step passed 3 of 3 alone (timeout x4); no blocker found, and none ruled out on CI's runner
+- ci:Go test: RepoSteward's own check of it cannot pass here, whatever the code does, so that is RepoSteward's to fix, not yours: its replay fails on your fork's own branch too (in 476.3 s), where CI passed the job: the replay is broken, so it can't tell whether the merge broke it; it ends with "Go CLI shards: success"
+- ci:Scripts: couldn't reproduce CI's failure here: the replay here ends with "(cd "$RS_TREE" && export GOFLAGS='-mod=readonly -trimpath'; export GOTOOLCHAIN=local; bash -e -c 'node scripts/generate-linux-readiness.mjs --check') || { echo ", not with CI's failure; not replayed from CI's setup: "sudo apt-get update && sudo apt-get install -y ripgrep": installs system packages
 
 - Incremental on run `repo-20261117T181350Z-b4fd` (base result `20d95ce3f606`): upstream `b25edd57dd9a`..`d4e3c91c4df8` (10 commits), 0 new fork commits, 44 files changed. The base result contains the fork tip (its pull request is not merged; the fork is unchanged).
 - Carried from run `repo-20261117T181350Z-b4fd`: 43 obligations of 30 untouched features, with 254 checks re-run on this run's parents and merge (nothing below counts a run from the base).
@@ -27,8 +35,8 @@ Kept: the run is not sure these are the inventory entries named; confirm with `r
 - Unverified, the merge touched them (every executed clause passes, but the merge changed their cited code and some clauses are unchecked): R24 (unverified (merge touched it): internal/cli/run.go, internal/cli/run_test.go, internal/cli/ssh.go, internal/cli/ssh_forward_real_unix_test.go, internal/cli/sync_git_overlay_test.go; 0 of 1 clauses checked, all passing; unchecked: R24.13)
 - Clause coverage: 368 of 369 clauses checked (99%).
 - Checks kept: 394; decisions recorded: 0.
-- Model calls: 7469 (11153757 input, 399937024 cache-read, 3601759 output tokens), cost $0.00.
-- Wall time: 653.3 min.
+- Model calls: 7470 (11154883 input, 399937024 cache-read, 3602245 output tokens), cost $0.00.
+- Wall time: 772.2 min.
 
 ## Requirements on `3140e452e34a` (the requirement harness `c704`: `bash "$RS_PROBES/harness_all_requirements.sh"`)
 
@@ -657,14 +665,14 @@ wait; rs_rc=0; if [ -s "$rs_d/failed" ]; then rs_rc=1; echo "RS_FORKTESTS_FAILED
 
 ## Heavy jobs
 
-- 2009 jobs (1813 check runs, 172 worker commands); largest peak 40864 MiB of a 65536 MiB limit; final concurrency 7; 0 killed by memory, retried alone; 533.3 min waiting for a slot.
+- 2026 jobs (1830 check runs, 172 worker commands); largest peak 46611 MiB of a 65536 MiB limit; final concurrency 1; 0 killed by memory, retried alone; 533.3 min waiting for a slot.
 
 ## Phase budgets
 
 - obligations (8% share): 445 calls, 20.7 min, $0.00.
 - checks (12% share): 2680 calls, 171.3 min, $0.00.
 - integrate (55% share): 0 calls, 50.9 min, $0.00.
-- verify (25% share): 4344 calls, 401.5 min, $0.00.
+- verify (25% share): 4345 calls, 520.4 min, $0.00.
 
 ## Lead notes (claims, not records)
 
